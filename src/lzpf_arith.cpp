@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 namespace nzr::lzpf {
 
@@ -24,6 +25,34 @@ inline std::uint32_t LoadBigEndianU32(const std::uint8_t* p) {
     std::memcpy(&le, p, 4);
     return (le >> 24) | ((le & 0x00ff0000u) >> 8) |
            ((le & 0x0000ff00u) << 8) | (le << 24);
+}
+
+// Read n_bits from a SideBitState using the same MSB-first big-endian logic
+// as DecodeResidualsMono's inline bit reader (mirrors FUN_080b1fb0 applied to
+// the local_4c array in FUN_080a5330).
+inline std::uint32_t ReadSideBits(SideBitState* br, std::uint32_t n_bits) {
+    std::uint32_t old_cache = br->cache;
+    std::uint32_t bits;
+    if (br->n_valid < n_bits) {
+        std::uint32_t need       = n_bits - br->n_valid;
+        std::uint32_t new_nvalid = 32u - need;
+        std::uint32_t word       = new_nvalid;
+        if (br->cur < br->end) {
+            std::uint32_t raw;
+            __builtin_memcpy(&raw, br->cur, 4);
+            word = ((raw >> 24u) & 0xffu) | ((raw >> 8u) & 0xff00u) |
+                   ((raw & 0xff00u) << 8u) | ((raw & 0xffu) << 24u);
+        }
+        br->cur += 4;
+        old_cache     = word;
+        bits          = (br->cache << (need & 0x1fu)) | (old_cache >> (new_nvalid & 0x1fu));
+        br->n_valid   = new_nvalid;
+    } else {
+        br->n_valid -= n_bits;
+        bits         = br->cache >> (br->n_valid & 0x1fu);
+    }
+    br->cache = old_cache;
+    return bits & Mask(n_bits);
 }
 
 }  // namespace
@@ -1033,9 +1062,6 @@ std::size_t DecodeArithBuffer(const std::uint8_t* input, std::size_t input_size,
     RangeCoderFinalize(br);
 
     // Bytes consumed: legacy `((7 - n_valid) + (cur - start) * 8) >> 3`.
-    // Equivalent to ceil((bits_consumed_from_input) / 8). The trailing
-    // ReadBits inside RangeCoderFinalize already advanced cur past the byte
-    // boundary, so naive cur-start over-reports. The formula corrects for that.
     const std::int64_t bits =
         (7 - static_cast<std::int64_t>(br.n_valid)) +
         static_cast<std::int64_t>(br.cur - br.start) * 8;
@@ -1419,6 +1445,225 @@ bool ReadCodeLengthsHuffmanScratch(BitReader& br, std::uint8_t* dst,
     return true;
 }
 #endif
+// ---------------------------------------------------------------------------
+// Prefilter+arith decoder (task #13)
+// ---------------------------------------------------------------------------
+
+// FUN_0809baa0 — mono residual decoder.
+// Bytes < 0xe0: direct zigzag. Bytes >= 0xe0: pull extra bits from side stream.
+// Zigzag: value = (byte >> 1) ^ -(byte & 1)
+void DecodeResidualsMono(std::int32_t* out, std::size_t count,
+                         const std::uint8_t* arith_bytes, SideBitState* br) {
+    const std::uint8_t* end_ptr = br->end;
+    const std::uint8_t* cur     = br->cur;
+    std::uint32_t       cache   = br->cache;
+    std::uint32_t       n_valid = br->n_valid;
+
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint32_t b = arith_bytes[i];
+        if (b <= 0xdfu) {
+            out[i] = static_cast<std::int32_t>((b >> 1u) ^ (0u - (b & 1u)));
+        } else {
+            std::uint32_t n_bits  = (b < 0xe1u) ? 1u : (b - 0xe0u);
+            std::uint32_t old_cache = cache;
+            std::uint32_t bits;
+            if (n_valid < n_bits) {
+                std::uint32_t need      = n_bits - n_valid;
+                std::uint32_t new_nvalid = 32u - need;
+                std::uint32_t word = new_nvalid;
+                if (cur < end_ptr) {
+                    std::uint32_t raw;
+                    __builtin_memcpy(&raw, cur, 4);
+                    word = ((raw >> 24u) & 0xffu) | ((raw >> 8u) & 0xff00u) |
+                           ((raw & 0xff00u) << 8u) | ((raw & 0xffu) << 24u);
+                }
+                cur += 4;
+                old_cache = word;
+                bits = (cache << (need & 0x1fu)) | (old_cache >> (new_nvalid & 0x1fu));
+                n_valid = new_nvalid;
+            } else {
+                n_valid -= n_bits;
+                bits = cache >> (n_valid & 0x1fu);
+            }
+            cache = old_cache;
+            std::uint32_t base = RunLengthOffset(b - 0xe0u) + 0xe0u;
+            std::uint32_t val  = base + (bits & Mask(n_bits));
+            out[i] = static_cast<std::int32_t>((val >> 1u) ^ (0u - (val & 1u)));
+        }
+    }
+
+    br->cur     = cur;
+    br->cache   = cache;
+    br->n_valid = n_valid;
+}
+
+// FUN_080a50c0 — reconstruct sample output from int32 delta residuals.
+// Integrates deltas and writes sample_width-byte samples (LE or BE).
+void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
+                               const std::int32_t* residuals,
+                               const PrefilterParams* p) {
+    const std::uint8_t sw  = p->sample_width;
+    const std::uint8_t end = p->endian;
+    if (sw == 0 || total_bytes == 0) return;
+    std::size_t n_samples = total_bytes / sw;
+    if (n_samples == 0) return;
+
+    std::int32_t accum = 0;
+    std::uint8_t* dst  = out;
+    for (std::size_t i = 0; i < n_samples; ++i) {
+        accum += residuals[i];
+        std::int32_t v = accum;
+        if (sw == 1u) {
+            *dst++ = static_cast<std::uint8_t>(v);
+        } else if (sw == 2u) {
+            if (end == 0u) {
+                dst[0] = static_cast<std::uint8_t>((v >> 8u) & 0xffu);
+                dst[1] = static_cast<std::uint8_t>(v & 0xffu);
+            } else {
+                std::uint16_t v16 = static_cast<std::uint16_t>(v);
+                __builtin_memcpy(dst, &v16, 2);
+            }
+            dst += 2;
+        } else {
+            if (end == 0u) {
+                dst[0] = static_cast<std::uint8_t>((v >> 16u) & 0xffu);
+                dst[1] = static_cast<std::uint8_t>((v >> 8u)  & 0xffu);
+                dst[2] = static_cast<std::uint8_t>(v & 0xffu);
+            } else {
+                dst[0] = static_cast<std::uint8_t>(v & 0xffu);
+                dst[1] = static_cast<std::uint8_t>((v >> 8u)  & 0xffu);
+                dst[2] = static_cast<std::uint8_t>((v >> 16u) & 0xffu);
+            }
+            dst += 3;
+        }
+    }
+}
+
+// FUN_080a5330 — core prefilter block decoder.
+std::size_t DecodePrefilterBlock(const std::uint8_t* input, std::size_t input_size,
+                                  std::uint8_t* output, std::size_t output_size,
+                                  bool is_stereo_variant) {
+    if (input_size == 0 || output_size == 0) return 0;
+
+    // Header byte → packed format params (FUN_080a5330 lines 44-101).
+    std::uint8_t hdr = input[0];
+    PrefilterParams p{};
+    p.flag_a  = hdr & 1u;
+    std::uint32_t bVar7 = hdr >> 1u;
+    std::uint32_t cVar1 = bVar7 / 3u;
+    p.channels = static_cast<std::int8_t>(bVar7 - cVar1 * 3u);
+    std::uint32_t w     = cVar1 / 5u;
+    std::uint32_t bVar7b = cVar1 - w * 5u;
+    if (bVar7b != 0u) {
+        p.endian       = static_cast<std::uint8_t>((bVar7b - 1u) & 1u);
+        std::uint8_t cVar12 = static_cast<std::uint8_t>(((bVar7b - 1u) >> 1u) + 1u);
+        p.sample_width = cVar12 + 1u;
+    } else {
+        p.endian       = 0u;
+        p.sample_width = 1u;
+    }
+    p.prefix_count = static_cast<std::int16_t>(w);
+
+    const std::uint8_t* ptr = input + 1;
+    std::size_t remaining   = input_size - 1u;
+
+    // Extended prefix_count (local_26 == 6 → read one more byte).
+    if (p.prefix_count == 6) {
+        if (remaining == 0) return 0;
+        p.prefix_count = static_cast<std::int16_t>(static_cast<std::uint32_t>(ptr[0]) + 6u);
+        ++ptr; --remaining;
+    }
+
+    // Copy literal prefix bytes.
+    std::uint32_t prefix = static_cast<std::uint32_t>(p.prefix_count < 0 ? 0 : p.prefix_count);
+    if (prefix > remaining || prefix > output_size) return 0;
+    if (prefix > 0) { __builtin_memcpy(output, ptr, prefix); ptr += prefix; remaining -= prefix; }
+
+    // Sample counts.
+    std::uint32_t sw         = p.sample_width;
+    if (sw == 0) return 0;
+    std::uint32_t avail      = static_cast<std::uint32_t>(output_size) - prefix;
+    std::uint32_t n_per_chan = avail / sw;
+    if (p.channels != 0) n_per_chan &= ~1u;
+    std::uint32_t remainder  = avail - n_per_chan * sw;
+    std::uint32_t aligned_out = avail - remainder;
+    std::uint32_t n_elems    = aligned_out / sw; // = uStack_5007c
+
+    // Arith-decode residual bytes.
+    std::vector<std::uint8_t> arith_buf(n_elems);
+    std::size_t consumed_arith = 0;
+    if (n_elems > 0) {
+        consumed_arith = DecodeArithBuffer(ptr, remaining, arith_buf.data(),
+                                           n_elems, 12u);
+        if (consumed_arith == 0) return 0;
+        ptr += consumed_arith; remaining -= consumed_arith;
+    }
+
+    // Side-bit stream (follows the arith payload).
+    SideBitState br{};
+    br.ignored = ptr;
+    br.end     = ptr + remaining;
+    br.cur     = ptr;
+    br.cache   = 0u;
+    br.n_valid = 0u;
+
+    // Predictor init bit-reads (FUN_080a5330 lines 216-254).
+    // For each predictor, read 1 bit; if 1, read 3 more bits to load the
+    // predictor's initial coefficient.  These bits come from the side stream
+    // BEFORE FUN_0809baa0 runs.  We read (and for now discard) the values to
+    // advance the side-stream cursor so that side_consumed is correct.
+    // predictor_count = param_1[1] = 1 for the lzpf mono path.
+    {
+        const std::uint32_t predictor_count = 1u;
+        for (std::uint32_t pi = 0u; pi < predictor_count; ++pi) {
+            std::uint32_t bit = ReadSideBits(&br, 1u);
+            if (bit != 0u) {
+                (void)ReadSideBits(&br, 3u);
+            }
+        }
+    }
+
+    // Residual decode → int32 array.
+    std::vector<std::int32_t> residuals(n_elems);
+    if (!is_stereo_variant) {
+        DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
+    } else {
+        return 0; // FUN_0809bbf0 not yet ported
+    }
+    // Side-stream bytes consumed (FUN_080a5330 line 263).
+    // Uses signed arithmetic: (7 - n_valid) can be negative when n_valid > 7.
+    std::int32_t side_bits_signed =
+        static_cast<std::int32_t>(7) - static_cast<std::int32_t>(br.n_valid)
+        + static_cast<std::int32_t>(br.cur - ptr) * 8;
+    std::size_t side_consumed = (side_bits_signed > 0)
+        ? (static_cast<std::uint32_t>(side_bits_signed) >> 3u)
+        : 0u;
+    if (side_consumed > remaining) side_consumed = remaining;
+
+    // Output reconstruction.
+    ReconstructOutputSamples(output + prefix, aligned_out, residuals.data(), &p);
+
+    return static_cast<std::size_t>(ptr - input) + side_consumed;
+}
+
+// FUN_080a5bb0 — loop wrapper splitting output into ≤ 65536-byte chunks.
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant) {
+    if (output_size == 0) return 0;
+    std::size_t in_off = 0, out_off = 0;
+    while (out_off < output_size) {
+        std::size_t chunk = std::min<std::size_t>(output_size - out_off, 0x10000u);
+        std::size_t used  = DecodePrefilterBlock(
+            input + in_off, input_size - in_off,
+            output + out_off, chunk, is_stereo_variant);
+        if (used == 0) return 0;
+        in_off  += used;
+        out_off += chunk;
+    }
+    return in_off;
+}
+
 // ---------------------------------------------------------------------------
 // End scratch port body.
 // ---------------------------------------------------------------------------

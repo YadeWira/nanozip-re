@@ -174,4 +174,62 @@ std::size_t DecodeArithBuffer(const std::uint8_t* input, std::size_t input_size,
                                std::uint8_t* output, std::size_t output_count,
                                std::uint32_t max_len);
 
+// ── Prefilter+arith decoder (FUN_080a5bb0 / FUN_080a5330 / callees) ──────────
+//
+// NanoZip uses this path when `uVar9 & 7 == 4` in the lzpf block dispatcher.
+// It decodes audio-like data with a delta-zigzag prefilter, producing sample
+// widths of 1, 2, or 3 bytes (controlled by the per-block header byte).
+
+// Bit-reader state used by the residual decoders (FUN_0809baa0 / FUN_0809bbf0).
+// Mirrors the 5-word array that FUN_080a5330 builds from local_4c/48/44/40/3c
+// and passes as param_4.  Fields are byte pointers matching the legacy layout;
+// cur and end are always uint32-aligned in practice.
+struct SideBitState {
+    const std::uint8_t* ignored;  // [0] local_4c — preserved but unused by bit ops
+    const std::uint8_t* end;      // [1] local_48 — one-past-last readable byte
+    const std::uint8_t* cur;      // [2] local_44 — current read cursor (uint32-aligned)
+    std::uint32_t cache;          // [3] local_40 — current big-endian 32-bit word
+    std::uint32_t n_valid;        // [4] local_3c — valid bits remaining in cache
+};
+
+// Packed format parameters decoded from the prefilter block header byte.
+// Mirrors the &local_2a layout that FUN_080a5330 passes to FUN_080a50c0.
+struct PrefilterParams {
+    std::uint8_t flag_a;       // [0] = *input & 1
+    std::uint8_t endian;       // [1] = ((bVar7/3)%5 - 1) & 1  (0=big, 1=little-endian)
+    std::uint8_t sample_width; // [2] = bytes per sample (1, 2, or 3)
+    std::int8_t  channels;     // [3] = local_27 = bVar7 % 3  (0=mono, non-0=stereo-split)
+    std::int16_t prefix_count; // [4..5] = local_26 = number of literal prefix bytes
+};
+
+// Decode `count` int32 residuals from `arith_bytes` into `out` using `br` for
+// extended-range codes (input bytes >= 0xe0). Mirrors FUN_0809baa0.
+// `br` is updated in-place (cur/cache/n_valid advance as bits are consumed).
+void DecodeResidualsMono(std::int32_t* out, std::size_t count,
+                         const std::uint8_t* arith_bytes, SideBitState* br);
+
+// Reconstruct sample output from int32 delta residuals into `out`.
+// Mirrors FUN_080a50c0 (mono / non-stereo-split path).
+// `total_bytes` = n_samples * sample_width.
+void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
+                               const std::int32_t* residuals,
+                               const PrefilterParams* p);
+
+// Decode one prefilter block of up to 65536 output bytes. Mirrors FUN_080a5330.
+// `input`/`input_size`: compressed bytes starting immediately after the outer
+//   varint (the bytes FUN_080a5bb0 feeds as param_2 on each call).
+// `is_stereo_variant`: true when the lzpf-context flag (*ctx & 1) is set
+//   (selects FUN_0809bbf0 residual decoder); false selects FUN_0809baa0.
+// Returns input bytes consumed, or 0 on error.
+std::size_t DecodePrefilterBlock(const std::uint8_t* input, std::size_t input_size,
+                                  std::uint8_t* output, std::size_t output_size,
+                                  bool is_stereo_variant);
+
+// Loop wrapper that splits output into chunks of ≤ 65536 bytes and calls
+// DecodePrefilterBlock for each chunk. Mirrors FUN_080a5bb0.
+// Returns total input bytes consumed, or 0 on error.
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant);
+
 }  // namespace nzr::lzpf

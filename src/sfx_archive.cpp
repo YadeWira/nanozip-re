@@ -2955,7 +2955,36 @@ bool TryParseLegacyCnArchive(
                         const bool mode_prefilter = ((uvar9 & 7u) == 4u);
                         const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
                         const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
-                        if (mode_prefilter) { decode_ok = false; break; }
+                        if (mode_prefilter) {
+                            // uVar18 (bit 3 of uvar9) selects lzpf (0) vs lzhd-large (1) core.
+                            // lzhd-large prefilter (FUN_080a9ca0) not yet ported.
+                            const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;
+                            if (uvar18 != 0u) { decode_ok = false; break; }
+                            std::uint64_t block_out_size = uvar9 >> 4u;
+                            if (block_out_size == 0u) block_out_size = 0x8000u;
+                            if (block_out_size > 0x8001u) { decode_ok = false; break; }
+                            if (total_written + block_out_size > total_data_size) {
+                                decode_ok = false; break;
+                            }
+                            if (window_capacity - window_cursor < window_wrap_threshold) {
+                                window_cursor = 0;
+                            }
+                            const std::size_t block_start_in_window = window_cursor;
+                            const std::size_t avail_in = stream_data_end - input_pos;
+                            const std::size_t pf_consumed = nzr::lzpf::DecodePrefilterStream(
+                                bytes.data() + input_pos, avail_in,
+                                window + block_start_in_window,
+                                static_cast<std::size_t>(block_out_size),
+                                /*is_stereo_variant=*/false);
+                            if (pf_consumed == 0) { decode_ok = false; break; }
+                            input_pos += pf_consumed;
+                            window_cursor += static_cast<std::size_t>(block_out_size);
+                            std::memcpy(decoded.data() + total_written,
+                                        window + block_start_in_window,
+                                        static_cast<std::size_t>(block_out_size));
+                            total_written += static_cast<std::size_t>(block_out_size);
+                            continue;
+                        }
                         // Raw-bytecode LZ77 (no side stream) not yet ported.
                         if (!mode_literal && !mode_lz77_side) { decode_ok = false; break; }
                         std::uint64_t block_out_size = uvar9 >> 3u;
