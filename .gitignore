@@ -1,0 +1,11 @@
+build/
+build-release/
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+__pycache__/
+*.pyc
+/bin/
