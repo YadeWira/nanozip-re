@@ -12,26 +12,31 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 - Native (no original binary at runtime) decoding for all compression methods.
 - Document every reverse-engineered finding so the knowledge is not lost.
 
-## Current coverage
+## Clone percentage
 
-Coverage is measured on a deterministic AES-CTR-of-zeros fixture to avoid entropy-dependent flakiness.
+**Overall reconstruction estimate: ~55%**
 
-| Method | Description | Native decode? |
-|--------|-------------|----------------|
-| `-cn`  | Store (no compression) | ✅ Always native |
-| `-cf`  | lzpf (LZ77 + arith side-stream, small dict) | ✅ Native |
-| `-cF`  | lzpf large (24-bit hash, large dict) | ✅ Native |
-| `-cd`  | lzhd | ✅ Native |
-| `-cD`  | lzhd large | ✅ Native |
-| `-co`  | optimum1 (BWT + range coder) | ✅ Native |
-| `-cO`  | optimum2 (BWT + range coder) | ✅ Native |
-| `-cc`  | cm (context mixer) | ✅ Native |
+This is a rough but honest measure of how much of NanoZip's full decode surface has been natively reimplemented in C++, independent of input entropy.
+
+| Component | Cloned? | Notes |
+|-----------|---------|-------|
+| CLI structure (`l/t/x/a/s`, all switches) | ✅ 100% | Full parser |
+| Archive format (header, entry table, stream families `0x2b/0x3b/0x4b`) | ✅ 100% | |
+| Store (`-cn`) | ✅ 100% | Trivial copy |
+| lzpf decode LZ77+arith path (`-cf/-cF`) | ✅ ~90% | Works for all observed block modes except prefilter+arith (`uVar9 & 7 == 4`, task #13) |
+| lzpf prefilter+arith path (`-cf`) | ❌ 0% | `FUN_080a5330` ~700 LOC + callees, not yet ported (task #13) |
+| lzhd decoder (`-cd/-cD`) | ❌ ~10% | Format parsing done; `FUN_080b5240` core + PAQ context mixer not ported |
+| optimum decoder (`-co/-cO`) | ✅ ~70% | BWT + range-coder variants A/B native; edge shapes bridge |
+| cm decoder (`-cc`) | ❌ ~10% | Format parsing done; context mixer (`FUN_080b32c0`, 780 LOC + SSE2) not ported |
+| Encode for all methods | ✅ functional | Uses original binary via bridge; native encode not planned until decoders are complete |
+
+### Fixture-based benchmark
+
+The `coverage_matrix.sh` test uses a deterministic AES-CTR-of-zeros fixture (low entropy). On that fixture:
 
 **native_strict_percent = 100% (8/8)** — no bridge, no compat, no original binary subprocess.
 
-> "native_strict" = extract succeeds with zero calls to `/usr/bin/nz`.
-> The fixture uses low-entropy data; some high-entropy inputs for `-cf` still
-> use a bridge fallback (prefilter+arith path, task #13, not yet ported).
+Low-entropy input rarely triggers the prefilter+arith block mode, so the fixture passes fully native even though that path is not yet ported. Real-world compressible data (text, source code, binaries) will hit that path and fall back to the extract bridge for `-cf/-cF`.
 
 ## Architecture
 
