@@ -18,6 +18,7 @@
 #include <ios>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -2245,32 +2246,122 @@ bool TryParseLegacyCnArchive(
     }
     pos += 3u;
 
+    // Scan chunk-tagged records to extract checksum mode, codec params, and
+    // filename-table span.  NZ serialises the header as a sequence of
+    // [varint (size<<4)|type] [size-byte payload] chunks.  When the initial
+    // lower nibble of the varint is 15, one extra byte follows the varint to
+    // encode the real type and a stream ID.
+    //
+    // Single-stream archives:
+    //   [type-5 size-0 checksum] [type-11 size-2..4 codec] [type-1 size-N table]
+    //
+    // Parallel archives (-p10 etc.) have one type-5/type-11/type-1 record per
+    // parallel stream.  Each per-stream type-1 table contains the PARTIAL
+    // (per-stream) uncompressed size for each logical file; the true total is
+    // the sum across all streams.  We scan all chunks to accumulate totals.
     ChecksumMode checksum_mode = ChecksumMode::kNone;
     bool checksum_verification_supported = true;
-    if (pos < bytes.size()) {
-        if (bytes[pos] == 0x05u) {
-            // Legacy default checksum mode in NanoZip 0.09 (`-hf`): NanoZip Fletcher32 variant.
-            checksum_mode = ChecksumMode::kFletcher32;
-            ++pos;
-        } else if (bytes[pos] == 0x06u) {
-            checksum_mode = ChecksumMode::kCrc16;
-            ++pos;
-        } else if (bytes[pos] == 0x07u) {
-            checksum_mode = ChecksumMode::kCrc32;
-            ++pos;
+    unsigned char method = 0u, method_p0 = 0u, method_p1 = 0u;
+    int cm_a_bits = 28, cm_b_bits = 25;
+    std::uint32_t cm_window_size = 1024u * 1024u;
+    std::size_t table_start = 0u, table_end = 0u;
+    bool found_codec = false, found_table = false;
+    // Accumulated file sizes across all per-stream type-1 tables.
+    std::map<std::string, std::uint64_t> size_accum;
+
+    for (int guard = 0; guard < 1024 && pos < bytes.size(); ++guard) {
+        std::uint64_t r64 = 0u;
+        if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) break;
+        auto r = static_cast<std::uint32_t>(r64);
+        unsigned ctype   = r & 0x0fu;
+        unsigned cstream = 0u;
+        std::size_t csize = static_cast<std::size_t>(r >> 4u);
+
+        if (ctype == 15u) {
+            if (pos >= bytes.size()) break;
+            unsigned ext = static_cast<unsigned>(bytes[pos++]);
+            if (ext >= 0xf8u) {
+                if (pos >= bytes.size()) break;
+                ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[pos++]) + 248u;
+            }
+            ctype   = ext & 0x0fu;
+            cstream = ext >> 4u;
+            if (cstream == 0u) ctype += 15u;
+        }
+
+        if (pos + csize > bytes.size()) break;
+        const bool is_main = (cstream == 0u);
+
+        // Checksum indicator: zero-payload main-stream chunk.
+        // Direct (single-stream): type 5/6/7.
+        // Extended (multi-stream): type 20/21/22 = 15+5/6/7 with stream=0.
+        if (is_main && csize == 0u) {
+            if      (ctype == 5u || ctype == 20u) checksum_mode = ChecksumMode::kFletcher32;
+            else if (ctype == 6u || ctype == 21u) checksum_mode = ChecksumMode::kCrc16;
+            else if (ctype == 7u || ctype == 22u) checksum_mode = ChecksumMode::kCrc32;
+        }
+
+        // Codec params: type 11, main stream.  Payload: [p0] [p1] [extras...].
+        // method byte = (csize<<4)|11 = 0x2b (lzpf/lzhd), 0x3b (optimum), 0x4b (cm).
+        if (!found_codec && ctype == 11u && is_main && csize >= 1u) {
+            method    = static_cast<unsigned char>((csize << 4u) | 11u);
+            method_p0 = bytes[pos];
+            method_p1 = (csize >= 2u) ? bytes[pos + 1u] : 0u;
+            // CM (p0=7, size>=4): payload[2]=B (unused), payload[3]=CD.
+            if (method == 0x4bu && method_p0 == 7u && csize >= 4u) {
+                const unsigned char cd_byte = bytes[pos + 3u];
+                cm_a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
+                cm_b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
+                const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
+                unsigned m = xp1 & 0x0fu;
+                const unsigned s = xp1 >> 4u;
+                if (s) m = (m + 16u) << (s - 1u);
+                cm_window_size = m << 16u;
+            }
+            pos += csize;
+            found_codec = true;
+        }
+        // Filename table: type 1 (any stream).  Accumulate per-filename sizes.
+        // For the main-stream chunk, also record table_start/table_end.
+        // Do NOT break early — parallel archives have type-1 chunks from every stream.
+        else if (ctype == 1u && csize >= 2u) {
+            // Accumulate sizes from this stream's table.
+            std::size_t tp = pos, tend = pos + csize;
+            while (tp < tend) {
+                std::uint64_t fsize = 0u;
+                if (!ReadLegacyVarint(bytes, &tp, tend, &fsize)) break;
+                const auto nul_it = std::find(
+                    bytes.begin() + static_cast<std::ptrdiff_t>(tp),
+                    bytes.begin() + static_cast<std::ptrdiff_t>(tend),
+                    static_cast<unsigned char>(0));
+                if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(tend)) break;
+                std::string fname(
+                    bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it);
+                size_accum[fname] += fsize;
+                tp = static_cast<std::size_t>(
+                    std::distance(bytes.begin(), nul_it)) + 1u;
+            }
+            // Record the first main-stream type-1 chunk as the canonical table.
+            if (found_codec && is_main && !found_table) {
+                table_start = pos;
+                table_end   = pos + csize;
+                found_table = true;
+            }
+            pos += csize;
+        }
+        else {
+            pos += csize;
         }
     }
 
-    if (pos + 3u > bytes.size()) {
+    if (!found_codec || !found_table) {
         if (out_error_message != nullptr) {
-            *out_error_message = "Data corrupted while reading headers!";
+            *out_error_message =
+                found_codec ? "Legacy filename table encoding is not recognized."
+                            : "Legacy stream family is not recognized.";
         }
         return false;
     }
-
-    const unsigned char method = bytes[pos++];
-    const unsigned char method_p0 = bytes[pos++];
-    const unsigned char method_p1 = bytes[pos++];
 
     if (method != 0x2bu && method != 0x3bu && method != 0x4bu) {
         if (out_error_message != nullptr) {
@@ -2280,42 +2371,12 @@ bool TryParseLegacyCnArchive(
     }
     const bool native_store_payload = (method_p0 == 0u);
 
-    // -cc archives (method=0x4b, p0=7) carry two extra parameter bytes before
-    // the filename-table span: a B byte (unused) and a packed C/D byte that
-    // encodes a_bits = (cd>>4)+20 and b_bits = (cd&0xf)+18.
-    int cm_a_bits = 28, cm_b_bits = 25;
-    std::uint32_t cm_window_size = 1024u * 1024u;
-    if (method == 0x4bu && method_p0 == 7u && pos + 2u <= bytes.size()) {
-        const unsigned char cd_byte = bytes[pos + 1u];
-        cm_a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
-        cm_b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
-        // ExpandByteFloat(method_p1): m=(x+1)&0xf, s=(x+1)>>4; if s: m=(m+16)<<(s-1)
-        const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
-        unsigned m = xp1 & 0x0fu;
-        const unsigned s = xp1 >> 4u;
-        if (s) m = (m + 16u) << (s - 1u);
-        cm_window_size = m << 16u;
-    }
-
-    std::uint64_t table_span = 0;
-    if (!ReadLegacyTableSpanFlexible(bytes, &pos, &table_span)) {
-        if (out_error_message != nullptr) {
-            *out_error_message = "Legacy filename table encoding is not recognized.";
-        }
-        return false;
-    }
-
-    const std::uint64_t table_len_u64 = table_span + 2u;
-    if (table_len_u64 > static_cast<std::uint64_t>(bytes.size()) ||
-        pos + static_cast<std::size_t>(table_len_u64) > bytes.size()) {
+    if (table_end > bytes.size()) {
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
         }
         return false;
     }
-
-    const std::size_t table_start = pos;
-    const std::size_t table_end = pos + static_cast<std::size_t>(table_len_u64);
 
     std::vector<LegacyCnEntry> entries;
     std::size_t p = table_start;
@@ -2366,6 +2427,21 @@ bool TryParseLegacyCnArchive(
             *out_error_message = "Data corrupted while reading headers!";
         }
         return false;
+    }
+
+    // Parallel archives (-pN): each stream emits its own type-1 table with the
+    // PARTIAL uncompressed size for that stream's portion of each file.  The
+    // size_accum map holds the sum across all streams for each filename.
+    // Override per-entry sizes from the main-stream table with the totals.
+    if (!size_accum.empty()) {
+        for (auto& e : entries) {
+            auto it = size_accum.find(e.path);
+            if (it != size_accum.end() && it->second != e.size) {
+                total_data_size -= e.size;
+                e.size = it->second;
+                total_data_size += e.size;
+            }
+        }
     }
 
     // Multi-block compressed archives write one filename table per block.
