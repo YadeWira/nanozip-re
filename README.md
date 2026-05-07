@@ -122,7 +122,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 
 - [x] **Task #13**: lzpf prefilter+arith mono path complete (`FUN_080a5330` + `FUN_08095d90` LPC filter). Stereo variant (`FUN_0809bbf0`) deferred.
 - [ ] **Task #13b**: lzpf prefilter+arith stereo path (`FUN_0809bbf0` — dual-channel residual decode). Low priority until a stereo `-cf` fixture is confirmed needed.
-- [ ] **Task #24**: 1-byte LZ77 divergence in variant A for high-entropy bytecode (semirandom block 18, side_count=8416). Root cause: hash-table aliasing vs the decompile. Needs objdump inner-loop + register-level trace to find the real storage.
+- [x] **Task #24**: 1-byte LZ77 divergence in variant A (semirandom block 18, side_count=8416) — believed fixed by hash-table init=3 fix (2026-05-05). No reproduction in 5+ fixture types (8KB–820KB, text/random/mix). Cannot reproduce without original session fixture.
 - [x] **Task #14**: lzhd native decoder complete — `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit arith, 680 LOC); byte-exact on 50 KB text fixture. Parallel variant (`FUN_080b50b0`) deferred.
 
 ## Progress log
