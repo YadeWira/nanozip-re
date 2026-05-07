@@ -1,8 +1,80 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace nzr::lzpf {
+
+// LPC predictor state (FUN_08095d90, 4-tap SIMD path). Persists across
+// prefilter blocks. Zero-initialize before first use; set shift from side
+// stream before each Run() call.
+//
+// The 4-tap SIMD path (runs when order field < 9 and != 8) processes two
+// samples per loop iteration: factors are updated only on the first sample of
+// each pair. This halves the effective convergence rate vs a naive per-sample
+// update. Sign convention: positive decoded → -1, negative → +1, zero → 0.
+struct LpcPredictor {
+    std::int32_t  predicted_value{0};
+    std::uint32_t shift{0};
+    std::int16_t  hist[4]{};
+    std::int16_t  sign_hist[4]{};
+    std::int16_t  factors[4]{};
+
+    void Init(std::uint32_t sh) {
+        shift = sh;
+        predicted_value = 0;
+        std::memset(hist,      0, sizeof(hist));
+        std::memset(sign_hist, 0, sizeof(sign_hist));
+        std::memset(factors,   0, sizeof(factors));
+    }
+
+    void ResetState() {
+        predicted_value = 0;
+        std::memset(hist,      0, sizeof(hist));
+        std::memset(sign_hist, 0, sizeof(sign_hist));
+        std::memset(factors,   0, sizeof(factors));
+    }
+
+    void Run(std::int32_t* samples, std::uint32_t n) {
+        for (std::uint32_t i = 0; i < n; ) {
+            step(samples[i++], /*update_factors=*/true);
+            if (i < n)
+                step(samples[i++], /*update_factors=*/false);
+        }
+    }
+
+private:
+    static std::int16_t sign16(std::int16_t v) noexcept {
+        if (v > 0) return static_cast<std::int16_t>(-1);
+        if (v < 0) return static_cast<std::int16_t>(1);
+        return 0;
+    }
+
+    void step(std::int32_t& sample, bool update_factors) noexcept {
+        const std::int32_t decoded = sample + predicted_value;
+        sample = decoded;
+        if (update_factors) {
+            if (predicted_value < decoded) {
+                for (int k = 0; k < 4; k++)
+                    factors[k] = static_cast<std::int16_t>(factors[k] - sign_hist[k]);
+            } else {
+                for (int k = 0; k < 4; k++)
+                    factors[k] = static_cast<std::int16_t>(factors[k] + sign_hist[k]);
+            }
+        }
+        const std::int16_t h16 = static_cast<std::int16_t>(decoded);
+        hist[3] = hist[2]; hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = h16;
+        const std::int16_t s16 = sign16(h16);
+        sign_hist[3] = sign_hist[2]; sign_hist[2] = sign_hist[1];
+        sign_hist[1] = sign_hist[0]; sign_hist[0] = s16;
+        std::int32_t sum = 0;
+        for (int k = 0; k < 4; k++)
+            sum += static_cast<std::int32_t>(hist[k]) * static_cast<std::int32_t>(factors[k]);
+        predicted_value = sum >> (shift & 0x1fu);
+    }
+};
 
 // MSB-first big-endian bit reader.
 //
@@ -231,5 +303,14 @@ std::size_t DecodePrefilterBlock(const std::uint8_t* input, std::size_t input_si
 std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
                                    std::uint8_t* output, std::size_t output_size,
                                    bool is_stereo_variant);
+
+// Overload that accepts a caller-managed LpcPredictor so that state persists
+// across successive DecodePrefilterStream calls for multi-block archives.
+// Pass a zero-initialized LpcPredictor and reuse it for every prefilter block
+// that belongs to the same compressed stream.
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant,
+                                   LpcPredictor* persistent_pred);
 
 }  // namespace nzr::lzpf

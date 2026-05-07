@@ -2792,20 +2792,17 @@ bool TryParseLegacyCnArchive(
         return true;
     };
     const auto validate_decoded_candidate = [&](const std::vector<unsigned char>& candidate) -> bool {
-        if (candidate.size() != static_cast<std::size_t>(total_data_size)) {
+        if (candidate.size() != static_cast<std::size_t>(total_data_size))
             return false;
-        }
         std::size_t cursor = 0;
         for (const LegacyCnEntry& e : entries) {
-            if (e.size > static_cast<std::uint64_t>(candidate.size() - cursor)) {
+            if (e.size > static_cast<std::uint64_t>(candidate.size() - cursor))
                 return false;
-            }
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (e.has_checksum && checksum_verification_supported) {
                 const std::uint32_t got = ComputeBufferChecksum(checksum_mode, candidate.data() + cursor, n);
-                if (got != e.checksum) {
+                if (got != e.checksum)
                     return false;
-                }
             }
             cursor += n;
         }
@@ -2943,6 +2940,7 @@ bool TryParseLegacyCnArchive(
                     std::size_t total_written = 0;
                     std::size_t input_pos = bp;
                     bool decode_ok = true;
+                    nzr::lzpf::LpcPredictor pf_pred{};
                     while (total_written < total_data_size) {
                         // If we've consumed the current stream's bytes and
                         // there's more output to produce, advance to the
@@ -3000,7 +2998,8 @@ bool TryParseLegacyCnArchive(
                                 bytes.data() + input_pos, avail_in,
                                 window + block_start_in_window,
                                 static_cast<std::size_t>(block_out_size),
-                                /*is_stereo_variant=*/false);
+                                /*is_stereo_variant=*/false,
+                                &pf_pred);
                             if (pf_consumed == 0) { decode_ok = false; break; }
                             input_pos += pf_consumed;
                             window_cursor += static_cast<std::size_t>(block_out_size);
@@ -3087,7 +3086,8 @@ bool TryParseLegacyCnArchive(
                         total_written += static_cast<std::size_t>(block_out_size);
                     }
                     if (decode_ok && total_written == total_data_size) {
-                        if (validate_decoded_candidate(decoded)) {
+                        bool vok = validate_decoded_candidate(decoded);
+                        if (vok) {
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = decoded.size();

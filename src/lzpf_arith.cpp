@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -54,81 +55,6 @@ inline std::uint32_t ReadSideBits(SideBitState* br, std::uint32_t n_bits) {
     br->cache = old_cache;
     return bits & Mask(n_bits);
 }
-
-// Adaptive order-N LPC inverse filter (FUN_08095d90, scalar port of
-// LinearPredictor::RunSmall from Shelwien's nzdec_v0 source).
-// hist[] has two parallel sections relative to cur_ptr:
-//   [0..order-1]       — sample history (int16)
-//   [512..512+order-1] — sign history   (int16)
-// Circular buffer wraps from hist[0] back to hist[2560-order] with a
-// partial copy of the overlap region (matching nzdec CopyHist logic).
-struct LpcPredictor {
-    static constexpr std::size_t kHistSize = 3072;
-
-    std::int32_t  predicted_value{0};
-    std::uint32_t order{0};
-    std::uint32_t shift{0};
-    std::int16_t* cur_ptr{nullptr};
-    std::int16_t  factors[512]{};
-    std::int16_t  hist[kHistSize]{};
-
-    void Init(std::uint32_t ord, std::uint32_t sh) {
-        order = ord; shift = sh;
-        predicted_value = 0;
-        cur_ptr = &hist[2048];
-        std::memset(&hist[2048],       0, sizeof(std::int16_t) * ord);
-        std::memset(&hist[2048 + 512], 0, sizeof(std::int16_t) * ord);
-        std::memset(factors,           0, sizeof(std::int16_t) * ord);
-    }
-
-    void ResetState() {
-        predicted_value = 0;
-        cur_ptr = &hist[2048];
-        if (order > 0) {
-            std::memset(&hist[2048],       0, sizeof(std::int16_t) * order);
-            std::memset(&hist[2048 + 512], 0, sizeof(std::int16_t) * order);
-            std::memset(factors,           0, sizeof(std::int16_t) * order);
-        }
-    }
-
-    void Run(std::int32_t* samples, std::uint32_t n) {
-        std::uint32_t ord = order;
-        for (; n; n--) {
-            std::int32_t delta    = *samples;
-            std::int32_t outvalue = delta + predicted_value;
-            *samples++ = outvalue;
-
-            std::int16_t* cp = cur_ptr;
-            if (delta <= 0) {
-                for (std::uint32_t i = 0; i != ord; i++)
-                    factors[i] = static_cast<std::int16_t>(factors[i] + cp[i + 512]);
-            } else {
-                for (std::uint32_t i = 0; i != ord; i++)
-                    factors[i] = static_cast<std::int16_t>(factors[i] - cp[i + 512]);
-            }
-
-            cur_ptr = cp - 1;
-            if (cur_ptr < hist) {
-                cur_ptr = &hist[2560 - ord];
-                for (std::uint32_t i = 0; i < ord - 1; i++) {
-                    cur_ptr[i + 1]       = hist[i];
-                    cur_ptr[i + 1 + 512] = hist[i + 512];
-                }
-            }
-
-            cur_ptr[0]   = static_cast<std::int16_t>(outvalue);
-            cur_ptr[512] = static_cast<std::int16_t>(outvalue)
-                               ? static_cast<std::int16_t>((outvalue >> 14) & 2) - 1
-                               : 0;
-
-            std::int32_t sum = 0;
-            for (std::uint32_t i = 0; i != ord; i++)
-                sum += static_cast<std::int32_t>(cur_ptr[i]) *
-                       static_cast<std::int32_t>(factors[i]);
-            predicted_value = sum >> shift;
-        }
-    }
-};
 
 }  // namespace
 
@@ -1695,7 +1621,6 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
         if (predictor_bit != 0u)
             predictor_order = ReadSideBits(&br, 3u) + 8u;
     }
-
     // Residual decode → int32 array.
     std::vector<std::int32_t> residuals(n_elems);
     if (!is_stereo_variant) {
@@ -1713,14 +1638,10 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
         : 0u;
     if (side_consumed > remaining) side_consumed = remaining;
 
-    // LPC inverse filter (FUN_08095d90, LAB_080a5890) applied between residual
-    // decode and output reconstruction when predictor_bit == 1.
+    // LPC inverse filter (FUN_08095d90, 4-tap path): in-place residuals+prediction.
     if (pred != nullptr) {
         if (predictor_bit) {
-            if (pred->order != predictor_order || pred->cur_ptr == nullptr)
-                pred->Init(predictor_order, predictor_order);
-            else
-                pred->shift = predictor_order;
+            pred->shift = predictor_order;
             pred->Run(residuals.data(), n_per_chan);
         } else {
             pred->ResetState();
@@ -1746,20 +1667,29 @@ std::size_t DecodePrefilterBlock(const std::uint8_t* input, std::size_t input_si
 // LPC predictor state persists across blocks (matches nz_context lifetime).
 std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
                                    std::uint8_t* output, std::size_t output_size,
-                                   bool is_stereo_variant) {
+                                   bool is_stereo_variant,
+                                   LpcPredictor* persistent_pred) {
     if (output_size == 0) return 0;
-    LpcPredictor pred{};
+    LpcPredictor local_pred{};
+    LpcPredictor* pred = persistent_pred ? persistent_pred : &local_pred;
     std::size_t in_off = 0, out_off = 0;
     while (out_off < output_size) {
         std::size_t chunk = std::min<std::size_t>(output_size - out_off, 0x10000u);
         std::size_t used  = DecodePFBlock(
             input + in_off, input_size - in_off,
-            output + out_off, chunk, is_stereo_variant, &pred);
+            output + out_off, chunk, is_stereo_variant, pred);
         if (used == 0) return 0;
         in_off  += used;
         out_off += chunk;
     }
     return in_off;
+}
+
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant) {
+    return DecodePrefilterStream(input, input_size, output, output_size,
+                                 is_stereo_variant, nullptr);
 }
 
 // ---------------------------------------------------------------------------

@@ -136,7 +136,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-04-24 | `DecodeLz77VariantB` (`-cF`, 24-bit hash) complete; 7/7 `-cF` samples native |
 | 2026-05-05 | Hash table init bug fixed (0→3); window_capacity formula corrected (`(p1+1)×64 KiB`); 8/8 methods 100% native_strict |
 | 2026-05-07 | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
-| 2026-05-07 | lzpf prefilter+arith mono path complete (task #13): `FUN_080a5330` + `FUN_08095d90` adaptive LPC filter; byte-exact on WAV/PCM fixtures. |
+| 2026-05-07 | lzpf prefilter+arith mono path byte-exact (task #13): `LpcPredictor` fixed to 4-tap, 2-samples-per-iteration (factors update only on first of each pair — matching `FUN_08095d90` SIMD path); Fletcher32 verified on ramp WAV fixture. |
 | 2026-05-07 | lzhd native decoder complete (task #14): `DecLZ` PAQ context mixer + 12-bit range coder ported from nzdec_v0 `NZ_LZ.cpp` (680 LOC); byte-exact on 50 KB text fixture. C++ const-linkage bug fixed (`extern const kLzModelLNext`). |
 
 ## License
