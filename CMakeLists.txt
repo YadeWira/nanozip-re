@@ -13,6 +13,8 @@ set(RECON_SOURCES
     src/lzpf_arith.cpp
 )
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+
 add_executable(nz_recon ${RECON_SOURCES})
 add_executable(nz_sfx_recon ${RECON_SOURCES})
 

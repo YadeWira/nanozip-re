@@ -2417,14 +2417,15 @@ bool TryParseLegacyCnArchive(
                 if (!LooksLikeLegacyFilenameTable(bytes, tp, tend)) {
                     continue;
                 }
-                // Validate each entry: file_size non-zero and within bytes remaining after the archive.
+                // Validate each entry: file_size must be non-zero.
+                // We are inside the !native_store_payload branch, so sizes are
+                // decompressed lengths and may exceed the compressed archive size.
                 std::size_t vp = tp;
                 std::vector<LegacyCnEntry> add_entries;
                 bool valid = true;
                 while (vp < tend) {
                     std::uint64_t fs = 0;
-                    if (!ReadLegacyVarint(bytes, &vp, tend, &fs) || fs == 0u ||
-                        fs > static_cast<std::uint64_t>(bytes.size())) {
+                    if (!ReadLegacyVarint(bytes, &vp, tend, &fs) || fs == 0u) {
                         valid = false;
                         break;
                     }
