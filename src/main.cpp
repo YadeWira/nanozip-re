@@ -1,11 +1,14 @@
 #include "nz_sfx/sfx_archive.hpp"
 #include "nz_sfx/sfx_cli.hpp"
+#include "nz_cm.h"
 
 #include <iostream>
 
 int main(int argc, char** argv) {
     using nz::recon::CliOptions;
     using nz::recon::Command;
+
+    NzCmInitAll();
 
     nz::recon::PrintBanner(std::cout);
     std::cout << std::flush;

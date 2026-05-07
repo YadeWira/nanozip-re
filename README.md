@@ -14,7 +14,7 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 
 ## Clone percentage
 
-**Overall reconstruction estimate: ~55%**
+**Overall reconstruction estimate: ~70%**
 
 This is a rough but honest measure of how much of NanoZip's full decode surface has been natively reimplemented in C++, independent of input entropy.
 
@@ -27,7 +27,7 @@ This is a rough but honest measure of how much of NanoZip's full decode surface 
 | lzpf prefilter+arith path (`-cf`) | ❌ 0% | `FUN_080a5330` ~700 LOC + callees, not yet ported (task #13) |
 | lzhd decoder (`-cd/-cD`) | ❌ ~10% | Format parsing done; `FUN_080b5240` core + PAQ context mixer not ported |
 | optimum decoder (`-co/-cO`) | ✅ ~70% | BWT + range-coder variants A/B native; edge shapes bridge |
-| cm decoder (`-cc`) | ❌ ~10% | Format parsing done; context mixer (`FUN_080b32c0`, 780 LOC + SSE2) not ported |
+| cm decoder (`-cc`) | ✅ ~95% | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
 | Encode for all methods | ✅ functional | Uses original binary via bridge; native encode not planned until decoders are complete |
 
 ### Fixture-based benchmark
@@ -45,9 +45,11 @@ nz_recon CLI
 ├── sfx_archive.cpp    — core: archive format, dispatcher, native decoders
 ├── sfx_cli.cpp        — CLI parsing (l/t/x/a/s + switches)
 ├── lzpf_arith.cpp     — lzpf arith primitives (BitReader, Huffman, LZ77 A/B)
+├── nz_cm.cpp          — CM decoder: ported from nzdec_v0 NZ_CM.cpp (context mixer, range coder, all tables)
 ├── linux32_cm_map.cpp — cm context-mixer vtable mapping (linux32 ELF offsets)
 └── include/
     ├── lzpf_arith.h
+    ├── nz_cm.h        — CM decoder public API
     └── nz_sfx/        — internal headers
 ```
 
@@ -131,6 +133,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-04-24 | Sliding-window dict + wrap-to-0 logic confirmed via GDB; `last_lz_dest` per-block reset fixed |
 | 2026-04-24 | `DecodeLz77VariantB` (`-cF`, 24-bit hash) complete; 7/7 `-cF` samples native |
 | 2026-05-05 | Hash table init bug fixed (0→3); window_capacity formula corrected (`(p1+1)×64 KiB`); 8/8 methods 100% native_strict |
+| 2026-05-07 | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
 
 ## License
 

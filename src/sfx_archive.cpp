@@ -1,5 +1,6 @@
 #include "nz_sfx/sfx_archive.hpp"
 #include "lzpf_arith.h"
+#include "nz_cm.h"
 
 #include <algorithm>
 #include <array>
@@ -1191,6 +1192,11 @@ struct LegacyCnContext {
     std::uint8_t legacy_method = 0;
     std::uint8_t legacy_method_p0 = 0;
     std::uint8_t legacy_method_p1 = 0;
+    // CM decoder params (method==0x4b, p0==7): extracted from the two extra
+    // bytes that precede the filename table span in -cc archives.
+    int cm_a_bits = 28;
+    int cm_b_bits = 25;
+    std::uint32_t cm_window_size = 1024u * 1024u;
     bool native_payload_supported = false;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
@@ -2273,6 +2279,23 @@ bool TryParseLegacyCnArchive(
     }
     const bool native_store_payload = (method_p0 == 0u);
 
+    // -cc archives (method=0x4b, p0=7) carry two extra parameter bytes before
+    // the filename-table span: a B byte (unused) and a packed C/D byte that
+    // encodes a_bits = (cd>>4)+20 and b_bits = (cd&0xf)+18.
+    int cm_a_bits = 28, cm_b_bits = 25;
+    std::uint32_t cm_window_size = 1024u * 1024u;
+    if (method == 0x4bu && method_p0 == 7u && pos + 2u <= bytes.size()) {
+        const unsigned char cd_byte = bytes[pos + 1u];
+        cm_a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
+        cm_b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
+        // ExpandByteFloat(method_p1): m=(x+1)&0xf, s=(x+1)>>4; if s: m=(m+16)<<(s-1)
+        const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
+        unsigned m = xp1 & 0x0fu;
+        const unsigned s = xp1 >> 4u;
+        if (s) m = (m + 16u) << (s - 1u);
+        cm_window_size = m << 16u;
+    }
+
     std::uint64_t table_span = 0;
     if (!ReadLegacyTableSpanFlexible(bytes, &pos, &table_span)) {
         if (out_error_message != nullptr) {
@@ -3264,6 +3287,9 @@ bool TryParseLegacyCnArchive(
     ctx.legacy_method = method;
     ctx.legacy_method_p0 = method_p0;
     ctx.legacy_method_p1 = method_p1;
+    ctx.cm_a_bits = cm_a_bits;
+    ctx.cm_b_bits = cm_b_bits;
+    ctx.cm_window_size = cm_window_size;
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     if (native_store_payload) {
         ctx.payload_mode = LegacyPayloadMode::kStore;
@@ -3290,6 +3316,13 @@ bool TryParseLegacyCnArchive(
                 bytes.begin() + static_cast<std::ptrdiff_t>(literal_data_offset),
                 bytes.begin() + static_cast<std::ptrdiff_t>(literal_data_offset + literal_data_size));
         }
+    } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
+               method == 0x4bu && method_p0 == 7u &&
+               payload_start < bytes.size()) {
+        // For native CM decode: store the raw compressed stream bytes so
+        // TryDecodeLegacyCm can parse stream_tag + block headers directly.
+        ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
+                        bytes.end());
     }
 
     *out_context = std::move(ctx);
@@ -3335,6 +3368,186 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     return 0;
 }
 
+// Decode -cc (nz_cm) compressed payload natively using the ported CM decoder.
+// Parses the stream_tag varint + one or more per-block headers (payload_size,
+// decr_param, param6, size18, staged_checksum_count, param2..dece_param) that
+// immediately follow it, and feeds each block to CM_Decode.
+static bool TryDecodeLegacyCm(
+    const LegacyCnContext& legacy,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message) {
+    if (out_data == nullptr) return false;
+    out_data->clear();
+
+    if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
+    if (legacy.data.empty()) return false;
+
+    const auto* raw = legacy.data.data();
+    const std::size_t raw_len = legacy.data.size();
+
+    // Read stream_tag varint: value = N, stream_bytes = N >> 4, low nibble must be 0.
+    std::size_t pos = 0;
+    std::uint64_t stream_tag = 0;
+    {
+        unsigned shift = 7;
+        unsigned char c = raw[pos++];
+        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+        while ((c & 0x80u) != 0u) {
+            if (pos >= raw_len || shift >= 63u) {
+                if (out_error_message) *out_error_message = "cm: truncated stream_tag";
+                return false;
+            }
+            c = raw[pos++];
+            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            shift += 7u;
+        }
+    }
+    if ((stream_tag & 0x0fu) != 0u) {
+        if (out_error_message) *out_error_message = "cm: bad stream_tag alignment";
+        return false;
+    }
+    const std::uint64_t stream_bytes = stream_tag >> 4u;
+    if (stream_bytes > raw_len - pos) {
+        if (out_error_message) *out_error_message = "cm: stream_bytes exceeds data";
+        return false;
+    }
+    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
+
+    NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    if (!cm) {
+        if (out_error_message) *out_error_message = "cm: allocation failed";
+        return false;
+    }
+
+    out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
+    bool ok = true;
+
+    while (pos < stream_end) {
+        if (pos + 4u > stream_end) { ok = false; break; }
+        const std::uint32_t payload_size =
+            static_cast<std::uint32_t>(raw[pos]) |
+            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+        pos += 4u;
+        if (payload_size > stream_end - pos) { ok = false; break; }
+        const std::uint8_t* payload = raw + pos;
+        pos += payload_size;
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t decr_param = raw[pos++];
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param6 = raw[pos++];
+
+        std::uint32_t out_size = 0;
+        if (param6) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+        }
+
+        // Skip staged checksums.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t staged_count = raw[pos++];
+        if (pos + staged_count > stream_end) { ok = false; break; }
+        pos += staged_count;
+
+        // Skip param2 vector.
+        if (pos >= stream_end) { ok = false; break; }
+        if (raw[pos++]) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+        // Skip param1 vector.
+        if (pos >= stream_end) { ok = false; break; }
+        if (raw[pos++]) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+        // Skip param16, texttransformer_enabled, dece_param (3 bytes).
+        if (pos + 1u > stream_end) { ok = false; break; }
+        pos++; // param16
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t tt_enabled = raw[pos++];
+        if (tt_enabled) {
+            // Skip text_transforms byte + optional string vectors.
+            if (pos >= stream_end) { ok = false; break; }
+            const std::uint8_t tt_flags = raw[pos++];
+            auto skip_varint_str = [&]() -> bool {
+                // ReadVarint + skip n bytes
+                if (pos >= stream_end) return false;
+                std::uint32_t n = 0, sh = 0;
+                unsigned char vc;
+                do {
+                    if (pos >= stream_end) return false;
+                    vc = raw[pos++];
+                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh;
+                    sh += 7u;
+                } while (vc & 0x80u);
+                if (pos + n > stream_end) return false;
+                pos += n;
+                return true;
+            };
+            if ((tt_flags & 2u) && !skip_varint_str()) { ok = false; break; }
+            if ((tt_flags & 16u) && !skip_varint_str()) { ok = false; break; }
+        }
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t dece_param = raw[pos++];
+        if (dece_param) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+
+        if (!param6 || out_size == 0u) continue;
+
+        if (decr_param == 1u) NzCmReset(cm);
+
+        const std::size_t prev_size = out_data->size();
+        out_data->resize(prev_size + out_size);
+        NzCmDecode(cm, payload, payload_size, out_data->data() + prev_size, out_size);
+    }
+
+    NzCmDestroy(cm);
+
+    if (!ok) {
+        out_data->clear();
+        if (out_error_message) *out_error_message = "cm: malformed block stream";
+        return false;
+    }
+    if (out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
+        out_data->clear();
+        if (out_error_message) *out_error_message = "cm: output size mismatch";
+        return false;
+    }
+    return true;
+}
+
 int RunLegacyCnExtractOrTest(
     const CliOptions& options,
     const LegacyCnContext& legacy,
@@ -3342,6 +3555,19 @@ int RunLegacyCnExtractOrTest(
     std::ostream& os) {
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
+        std::string cm_decode_error;
+        if (TryDecodeLegacyCm(legacy, &bridged_data, &cm_decode_error)) {
+            LegacyCnContext bridged = legacy;
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.data = std::move(bridged_data);
+            if (options.verbose) {
+                os << "[native] decoded -cc payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+        }
         std::string extract_bridge_error;
         if (TryDecodeLegacyWithExtractBridge(legacy, &bridged_data, &extract_bridge_error)) {
             LegacyCnContext bridged = legacy;
