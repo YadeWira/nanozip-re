@@ -66,10 +66,10 @@ struct ArithmeticDecoder {
 // Static tables
 // ---------------------------------------------------------------------------
 
-static uint16_t kModelInterpolation[4096];
-static uint16_t kModelLutLookup[4096];
-static uint32_t kDivideLookup[256];
-static uint16_t kLzPredSumLookup[256];
+uint16_t kModelInterpolation[4096];
+uint16_t kModelLutLookup[4096];
+uint32_t kDivideLookup[256];
+uint16_t kLzPredSumLookup[256];
 static uint8_t  kCmFlagCrap[256];
 static uint32_t kHashHist8Mult[256];
 static uint32_t kHashHist4Mult[256];
@@ -77,9 +77,9 @@ static uint32_t kHashHist10Mult[256];
 static uint32_t kHashHist24Mult[256];
 static uint32_t kHashHist6Mult[256];
 
-static int16_t kLzModelInterpolation[256];
+int16_t kLzModelInterpolation[256];
 
-static const uint8_t kLzModelLNext[256 * 2] = {
+extern const uint8_t kLzModelLNext[256 * 2] = {
    1,  2,  3,  5,  4,  6,  7, 10,  8, 12,  9, 13, 11, 14, 15, 19,
   16, 23, 17, 24, 18, 25, 20, 27, 21, 28, 22, 29, 26, 30, 31, 33,
   32, 35, 32, 35, 32, 35, 32, 35, 34, 37, 34, 37, 34, 37, 34, 37,

@@ -12,6 +12,7 @@ set(RECON_SOURCES
     src/linux32_cm_map.cpp
     src/lzpf_arith.cpp
     src/nz_cm.cpp
+    src/nz_lzhd.cpp
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)

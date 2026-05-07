@@ -1,6 +1,7 @@
 #include "nz_sfx/sfx_archive.hpp"
 #include "lzpf_arith.h"
 #include "nz_cm.h"
+#include "nz_lzhd.h"
 
 #include <algorithm>
 #include <array>
@@ -3368,6 +3369,190 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     return 0;
 }
 
+// Decode -cd/-cD (nz_lzhd) compressed payload natively using the ported DecLZ
+// decoder. Same block-header format as -cc CM blocks; decr_param==1 → LZ block.
+// window_base is fixed to the start of the output buffer (not circular).
+static bool TryDecodeLegacyLzhd(
+    const LegacyCnContext& legacy,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message) {
+    if (out_data == nullptr) return false;
+    out_data->clear();
+
+    if (legacy.legacy_method != 0x2bu ||
+        (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u))
+        return false;
+    if (legacy.data.empty()) return false;
+
+    const auto* raw = legacy.data.data();
+    const std::size_t raw_len = legacy.data.size();
+
+    std::size_t pos = 0;
+    std::uint64_t stream_tag = 0;
+    {
+        unsigned shift = 7;
+        unsigned char c = raw[pos++];
+        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+        while ((c & 0x80u) != 0u) {
+            if (pos >= raw_len || shift >= 63u) {
+                if (out_error_message) *out_error_message = "lzhd: truncated stream_tag";
+                return false;
+            }
+            c = raw[pos++];
+            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            shift += 7u;
+        }
+    }
+    if ((stream_tag & 0x0fu) != 0u) {
+        if (out_error_message) *out_error_message = "lzhd: bad stream_tag alignment";
+        return false;
+    }
+    const std::uint64_t stream_bytes = stream_tag >> 4u;
+    if (stream_bytes > raw_len - pos) {
+        if (out_error_message) *out_error_message = "lzhd: stream_bytes exceeds data";
+        return false;
+    }
+    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
+
+    // Pre-allocate full output with 16-byte zero prefix for safe history reads
+    // (DecLZ reads cur_ptr[-5] etc. from the first byte).
+    static constexpr std::size_t kWindowPad = 16u;
+    const std::size_t total_out = static_cast<std::size_t>(legacy.total_data_size);
+    std::vector<unsigned char> buf(kWindowPad + total_out, 0u);
+    unsigned char* const window_base = buf.data() + kWindowPad;
+
+    NzLzhdDecoder* dec = NzLzhdCreate();
+    if (!dec) {
+        if (out_error_message) *out_error_message = "lzhd: allocation failed";
+        return false;
+    }
+
+    std::size_t written = 0u;
+    bool ok = true;
+
+    while (pos < stream_end) {
+        if (pos + 4u > stream_end) { ok = false; break; }
+        const std::uint32_t payload_size =
+            static_cast<std::uint32_t>(raw[pos]) |
+            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+        pos += 4u;
+        if (payload_size > stream_end - pos) { ok = false; break; }
+        const std::uint8_t* payload = raw + pos;
+        pos += payload_size;
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t decr_param = raw[pos++];
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param6 = raw[pos++];
+
+        std::uint32_t out_size = 0u;
+        if (param6) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+        }
+
+        // Skip staged checksums.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t staged_count = raw[pos++];
+        if (pos + staged_count > stream_end) { ok = false; break; }
+        pos += staged_count;
+
+        // Skip param2 vector.
+        if (pos >= stream_end) { ok = false; break; }
+        if (raw[pos++]) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos])   |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+        // Skip param1 vector.
+        if (pos >= stream_end) { ok = false; break; }
+        if (raw[pos++]) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos])   |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+        // param16, texttransformer_enabled, dece_param.
+        if (pos + 1u > stream_end) { ok = false; break; }
+        pos++; // param16
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t tt_enabled = raw[pos++];
+        if (tt_enabled) {
+            if (pos >= stream_end) { ok = false; break; }
+            const std::uint8_t tt_flags = raw[pos++];
+            auto skip_varint_str = [&]() -> bool {
+                if (pos >= stream_end) return false;
+                std::uint32_t n = 0u, sh = 0u;
+                unsigned char vc;
+                do {
+                    if (pos >= stream_end) return false;
+                    vc = raw[pos++];
+                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh;
+                    sh += 7u;
+                } while (vc & 0x80u);
+                if (pos + n > stream_end) return false;
+                pos += n;
+                return true;
+            };
+            if ((tt_flags & 2u)  && !skip_varint_str()) { ok = false; break; }
+            if ((tt_flags & 16u) && !skip_varint_str()) { ok = false; break; }
+        }
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t dece_param = raw[pos++];
+        if (dece_param) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos])   |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            pos += vlen;
+        }
+
+        if (!param6 || out_size == 0u) continue;
+        if (decr_param != 1u) { ok = false; break; } // only LZ blocks expected for lzhd
+        if (written + out_size > total_out) { ok = false; break; }
+
+        NzLzhdDecode(dec, payload, payload_size,
+                     window_base + written, out_size, window_base);
+        written += out_size;
+    }
+
+    NzLzhdDestroy(dec);
+
+    if (!ok) {
+        if (out_error_message) *out_error_message = "lzhd: malformed block stream";
+        return false;
+    }
+    if (written != total_out) {
+        if (out_error_message) *out_error_message = "lzhd: output size mismatch";
+        return false;
+    }
+    out_data->assign(window_base, window_base + total_out);
+    return true;
+}
+
 // Decode -cc (nz_cm) compressed payload natively using the ported CM decoder.
 // Parses the stream_tag varint + one or more per-block headers (payload_size,
 // decr_param, param6, size18, staged_checksum_count, param2..dece_param) that
@@ -3555,6 +3740,19 @@ int RunLegacyCnExtractOrTest(
     std::ostream& os) {
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
+        std::string lzhd_decode_error;
+        if (TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error)) {
+            LegacyCnContext bridged = legacy;
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.data = std::move(bridged_data);
+            if (options.verbose) {
+                os << "[native] decoded -cd payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+        }
         std::string cm_decode_error;
         if (TryDecodeLegacyCm(legacy, &bridged_data, &cm_decode_error)) {
             LegacyCnContext bridged = legacy;

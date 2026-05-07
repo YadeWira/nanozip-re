@@ -14,7 +14,7 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 
 ## Clone percentage
 
-**Overall reconstruction estimate: ~80%**
+**Overall reconstruction estimate: ~85%**
 
 This is a rough but honest measure of how much of NanoZip's full decode surface has been natively reimplemented in C++, independent of input entropy.
 
@@ -25,7 +25,7 @@ This is a rough but honest measure of how much of NanoZip's full decode surface 
 | Store (`-cn`) | ✅ 100% | Trivial copy |
 | lzpf decode LZ77+arith path (`-cf/-cF`) | ✅ ~95% | All observed block modes native (LZ77+arith, literal, prefilter+arith mono) |
 | lzpf prefilter+arith path (`-cf`) | ✅ ~90% | `FUN_080a5330` + LPC filter (`FUN_08095d90`) fully ported; mono variant byte-exact. Stereo variant (`is_stereo`) deferred. |
-| lzhd decoder (`-cd/-cD`) | ❌ ~10% | Format parsing done; `FUN_080b5240` core + PAQ context mixer not ported |
+| lzhd decoder (`-cd/-cD`) | ✅ ~90% | `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit range coder, 680 LOC, ported from nzdec_v0 `NZ_LZ.cpp`); byte-exact on 50 KB text fixture |
 | optimum decoder (`-co/-cO`) | ✅ ~70% | BWT + range-coder variants A/B native; edge shapes bridge |
 | cm decoder (`-cc`) | ✅ ~95% | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
 | Encode for all methods | ✅ functional | Uses original binary via bridge; native encode not planned until decoders are complete |
@@ -46,10 +46,12 @@ nz_recon CLI
 ├── sfx_cli.cpp        — CLI parsing (l/t/x/a/s + switches)
 ├── lzpf_arith.cpp     — lzpf arith primitives (BitReader, Huffman, LZ77 A/B)
 ├── nz_cm.cpp          — CM decoder: ported from nzdec_v0 NZ_CM.cpp (context mixer, range coder, all tables)
+├── nz_lzhd.cpp        — lzhd decoder: ported from nzdec_v0 NZ_LZ.cpp (DecLZ, PAQ context mixer, 12-bit arith)
 ├── linux32_cm_map.cpp — cm context-mixer vtable mapping (linux32 ELF offsets)
 └── include/
     ├── lzpf_arith.h
     ├── nz_cm.h        — CM decoder public API
+    ├── nz_lzhd.h      — lzhd decoder public API
     └── nz_sfx/        — internal headers
 ```
 
@@ -121,7 +123,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 - [x] **Task #13**: lzpf prefilter+arith mono path complete (`FUN_080a5330` + `FUN_08095d90` LPC filter). Stereo variant (`FUN_0809bbf0`) deferred.
 - [ ] **Task #13b**: lzpf prefilter+arith stereo path (`FUN_0809bbf0` — dual-channel residual decode). Low priority until a stereo `-cf` fixture is confirmed needed.
 - [ ] **Task #24**: 1-byte LZ77 divergence in variant A for high-entropy bytecode (semirandom block 18, side_count=8416). Root cause: hash-table aliasing vs the decompile. Needs objdump inner-loop + register-level trace to find the real storage.
-- [ ] **lzhd native decoder**: `FUN_080b5240` serial + `FUN_080b50b0` parallel, sharing `FUN_080b32c0` (780-line PAQ-style context mixer with SSE2 intrinsics).
+- [x] **Task #14**: lzhd native decoder complete — `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit arith, 680 LOC); byte-exact on 50 KB text fixture. Parallel variant (`FUN_080b50b0`) deferred.
 
 ## Progress log
 
@@ -135,6 +137,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-05-05 | Hash table init bug fixed (0→3); window_capacity formula corrected (`(p1+1)×64 KiB`); 8/8 methods 100% native_strict |
 | 2026-05-07 | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
 | 2026-05-07 | lzpf prefilter+arith mono path complete (task #13): `FUN_080a5330` + `FUN_08095d90` adaptive LPC filter; byte-exact on WAV/PCM fixtures. |
+| 2026-05-07 | lzhd native decoder complete (task #14): `DecLZ` PAQ context mixer + 12-bit range coder ported from nzdec_v0 `NZ_LZ.cpp` (680 LOC); byte-exact on 50 KB text fixture. C++ const-linkage bug fixed (`extern const kLzModelLNext`). |
 
 ## License
 
