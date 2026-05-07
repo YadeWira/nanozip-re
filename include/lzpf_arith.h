@@ -280,6 +280,11 @@ struct PrefilterParams {
 void DecodeResidualsMono(std::int32_t* out, std::size_t count,
                          const std::uint8_t* arith_bytes, SideBitState* br);
 
+// Stereo-variant residual decoder. Mirrors FUN_0809bbf0.
+// Symbol 0 → zero; non-zero symbols use VLC magnitude + explicit sign bit.
+void DecodeResidualsStereo(std::int32_t* out, std::size_t count,
+                           const std::uint8_t* arith_bytes, SideBitState* br);
+
 // Reconstruct sample output from int32 delta residuals into `out`.
 // Mirrors FUN_080a50c0 (mono / non-stereo-split path).
 // `total_bytes` = n_samples * sample_width.

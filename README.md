@@ -121,7 +121,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 ## Backlog
 
 - [x] **Task #13**: lzpf prefilter+arith mono path complete (`FUN_080a5330` + `FUN_08095d90` LPC filter). Stereo variant (`FUN_0809bbf0`) deferred.
-- [ ] **Task #13b**: lzpf prefilter+arith stereo path (`FUN_0809bbf0` — dual-channel residual decode). Low priority until a stereo `-cf` fixture is confirmed needed.
+- [x] **Task #13b**: lzpf prefilter+arith stereo residual decoder (`FUN_0809bbf0`) ported. Tables extracted from binary via GDB (`DAT_081b3a00/39c0/39c1/42f0/4380`); algorithm: VLC magnitude from byte + side-bit sign. No test fixture triggers `*param_1 & 1 == 1` with standard `-cf` encoding — speculative implementation, correct per decompile. `is_stereo_variant` flag path wired in `DecodePFBlock`.
 - [x] **Task #24**: 1-byte LZ77 divergence in variant A (semirandom block 18, side_count=8416) — believed fixed by hash-table init=3 fix (2026-05-05). No reproduction in 5+ fixture types (8KB–820KB, text/random/mix). Cannot reproduce without original session fixture.
 - [x] **Task #14**: lzhd native decoder complete — `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit arith, 680 LOC); byte-exact on 50 KB text fixture. Parallel variant (`FUN_080b50b0`) deferred.
 
@@ -138,6 +138,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-05-07 | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
 | 2026-05-07 | lzpf prefilter+arith mono path byte-exact (task #13): `LpcPredictor` fixed to 4-tap, 2-samples-per-iteration (factors update only on first of each pair — matching `FUN_08095d90` SIMD path); Fletcher32 verified on ramp WAV fixture. |
 | 2026-05-07 | lzhd native decoder complete (task #14): `DecLZ` PAQ context mixer + 12-bit range coder ported from nzdec_v0 `NZ_LZ.cpp` (680 LOC); byte-exact on 50 KB text fixture. C++ const-linkage bug fixed (`extern const kLzModelLNext`). |
+| 2026-05-07 | lzpf prefilter stereo residual decoder (task #13b): `DecodeResidualsStereo` ported from `FUN_0809bbf0` with binary-extracted tables; VLC magnitude + explicit sign-bit scheme. Speculative — no known fixture triggers this path with standard `-cf`. |
 
 ## License
 

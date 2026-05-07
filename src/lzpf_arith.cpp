@@ -1450,6 +1450,71 @@ bool ReadCodeLengthsHuffmanScratch(BitReader& br, std::uint8_t* dst,
 // Prefilter+arith decoder (task #13)
 // ---------------------------------------------------------------------------
 
+// FUN_0809bbf0 — stereo-variant residual decoder.
+// Threshold=1: symbol 0 → zero; symbols 1+ → VLC-style magnitude + sign bit.
+// Tables extracted from DAT_081b3a00/39c0/39c1/42f0/4380 at runtime via GDB.
+void DecodeResidualsStereo(std::int32_t* out, std::size_t count,
+                           const std::uint8_t* arith_bytes, SideBitState* br) {
+    // bVar1 = kStereoRange[symbol-1]  (group selector, always even, 0..62)
+    static constexpr std::uint8_t kStereoRange[256] = {
+        0x00,0x00,0x02,0x02,0x04,0x04,0x04,0x04,0x06,0x06,0x06,0x06,0x08,0x08,0x08,0x08,
+        0x0a,0x0a,0x0a,0x0a,0x0c,0x0c,0x0c,0x0c,0x0e,0x0e,0x0e,0x0e,0x10,0x10,0x10,0x10,
+        0x12,0x12,0x12,0x12,0x14,0x14,0x14,0x14,0x16,0x16,0x16,0x16,0x18,0x1a,0x1c,0x1e,
+        0x20,0x22,0x24,0x26,0x28,0x2a,0x2c,0x2e,0x30,0x32,0x34,0x36,0x38,0x3a,0x3c,0x3e,
+        /* 64-255: all 0 (direct magnitude = symbol, no extra bits) */
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    };
+    // DAT_081b39c0[0..63]: sub-range start offset per bVar1 (even indices used)
+    static constexpr std::uint8_t kSubOffset[64] = {
+        0x00,0x00,0x02,0x00,0x04,0x00,0x08,0x01,0x0c,0x02,0x10,0x03,0x14,0x04,0x18,0x05,
+        0x1c,0x06,0x20,0x07,0x24,0x08,0x28,0x0a,0x2c,0x0c,0x2d,0x0d,0x2e,0x0e,0x2f,0x0f,
+        0x30,0x10,0x31,0x11,0x32,0x12,0x33,0x13,0x34,0x14,0x35,0x15,0x36,0x16,0x37,0x17,
+        0x38,0x18,0x39,0x19,0x3a,0x1a,0x3b,0x1b,0x3c,0x1c,0x3d,0x1d,0x3e,0x1e,0x3f,0x1f,
+    };
+    // DAT_081b39c1[0..63]: extra bits count per bVar1 (even indices used)
+    static constexpr std::uint8_t kExBits[64] = {
+        0x00,0x02,0x00,0x04,0x00,0x08,0x01,0x0c,0x02,0x10,0x03,0x14,0x04,0x18,0x05,0x1c,
+        0x06,0x20,0x07,0x24,0x08,0x28,0x0a,0x2c,0x0c,0x2d,0x0d,0x2e,0x0e,0x2f,0x0f,0x30,
+        0x10,0x31,0x11,0x32,0x12,0x33,0x13,0x34,0x14,0x35,0x15,0x36,0x16,0x37,0x17,0x38,
+        0x18,0x39,0x19,0x3a,0x1a,0x3b,0x1b,0x3c,0x1c,0x3d,0x1d,0x3e,0x1e,0x3f,0x1f,0x00,
+    };
+    // DAT_081b4380[0..31] as uint32: base magnitude for range bVar1>>1
+    static constexpr std::uint32_t kBase[32] = {
+        0,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,
+        65536,131072,262144,524288,1048576,2097152,4194304,8388608,
+        16777216,33554432,67108864,134217728,268435456,536870912,1073741824,2147483648u,
+    };
+
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint32_t b = arith_bytes[i];
+        if (b == 0u) { out[i] = 0; continue; }
+
+        std::uint32_t iVar5 = b - 1u;  // b - threshold
+        std::uint32_t bVar1 = kStereoRange[iVar5];
+        std::uint32_t bVar2 = kExBits[bVar1];
+        std::uint32_t magnitude;
+
+        if (bVar2 == 0u) {
+            magnitude = b;  // = iVar5 + 1 (threshold)
+        } else {
+            std::uint32_t extra   = ReadSideBits(br, bVar2);
+            std::uint32_t shifted = ((iVar5 - kSubOffset[bVar1]) << (bVar2 & 0x1fu))
+                                    + kBase[bVar1 >> 1u];
+            magnitude = (extra | shifted) + 1u;
+            if (magnitude == 0u) { out[i] = 0; continue; }
+        }
+
+        // Sign bit: 0 → positive, 1 → negative
+        std::uint32_t sign = ReadSideBits(br, 1u);
+        out[i] = static_cast<std::int32_t>((magnitude ^ (0u - sign)) + sign);
+    }
+}
+
 // FUN_0809baa0 — mono residual decoder.
 // Bytes < 0xe0: direct zigzag. Bytes >= 0xe0: pull extra bits from side stream.
 // Zigzag: value = (byte >> 1) ^ -(byte & 1)
@@ -1626,7 +1691,7 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     if (!is_stereo_variant) {
         DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
     } else {
-        return 0; // FUN_0809bbf0 not yet ported
+        DecodeResidualsStereo(residuals.data(), n_elems, arith_buf.data(), &br);
     }
     // Side-stream bytes consumed (FUN_080a5330 line 263).
     // Uses signed arithmetic: (7 - n_valid) can be negative when n_valid > 7.
