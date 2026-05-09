@@ -4509,10 +4509,21 @@ int RunAddNativeLegacyStream(const CliOptions& options, const std::vector<Source
         out.put(static_cast<char>(legacy_checksum_header));
     }
 
+    // spec.method is the chunk varint: (csize<<4)|11.  Write exactly csize payload
+    // bytes so the chunk scanner can locate the following type-1 table chunk.
+    // p0 and p1 occupy slots 0 and 1; fill remaining slots with zeros.
     out.put(static_cast<char>(spec.method));
     out.put(static_cast<char>(spec.method_p0));
     out.put(static_cast<char>(spec.method_p1));
+    {
+        const unsigned codec_csize = static_cast<unsigned>(spec.method) >> 4u;
+        for (unsigned i = 2u; i < codec_csize; ++i) {
+            out.put(static_cast<char>(0u));
+        }
+    }
 
+    // WriteLegacyTableSpan(N-2) and WriteLegacyVarint((N<<4)|1) produce identical
+    // bytes, so table_span doubles as the type-1 chunk varint for the scanner.
     out.write(reinterpret_cast<const char*>(table_span.data()), static_cast<std::streamsize>(table_span.size()));
     out.write(reinterpret_cast<const char*>(table.data()), static_cast<std::streamsize>(table.size()));
     if (!checksum_bytes.empty()) {

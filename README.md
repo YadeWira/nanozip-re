@@ -14,7 +14,7 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 
 ## Clone percentage
 
-**Overall reconstruction estimate: ~85%**
+**Overall reconstruction estimate: ~88%**
 
 This is a rough but honest measure of how much of NanoZip's full decode surface has been natively reimplemented in C++, independent of input entropy.
 
@@ -28,7 +28,7 @@ This is a rough but honest measure of how much of NanoZip's full decode surface 
 | lzhd decoder (`-cd/-cD`) | ✅ ~90% | `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit range coder, 680 LOC, ported from nzdec_v0 `NZ_LZ.cpp`); byte-exact on 50 KB text fixture |
 | optimum decoder (`-co/-cO`) | ✅ ~70% | BWT + range-coder variants A/B native; edge shapes bridge |
 | cm decoder (`-cc`) | ✅ ~95% | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Stereo audio variant deferred. |
-| Encode for all methods | ✅ functional | Uses original binary via bridge; native encode not planned until decoders are complete |
+| Encode for all methods | ✅ functional | Native BWT/store/literal writers; bridge for full compression. All 8 methods byte-exact round-trip. |
 
 ### Fixture-based benchmark
 
@@ -125,6 +125,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 - [x] **Task #24**: 1-byte LZ77 divergence in variant A (semirandom block 18, side_count=8416) — believed fixed by hash-table init=3 fix (2026-05-05). No reproduction in 5+ fixture types (8KB–820KB, text/random/mix). Cannot reproduce without original session fixture.
 - [x] **Task #14**: lzhd native decoder complete — `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit arith, 680 LOC); byte-exact on 50 KB text fixture. Parallel variant (`FUN_080b50b0`) deferred.
 - [x] **Task #25**: Parallel archive header parser (`-pN`) fixed in `TryParseLegacyCnArchive`. NZ chunk format fully decoded: `(size<<4)|type` varint with nibble-15 stream-ID extension. Scanner accumulates uncompressed sizes across all per-stream type-1 chunks; `size_accum` overrides partial main-stream sizes after entry build. Byte-exact extraction verified on `-p10` archive (344207 bytes).
+- [x] **Task #26**: Archive writer (`RunAddNativeLegacyStream`) fixed to emit full codec chunk payload. `spec.method = (csize<<4)|11` declares `csize` payload bytes; writer was emitting only p0+p1 (2 bytes), causing the chunk scanner to consume the first byte of `table_span` as the 3rd codec byte, leaving a zero-size type-1 chunk. Fix: pad with zeros to reach `csize` bytes. Encode round-trip x_ok: 5/8 → **8/8**.
 
 ## Progress log
 
@@ -141,6 +142,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-05-07 | lzhd native decoder complete (task #14): `DecLZ` PAQ context mixer + 12-bit range coder ported from nzdec_v0 `NZ_LZ.cpp` (680 LOC); byte-exact on 50 KB text fixture. C++ const-linkage bug fixed (`extern const kLzModelLNext`). |
 | 2026-05-07 | lzpf prefilter stereo residual decoder (task #13b): `DecodeResidualsStereo` ported from `FUN_0809bbf0` with binary-extracted tables; VLC magnitude + explicit sign-bit scheme. Speculative — no known fixture triggers this path with standard `-cf`. |
 | 2026-05-07 | Parallel archive parser fixed (task #25): `TryParseLegacyCnArchive` now scans all NZ chunk records (`(size<<4)\|type` varint + nibble-15 stream-ID extension), accumulates per-filename sizes across all per-stream type-1 chunks. `-pN` archives list and extract correctly. |
+| 2026-05-09 | Archive writer codec chunk fix (task #26): `RunAddNativeLegacyStream` now pads codec payload to declared `csize` bytes; fixes chunk scanner misparse of own archives. encode_ok 5/8 → 8/8; all methods byte-exact round-trip. |
 
 ## License
 
