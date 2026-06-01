@@ -2,6 +2,7 @@
 #include "lzpf_arith.h"
 #include "nz_cm.h"
 #include "nz_lzhd.h"
+#include "nz_text_transform.h"
 
 #include <algorithm>
 #include <array>
@@ -3446,8 +3447,15 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
 }
 
 // Decode -cd/-cD (nz_lzhd) compressed payload natively using the ported DecLZ
-// decoder. Same block-header format as -cc CM blocks; decr_param==1 → LZ block.
-// window_base is fixed to the start of the output buffer (not circular).
+// decoder.
+//
+// Block format (from strace of nz binary): the archive parser reads each type-0
+// chunk as a unit of exactly chunk.size bytes.  The chunk body is the raw DecLZ
+// bitstream — no Header struct, no payload_size/decr_param prefix.  The
+// stream_tag varint encodes (compressed_bytes << 4) | 0, identical to the
+// type-0 chunk varint.  Multi-file archives have one type-0 chunk per logical
+// block; each chunk is decoded independently and the outputs are concatenated
+// in file-table order.
 static bool TryDecodeLegacyLzhd(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
@@ -3463,33 +3471,6 @@ static bool TryDecodeLegacyLzhd(
     const auto* raw = legacy.data.data();
     const std::size_t raw_len = legacy.data.size();
 
-    std::size_t pos = 0;
-    std::uint64_t stream_tag = 0;
-    {
-        unsigned shift = 7;
-        unsigned char c = raw[pos++];
-        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
-        while ((c & 0x80u) != 0u) {
-            if (pos >= raw_len || shift >= 63u) {
-                if (out_error_message) *out_error_message = "lzhd: truncated stream_tag";
-                return false;
-            }
-            c = raw[pos++];
-            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
-            shift += 7u;
-        }
-    }
-    if ((stream_tag & 0x0fu) != 0u) {
-        if (out_error_message) *out_error_message = "lzhd: bad stream_tag alignment";
-        return false;
-    }
-    const std::uint64_t stream_bytes = stream_tag >> 4u;
-    if (stream_bytes > raw_len - pos) {
-        if (out_error_message) *out_error_message = "lzhd: stream_bytes exceeds data";
-        return false;
-    }
-    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
-
     // Pre-allocate full output with 16-byte zero prefix for safe history reads
     // (DecLZ reads cur_ptr[-5] etc. from the first byte).
     static constexpr std::size_t kWindowPad = 16u;
@@ -3503,116 +3484,44 @@ static bool TryDecodeLegacyLzhd(
         return false;
     }
 
+    std::size_t pos = 0u;
     std::size_t written = 0u;
     bool ok = true;
 
-    while (pos < stream_end) {
-        if (pos + 4u > stream_end) { ok = false; break; }
-        const std::uint32_t payload_size =
-            static_cast<std::uint32_t>(raw[pos]) |
-            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-        pos += 4u;
-        if (payload_size > stream_end - pos) { ok = false; break; }
-        const std::uint8_t* payload = raw + pos;
-        pos += payload_size;
-
-        if (pos >= stream_end) { ok = false; break; }
-        const std::uint8_t decr_param = raw[pos++];
-
-        if (pos >= stream_end) { ok = false; break; }
-        const std::uint8_t param6 = raw[pos++];
-
-        std::uint32_t out_size = 0u;
-        if (param6) {
-            if (pos + 4u > stream_end) { ok = false; break; }
-            out_size =
-                static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u;
+    // Each type-0 chunk is one stream: stream_tag varint followed by
+    // stream_bytes bytes of raw DecLZ compressed data.
+    while (pos < raw_len && written < total_out) {
+        // Read stream_tag (ParseChunk-style biased varint).
+        std::uint64_t stream_tag = 0u;
+        {
+            unsigned shift = 7u;
+            unsigned char c = raw[pos++];
+            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+            while ((c & 0x80u) != 0u) {
+                if (pos >= raw_len || shift >= 63u) {
+                    ok = false; break;
+                }
+                c = raw[pos++];
+                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+                shift += 7u;
+            }
+            if (!ok) break;
         }
+        if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
+        const std::uint64_t stream_bytes = stream_tag >> 4u;
+        if (stream_bytes == 0u || stream_bytes > raw_len - pos) { ok = false; break; }
 
-        // Skip staged checksums.
-        if (pos >= stream_end) { ok = false; break; }
-        const std::uint8_t staged_count = raw[pos++];
-        if (pos + staged_count > stream_end) { ok = false; break; }
-        pos += staged_count;
+        const std::uint8_t* block_in  = raw + pos;
+        const std::uint32_t block_in_size = static_cast<std::uint32_t>(stream_bytes);
+        pos += static_cast<std::size_t>(stream_bytes);
 
-        // Skip param2 vector.
-        if (pos >= stream_end) { ok = false; break; }
-        if (raw[pos++]) {
-            if (pos + 4u > stream_end) { ok = false; break; }
-            std::uint32_t vlen =
-                static_cast<std::uint32_t>(raw[pos])   |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u;
-            if (pos + vlen > stream_end) { ok = false; break; }
-            pos += vlen;
-        }
-        // Skip param1 vector.
-        if (pos >= stream_end) { ok = false; break; }
-        if (raw[pos++]) {
-            if (pos + 4u > stream_end) { ok = false; break; }
-            std::uint32_t vlen =
-                static_cast<std::uint32_t>(raw[pos])   |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u;
-            if (pos + vlen > stream_end) { ok = false; break; }
-            pos += vlen;
-        }
-        // param16, texttransformer_enabled, dece_param.
-        if (pos + 1u > stream_end) { ok = false; break; }
-        pos++; // param16
-        if (pos >= stream_end) { ok = false; break; }
-        const std::uint8_t tt_enabled = raw[pos++];
-        if (tt_enabled) {
-            if (pos >= stream_end) { ok = false; break; }
-            const std::uint8_t tt_flags = raw[pos++];
-            auto skip_varint_str = [&]() -> bool {
-                if (pos >= stream_end) return false;
-                std::uint32_t n = 0u, sh = 0u;
-                unsigned char vc;
-                do {
-                    if (pos >= stream_end) return false;
-                    vc = raw[pos++];
-                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh;
-                    sh += 7u;
-                } while (vc & 0x80u);
-                if (pos + n > stream_end) return false;
-                pos += n;
-                return true;
-            };
-            if ((tt_flags & 2u)  && !skip_varint_str()) { ok = false; break; }
-            if ((tt_flags & 16u) && !skip_varint_str()) { ok = false; break; }
-        }
-        if (pos >= stream_end) { ok = false; break; }
-        const std::uint8_t dece_param = raw[pos++];
-        if (dece_param) {
-            if (pos + 4u > stream_end) { ok = false; break; }
-            std::uint32_t vlen =
-                static_cast<std::uint32_t>(raw[pos])   |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u)  |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u;
-            if (pos + vlen > stream_end) { ok = false; break; }
-            pos += vlen;
-        }
+        // out_size for this block: everything remaining (single-block archives)
+        // or a per-block portion.  We pass what's left; DecLZ stops when done.
+        const std::uint32_t block_out = static_cast<std::uint32_t>(total_out - written);
 
-        if (!param6 || out_size == 0u) continue;
-        if (decr_param != 1u) { ok = false; break; } // only LZ blocks expected for lzhd
-        if (written + out_size > total_out) { ok = false; break; }
-
-        NzLzhdDecode(dec, payload, payload_size,
-                     window_base + written, out_size, window_base);
-        written += out_size;
+        NzLzhdDecode(dec, block_in, block_in_size,
+                     window_base + written, block_out, window_base);
+        written += block_out;
     }
 
     NzLzhdDestroy(dec);
@@ -3718,9 +3627,11 @@ static bool TryDecodeLegacyCm(
         if (pos + staged_count > stream_end) { ok = false; break; }
         pos += staged_count;
 
-        // Skip param2 vector.
+        // Read param2 flag + vector.
         if (pos >= stream_end) { ok = false; break; }
-        if (raw[pos++]) {
+        const std::uint8_t param2_flag = raw[pos++];
+        std::vector<std::uint8_t> param2_data;
+        if (param2_flag) {
             if (pos + 4u > stream_end) { ok = false; break; }
             std::uint32_t vlen =
                 static_cast<std::uint32_t>(raw[pos]) |
@@ -3729,11 +3640,14 @@ static bool TryDecodeLegacyCm(
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
             if (pos + vlen > stream_end) { ok = false; break; }
+            param2_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
-        // Skip param1 vector.
+        // Read param1 flag + vector.
         if (pos >= stream_end) { ok = false; break; }
-        if (raw[pos++]) {
+        const std::uint8_t param1_flag = raw[pos++];
+        std::vector<std::uint8_t> param1_data;
+        if (param1_flag) {
             if (pos + 4u > stream_end) { ok = false; break; }
             std::uint32_t vlen =
                 static_cast<std::uint32_t>(raw[pos]) |
@@ -3742,19 +3656,20 @@ static bool TryDecodeLegacyCm(
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
             if (pos + vlen > stream_end) { ok = false; break; }
+            param1_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
-        // Skip param16, texttransformer_enabled, dece_param (3 bytes).
+        // Skip param16.
         if (pos + 1u > stream_end) { ok = false; break; }
-        pos++; // param16
+        pos++;
+        // Read texttransformer_enabled.
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t tt_enabled = raw[pos++];
+        std::uint8_t tt_flags = 0;
         if (tt_enabled) {
-            // Skip text_transforms byte + optional string vectors.
             if (pos >= stream_end) { ok = false; break; }
-            const std::uint8_t tt_flags = raw[pos++];
+            tt_flags = raw[pos++];
             auto skip_varint_str = [&]() -> bool {
-                // ReadVarint + skip n bytes
                 if (pos >= stream_end) return false;
                 std::uint32_t n = 0, sh = 0;
                 unsigned char vc;
@@ -3769,8 +3684,13 @@ static bool TryDecodeLegacyCm(
                 return true;
             };
             if ((tt_flags & 2u) && !skip_varint_str()) { ok = false; break; }
+            // tt_flags=0x10 carries a word-list blob (varint-str); skip it to keep
+            // the stream cursor aligned. The word-list transform is not yet native.
             if ((tt_flags & 16u) && !skip_varint_str()) { ok = false; break; }
+            // Transforms other than 0x08 (dictionary) not yet natively implemented.
+            (void)tt_flags;
         }
+        // Read dece_param.
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t dece_param = raw[pos++];
         if (dece_param) {
@@ -3789,9 +3709,28 @@ static bool TryDecodeLegacyCm(
 
         if (decr_param == 1u) NzCmReset(cm);
 
-        const std::size_t prev_size = out_data->size();
-        out_data->resize(prev_size + out_size);
-        NzCmDecode(cm, payload, payload_size, out_data->data() + prev_size, out_size);
+        if (tt_enabled && (tt_flags & ~0x08u)) {
+            // Unsupported text transform (e.g. 0x10 word-list): decline so the
+            // caller falls back to the extract bridge. Not yet native.
+            ok = false; break;
+        } else if (tt_enabled && (tt_flags & 0x08u)) {
+            // CM output is word-dict encoded; expand with dictionary transform.
+            std::vector<std::uint8_t> cm_buf(out_size);
+            NzCmDecode(cm, payload, payload_size, cm_buf.data(), out_size);
+            const std::size_t prev_size = out_data->size();
+            const std::uint32_t remaining =
+                static_cast<std::uint32_t>(legacy.total_data_size) -
+                static_cast<std::uint32_t>(prev_size);
+            out_data->resize(prev_size + remaining);
+            const std::uint32_t expanded = NzTextTransformDict(
+                cm_buf.data(), out_size, out_data->data() + prev_size, remaining);
+            if (expanded == 0) { ok = false; break; }
+            out_data->resize(prev_size + expanded);
+        } else {
+            const std::size_t prev_size = out_data->size();
+            out_data->resize(prev_size + out_size);
+            NzCmDecode(cm, payload, payload_size, out_data->data() + prev_size, out_size);
+        }
     }
 
     NzCmDestroy(cm);
@@ -3905,7 +3844,8 @@ int RunLegacyCnExtractOrTest(
             continue;
         }
 
-        if (e.has_checksum && legacy.checksum_verification_supported) {
+        if (e.has_checksum && legacy.checksum_verification_supported &&
+            options.checksum != ChecksumMode::kNone) {
             const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
             if (got != e.checksum) {
                 os << "Checksum mismatch: " << e.path << " (expected "

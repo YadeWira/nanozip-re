@@ -1,0 +1,269 @@
+#include "nz_text_transform.h"
+#include "nz_extab.h"
+#include <cstring>
+#include <cstdint>
+
+// kDictionary5to8: maps 5-bit letter code → character (0=terminator, 1='a'..26='z')
+// Derived from disassembly of init function at 0x80b70b0 in linux32/nz
+static const uint8_t kDictionary5to8[32] = {
+    0x00, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+    0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
+    0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
+    0x78, 0x79, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+// kCharacterTraits_0: character class flags (in .rodata at 0x081332e0 in linux32/nz)
+//   0x00=control  0x08=whitespace  0x10=sentence punct  0x04=digit
+//   0x41=uppercase  0x21=lowercase  0x80=other punct
+static const uint8_t kCharacterTraits_0[256] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00, 0x08, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10, 0x80, 0x10, 0x80,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10,
+    0x80, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+    0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x80, 0x80, 0x80, 0x00, 0x80,
+    0x00, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21,
+    0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x21, 0x80, 0x80, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+// kCharacterTraits_1: 1 = continue fast-copy (word char), 0 = word boundary
+// Derived from separator string at 0x813c61c in linux32/nz (22 bytes):
+// {space,LF,CR,TAB,",',\,/,(,<,[,{,&,-,_,|,=,>,;,.,!,?}
+static const uint8_t kCharacterTraits_1[256] = {
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+};
+
+// Port of InsertLongDict: writes word characters backward into buf, returns new wp
+static inline uint8_t* InsertLongDict(uint8_t* wp, uint32_t dict_index) {
+    uint8_t* wp_org = wp;
+    uint16_t init_val;
+    memcpy(&init_val, &kCharDictBig_Initial[dict_index], sizeof(init_val));
+    wp -= 2;
+    memcpy(wp, &init_val, 2);
+
+    uint32_t dict32 = kCharDictBig_Lo[dict_index];
+    do {
+        *--wp = kDictionary5to8[(dict32 >> 25) & 0x1fu];
+    } while ((dict32 <<= 5) & 0x3E000000u);
+
+    if (wp_org - wp == 8) {
+        dict32 = kCharDictBig_Hi[dict_index];
+        if (dict32) {
+            do {
+                *--wp = kDictionary5to8[(dict32 >> 25) & 0x1fu];
+            } while ((dict32 <<= 5) & 0x3E000000u);
+        }
+    }
+    return wp;
+}
+
+// Port of InsertMidDict
+static inline uint8_t* InsertMidDict(uint8_t* wp, uint32_t dict_index) {
+    uint16_t init_val;
+    memcpy(&init_val, &kCharDictMid_Initial[dict_index], sizeof(init_val));
+    wp -= 2;
+    memcpy(wp, &init_val, 2);
+
+    uint32_t dict32 = kCharDictMid[dict_index];
+    do {
+        *--wp = kDictionary5to8[(dict32 >> 25) & 0x1fu];
+    } while ((dict32 <<= 5) & 0x3E000000u);
+    return wp;
+}
+
+// Port of CopyDictEntWithCase
+static inline void CopyDictEntWithCase(uint8_t* out, const uint8_t* wp, uint32_t wl, uint32_t case_mode) {
+    uint32_t u0, u1, u2, u3;
+    memcpy(&u0, wp + 0, 4);
+    memcpy(&u1, wp + 4, 4);
+    memcpy(out + 0, &u0, 4);
+    memcpy(out + 4, &u1, 4);
+    if (wl > 8) {
+        memcpy(&u2, wp + 8, 4);
+        memcpy(&u3, wp + 12, 4);
+        memcpy(out + 8, &u2, 4);
+        memcpy(out + 12, &u3, 4);
+    }
+    if (case_mode) {
+        out[0] ^= 0x20u;
+        if (case_mode == 2) {
+            u0 = 0x20202020u;
+            memcpy(&u1, out + 1, 4); u1 ^= u0; memcpy(out + 1, &u1, 4);
+            memcpy(&u2, out + 5, 4); u2 ^= u0; memcpy(out + 5, &u2, 4);
+            if (wl > 9) {
+                memcpy(&u3, out + 9,  4); u3 ^= u0; memcpy(out + 9,  &u3, 4);
+                uint32_t u4; memcpy(&u4, out + 13, 4); u4 ^= u0; memcpy(out + 13, &u4, 4);
+            }
+        }
+    }
+}
+
+// Port of FormatIP
+static uint8_t* FormatIP(uint32_t ip, uint8_t* out) {
+    uint32_t num_parts = 4;
+    do {
+        uint32_t part = ip >> 24;
+        ip <<= 8;
+        if (part >= 100) {
+            out[0] = static_cast<uint8_t>(part / 100 + '0');
+            out[1] = static_cast<uint8_t>(part / 10 % 10 + '0');
+            out[2] = static_cast<uint8_t>(part % 10 + '0');
+            out[3] = '.';
+            out += 4;
+        } else {
+            if (part >= 10) {
+                *out++ = static_cast<uint8_t>(part / 10 % 10 + '0');
+                part %= 10;
+            }
+            *out = static_cast<uint8_t>(part + '0');
+            out[1] = '.';
+            out += 2;
+        }
+    } while (--num_parts);
+    return out - 1;
+}
+
+// Port of TransformText_1_Dictionary from NZ_TextTransforms.cpp.
+// in:        CM-decoded byte stream (word-dictionary encoded), MUST end with 0x20 (space)
+// in_size:   byte count including the trailing space
+// out:       output buffer (must be >= allocated bytes)
+// allocated: capacity of out
+// Returns decoded size (stripping trailing space), 0 on error.
+uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
+                             uint8_t* out, uint32_t allocated) {
+    (void)allocated;
+    const uint8_t* out_org = out;
+    if (in_size <= 1 || in[in_size - 1] != 0x20u)
+        return 0;
+
+    uint32_t recent_ip[20];
+    for (uint32_t i = 0; i < 20; i++)
+        recent_ip[i] = i;
+
+    uint8_t case_mode = 0;
+    const uint8_t* in_end = in + in_size;
+
+    while (in < in_end) {
+        uint32_t b = *in++;
+        uint32_t c;
+
+        if (b == 127u) {
+            c = *in++;
+            if (c != 32u) {
+                if ((kCharacterTraits_0[c] & 0x20u) && c <= 117u) {
+                    uint32_t ip;
+                    if (c == 97u) {
+                        if (in_end - in < 4) break;
+                        ip = (in[3] | ((uint32_t)(in[2] | (uint32_t)((((uint32_t)in[0] << 8) | in[1]) << 8)) << 8)) + 0x1000000u;
+                        in += 4;
+                        for (int i = 19; i != 0; i--)
+                            recent_ip[i] = recent_ip[i - 1];
+                        recent_ip[0] = ip;
+                    } else {
+                        uint32_t idx = c - 98u;
+                        ip = recent_ip[idx];
+                        if (idx) {
+                            do {
+                                recent_ip[idx] = recent_ip[idx - 1];
+                            } while (--idx);
+                            recent_ip[0] = ip;
+                        }
+                    }
+                    if (in >= in_end) break;
+                    out = FormatIP(ip, out);
+                    c = *in++;
+                }
+                case_mode = 0;
+                goto output_next_char;
+            }
+            b = *in++;
+            if (b == 127u) {
+                if (*in++ != 32u) break;
+                b = *in++;
+                case_mode = 2;
+            } else {
+                case_mode = 1;
+            }
+        } else {
+            case_mode = 0;
+        }
+
+        if (b > 127u) {
+            c = *in++;
+            // buf layout: [0..13] writable space, [14] = wp_org, always 14 bytes max word
+            uint8_t buf[6 + 6 + 2 + 2 + 1];
+            uint8_t* wp = buf + 6 + 6 + 2;
+            uint32_t dict_index;
+            if (c > 127u) {
+                dict_index = c ^ (b << 7) ^ 0x7f7fu;
+                c = *in++;
+                wp = InsertLongDict(wp, dict_index);
+            } else {
+                wp = InsertMidDict(wp, b - 128u);
+            }
+            uint32_t wl = static_cast<uint32_t>((buf + 6 + 6 + 2) - wp);
+            out += wl;
+            CopyDictEntWithCase(out - wl, wp, wl, case_mode);
+        } else {
+            uint32_t dict32 = kCharacterDictUltrasmall[b];
+            if (dict32 == 0u || (kCharacterTraits_0[c = *in] & 1u)) {
+                c = b;
+                if (case_mode != 0)
+                    c ^= 32u * (kCharacterTraits_0[b] & 1u);
+            } else {
+                in++;
+                uint32_t out32 = dict32;
+                memcpy(out, &out32, 4);
+                uint8_t* old_out = out;
+                out += (dict32 >> 24);
+                if (case_mode != 0) {
+                    *old_out++ ^= 0x20u;
+                    if (case_mode == 2) {
+                        while (old_out != out)
+                            *old_out++ ^= 0x20u;
+                    }
+                }
+            }
+        }
+
+    output_next_char:
+        *out++ = static_cast<uint8_t>(c);
+        if (kCharacterTraits_1[c]) {
+            if (in >= in_end) break;
+            for (;;) {
+                c = *in++;
+                *out++ = static_cast<uint8_t>(c);
+                if (!kCharacterTraits_1[c]) break;
+                if (case_mode == 2)
+                    out[-1] = static_cast<uint8_t>(c ^ (32u * (kCharacterTraits_0[c] & 1u)));
+            }
+        }
+    }
+
+    if (in > in_end || out[-1] != 0x20u)
+        return 0;
+    return static_cast<uint32_t>(out - 1 - out_org);
+}

@@ -13,6 +13,7 @@ set(RECON_SOURCES
     src/lzpf_arith.cpp
     src/nz_cm.cpp
     src/nz_lzhd.cpp
+    src/nz_text_transform.cpp
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
