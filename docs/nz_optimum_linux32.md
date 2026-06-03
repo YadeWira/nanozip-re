@@ -1,70 +1,70 @@
-# NanoZip 0.09a Linux32 - Notas RE `-co/-cO/-cc`
+# NanoZip 0.09a Linux32 - RE notes for `-co/-cO/-cc`
 
-Estado de esta iteracion:
+Status of this iteration:
 
 - `-cc`:
-  - subcaso `literal-wrapper` ya detectado en parser nativo:
+  - `literal-wrapper` subcase already detected in the native parser:
     - `stream = [u32 raw_size][raw_payload][trailer]`
-    - se activa cuando `raw_size == total_data_size`.
-  - ejemplos donde aplica:
-    - `test_cc.nz` (payload de 5 bytes)
-    - `/tmp/nz_cov2/cc.nz` (payload de 8244 bytes)
-  - ejemplos donde no aplica (sigue bridge/compat):
-    - `/tmp/nz_probe_alg/repa_cc.nz` (stream comprimido real de 4096 bytes repetidos)
+    - activates when `raw_size == total_data_size`.
+  - examples where it applies:
+    - `test_cc.nz` (5-byte payload)
+    - `/tmp/nz_cov2/cc.nz` (8244-byte payload)
+  - examples where it does not apply (still bridge/compat):
+    - `/tmp/nz_probe_alg/repa_cc.nz` (real 4096-byte compressed stream of repeated data)
 
 - `-co/-cO`:
-  - subcaso chico ya soportado en nativo puro:
+  - small subcase already supported in pure native:
     - `stream = [u32 raw_size][bwt_last(raw_size)][u24 primary_index][trailer]`
-    - validado en `test_co.nz` y `test_cO.nz` sin bridges.
-  - subcaso BWT con trailer de 16 bytes soportado en nativo puro:
+    - validated on `test_co.nz` and `test_cO.nz` without bridges.
+  - BWT subcase with 16-byte trailer supported in pure native:
     - `stream = [u32 raw_size][bwt_last(raw_size)][trailer16]`
-    - `primary_index` en `trailer[5..7]` (u24 little-endian).
-    - validado sin bridges en muestras 8KiB (`rand8k/mix8k`, `-co/-cO`).
-  - subcaso `raw-wrapper` (incompresible) soportado en nativo puro:
+    - `primary_index` in `trailer[5..7]` (u24 little-endian).
+    - validated without bridges on 8 KiB samples (`rand8k/mix8k`, `-co/-cO`).
+  - `raw-wrapper` subcase (incompressible) supported in pure native:
     - `stream = [u32 raw_size][raw_payload][trailer]`
-    - se activa cuando `raw_size == total_data_size` y valida checksums por entrada.
-    - validado sin bridges:
+    - activates when `raw_size == total_data_size` and validates checksums per entry.
+    - validated without bridges:
       - `/tmp/nz_co_lpaq_probe/legacy_co_combo.nz`
       - `/tmp/nz_co_lpaq_probe/legacy_cO_combo.nz`
-  - streams comprimidos reales observados (no literal).
-  - muestras chicas (`test_co.nz`, `test_cO.nz`) muestran un patron compatible con BWT+metadata:
-    - `u32` inicial igual a tamaño original (ej. `05 00 00 00`)
-    - bloque tipo BWT para `hola\\n`: `61 6c 0a 6f 68` (`al\\noh`)
-    - indice primario observado (`00 00 02`).
-  - muestras multiarchivo comprimidas (ej. `/tmp/nz_co_analysis/co.nz`) aun no tienen decoder puro.
-  - confirmacion adicional (`/tmp/nz_co_probe/co.nz`, `stream_bytes=8267`):
-    - prefijo aparente: `u32 n = 8241`, seguido por `n` bytes y `u24=308`;
-    - quedan 19 bytes de trailer:
+  - real compressed streams observed (not literal).
+  - small samples (`test_co.nz`, `test_cO.nz`) show a pattern compatible with BWT+metadata:
+    - initial `u32` equal to original size (e.g. `05 00 00 00`)
+    - BWT-style block for `hola\n`: `61 6c 0a 6f 68` (`al\noh`)
+    - observed primary index (`00 00 02`).
+  - compressed multi-file samples (e.g. `/tmp/nz_co_analysis/co.nz`) still lack a pure decoder.
+  - additional confirmation (`/tmp/nz_co_probe/co.nz`, `stream_bytes=8267`):
+    - apparent prefix: `u32 n = 8241`, followed by `n` bytes and `u24=308`;
+    - 19 bytes of trailer remain:
       - `co`: `20000003de272f004908000000000000000000`
       - `cO`: `20000003de272f014908000000000000000000`
-    - `co` y `cO` difieren en 1 byte del trailer (`00` vs `01`), consistente con variante del metodo;
-    - aplicar `InverseBwt` directo sobre esos `n` bytes **no** reconstruye el payload original,
-      por lo que el bloque grande no es solo `[bwt_last][primary]` crudo.
-  - contraste con `lpaq1v2..lpaq8` (build 32-bit, corpus `/tmp/nz_co_analysis/co.nz`):
-    - se probaron entradas `raw` y `bwt_last` con memoria `0..9`;
-    - hubo candidatos con tamaño de payload cercano (`8240..8243`) pero **0 coincidencias exactas**;
-    - prefijo común con el body legacy: `0` bytes en los mejores casos.
-    - conclusión: el body `-co` real no coincide byte-a-byte con salida directa de esas versiones lpaq en modo estándar.
+    - `co` and `cO` differ in 1 trailer byte (`00` vs `01`), consistent with a method variant;
+    - applying `InverseBwt` directly over those `n` bytes **does not** reconstruct the original payload,
+      so the large block is not just `[bwt_last][primary]` raw.
+  - contrast with `lpaq1v2..lpaq8` (32-bit build, corpus `/tmp/nz_co_analysis/co.nz`):
+    - both `raw` and `bwt_last` inputs were tried with memory `0..9`;
+    - there were candidates with near payload size (`8240..8243`) but **0 exact matches**;
+    - common prefix with the legacy body: `0` bytes in the best cases.
+    - conclusion: the real `-co` body does not match byte-for-byte with the direct output of those lpaq versions in standard mode.
 
-## Call-chain runtime confirmado (`-co/-cO` real)
+## Confirmed runtime call-chain (real `-co/-cO`)
 
-Trazas `gdb` en muestras actuales muestran que, dentro de `0x080aa850`, hay rutas activas distintas:
+`gdb` traces on the current samples show that, inside `0x080aa850`, there are distinct active paths:
 
-1. ruta BWT directa:
-   - `0x080aa850 -> 0x0809d370` (sin prefiltro);
-   - usada por wrappers BWT (incluye subtipo `trailer16 primary@+5`).
-2. ruta BWT con prefiltro:
+1. direct BWT path:
+   - `0x080aa850 -> 0x0809d370` (without prefilter);
+   - used by BWT wrappers (includes the `trailer16 primary@+5` subtype).
+2. BWT path with prefilter:
    - `0x080aa850 -> 0x0809a250 -> 0x0809d370`;
-   - usada en streams multiarchivo comprimidos (`co/cO` reales pendientes).
-3. ruta alterna repetitivos:
+   - used in compressed multi-file streams (real `co/cO` still pending).
+3. alternate repetitive-data path:
    - `0x080aa850 -> 0x080acaf0 -> 0x080ace10 -> 0x080accd0`;
-   - aun pendiente en C++ puro.
+   - still pending in pure C++.
 
-Nota:
+Note:
 
-- `0x080abca0` sigue existiendo en la familia optimum/cm, pero no es la ruta principal observada en el corpus `co/cO` de esta pasada.
+- `0x080abca0` still exists in the optimum/cm family, but it is not the main path observed in the current `co/cO` corpus.
 
-## Muestras de referencia (dump)
+## Reference samples (dump)
 
 - `test_co.nz`:
   - `stream_bytes=25`
@@ -81,49 +81,49 @@ Nota:
   - `head=17000000beeb672bf3789693...`
   - `tail=...000140000000036e7d4101010000000300000000`
 
-Proximo objetivo tecnico:
+Next technical goal:
 
-1. mapear argumentos y estado de `0x080aa850` -> `0x080abca0` (stack + offsets `ctx`) en la ruta que termina en `0x080aab2f`;
-2. identificar el significado de `u32 n`, `u24` y trailer de 19 bytes en bloques grandes;
-3. implementar decoder incremental por bloques;
-4. validar contra corpus:
+1. map the arguments and state of `0x080aa850` -> `0x080abca0` (stack + `ctx` offsets) in the path that ends at `0x080aab2f`;
+2. identify the meaning of `u32 n`, `u24` and the 19-byte trailer in large blocks;
+3. implement an incremental block decoder;
+4. validate against corpus:
    - `test_co.nz`, `test_cO.nz`
    - `/tmp/nz_cov2/co.nz`, `/tmp/nz_cov2/cO.nz`
-   - casos repetitivos `repa_co`, `repa2_co`.
+   - repetitive cases `repa_co`, `repa2_co`.
 
-## Reclasificacion runtime (pasada actual)
+## Runtime reclassification (current pass)
 
-Se agrego trazado automatizado (`tests/legacy_optimum_trace_path.sh`) y se corrio sobre corpus `co/cO` (`/tmp/nz_co_grid`, `/tmp/nz_co_pairs`, `/tmp/nz_co_analysis`, `/tmp/nz_co_small`, `/tmp/nz_co_lpaq_probe`).
+Automated tracing (`tests/legacy_optimum_trace_path.sh`) was added and run over the `co/cO` corpus (`/tmp/nz_co_grid`, `/tmp/nz_co_pairs`, `/tmp/nz_co_analysis`, `/tmp/nz_co_small`, `/tmp/nz_co_lpaq_probe`).
 
-Rutas observadas en `linux32/nz`:
+Paths observed in `linux32/nz`:
 
 1. `b98a0 -> b1950 -> aa850`:
-   - subcaso wrapper simple;
-   - en reconstruccion actual ya se resuelve nativo puro (sin `[compat]`).
+   - simple wrapper subcase;
+   - already resolved in pure native (no `[compat]`).
 2. `b98a0 -> b1950 -> aa850 -> acaf0`:
-   - subcaso comprimido alterno (frecuente en repetitivos);
-   - sigue pendiente en C++ puro (hoy cae a compat).
+   - alternate compressed subcase (frequent in repetitive data);
+   - still pending in pure C++ (today it falls back to compat).
 3. `b98a0 -> b1950 -> aa850 -> a9d370`:
-   - subcaso comprimido principal (frecuente);
-   - ya cubierto en nativo puro para el lote actual.
+   - main compressed subcase (frequent);
+   - already covered in pure native for the current batch.
 4. `b98a0 -> b1950 -> aa850 -> a9a250 -> a9d370`:
-   - subcaso mas pesado (ej. `/tmp/nz_co_analysis/co.nz`);
-   - sigue pendiente en C++ puro (hoy cae a compat).
+   - heavier subcase (e.g. `/tmp/nz_co_analysis/co.nz`);
+   - still pending in pure C++ (today it falls back to compat).
 
-Conteo en corrida de clasificacion (86 muestras):
+Counts in a classification run (86 samples):
 
 - `aa850 -> a9d370`: 44
 - `aa850 -> acaf0`: 26
-- `aa850` (solo): 10
+- `aa850` (only): 10
 - `aa850 -> a9a250 -> a9d370`: 2
 
-Cruce con `nz_recon` sin bridges (`NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`):
+Cross-check with `nz_recon` without bridges (`NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`):
 
-- ruta `aa850` (solo): `t/x` sin `[compat]`;
-- ruta `a9d370`: `t/x` sin `[compat]`;
-- rutas `acaf0` y `a9a250+a9d370`: `t/x` correctos pero con `[compat]`.
+- `aa850` (only) path: `t/x` without `[compat]`;
+- `a9d370` path: `t/x` without `[compat]`;
+- `acaf0` and `a9a250+a9d370` paths: `t/x` correct but with `[compat]`.
 
-Implicacion directa:
+Direct implication:
 
-- el bloqueo de `-co/-cO` puro ya no se ataca via `0x080abca0` para el corpus principal actual;
-- el port C++ debe priorizar `0x0809d370` (y su prefiltro `0x0809a250` cuando aplica), luego `0x080acaf0`/`0x080ace10`/`0x080accd0`.
+- the pure `-co/-cO` blocker is no longer attacked via `0x080abca0` for the current main corpus;
+- the C++ port must prioritize `0x0809d370` (and its prefilter `0x0809a250` when applicable), then `0x080acaf0`/`0x080ace10`/`0x080accd0`.

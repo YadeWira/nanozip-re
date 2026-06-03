@@ -1,24 +1,24 @@
-# NanoZip 0.09a Linux32 - RE de `nz_lzpf` (`-cf`/`-cF`)
+# NanoZip 0.09a Linux32 - RE of `nz_lzpf` (`-cf`/`-cF`)
 
-Base analizada: `work/linux32/nz`
+Base analyzed: `work/linux32/nz`
 
-## Contexto
+## Context
 
-En la reconstruccion actual, `-cn` ya se procesa nativamente y `-cf/-cF`:
-- nativo puro: subcaso `literal-only`
-- bridge de extracción (sin ptrace): decode de payload comprimido observado usando backend legado en temporal
-- bridge `gdb` sobre backend linux32: payload comprimido observado (sin reimplementacion algebraica completa del core).
-Este documento resume el mapeo RE del bloque `nz_lzpf` para habilitar decoder nativo real.
+In the current reconstruction, `-cn` is already processed natively and `-cf/-cF`:
+- pure native: `literal-only` subcase
+- extract bridge (no ptrace): decodes the observed compressed payload using the legacy backend in a temp dir
+- `gdb` bridge over the linux32 backend: observed compressed payload (without a complete algebraic reimplementation of the core).
+This document summarizes the RE mapping of the `nz_lzpf` block to enable a real native decoder.
 
-## Constructor/familia
+## Constructor/family
 
-- Constructor de familia lzpf/lzpf_large: `fcn.08098050` (llamado desde dispatcher `fcn.08092470`).
-- Constructor de objeto base lzpf: `fcn.080972d0`.
-- En `fcn.080972d0` se instala vtable en `0x08132c68`.
+- lzpf/lzpf_large family constructor: `fcn.08098050` (called from the dispatcher `fcn.08092470`).
+- lzpf base-object constructor: `fcn.080972d0`.
+- In `fcn.080972d0` the vtable is installed at `0x08132c68`.
 
-## Vtable `0x08132c68` (objeto `nz_lzpf`)
+## Vtable `0x08132c68` (`nz_lzpf` object)
 
-Entradas observadas:
+Observed entries:
 
 1. `0x08097550`
 2. `0x080972d0`
@@ -27,110 +27,110 @@ Entradas observadas:
 5. `0x08097280`
 6. `0x08097e20`
 
-Hipotesis funcional (por comportamiento y xrefs):
+Functional hypothesis (from behavior and xrefs):
 
-1. `0x08097550`: estimador de memoria (usa `0x08097510` + `0x200000`).
-2. `0x080972d0`: ctor/reinit del objeto.
-3. `0x08097340`: wrapper destructor/release.
-4. `0x080974f0`: wrapper de reset/reinit parcial.
-5. `0x08097280`: carga/config de limites (lee `ctx+4`, valida `<= 0x100044`, llama `0x080917d0`).
-6. `0x08097e20`: rutina principal de proceso (encode/decode wrapper).
+1. `0x08097550`: memory estimator (uses `0x08097510` + `0x200000`).
+2. `0x080972d0`: object ctor/reinit.
+3. `0x08097340`: destructor/release wrapper.
+4. `0x080974f0`: partial reset/reinit wrapper.
+5. `0x08097280`: limits load/config (reads `ctx+4`, validates `<= 0x100044`, calls `0x080917d0`).
+6. `0x08097e20`: main process routine (encode/decode wrapper).
 
-## Core de proceso
+## Process core
 
-- `fcn.08097e20` prepara estado y buffers de trabajo.
-- `fcn.08097e20` invoca `fcn.08097570` (core grande, ~2.2 KB de codigo).
-- `fcn.08097570` contiene:
-  - parseo de varints con patron de continuation bit (similar a parser legacy ya reconstruido),
-  - ramas con copy/match y tablas de contexto,
-  - varias rutas de error devolviendo codigos que `0x08097e20` remapea.
+- `fcn.08097e20` prepares state and working buffers.
+- `fcn.08097e20` calls `fcn.08097570` (large core, ~2.2 KB of code).
+- `fcn.08097570` contains:
+  - varint parsing with the continuation-bit pattern (similar to the already-reconstructed legacy parser),
+  - branches with copy/match and context tables,
+  - several error paths returning codes that `0x08097e20` remaps.
 
-### Hallazgo de calling convention (importante)
+### Calling convention finding (important)
 
-`0x08097570` **no** se comporta como cdecl normal de 5 argumentos.
+`0x08097570` does **not** behave as a normal 5-argument cdecl.
 
-En call-sites reales (`0x08097edb`, `0x08097f4d`) se observa:
+In real call-sites (`0x08097edb`, `0x08097f4d`) we see:
 
-- solo se pasa un argumento explicito: `mov [esp], eax; call 0x08097570`
-- el resto del estado se consume desde offsets de stack ya preparados por `0x08097e20`.
+- only one explicit argument is passed: `mov [esp], eax; call 0x08097570`
+- the rest of the state is consumed from stack offsets already prepared by `0x08097e20`.
 
-Implicacion para port C++:
+Implication for the C++ port:
 
-- no conviene traducir `0x08097570` aislada como funcion "limpia";
-- conviene portar primero el par `0x08097e20 + 0x08097570` como pipeline unico de decode.
+- it is not convenient to translate `0x08097570` standalone as a "clean" function;
+- the pair `0x08097e20 + 0x08097570` should be ported first as a single decode pipeline.
 
-## Layout de stack confirmado (gdb + objdump)
+## Confirmed stack layout (gdb + objdump)
 
-Muestra usada:
+Sample used:
 
 - `/tmp/nz_cf_probe/cf_repA.nz` (`-cf`, 4096 x `A`).
 
-En `0x08097e20` (caller) se observan dos call-sites a `0x08097570`:
+In `0x08097e20` (caller) two call-sites to `0x08097570` are observed:
 
 - `0x08097edb`
 - `0x08097f4d`
 
-Antes del `call`, el caller prepara:
+Before the `call`, the caller prepares:
 
 - `[esp+0x00] = ctx` (`ebx+0x40`)
 - `[esp+0x04] = state_ptr` (`&local_0x38`)
 - `[esp+0x08] = out_ptr`
 - `[esp+0x0c] = out_len_ptr` (`&local_0x7c`)
 
-En el callee (`0x08097570`) esos slots se consumen como:
+In the callee (`0x08097570`) those slots are consumed as:
 
 - `[esp+0xa4]`: `ctx`
 - `[esp+0xa0]`: `state_ptr`
 - `[esp+0xa8]`: `out_ptr`
 - `[esp+0xac]`: `out_len_ptr`
 
-(`push ebp/edi/esi/ebx` + `sub esp,0x8c` desplazan los offsets).
+(`push ebp/edi/esi/ebx` + `sub esp,0x8c` shift the offsets.)
 
-Observaciones de runtime:
+Runtime observations:
 
-- `ctx+0x1c`: puntero a stream comprimido.
-- `ctx+0x20`: bytes pendientes de stream.
-- `ctx+0x24..0x40`: estado de continuidad entre bloques (se rellena en `0x08097d9f` y se reusa en `0x08097dfa`).
-- retorno `eax` de `0x08097570`: codigos intermedios remapeados por `0x08097e20`.
+- `ctx+0x1c`: pointer to the compressed stream.
+- `ctx+0x20`: pending stream bytes.
+- `ctx+0x24..0x40`: continuity state between blocks (filled at `0x08097d9f` and reused at `0x08097dfa`).
+- `eax` return of `0x08097570`: intermediate codes remapped by `0x08097e20`.
 
-## Codigos de retorno (parcial)
+## Return codes (partial)
 
-En `fcn.08097e20` se observa remapeo de retorno de `0x08097570`:
+In `fcn.08097e20` a remap of the return value of `0x08097570` is observed:
 
-- `eax == 1`  -> retorna `2`
-- `eax == 2`  -> retorna `3`
-- `eax == 3`  -> retorna `4`
-- ruta default de error -> `5`
-- checks de limites en bucle -> `6` o `7`
-- ruta con callback `[vtable+0x0c]` y `xor ebx, ebx` -> `0` (exito)
+- `eax == 1`  -> returns `2`
+- `eax == 2`  -> returns `3`
+- `eax == 3`  -> returns `4`
+- default error path -> `5`
+- limit checks in the loop -> `6` or `7`
+- path with `[vtable+0x0c]` callback and `xor ebx, ebx` -> `0` (success)
 
-Mapeo exacto pendiente (siguiente etapa): etiquetar cada codigo con causa (`input corrupto`, `buffer corto`, etc.).
+Exact mapping pending (next step): label each code with its cause (`corrupt input`, `short buffer`, etc.).
 
-## Formato de stream `-cf` observado
+## Observed `-cf` stream format
 
-Muestras reales comprimidas (no literal-only):
+Real compressed samples (not literal-only):
 
 - `4096 x 'A'` -> `cf_repA.nz` (71 bytes)
-- `AB` repetido -> `cf_repAB.nz` (72 bytes)
-- `ABC` repetido -> `cf_repABC.nz` (73 bytes)
-- texto repetitivo -> `cf_english.nz` (85 bytes)
+- `AB` repeated -> `cf_repAB.nz` (72 bytes)
+- `ABC` repeated -> `cf_repABC.nz` (73 bytes)
+- repetitive text -> `cf_english.nz` (85 bytes)
 
-Patron estable en payload:
+Stable pattern in the payload:
 
-- prefijo varint de stream con nibble bajo `0` (`stream_tag`, `stream_bytes = tag >> 4`)
-- cuerpo comprimido (ya no coincide con `bitlen = total_size*8+1` del caso literal-only)
+- stream varint prefix with low nibble `0` (`stream_tag`, `stream_bytes = tag >> 4`)
+- compressed body (no longer matches `bitlen = total_size*8+1` of the literal-only case)
 
-Ejemplo `cf_repA.nz` (cuerpo):
+Example `cf_repA.nz` (body):
 
 - `80 01 83 ff 00 06 00 2f 2f cf c7 fd 6f ff 60 de 90 40`
 
-Esto confirma que el subcaso literal-only no cubre `-cf` real y que el siguiente paso debe implementar decoder desde `0x08097570`.
+This confirms that the literal-only subcase does not cover real `-cf` and that the next step must implement a decoder from `0x08097570`.
 
-## Plan tecnico siguiente
+## Next technical plan
 
-1. Re-etiquetar bloques en `0x08097570` (lectura tokens, match copy, salida literal, control de fin).
-2. Extraer pseudocodigo de bloques clave y traducir a C++ puro.
-3. Integrar decoder en `TryParseLegacyCnArchive` / `RunLegacyCnExtractOrTest` para `method_p0 == 1/2`.
-4. Validar contra:
-   - muestras chicas (`cf_repA`, `cf_repAB`, `cf_repABC`, `cf_english`)
-   - muestras grandes (`big_cf.nz`).
+1. Re-label blocks in `0x08097570` (token read, match copy, literal output, end control).
+2. Extract pseudocode of the key blocks and translate them to pure C++.
+3. Integrate the decoder in `TryParseLegacyCnArchive` / `RunLegacyCnExtractOrTest` for `method_p0 == 1/2`.
+4. Validate against:
+   - small samples (`cf_repA`, `cf_repAB`, `cf_repABC`, `cf_english`)
+   - large samples (`big_cf.nz`).

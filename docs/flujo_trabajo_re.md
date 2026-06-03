@@ -1,56 +1,56 @@
-# Flujo de Trabajo RE de NanoZip (Reconstruccion CLI)
+# NanoZip RE Workflow (CLI reconstruction)
 
-Fecha de corte: 2026-04-03
+Cutoff date: 2026-04-03
 
-## Objetivo operativo
+## Operational goal
 
-Reconstruir `l/t/x/a/s` de NanoZip 0.09a sin SFX, priorizando:
+Reconstruct `l/t/x/a/s` of NanoZip 0.09a without SFX, prioritizing:
 
-1. compatibilidad real de uso (`l/t/x` funcionando en archivos legacy);
-2. trazabilidad del formato (header, tabla, metadata, payload);
-3. reemplazo progresivo de compat/bridges por decode C++ puro.
+1. real usage compatibility (`l/t/x` working on legacy archives);
+2. format traceability (header, table, metadata, payload);
+3. progressive replacement of compat/bridges with pure C++ decode.
 
-## Definiciones de porcentaje
+## Percentage definitions
 
 - `usage_real_percent`:
-  - porcentaje de metodos `-c*` que pasan `l/t/x` con salida correcta;
-  - incluye rutas de bridge/compat cuando se activan.
+  - percentage of `-c*` methods that pass `l/t/x` with correct output;
+  - includes bridge/compat paths when activated.
 - `native_only_percent`:
-  - porcentaje de metodos `-c*` que pasan `l/t/x` sin emitir `[compat]`;
-  - puede incluir decode por `extract bridge` o `gdb bridge`.
-- `native_pure_percent` (medicion manual recomendada):
-  - mismo criterio anterior, pero desactivando bridges:
+  - percentage of `-c*` methods that pass `l/t/x` without emitting `[compat]`;
+  - may still use the `extract bridge` or `gdb bridge`.
+- `native_pure_percent` (recommended manual measurement):
+  - same criterion as above, but with bridges disabled:
   - `NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`.
 - `encode_real_percent`:
-  - porcentaje de metodos `-c*` donde `a/s` y luego `t/x` del archivo generado pasan correctamente.
+  - percentage of `-c*` methods where `a/s` followed by `t/x` of the produced archive passes correctly.
 - `encode_native_no_compat_percent`:
-  - porcentaje de metodos `-c*` donde `a/s` no emite `[compat]`.
+  - percentage of `-c*` methods where `a/s` does not emit `[compat]`.
 - `encode_native_no_compat_bridge_percent`:
-  - porcentaje de metodos `-c*` donde `a/s` no emite `[compat]` ni `[bridge]`.
+  - percentage of `-c*` methods where `a/s` emits neither `[compat]` nor `[bridge]`.
 
-## Herramientas usadas
+## Tools used
 
-- RE/inspeccion:
+- RE/inspection:
   - `rizin/radare2`, `gdb` (batch), `xxd`, `strace`, `rg`.
-- validacion de comportamiento:
-  - `work/linux64/nz`, `work/linux32/nz` como oraculo.
-- reconstruccion:
+- Behavior validation:
+  - `work/linux64/nz`, `work/linux32/nz` as oracle.
+- Reconstruction:
   - `cmake`, `g++`.
 
-## Flujo base (iteracion estandar)
+## Base flow (standard iteration)
 
-1. Construir binario reconstruido.
-2. Medir baseline de cobertura (`coverage_matrix.sh`).
-3. Repetir baseline con bridges desactivados para medir avance puro.
-4. Tomar muestra `.nz` y extraer stream interno para hipotesis de formato.
-5. Implementar subcaso en parser/decode C++ (siempre conservador).
-6. Ejecutar regresion:
-   - `l/t/x` en corpus de prueba;
-   - `cmp` de archivos extraidos vs originales;
-   - matriz de cobertura completa.
-7. Documentar hallazgo y dejar siguiente paso concreto.
+1. Build the reconstructed binary.
+2. Measure the coverage baseline (`coverage_matrix.sh`).
+3. Re-run the baseline with bridges disabled to measure pure progress.
+4. Take a `.nz` sample and extract its internal stream to form format hypotheses.
+5. Implement the subcase in C++ parser/decode (always conservative).
+6. Run regression:
+   - `l/t/x` on the test corpus;
+   - `cmp` of extracted files vs originals;
+   - full coverage matrix.
+7. Document the finding and leave a concrete next step.
 
-## Comandos de referencia
+## Reference commands
 
 Build:
 
@@ -62,108 +62,108 @@ cp build-release/nz_recon bin/nz_recon
 cp build-release/nz_sfx_recon bin/nz_sfx_recon
 ```
 
-Cobertura normal:
+Normal coverage:
 
 ```bash
 cd work/reconstruccion
 ./tests/coverage_matrix.sh
 ```
 
-Cobertura sin bridges (pureza):
+Coverage without bridges (purity):
 
 ```bash
 cd work/reconstruccion
 NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1 ./tests/coverage_matrix.sh
 ```
 
-Dump de stream legacy:
+Legacy stream dump:
 
 ```bash
 cd work/reconstruccion
-./tests/legacy_stream_dump.py /ruta/al/archivo.nz
+./tests/legacy_stream_dump.py /path/to/archive.nz
 ```
 
-Traza de ruta runtime `-co/-cO` en backend legacy:
+`-co/-cO` runtime path trace in the legacy backend:
 
 ```bash
 cd work/reconstruccion
-./tests/legacy_optimum_trace_path.sh /ruta/al/archivo.nz
+./tests/legacy_optimum_trace_path.sh /path/to/archive.nz
 ```
 
-Matriz de rutas runtime vs pureza nativa (lote de muestras):
+Runtime path matrix vs native purity (sample batch):
 
 ```bash
 cd work/reconstruccion
 ./tests/legacy_optimum_path_matrix.py '/tmp/nz_co_grid/*.nz' '/tmp/nz_co_pairs/*.nz'
 ```
 
-## Rutas de decode legacy (orden real)
+## Legacy decode paths (real order)
 
-Para `t/x` de archivos legacy:
+For `t/x` of legacy archives:
 
-1. parser nativo de header + tabla + metadata;
-2. si payload no nativo:
-   - `extract bridge` (usa backend legacy en dir temporal, sin ptrace);
-   - luego `gdb bridge` (si disponible);
-3. si ambos fallan:
-   - fallback `[compat]` al backend legacy.
+1. native header + table + metadata parser;
+2. if the payload is not native:
+   - `extract bridge` (uses the legacy backend in a temp dir, no ptrace);
+   - then `gdb bridge` (if available);
+3. if both fail:
+   - `[compat]` fallback to the legacy backend.
 
-## Rutas de compresion `a/s` (estado real)
+## `a/s` compression paths (real state)
 
-- `-cn`: compresion/escritura nativa en C++.
-- metodos legacy (`-cf/-cF/-cd/-cD/-co/-cO/-cc`):
-  - por defecto: writer nativo `native-first` por wrappers RE:
+- `-cn`: native C++ compression/writing.
+- legacy methods (`-cf/-cF/-cd/-cD/-co/-cO/-cc`):
+  - by default: native `native-first` writer with RE wrappers:
     - `cf/cF`: `literal-only`;
     - `cd/cD`: `literal-wrapper` (`[varint][0x00][raw]`);
-    - `co/cO`: wrapper BWT (`[u32 size][bwt_last][u24 primary]`, limite 32 KiB en writer nativo);
+    - `co/cO`: BWT wrapper (`[u32 size][bwt_last][u24 primary]`, 32 KiB limit in native writer);
     - `cc`: `raw-wrapper` (`[u32 size][raw]`).
-  - si writer nativo falla y bridge esta habilitado: fallback a backend legacy (marca `[bridge]`, sin pre-forward `[compat]`);
-  - `NZ_DISABLE_COMPRESS_BRIDGE=1`: desactiva fallback bridge y fuerza salida estrictamente nativa (error si el wrapper no aplica).
-  - soporta `-h*` (con mapeo `-hf -> Fletcher32` en header legacy).
+  - if the native writer fails and the bridge is enabled: fallback to the legacy backend (marked `[bridge]`, without the prior `[compat]` marker);
+  - `NZ_DISABLE_COMPRESS_BRIDGE=1`: disables the bridge fallback and forces strictly native output (error if the wrapper does not apply).
+  - supports `-h*` (with `-hf -> Fletcher32` mapping in the legacy header).
 
-## Variables de entorno operativas
+## Operational environment variables
 
 - `NZ_LEGACY_BACKEND`:
-  - ruta a backend `nz` (archivo o directorio contenedor).
+  - path to the `nz` backend (file or containing directory).
 - `NZ_LEGACY_BRIDGE_BACKEND`:
-  - ruta al backend linux32 para `gdb bridge`.
+  - path to the linux32 backend for the `gdb bridge`.
 - `NZ_DISABLE_EXTRACT_BRIDGE`:
-  - desactiva puente de extraccion.
+  - disables the extract bridge.
 - `NZ_DISABLE_GDB_BRIDGE`:
-  - desactiva puente por gdb/ptrace.
+  - disables the gdb/ptrace bridge.
 - `NZ_DISABLE_COMPRESS_BRIDGE`:
-  - desactiva fallback bridge de compresion `a/s` para metodos legacy y fuerza resultado estrictamente nativo.
+  - disables the `a/s` compression bridge fallback for legacy methods and forces strictly native output.
 
-## Estado actual por metodo `-c`
+## Current state per `-c` method
 
-- `cn`: nativo puro.
-- `cd/cD`: nativo puro en subcaso literal-only observado; writer nativo de wrapper RE disponible.
+- `cn`: pure native.
+- `cd/cD`: pure native in the observed literal-only subcase; native RE wrapper writer available.
 - `cc`:
-  - nativo puro en subcaso `literal-wrapper` (`[u32 size][raw][trailer]`);
-  - writer nativo `raw-wrapper` disponible;
-  - en streams comprimidos reales aun requiere bridge/compat.
-- `cf/cF`: literal-only puro; writer nativo literal disponible; streams comprimidos reales aun pendientes.
+  - pure native in the `literal-wrapper` subcase (`[u32 size][raw][trailer]`);
+  - native `raw-wrapper` writer available;
+  - real compressed streams still require bridge/compat.
+- `cf/cF`: pure literal-only; native literal writer available; real compressed streams still pending.
 - `co/cO`:
-  - decoder nativo del wrapper BWT observado en muestras chicas;
-  - decoder nativo del subcaso `raw-wrapper` observado en entradas incomprimibles;
-  - writer nativo BWT-wrapper disponible (limite 32 KiB);
-  - streams comprimidos reales generales aun pendientes (bridge/compat).
+  - native BWT-wrapper decoder observed on small samples;
+  - native `raw-wrapper` subcase decoder observed on incompressible entries;
+  - native BWT-wrapper writer available (32 KiB limit);
+  - general real compressed streams still pending (bridge/compat).
 
-## Principio de implementacion
+## Implementation principle
 
-Siempre validar subcasos con checks estructurales fuertes:
+Always validate subcases with strong structural checks:
 
-1. layout coherente de stream (`stream_tag`, longitudes, limites);
-2. tamaño total esperado (`total_data_size`);
-3. consistencia por entradas (nunca leer fuera de rango);
-4. fallback seguro a bridge/compat cuando no se cumple.
+1. coherent stream layout (`stream_tag`, lengths, limits);
+2. expected total size (`total_data_size`);
+3. per-entry consistency (never read out of range);
+4. safe fallback to bridge/compat when the checks do not hold.
 
-## Backlog inmediato
+## Immediate backlog
 
-1. Port de `cf/cF` comprimido real (core RE `0x08097570/0x08097e20`).
-2. Completar decoder puro de `co/cO` para streams comprimidos generales pendientes:
-   - prefiltro `0x0809a250` en ruta `0x080aa850 -> 0x0809a250 -> 0x0809d370`;
-   - ruta alterna repetitivos `0x080aa850 -> 0x080acaf0 -> 0x080ace10 -> 0x080accd0`.
-   - nota: la ruta BWT directa `0x080aa850 -> 0x0809d370` ya tiene cobertura nativa en wrappers observados (incluyendo `primary` en trailer16@+5).
-3. Extender decoder puro de `cc` para streams comprimidos reales.
-4. Completar parseo de metadata multi-archivo legacy (timestamps/permisos/checksum por entrada).
+1. Port the real `cf/cF` compressed path (RE core `0x08097570/0x08097e20`).
+2. Complete the pure `co/cO` decoder for the general real compressed streams still pending:
+   - prefilter `0x0809a250` on the `0x080aa850 -> 0x0809a250 -> 0x0809d370` path;
+   - alternate repetitive path `0x080aa850 -> 0x080acaf0 -> 0x080ace10 -> 0x080accd0`.
+   - note: the direct BWT path `0x080aa850 -> 0x0809d370` already has native coverage on observed wrappers (including `primary` in trailer16@+5).
+3. Extend the pure `cc` decoder to real compressed streams.
+4. Complete the multi-file legacy metadata parser (timestamps/permissions/checksum per entry).
