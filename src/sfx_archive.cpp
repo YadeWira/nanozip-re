@@ -3769,7 +3769,40 @@ int RunLegacyCnExtractOrTest(
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
         std::string cm_decode_error;
-        if (TryDecodeLegacyCm(legacy, &bridged_data, &cm_decode_error)) {
+        std::vector<unsigned char> cm_native_data;
+        const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);
+        // Verify the native CM output against the legacy extract bridge before trusting
+        // it. The native CM decoder currently has a known architectural mismatch with
+        // the legacy decoder for short inputs (4-byte patterns repeated 3+ times), and
+        // that mismatch surfaces as a silent data corruption that only the downstream
+        // checksum would catch. Cross-check the first 32 bytes; if they differ, fall
+        // through to the extract bridge path so the user gets byte-exact output.
+        // The cross-check is skipped when the extract bridge is disabled (NZ_DISABLE_
+        // EXTRACT_BRIDGE) to preserve the legacy fast path in CI.
+        bool cm_verified = false;
+        if (cm_native_ok
+            && std::getenv("NZ_DISABLE_EXTRACT_BRIDGE") == nullptr
+            && !legacy.entries.empty()
+            && legacy.total_data_size > 0u) {
+            std::vector<unsigned char> bridge_data;
+            std::string verify_error;
+            if (TryDecodeLegacyWithExtractBridge(legacy, &bridge_data, &verify_error)) {
+                const std::size_t cmp_len = std::min<std::size_t>(cm_native_data.size(), bridge_data.size());
+                constexpr std::size_t kVerifyBytes = 32u;
+                const std::size_t check_len = std::min(cmp_len, kVerifyBytes);
+                if (check_len == 0u
+                    || std::memcmp(cm_native_data.data(), bridge_data.data(), check_len) == 0) {
+                    cm_verified = true;
+                } else if (options.verbose) {
+                    os << "[native] CM native output differs from legacy in first "
+                       << check_len << " bytes; falling back to extract bridge.\n";
+                }
+            }
+        } else if (cm_native_ok) {
+            cm_verified = true;
+        }
+        if (cm_verified) {
+            bridged_data = std::move(cm_native_data);
             LegacyCnContext bridged = legacy;
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
