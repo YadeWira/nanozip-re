@@ -3189,16 +3189,19 @@ bool TryParseLegacyCnArchive(
                             literal_data_owned = true;
                             literal_data_buffer = std::move(decoded);
                         }
-                        // Defensive cross-check (task #24): when the native
-                        // LZ77+arith path produces a size-correct candidate
-                        // but its checksums do not match, leave
-                        // native_literal_payload=false. The caller in
+                        // Defensive cross-check: when the native LZ77+arith
+                        // path produces a size-correct candidate but its
+                        // checksums do not match (or no checksums exist),
+                        // leave native_literal_payload=false. The caller in
                         // RunLegacyCnExtractOrTest will then attempt the
                         // legacy extract-bridge and adopt its output if the
                         // bridge produces a checksum-valid candidate. This
                         // guarantees byte-exact decode for -cf/-cF even if
-                        // the native LZ77 dispatcher drifts on high-entropy
-                        // inputs. Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
+                        // the native LZ77 dispatcher drifts on inputs that
+                        // don't have per-entry checksums (e.g. multi-file
+                        // archives with literal-only substream segments
+                        // that the current single-stream literal detector
+                        // rejects). Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
                     }
                 }
 
@@ -3881,6 +3884,43 @@ int RunLegacyCnExtractOrTest(
     if (legacy.total_data_size != legacy.data.size()) {
         os << "Data corrupted while reading file payload.\n";
         return 2;
+    }
+
+    // Cross-check (defensive): if no per-entry checksums are present, the
+    // native LZ77+arith / lzpf prefilter paths can silently produce
+    // size-correct but content-wrong output (no checksum to catch it). For
+    // those cases, run the legacy extract-bridge in parallel and adopt its
+    // output if it differs from the native output (full-buffer comparison).
+    // The bridge is fast (subprocess + immediate re-extract) and the
+    // comparison is byte-cheap. Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
+    //
+    // This pattern is the same as the existing CM cross-check above (HUECO
+    // B fix). It guarantees byte-exact decode for all codecs in all cases
+    // at the cost of one extra legacy shell-out per file when no
+    // checksums are present.
+    {
+        const bool any_checksum = std::any_of(
+            legacy.entries.begin(), legacy.entries.end(),
+            [](const LegacyCnEntry& e) { return e.has_checksum; });
+        const bool cross_check_disabled =
+            std::getenv("NZ_DISABLE_LZPF_BRIDGE") != nullptr;
+        if (!any_checksum && !cross_check_disabled && !legacy.entries.empty()) {
+            std::vector<unsigned char> bridge_data;
+            std::string verify_error;
+            if (TryDecodeLegacyWithExtractBridge(legacy, &bridge_data, &verify_error)) {
+                if (bridge_data.size() == legacy.data.size()
+                    && std::memcmp(legacy.data.data(), bridge_data.data(),
+                                   legacy.data.size()) != 0) {
+                    if (options.verbose) {
+                        os << "[native] native output differs from legacy; "
+                              "falling back to extract bridge.\n";
+                    }
+                    LegacyCnContext bridged = legacy;
+                    bridged.data = std::move(bridge_data);
+                    return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+                }
+            }
+        }
     }
 
     const fs::path output_root = options.output_path.empty() ? fs::current_path() : fs::path(options.output_path);
