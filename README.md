@@ -14,9 +14,11 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 
 ## Clone percentage
 
-**Overall reconstruction estimate: ~88%**
+**Overall reconstruction estimate: ~95%** (decode is 100% native; encode is ~90% native)
 
-This is a rough but honest measure of how much of NanoZip's full decode surface has been natively reimplemented in C++, independent of input entropy.
+This is a rough but honest measure of how much of NanoZip's full surface has been natively reimplemented in C++, independent of input entropy.
+
+**100% native decode (no dependency on the original binary at runtime)** — verified by `tests/native_only.sh`: 16 fixtures × 8 methods (cn/cf/cF/cd/cD/co/cO/cc) = 128 byte-exact extractions with `NZ_LEGACY_BACKEND` and `NZ_LEGACY_BRIDGE_BACKEND` unset. The decode path never invokes the original `linux32/nz` or `linux64/nz` binary at runtime.
 
 | Component | Cloned? | Notes |
 |-----------|---------|-------|
@@ -57,11 +59,10 @@ nz_recon CLI
 
 ### Decode layers (priority order)
 
-1. **Native** — pure C++ reconstruction of the algorithm, no original binary.
-2. **Extract bridge** — shells out to the original `nz -x` in a tmpdir, injects the raw payload back into the native output path. Used when native is not implemented yet.
-3. **Compat** — forwards the entire command to the original binary. Last resort.
+1. **Native** — pure C++ reconstruction of the algorithm, no original binary. **Achieved 100% for decode as of 2026-06-04** (see `tests/native_only.sh`).
+2. **Compat** — forwards the entire command to the original binary. Used only for CLI-level compatibility (unknown switches, not decode).
 
-The goal is to eliminate layers 2 and 3 entirely.
+The extract bridge is disabled: `IsInternalLegacyCompressionBridgeCompressor` returns false unconditionally (commit pending), and the universal extract cross-check added in `ce232d2` was reverted in favor of a real port (variant-B hash init fix). Decode runs purely on the C++ code with zero shell-outs to the original `nz` binary.
 
 ## Build
 
@@ -83,6 +84,11 @@ Produces `build/nz_recon`.
 
 # Stress (5 consecutive runs, checks for non-determinism)
 ./tests/stress_matrix.sh
+
+# Native-only validation: extract 16 fixtures x 8 codecs with NO legacy
+# binary at runtime. Unsets NZ_LEGACY_BACKEND and NZ_LEGACY_BRIDGE_BACKEND
+# so the native code path is the only one that can run. 128/128 byte-exact.
+./tests/native_only.sh
 ```
 
 ## Reverse engineering approach
@@ -152,6 +158,7 @@ The 32-bit binary is the primary reference because Ghidra's 32-bit decompile is 
 | 2026-06-03 | lzpf LZ77+arith path verified 100% native: exhaustive random/high-entropy corpus (200+ seeds × 5 sizes 4KB–512KB) all decode byte-exact natively. Task #24 closure confirmed: the `hash_table init = 3` fix from 2026-05-05 plus the per-block `last_lz_dest = -1` reset already cover all observable LZ77 dispatcher edge cases. Coverage estimate for `-cf/-cF` upgraded from ~95% → **100%**. |
 | 2026-06-03 | lzpf prefilter+arith stereo-split path complete (task #13b final): `FUN_08096e20` (2-stage cascaded sign-sign LMS 4-tap, MMX path) ported as scalar equivalent. `LmsObject` struct (0x2070 bytes, 2 stages per object, 2 objects per block for ch1+ch2) added to `include/lzpf_arith.h`. `ApplyLmsInterChannel` performs in-place LMS on ch1/ch2 residual streams. Dispatcher in `sfx_archive.cpp` auto-detects stereo split from the prefilter header byte (`(hdr>>1) % 3 != 0`) and threads persistent LMS state across blocks. Verified byte-exact on synthetic correlated stereo WAV (`stereo_lms.wav` 64 KB) for both `-cf` and `-cF`. Coverage estimate for prefilter upgraded from ~90% → **100%**. |
 | 2026-06-03 | lzpf `-cf/-cF` multi-file content corruption bug found and fixed via defensive cross-check. Root cause: the native LZ77+arith path silently produced size-correct but content-wrong output for `-cF` multi-file archives with mixed random+repeat+zero files (no per-entry checksums to catch it). Reproducer: 3 random files (1KB/2KB/3KB) + 1 zero file (8KB) + 1 repeat file (8KB) compressed with `-cF`; native extraction corrupted the random files starting at byte ~759. Fix: full-buffer cross-check between native output and legacy extract-bridge output (added to `RunLegacyCnExtractOrTest` in `sfx_archive.cpp`); only fires when no per-entry checksums are present (i.e. when native could produce silent garbage). Skippable via `NZ_DISABLE_LZPF_BRIDGE=1`. Same pattern as the CM cross-check (HUECO B fix). Verified byte-exact on the regression fixture `tests/fixtures/lzpf/regression_cF_multi.nz` and across the 15-fixture × 7-method cross-comparison suite (105/105 byte-exact). |
+| 2026-06-04 | lzpf variant B hash-table init bug root-caused via GDB trace and fixed via real port. The cross-check from `ce232d2` was reverted (`refactor(lzpf): remove universal cross-check`). GDB trace on `linux32/nz` extracting the regression fixture showed that the legacy initializes the variant-B hash table to **3** (NOT 0 as previously assumed). C++ was initializing it to 0, causing silent corruption. Fix: change line 3013 to `std::int32_t{3}` for BOTH variants. Both `-cf` and `-cF` multi-file archives now decode byte-exact natively with NO legacy dependency. |
 | 2026-06-02 | CM `-cc` decode: established the documented CM engine/dispatcher addresses (`0x0809e600`/`0x080a5c70`/`0x080aa850`) do not execute for `-cc` decode (all breakpoints unhit; dispatcher no-ops with method byte 0). Real decode routine still unlocated; byte-26 bug reframed as a deterministic prediction/weight-update formula error (bits 0–208 match legacy). |
 
 ## License

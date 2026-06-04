@@ -3008,9 +3008,18 @@ bool TryParseLegacyCnArchive(
                     // The variant-B allocation is large but matches the legacy
                     // `nz_lzpf_large` codec footprint. Allocated lazily — only
                     // when method_p0 == 2.
+                    //
+                    // BOTH variants initialize the hash table to 3, NOT 0.
+                    // GDB trace (2026-06-04) on linux32/nz confirms that
+                    // nz_lzpf_large also fills the hash table with the value
+                    // 3 before any block is processed. Using 0 for variant B
+                    // (the previous default) caused silent data corruption
+                    // for multi-file archives with mixed random/repeat/zero
+                    // files (regression fixture
+                    // tests/fixtures/lzpf/regression_cF_multi.nz).
                     std::vector<std::int32_t> hash_table(
                         is_variant_b ? std::size_t{0x1000000u} : std::size_t{8192u},
-                        is_variant_b ? std::int32_t{0} : std::int32_t{3});
+                        std::int32_t{3});
                     std::vector<std::uint8_t> byte_buffer_b(
                         is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
                     std::size_t window_cursor = window_initial_cursor;
@@ -3806,7 +3815,7 @@ int RunLegacyCnExtractOrTest(
         // it. The native CM decoder currently has a known architectural mismatch with
         // the legacy decoder for short inputs (4-byte patterns repeated 3+ times), and
         // that mismatch surfaces as a silent data corruption that only the downstream
-        // checksum would catch. Cross-check the first 32 bytes; if they differ, fall
+        // checksum would catch. Full-buffer comparison: if any byte differs, fall
         // through to the extract bridge path so the user gets byte-exact output.
         // The cross-check is skipped when the extract bridge is disabled (NZ_DISABLE_
         // EXTRACT_BRIDGE) to preserve the legacy fast path in CI.
@@ -3818,15 +3827,13 @@ int RunLegacyCnExtractOrTest(
             std::vector<unsigned char> bridge_data;
             std::string verify_error;
             if (TryDecodeLegacyWithExtractBridge(legacy, &bridge_data, &verify_error)) {
-                const std::size_t cmp_len = std::min<std::size_t>(cm_native_data.size(), bridge_data.size());
-                constexpr std::size_t kVerifyBytes = 32u;
-                const std::size_t check_len = std::min(cmp_len, kVerifyBytes);
-                if (check_len == 0u
-                    || std::memcmp(cm_native_data.data(), bridge_data.data(), check_len) == 0) {
+                if (cm_native_data.size() == bridge_data.size()
+                    && std::memcmp(cm_native_data.data(), bridge_data.data(),
+                                   cm_native_data.size()) == 0) {
                     cm_verified = true;
                 } else if (options.verbose) {
-                    os << "[native] CM native output differs from legacy in first "
-                       << check_len << " bytes; falling back to extract bridge.\n";
+                    os << "[native] CM native output differs from legacy; "
+                          "falling back to extract bridge.\n";
                 }
             }
         } else if (cm_native_ok) {
@@ -3884,43 +3891,6 @@ int RunLegacyCnExtractOrTest(
     if (legacy.total_data_size != legacy.data.size()) {
         os << "Data corrupted while reading file payload.\n";
         return 2;
-    }
-
-    // Cross-check (defensive): if no per-entry checksums are present, the
-    // native LZ77+arith / lzpf prefilter paths can silently produce
-    // size-correct but content-wrong output (no checksum to catch it). For
-    // those cases, run the legacy extract-bridge in parallel and adopt its
-    // output if it differs from the native output (full-buffer comparison).
-    // The bridge is fast (subprocess + immediate re-extract) and the
-    // comparison is byte-cheap. Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
-    //
-    // This pattern is the same as the existing CM cross-check above (HUECO
-    // B fix). It guarantees byte-exact decode for all codecs in all cases
-    // at the cost of one extra legacy shell-out per file when no
-    // checksums are present.
-    {
-        const bool any_checksum = std::any_of(
-            legacy.entries.begin(), legacy.entries.end(),
-            [](const LegacyCnEntry& e) { return e.has_checksum; });
-        const bool cross_check_disabled =
-            std::getenv("NZ_DISABLE_LZPF_BRIDGE") != nullptr;
-        if (!any_checksum && !cross_check_disabled && !legacy.entries.empty()) {
-            std::vector<unsigned char> bridge_data;
-            std::string verify_error;
-            if (TryDecodeLegacyWithExtractBridge(legacy, &bridge_data, &verify_error)) {
-                if (bridge_data.size() == legacy.data.size()
-                    && std::memcmp(legacy.data.data(), bridge_data.data(),
-                                   legacy.data.size()) != 0) {
-                    if (options.verbose) {
-                        os << "[native] native output differs from legacy; "
-                              "falling back to extract bridge.\n";
-                    }
-                    LegacyCnContext bridged = legacy;
-                    bridged.data = std::move(bridge_data);
-                    return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
-                }
-            }
-        }
     }
 
     const fs::path output_root = options.output_path.empty() ? fs::current_path() : fs::path(options.output_path);
@@ -4243,7 +4213,15 @@ bool TryRunLegacyBackend(const CliOptions& options, std::ostream& os, int* exit_
 }
 
 bool IsInternalLegacyCompressionBridgeCompressor(Compressor c) {
-    return c != Compressor::kNone;
+    // Disabled (2026-06-04): the legacy compression bridge was a fallback
+    // for codecs the native encoder could not handle (e.g. -cO optimum
+    // variants, -cc cm). Per the project goal of being 100% pure native
+    // RE (no dependency on the original binary at runtime), the bridge
+    // is disabled unconditionally. Codecs the native encoder cannot
+    // handle now produce an explicit "unsupported" error rather than
+    // silently invoking the legacy binary.
+    (void)c;
+    return false;
 }
 
 enum class LegacyNativeWrapper {
