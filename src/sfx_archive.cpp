@@ -3018,6 +3018,14 @@ bool TryParseLegacyCnArchive(
                     std::size_t input_pos = bp;
                     bool decode_ok = true;
                     nzr::lzpf::LpcPredictor pf_pred{};
+                    // LMS inter-channel state (FUN_08096e20) persists across blocks
+                    // when the prefilter is stereo-split. Zero-init; reset only at
+                    // the start of a new archive (the outer parse function allocates
+                    // these afresh per archive).
+                    nzr::lzpf::LmsObject pf_lms_ch1{};
+                    nzr::lzpf::LmsObject pf_lms_ch2{};
+                    pf_lms_ch1.Init();
+                    pf_lms_ch2.Init();
                     while (total_written < total_data_size) {
                         // If we've consumed the current stream's bytes and
                         // there's more output to produce, advance to the
@@ -3071,12 +3079,22 @@ bool TryParseLegacyCnArchive(
                             }
                             const std::size_t block_start_in_window = window_cursor;
                             const std::size_t avail_in = stream_data_end - input_pos;
+                            // Auto-detect stereo split from the prefilter header byte
+                            // (FUN_080a5330 line 50: channels = (hdr>>1) % 3).
+                            // If channels != 0, is_stereo_variant must be true so the
+                            // LMS inter-channel predictor (FUN_08096e20) runs. The LMS
+                            // objects persist across blocks in the outer loop.
+                            const std::uint8_t pf_hdr = bytes[input_pos];
+                            const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
+                            const bool is_stereo_pf = (pf_channels != 0u);
                             const std::size_t pf_consumed = nzr::lzpf::DecodePrefilterStream(
                                 bytes.data() + input_pos, avail_in,
                                 window + block_start_in_window,
                                 static_cast<std::size_t>(block_out_size),
-                                /*is_stereo_variant=*/false,
-                                &pf_pred);
+                                is_stereo_pf,
+                                &pf_pred,
+                                is_stereo_pf ? &pf_lms_ch1 : nullptr,
+                                is_stereo_pf ? &pf_lms_ch2 : nullptr);
                             if (pf_consumed == 0) { decode_ok = false; break; }
                             input_pos += pf_consumed;
                             window_cursor += static_cast<std::size_t>(block_out_size);
@@ -3171,6 +3189,16 @@ bool TryParseLegacyCnArchive(
                             literal_data_owned = true;
                             literal_data_buffer = std::move(decoded);
                         }
+                        // Defensive cross-check (task #24): when the native
+                        // LZ77+arith path produces a size-correct candidate
+                        // but its checksums do not match, leave
+                        // native_literal_payload=false. The caller in
+                        // RunLegacyCnExtractOrTest will then attempt the
+                        // legacy extract-bridge and adopt its output if the
+                        // bridge produces a checksum-valid candidate. This
+                        // guarantees byte-exact decode for -cf/-cF even if
+                        // the native LZ77 dispatcher drifts on high-entropy
+                        // inputs. Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
                     }
                 }
 

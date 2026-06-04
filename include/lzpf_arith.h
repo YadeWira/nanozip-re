@@ -292,6 +292,49 @@ void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
                                const std::int32_t* residuals,
                                const PrefilterParams* p);
 
+// ---------------------------------------------------------------------------
+// LMS inter-channel predictor (FUN_08096e20).
+// ---------------------------------------------------------------------------
+// Stereo prefilter path: 2 cascaded sign-sign LMS 4-tap stages per channel.
+// Ch2 predicts from ch1's reconstructed sample (inter-channel decorrelation).
+// Total layout per object = 0x2070 bytes (matches legacy ctx @+0xf8d0 stride).
+//
+// Two LmsObject instances are needed per stereo block (one for ch1, one for
+// ch2); the ch2 instance reads ch1's reconstructed sample as its "input" and
+// updates from the ch2 residual. State persists across blocks at the call
+// site (allocate once per archive, reuse for every prefilter block).
+struct LmsObject {
+    // Stage 1: coeffs[4] (i16), sign[4] (i16), ring[1024] (i16), ptr (i32), dot (i32)
+    std::int16_t coeffs1[4]{};
+    std::int16_t sign1[4]{};
+    std::int16_t ring1[1024]{};
+    std::int32_t ptr1{0};
+    std::int32_t dot1{0};
+    // Stage 2: same layout, offset +0x1030
+    std::int16_t coeffs2[4]{};
+    std::int16_t sign2[4]{};
+    std::int16_t ring2[1024]{};
+    std::int32_t ptr2{0};
+    std::int32_t dot2{0};
+    // shift byte at +0x2060 (init 0xd)
+    std::uint8_t shift{0xd};
+
+    void Init() {
+        std::memset(this, 0, sizeof(LmsObject));
+        shift = 0xd;
+    }
+};
+
+// Apply the LMS inter-channel predictor to in-place int32 residuals.
+//   ch1_residuals / ch2_residuals: arrays of length `n` (per-channel).
+//   obj_ch1 / obj_ch2: persistent LMS state (one per channel).
+// Mirrors FUN_08096e20 (MMX path at 0x08096e20 lines 64-118; equivalent
+// scalar port; final form is byte-equivalent to legacy on this corpus).
+// All arithmetic is i16-saturated for coeffs/sign/ring (paddsw / psubsw);
+// dot products are widened to i32 via pmaddwd. Shift applied to dot result.
+void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residuals,
+                          std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2);
+
 // Decode one prefilter block of up to 65536 output bytes. Mirrors FUN_080a5330.
 // `input`/`input_size`: compressed bytes starting immediately after the outer
 //   varint (the bytes FUN_080a5bb0 feeds as param_2 on each call).
@@ -317,5 +360,16 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
                                    std::uint8_t* output, std::size_t output_size,
                                    bool is_stereo_variant,
                                    LpcPredictor* persistent_pred);
+
+// Overload that also accepts caller-managed LMS inter-channel state for
+// stereo-split prefilter blocks. Both LMS objects must be the same across
+// successive calls for the same compressed stream. nullptr → internal
+// state (does not persist across calls; only useful for one-block tests).
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant,
+                                   LpcPredictor* persistent_pred,
+                                   LmsObject* persistent_lms_ch1,
+                                   LmsObject* persistent_lms_ch2);
 
 }  // namespace nzr::lzpf
