@@ -14,23 +14,33 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 
 ## Clone percentage
 
-**Overall reconstruction estimate: ~95%** (decode is 100% native; encode is ~90% native)
+**Overall reconstruction estimate: ~80%** (decode ~90% native with bridge fallback for known gaps; encode ~70% native)
 
-This is a rough but honest measure of how much of NanoZip's full surface has been natively reimplemented in C++, independent of input entropy.
+This is a rough but honest measure of how much of NanoZip's full surface has been natively reimplemented in C++, independent of input entropy. **Caveat**: `tests/native_only.sh` reports byte-exact equality with legacy output but does NOT verify that the bridge was not invoked at runtime. Several known gaps still trigger the legacy extract-bridge via `FindLegacyBackend` (which finds the system `nz` binary in `/usr/bin` or `/bin`).
 
-**100% native decode (no dependency on the original binary at runtime)** — verified by `tests/native_only.sh`: 16 fixtures × 8 methods (cn/cf/cF/cd/cD/co/cO/cc) = 128 byte-exact extractions with `NZ_LEGACY_BACKEND` and `NZ_LEGACY_BRIDGE_BACKEND` unset. The decode path never invokes the original `linux32/nz` or `linux64/nz` binary at runtime.
+**Known gaps where the bridge is invoked at runtime** (the bridge produces byte-exact output but the C++ does not decode these paths natively):
+- `lzpf` prefilter+arith on multi-stream or stereo audio files with LMS inter-channel active (e.g. `stereo_lms_cf.nz` fixture falls to the bridge). The prefilter core (`FUN_080a5330`) and LMS predictor (`FUN_08096e20`) are ported but the dispatcher invokes the bridge for `payload: compressed` chunks in this specific case.
+- `lzhd` parallel variant (`-pN`, `FUN_080b50b0`) not yet RE'd; serial `DecLZ` is native.
+- `optimum` BWT edge shapes (~30% of `-cO` archives) bridge.
+- `cm` `tt_flags=0x10` (word-list) text-transform tree bridges; CM decoder is architecturally divergent from the legacy direct RC+table path (HANDOFF §6B).
+- `cm` stereo audio variant deferred.
+
+**Planned work to reach 100% native decode** (no runtime bridge):
+1. `NZ_NO_BRIDGE=1` flag in `sfx_archive.cpp` to make the bridge opt-out and produce a hard error when invoked, instead of silently finding `/usr/bin/nz`.
+2. Restrict `FindLegacyBackend` to work-tree paths only (no `$PATH` search) to make the runtime dependency deterministic.
+3. Port the gaps above one at a time (each backed by a regression fixture).
 
 | Component | Cloned? | Notes |
 |-----------|---------|-------|
 | CLI structure (`l/t/x/a/s`, all switches) | ✅ 100% | Full parser |
 | Archive format (header, entry table, stream families `0x2b/0x3b/0x4b`) | ✅ 100% | |
 | Store (`-cn`) | ✅ 100% | Trivial copy |
-| lzpf decode LZ77+arith path (`-cf/-cF`) | ✅ 100% | All block modes native: LZ77+arith (variants A and B), literal, prefilter+arith mono. Variants A (13-bit hash) and B (24-bit hash, 64 MiB hash table). 8/8 native_strict; exhaustive random/high-entropy/mixed corpus verification (2026-06-03). |
-| lzpf prefilter+arith path (`-cf`) | ✅ 100% | `FUN_080a5330` + LPC filter (`FUN_08095d90`) fully ported; **mono and stereo audio byte-exact** (verified 2026-06-03 on synthetic correlated stereo WAV `stereo_lms.wav`, 64 KB, ch2 = ch1 + Gaussian noise). Stereo inter-channel LMS predictor `FUN_08096e20` (2-stage cascaded sign-sign 4-tap, MMX path) ported as scalar equivalent. |
-| lzhd decoder (`-cd/-cD`) | ✅ ~90% | `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit range coder, 680 LOC, ported from nzdec_v0 `NZ_LZ.cpp`); byte-exact on 50 KB text fixture |
-| optimum decoder (`-co/-cO`) | ✅ ~70% | BWT + range-coder variants A/B native; edge shapes bridge |
-| cm decoder (`-cc`) | ✅ ~95% | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Text-transform `tt_flags=0x08` (dictionary) native (`NzTextTransformDict`). `tt_flags=0x10` (word-list) bridges — blocked by a CM-decoder divergence bug (see Key findings). Stereo audio variant deferred. |
-| Encode for all methods | ✅ functional | Native BWT/store/literal writers; bridge for full compression. All 8 methods byte-exact round-trip. |
+| lzpf decode LZ77+arith path (`-cf/-cF`) | ✅ 100% | All block modes native: LZ77+arith (variants A and B), literal. Variants A (13-bit hash) and B (24-bit hash, 64 MiB hash table). 8/8 native_strict on `coverage_matrix.sh`; exhaustive random/high-entropy/mixed corpus verification (2026-06-03). Variant B hash init=3 fix in commit `049d041` (2026-06-04) closed the multi-archivo silent corruption. |
+| lzpf prefilter+arith path (`-cf`) | ⚠️ 100% (single-file), bridge on multi-stream | `FUN_080a5330` + LPC filter (`FUN_08095d90`) fully ported; **mono and stereo audio byte-exact** on synthetic correlated stereo WAV `stereo_lms.wav` (64 KB, ch2 = ch1 + Gaussian noise) when single-stream. Stereo inter-channel LMS predictor `FUN_08096e20` (2-stage cascaded sign-sign 4-tap, MMX path) ported as scalar equivalent in `lzpf_arith.cpp::ApplyLmsInterChannel`. **The multi-stream `payload: compressed` path on `stereo_lms_cf.nz` still bridges at runtime** (the C++ decodes correctly when invoked standalone but the dispatcher routes the archive through the legacy extract bridge). |
+| lzhd decoder (`-cd/-cD`) | ⚠️ ~90% | `FUN_080b5240` ported as `DecLZ` (PAQ context mixer + 12-bit range coder, 680 LOC, ported from nzdec_v0 `NZ_LZ.cpp`); byte-exact on 50 KB text fixture. Parallel variant `FUN_080b50b0` not yet RE'd (no decompile available). |
+| optimum decoder (`-co/-cO`) | ⚠️ ~70% | BWT + range-coder variants A/B native; ~30% of archives trigger the bridge on BWT edge shapes (boundary blocks, partial last block). |
+| cm decoder (`-cc`) | ⚠️ ~95% | Native CM decoder ported from nzdec_v0 reference (NZ_CM.cpp, 1100 LOC); all block modes decode natively. Text-transform `tt_flags=0x08` (dictionary) native (`NzTextTransformDict`). `tt_flags=0x10` (word-list) bridges — blocked by a CM-decoder divergence bug (see Key findings). Stereo audio variant deferred. The CM path is also covered by a full-buffer cross-check (commit pending) that adopts the bridge output if native diverges. |
+| Encode for all methods | ⚠️ functional | Native BWT/store/literal writers; the legacy compression bridge was disabled in commit `049d041` (`IsInternalLegacyCompressionBridgeCompressor` returns false unconditionally). Codecs the native encoder cannot handle now produce an explicit error. All 8 methods byte-exact round-trip via the native encoder for low-entropy inputs. |
 
 ### Fixture-based benchmark
 
@@ -39,6 +49,8 @@ The `coverage_matrix.sh` test uses a deterministic AES-CTR-of-zeros fixture (low
 **native_strict_percent = 100% (8/8)** — no bridge, no compat, no original binary subprocess.
 
 Low-entropy input rarely triggers the prefilter+arith block mode, so the fixture passes fully native even though that path is not yet ported. Real-world compressible data (text, source code, binaries) will hit that path and fall back to the extract bridge for `-cf/-cF`.
+
+**Important caveat**: `native_strict_percent` measures "no [bridge] / [compat] log line in stdout". It does NOT measure "the C++ code path actually ran the native decode vs silently called the legacy binary via `FindLegacyBackend`". A fixture that triggers the prefilter+arith block mode shows the bridge being invoked at runtime but still reports `native_strict_percent=100` because the bridge produces byte-exact output. To verify the code path is truly native, use `tests/native_only.sh` with the planned `NZ_NO_BRIDGE=1` flag.
 
 ## Architecture
 
@@ -59,10 +71,11 @@ nz_recon CLI
 
 ### Decode layers (priority order)
 
-1. **Native** — pure C++ reconstruction of the algorithm, no original binary. **Achieved 100% for decode as of 2026-06-04** (see `tests/native_only.sh`).
-2. **Compat** — forwards the entire command to the original binary. Used only for CLI-level compatibility (unknown switches, not decode).
+1. **Native** — pure C++ reconstruction of the algorithm, no original binary. **Mostly achieved for decode as of 2026-06-04, but NOT 100%** (see "Known gaps" above; the bridge is still invoked on some archives at runtime even when no `NZ_LEGACY_BACKEND` env var is set, because `FindLegacyBackend` also searches `$PATH` and finds `/usr/bin/nz` if installed system-wide).
+2. **Extract bridge** — shells out to the original `nz -x` in a tmpdir. The bridge is currently the FALLBACK path: invoked when the native decode fails validation or returns a size-correct but content-wrong candidate. Not opt-in; runs automatically whenever the system has a `nz` binary reachable.
+3. **Compat** — forwards the entire command to the original binary. Used only for CLI-level compatibility (unknown switches, not decode).
 
-The extract bridge is disabled: `IsInternalLegacyCompressionBridgeCompressor` returns false unconditionally (commit pending), and the universal extract cross-check added in `ce232d2` was reverted in favor of a real port (variant-B hash init fix). Decode runs purely on the C++ code with zero shell-outs to the original `nz` binary.
+The legacy **compression** bridge (`TryRunLegacyCompressionBridge`) is disabled: `IsInternalLegacyCompressionBridgeCompressor` returns false unconditionally (commit `049d041`). Codecs the native encoder cannot handle produce an explicit error rather than silently invoking the original binary. The legacy **extract** bridge is NOT yet disabled (it is the runtime fallback described in "Known gaps" above). `NZ_NO_BRIDGE=1` flag is planned (Phase 8.1) to make the bridge opt-out and force hard errors when the C++ code cannot decode natively.
 
 ## Build
 
