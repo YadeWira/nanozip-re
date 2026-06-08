@@ -758,7 +758,11 @@ static void CM_Input_Bit(CM* t, uint32_t bit) {
             *t->ptrs8[6] = kLzModelLNext[t->ptrs8_cur[6] * 2 + bit];
         }
     } else {
-        t->factors0_err = (uint8_t)(t->factors0_err + (uint8_t)(std::abs((int32_t)((int32_t)(bit << 8) - 128 - (int32_t)t->factors[0] / 16)) >> 3));
+        // NB: reference uses (factors[0] >> 4) — arithmetic shift (floor), NOT
+        // truncating division by 16. They differ for negative factors[0] and the
+        // 1-LSB drift perturbs factors0_err -> factors0_err_flt -> the factor[7]
+        // zeroing condition, causing the documented CM divergence from byte 26.
+        t->factors0_err = (uint8_t)(t->factors0_err + (uint8_t)(std::abs((int32_t)((int32_t)(bit << 8) - 128 - ((int32_t)t->factors[0] >> 4))) >> 3));
         t->factors7_err = (uint8_t)(t->factors7_err + (uint8_t)(std::abs((int32_t)((int32_t)(bit << 8) - 128 - (int32_t)t->factors7_div16)) >> 3));
 
         *t->modeld_ptr = kLzModelLNext[t->modeld_cur * 2 + bit];

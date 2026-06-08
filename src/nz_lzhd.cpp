@@ -194,7 +194,7 @@ DecLZ::DecLZ() {
     std::memset(model_h,            0x80, sizeof(model_h));
     std::memset(model_r,            0x80, sizeof(model_r));
     std::memset(model_i,            0x80, sizeof(model_i));
-    lz_create_model_lut(model_d, 12, 1536, 372, 371);
+    lz_create_model_lut(model_d, 1536, 12, 372, 371);
     std::memset(model_k,            0x88, sizeof(model_k));
     lz_memset32(model_j,  0x80008000u, sizeof(model_j)  / 4);
     std::memset(model_g,            0x80, sizeof(model_g));

@@ -3,6 +3,8 @@
 #include "nz_cm.h"
 #include "nz_lzhd.h"
 #include "nz_text_transform.h"
+#include "nz_postfilter.h"
+#include "nz_texttransform_num.h"
 
 #include <algorithm>
 #include <array>
@@ -952,7 +954,20 @@ bool IsExecutableFile(const fs::path& path) {
 #endif
 }
 
+// When NZ_NO_BRIDGE is set (to anything other than "0"), the reconstruction
+// must decode/compress entirely natively: every legacy-binary fallback is
+// disabled and a missing native path becomes a hard error instead of a silent
+// shell-out. This is the measurement tool for "true" native coverage — see the
+// extract-bridge false-positive note in HANDOFF_IA.txt §12.
+bool LegacyBridgeDisabled() {
+    const char* env = std::getenv("NZ_NO_BRIDGE");
+    return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 fs::path FindLegacyBackend32() {
+    if (LegacyBridgeDisabled()) {
+        return {};
+    }
     if (const char* env = std::getenv("NZ_LEGACY_BRIDGE_BACKEND")) {
         fs::path p(env);
         std::error_code ec;
@@ -1055,6 +1070,9 @@ std::string MakeTempPath(const char* prefix, const char* suffix) {
 }
 
 fs::path FindLegacyBackend() {
+    if (LegacyBridgeDisabled()) {
+        return {};
+    }
     if (const char* env = std::getenv("NZ_LEGACY_BACKEND")) {
         fs::path p(env);
         std::error_code ec;
@@ -1358,7 +1376,10 @@ bool TryDecodeLegacyWithExtractBridge(
     const fs::path backend = FindLegacyBackend();
     if (backend.empty()) {
         if (out_error_message != nullptr) {
-            *out_error_message = "legacy backend not found for extract bridge";
+            *out_error_message = LegacyBridgeDisabled()
+                ? "native decoder missing for this stream and NZ_NO_BRIDGE is set "
+                  "(refusing to shell out to the original binary)"
+                : "legacy backend not found for extract bridge";
         }
         return false;
     }
@@ -3437,8 +3458,11 @@ bool TryParseLegacyCnArchive(
     } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
                method == 0x4bu && method_p0 == 7u &&
                payload_start < bytes.size()) {
-        // For native CM decode: store the raw compressed stream bytes so
+        // For native CM decode: store the raw compressed stream so
         // TryDecodeLegacyCm can parse stream_tag + block headers directly.
+        // NOTE: -co/-cO (0x3b) and -cd (0x2b) are NOT populated — large blocks use
+        // a virtual-stream LZ framing (not flat payload_size) that crashes a flat
+        // DecLZ call; they bridge until that framing is reverse-engineered.
         ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
                         bytes.end());
     }
@@ -3706,10 +3730,12 @@ static bool TryDecodeLegacyCm(
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t tt_enabled = raw[pos++];
         std::uint8_t tt_flags = 0;
+        std::vector<std::uint8_t> tt2_data, tt16_data;
         if (tt_enabled) {
             if (pos >= stream_end) { ok = false; break; }
             tt_flags = raw[pos++];
-            auto skip_varint_str = [&]() -> bool {
+            // Header.Parse order: tt2_data (if &2) then tt16_data (if &16).
+            auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
                 if (pos >= stream_end) return false;
                 std::uint32_t n = 0, sh = 0;
                 unsigned char vc;
@@ -3720,15 +3746,12 @@ static bool TryDecodeLegacyCm(
                     sh += 7u;
                 } while (vc & 0x80u);
                 if (pos + n > stream_end) return false;
+                dst.assign(raw + pos, raw + pos + n);
                 pos += n;
                 return true;
             };
-            if ((tt_flags & 2u) && !skip_varint_str()) { ok = false; break; }
-            // tt_flags=0x10 carries a word-list blob (varint-str); skip it to keep
-            // the stream cursor aligned. The word-list transform is not yet native.
-            if ((tt_flags & 16u) && !skip_varint_str()) { ok = false; break; }
-            // Transforms other than 0x08 (dictionary) not yet natively implemented.
-            (void)tt_flags;
+            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
+            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
         }
         // Read dece_param.
         if (pos >= stream_end) { ok = false; break; }
@@ -3749,28 +3772,64 @@ static bool TryDecodeLegacyCm(
 
         if (decr_param == 1u) NzCmReset(cm);
 
-        if (tt_enabled && (tt_flags & ~0x08u)) {
-            // Unsupported text transform (e.g. 0x10 word-list): decline so the
-            // caller falls back to the extract bridge. Not yet native.
-            ok = false; break;
-        } else if (tt_enabled && (tt_flags & 0x08u)) {
-            // CM output is word-dict encoded; expand with dictionary transform.
-            std::vector<std::uint8_t> cm_buf(out_size);
-            NzCmDecode(cm, payload, payload_size, cm_buf.data(), out_size);
-            const std::size_t prev_size = out_data->size();
-            const std::uint32_t remaining =
-                static_cast<std::uint32_t>(legacy.total_data_size) -
-                static_cast<std::uint32_t>(prev_size);
-            out_data->resize(prev_size + remaining);
-            const std::uint32_t expanded = NzTextTransformDict(
-                cm_buf.data(), out_size, out_data->data() + prev_size, remaining);
-            if (expanded == 0) { ok = false; break; }
-            out_data->resize(prev_size + expanded);
-        } else {
-            const std::size_t prev_size = out_data->size();
-            out_data->resize(prev_size + out_size);
-            NzCmDecode(cm, payload, payload_size, out_data->data() + prev_size, out_size);
+        // Reference DecodeFromStream pipeline (post CM decode):
+        //   CM -> param2 (RLE u32 expand) -> param1 (AddBytes) -> text-transform
+        //   -> dece (exe filter).  Decode CM into a working buffer, then apply the
+        //   filters that are present in order. Filters not yet ported decline so
+        //   the caller can fall back to the extract bridge.
+        std::vector<std::uint8_t> work(out_size);
+        NzCmDecode(cm, payload, payload_size, work.data(), out_size);
+        std::uint32_t cur_size = out_size;
+
+        const std::size_t prev_size = out_data->size();
+        const std::uint32_t remaining =
+            static_cast<std::uint32_t>(legacy.total_data_size) -
+            static_cast<std::uint32_t>(prev_size);
+
+        // param2: u32-wise RLE expansion driven by the param2 side stream.
+        if (param2_flag) {
+            std::vector<std::uint8_t> exp(remaining);
+            std::uint32_t esz = remaining;
+            if (!NzBwtRleDecodeU32(param2_data.data(),
+                                   static_cast<std::uint32_t>(param2_data.size()),
+                                   work.data(), cur_size, exp.data(), &esz)
+                || esz == 0u) { ok = false; break; }
+            exp.resize(esz);
+            work.swap(exp);
+            cur_size = esz;
         }
+
+        // param1 (AddBytesFilter) and dece (exe filter) not yet ported.
+        if (param1_flag) { ok = false; break; }
+
+        // Text transforms, applied in reference order: 0x10 (number transform),
+        // then 0x08 (dictionary). Other bits (0x80/0x04/0x02/0x20/0x40/0x01) not
+        // yet ported -> decline so the caller can bridge.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & 0x10u)) {
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformNumber(
+                tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x08u)) {
+            // word-dict encoded; expand with dictionary transform.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t expanded = NzTextTransformDict(
+                work.data(), cur_size, tbuf.data(), remaining);
+            if (expanded == 0) { ok = false; break; }
+            tbuf.resize(expanded);
+            work.swap(tbuf);
+            cur_size = expanded;
+        }
+
+        if (dece_param) { ok = false; break; }
+
+        out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
     }
 
     NzCmDestroy(cm);
@@ -3783,6 +3842,229 @@ static bool TryDecodeLegacyCm(
     if (out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
         out_data->clear();
         if (out_error_message) *out_error_message = "cm: output size mismatch";
+        return false;
+    }
+    return true;
+}
+
+// Decode -co/-cO (nz_optimum1/2) natively. These use the same flat block framing
+// as -cc (chunk-header "stream_tag" + per-block Header: payload_size u32, decr_param,
+// param6, size18, staged, params, tt, dece) but the core codec is DecLZ (decr_param
+// == 1), driven through a persistent raw window (LZ back-references span blocks).
+// The reference (nzdec_v0) decodes -cO via DecodeLZ; the ported DecLZ is byte-exact
+// against it. The decoded raw stream is then run through the param2/param1/tt/dece
+// post-filter pipeline (same as -cc). decr_param == 0 (BWT) blocks are not yet
+// ported and cause a decline -> bridge.
+[[maybe_unused]] static bool TryDecodeLegacyOptimum(
+    const LegacyCnContext& legacy,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message) {
+    if (out_data == nullptr) return false;
+    out_data->clear();
+
+    if (legacy.legacy_method != 0x3bu ||
+        (legacy.legacy_method_p0 != 5u && legacy.legacy_method_p0 != 6u))
+        return false;
+    if (legacy.data.empty()) return false;
+
+    const auto* raw = legacy.data.data();
+    const std::size_t raw_len = legacy.data.size();
+
+    std::size_t pos = 0;
+    std::uint64_t stream_tag = 0;
+    {
+        unsigned shift = 7;
+        unsigned char c = raw[pos++];
+        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+        while ((c & 0x80u) != 0u) {
+            if (pos >= raw_len || shift >= 63u) { return false; }
+            c = raw[pos++];
+            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            shift += 7u;
+        }
+    }
+    if ((stream_tag & 0x0fu) != 0u) return false;
+    const std::uint64_t stream_bytes = stream_tag >> 4u;
+    if (stream_bytes > raw_len - pos) return false;
+    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
+
+    // Persistent raw window for DecLZ. Sum(size18) <= total_data_size because the
+    // post-transforms (param2 RLE / tt dict+number) only expand. Reserve generously
+    // and bounds-check so a reallocation can never move window_base mid-decode.
+    // DecLZ reads context bytes before the cursor (cur_ptr[-2..-6]) and copies
+    // matches from earlier output, so the window needs leading zero-padding
+    // (the reference MemBlocks pads data_org by 64 bytes).
+    static constexpr std::size_t kWindowPad = 64u;
+    const std::size_t window_cap =
+        static_cast<std::size_t>(legacy.total_data_size) + (1u << 20);
+    std::vector<std::uint8_t> rawbuf(kWindowPad + window_cap, 0u);
+    std::uint8_t* const window_base = rawbuf.data() + kWindowPad;
+    std::size_t raw_pos = 0;
+
+    NzLzhdDecoder* dec = NzLzhdCreate();
+    if (!dec) { return false; }
+
+    out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
+    bool ok = true;
+
+    while (pos < stream_end) {
+        if (pos + 4u > stream_end) { ok = false; break; }
+        const std::uint32_t payload_size =
+            static_cast<std::uint32_t>(raw[pos]) |
+            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+        pos += 4u;
+        if (payload_size > stream_end - pos) { ok = false; break; }
+        const std::uint8_t* payload = raw + pos;
+        pos += payload_size;
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t decr_param = raw[pos++];
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param6 = raw[pos++];
+        std::uint32_t out_size = 0;
+        if (param6) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            out_size = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+        }
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t staged_count = raw[pos++];
+        if (pos + staged_count > stream_end) { ok = false; break; }
+        pos += staged_count;
+
+        // decr_param == 0 (BWT) path not yet ported.
+        if (decr_param == 0u) { ok = false; break; }
+
+        // params 14/15 (BWT-only) appear only for decr_param==0, so for the LZ
+        // path we go straight to param2/param1/param16/tt/dece.
+        const std::uint8_t param2_flag = raw[pos++];
+        std::vector<std::uint8_t> param2_data;
+        if (param2_flag) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            param2_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
+        }
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param1_flag = raw[pos++];
+        if (param1_flag) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u + vlen;
+            if (pos > stream_end) { ok = false; break; }
+        }
+        if (pos + 1u > stream_end) { ok = false; break; }
+        pos++;  // param16
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t tt_enabled = raw[pos++];
+        std::uint8_t tt_flags = 0;
+        std::vector<std::uint8_t> tt16_data;
+        if (tt_enabled) {
+            if (pos >= stream_end) { ok = false; break; }
+            tt_flags = raw[pos++];
+            auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
+                if (pos >= stream_end) return false;
+                std::uint32_t n = 0, sh = 0; unsigned char vc;
+                do {
+                    if (pos >= stream_end) return false;
+                    vc = raw[pos++];
+                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh; sh += 7u;
+                } while (vc & 0x80u);
+                if (pos + n > stream_end) return false;
+                dst.assign(raw + pos, raw + pos + n); pos += n; return true;
+            };
+            std::vector<std::uint8_t> tt2_data;
+            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
+            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
+        }
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t dece_param = raw[pos++];
+        if (dece_param) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u + vlen;
+            if (pos > stream_end) { ok = false; break; }
+        }
+
+        if (!param6 || out_size == 0u) continue;
+
+        // Decode this block's LZ payload into the persistent window.
+        if (raw_pos + out_size > window_cap) { ok = false; break; }
+        NzLzhdDecode(dec, payload, payload_size, window_base + raw_pos, out_size, window_base);
+        std::vector<std::uint8_t> work(window_base + raw_pos, window_base + raw_pos + out_size);
+        raw_pos += out_size;
+        std::uint32_t cur_size = out_size;
+
+        const std::size_t prev_size = out_data->size();
+        const std::uint32_t remaining =
+            static_cast<std::uint32_t>(legacy.total_data_size) -
+            static_cast<std::uint32_t>(prev_size);
+
+        if (param2_flag) {
+            std::vector<std::uint8_t> exp(remaining);
+            std::uint32_t esz = remaining;
+            if (!NzBwtRleDecodeU32(param2_data.data(),
+                                   static_cast<std::uint32_t>(param2_data.size()),
+                                   work.data(), cur_size, exp.data(), &esz)
+                || esz == 0u) { ok = false; break; }
+            exp.resize(esz); work.swap(exp); cur_size = esz;
+        }
+        if (param1_flag) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & 0x10u)) {
+            std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
+            const std::uint32_t n = NzTextTransformNumber(
+                tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                work.data(), cur_size, tbuf.data(), remaining + (1u << 16));
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x08u)) {
+            // Non-CM codecs (optimum/lzhd, decparams type != 7) reorder the ASCII
+            // alphabet before the dictionary transform (TextTransformer ctor sets
+            // reorder_ascii_ = type != 7). Apply kReorderAscii in place first.
+            static const std::uint8_t kReorderAscii[256] = {
+                0,1,2,3,4,5,6,7,8,9,34,11,12,13,14,15, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                39,38,10,35,36,37,32,44,40,41,42,43,46,58,47,45, 48,49,50,51,52,53,54,55,56,57,33,59,60,61,62,63,
+                64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79, 80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+                96,115,107,122,110,109,112,118,100,120,99,106,108,114,103,104, 102,116,98,119,105,121,113,101,97,117,111,123,124,125,126,127,
+                128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143, 144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+                160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175, 176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+                192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207, 208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+                224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239, 240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+            };
+            for (std::uint32_t i = 0; i < cur_size; ++i) work[i] = kReorderAscii[work[i]];
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformDict(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
+        if (dece_param) { ok = false; break; }
+
+        out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+    }
+
+    NzLzhdDestroy(dec);
+
+    if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
+        out_data->clear();
+        if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
     }
     return true;
@@ -3808,6 +4090,12 @@ int RunLegacyCnExtractOrTest(
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
+        // NOTE: native -co/-cO (TryDecodeLegacyOptimum) is intentionally NOT wired
+        // in. Small -cO blocks use a flat DecLZ framing that decodes natively, but
+        // larger -cO files switch to the same virtual-stream LZ framing as -cd
+        // (the reference nzdec_ref also crashes on them), which makes a flat DecLZ
+        // call wild-read and SIGSEGV. Until the virtual-stream framing is reversed,
+        // -co/-cO route to the bridge. See PROGRESO_2026-06-08.md §optimum.
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
         const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);
@@ -3819,8 +4107,14 @@ int RunLegacyCnExtractOrTest(
         // through to the extract bridge path so the user gets byte-exact output.
         // The cross-check is skipped when the extract bridge is disabled (NZ_DISABLE_
         // EXTRACT_BRIDGE) to preserve the legacy fast path in CI.
+        // The CM mixing bug (factors0_err arithmetic-shift port error) was fixed
+        // 2026-06-08, so native CM is byte-exact for the general case. The bridge
+        // cross-check is kept as a safety net ONLY when the bridge is available
+        // (catches any residual edge case, e.g. tt16 word-list / stereo CM). When
+        // the bridge is disabled (NZ_NO_BRIDGE), trust the native result directly.
         bool cm_verified = false;
         if (cm_native_ok
+            && !LegacyBridgeDisabled()
             && std::getenv("NZ_DISABLE_EXTRACT_BRIDGE") == nullptr
             && !legacy.entries.empty()
             && legacy.total_data_size > 0u) {

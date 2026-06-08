@@ -14,6 +14,8 @@ set(RECON_SOURCES
     src/nz_cm.cpp
     src/nz_lzhd.cpp
     src/nz_text_transform.cpp
+    src/nz_postfilter.cpp
+    src/nz_texttransform_num.cpp
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
