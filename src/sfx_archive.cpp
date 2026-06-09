@@ -3619,44 +3619,55 @@ static bool TryDecodeLegacyCm(
     const auto* raw = legacy.data.data();
     const std::size_t raw_len = legacy.data.size();
 
-    // Read stream_tag varint: value = N, stream_bytes = N >> 4, low nibble must be 0.
-    std::size_t pos = 0;
-    std::uint64_t stream_tag = 0;
-    {
-        unsigned shift = 7;
-        unsigned char c = raw[pos++];
-        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
-        while ((c & 0x80u) != 0u) {
-            if (pos >= raw_len || shift >= 63u) {
-                if (out_error_message) *out_error_message = "cm: truncated stream_tag";
-                return false;
-            }
-            c = raw[pos++];
-            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
-            shift += 7u;
-        }
-    }
-    if ((stream_tag & 0x0fu) != 0u) {
-        if (out_error_message) *out_error_message = "cm: bad stream_tag alignment";
-        return false;
-    }
-    const std::uint64_t stream_bytes = stream_tag >> 4u;
-    if (stream_bytes > raw_len - pos) {
-        if (out_error_message) *out_error_message = "cm: stream_bytes exceeds data";
-        return false;
-    }
-    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
-
+    // Create the CM decoder once; its state persists across all data chunks.
     NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
     if (!cm) {
         if (out_error_message) *out_error_message = "cm: allocation failed";
         return false;
     }
-
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
     bool ok = true;
+    std::size_t pos = 0;
 
-    while (pos < stream_end) {
+    // Outer loop over consecutive type-0 data chunks. Large -cc archives split the
+    // payload into multiple chunks; the CM state carries across them (a block with
+    // decr_param != 1 does not reset). Each chunk header is a biased varint
+    // (size<<4)|type; non-type-0 chunks (metadata) between data chunks are skipped.
+    while (ok && pos < raw_len &&
+           out_data->size() < static_cast<std::size_t>(legacy.total_data_size)) {
+        std::uint64_t stream_tag = 0;
+        {
+            unsigned shift = 7;
+            unsigned char c = raw[pos++];
+            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+            while ((c & 0x80u) != 0u) {
+                if (pos >= raw_len || shift >= 63u) { ok = false; break; }
+                c = raw[pos++];
+                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+                shift += 7u;
+            }
+        }
+        if (!ok) break;
+        std::uint32_t chunk_type = static_cast<std::uint32_t>(stream_tag & 0x0fu);
+        std::uint64_t chunk_size = stream_tag >> 4u;
+        if (chunk_type == 15u) {  // extended stream-id form
+            if (pos >= raw_len) { ok = false; break; }
+            unsigned r = raw[pos++];
+            if (r >= 0xf8u) {
+                if (pos >= raw_len) { ok = false; break; }
+                r = (r & 7u) + 8u * raw[pos++] + 248u;
+            }
+            chunk_type = r & 0x0fu;
+            if ((r >> 4) == 0u) chunk_type += 15u;
+        }
+        if (chunk_size > raw_len - pos) { ok = false; break; }
+        if (chunk_type != 0u) {  // metadata chunk between data chunks: skip
+            pos += static_cast<std::size_t>(chunk_size);
+            continue;
+        }
+        const std::size_t stream_end = pos + static_cast<std::size_t>(chunk_size);
+
+        while (pos < stream_end) {
         if (pos + 4u > stream_end) { ok = false; break; }
         const std::uint32_t payload_size =
             static_cast<std::uint32_t>(raw[pos]) |
@@ -3768,7 +3779,14 @@ static bool TryDecodeLegacyCm(
             pos += vlen;
         }
 
-        if (!param6 || out_size == 0u) continue;
+        // param6 == 0 marks a STORED block: the CM could not compress (e.g. high-
+        // entropy / incompressible data), so the payload bytes are the raw output
+        // verbatim. (The reference decoder rejects these with param6 != 1; the
+        // linux32 binary stores them.)
+        if (!param6 || out_size == 0u) {
+            out_data->insert(out_data->end(), payload, payload + payload_size);
+            continue;
+        }
 
         if (decr_param == 1u) NzCmReset(cm);
 
@@ -3799,8 +3817,15 @@ static bool TryDecodeLegacyCm(
             cur_size = esz;
         }
 
-        // param1 (AddBytesFilter) and dece (exe filter) not yet ported.
-        if (param1_flag) { ok = false; break; }
+        // param1: AddBytesFilter (delta filter, output size == input size).
+        if (param1_flag) {
+            std::vector<std::uint8_t> tbuf(cur_size);
+            if (!NzAddBytesFilter(param1_data.data(),
+                                  static_cast<std::uint32_t>(param1_data.size()),
+                                  work.data(), cur_size, tbuf.data())) { ok = false; break; }
+            work.swap(tbuf);
+            // cur_size unchanged
+        }
 
         // Text transforms, applied in reference order: 0x10 (number transform),
         // then 0x08 (dictionary). Other bits (0x80/0x04/0x02/0x20/0x40/0x01) not
@@ -3830,6 +3855,7 @@ static bool TryDecodeLegacyCm(
         if (dece_param) { ok = false; break; }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        }
     }
 
     NzCmDestroy(cm);

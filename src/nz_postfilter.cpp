@@ -116,3 +116,93 @@ bool NzBwtRleDecodeU32(const uint8_t* model_data, uint32_t model_len,
     BwtRleExpander rle(model_data, model_data + model_len);
     return rle.DecodeU32(in, in_size, out, out_size);
 }
+
+// ---------------------------------------------------------------------------
+// param1 = AddBytesFilter (NZ.cpp + nz.h BitReader). Faithful port.
+// ---------------------------------------------------------------------------
+namespace {
+
+static uint32_t bswap32(uint32_t x) { return __builtin_bswap32(x); }
+
+// kBitcountToMask[i] = low-i-bit mask; [0]=0, [32]=0xffffffff.
+static uint32_t bitmask(uint32_t nb) { return nb >= 32u ? 0xffffffffu : ((1u << nb) - 1u); }
+
+struct BitReader {
+    uint32_t bitcount_, bitbuff_;
+    const uint32_t *ptr_, *ptr_start_, *ptr_end_;
+    void Initialize(const uint8_t* data, size_t size) {
+        bitcount_ = 0; bitbuff_ = 0;
+        ptr_ = (const uint32_t*)data; ptr_start_ = ptr_;
+        ptr_end_ = (const uint32_t*)(data + (size & ~size_t(3)));
+    }
+    uint32_t GetBits(uint32_t nb) {
+        uint32_t bits = bitbuff_, bitcount = bitcount_;
+        if (nb > bitcount) {
+            bitbuff_ = bswap32(ptr_ < ptr_end_ ? *ptr_++ : 0u);
+            uint32_t new_bitcount = 32u - (nb - bitcount);
+            bits = (bitbuff_ >> new_bitcount) | (bits << (nb - bitcount));
+            bitcount = new_bitcount;
+        } else {
+            bitcount -= nb;
+            bits >>= bitcount;
+        }
+        bitcount_ = bitcount;
+        return bitmask(nb) & bits;
+    }
+    uint32_t GetX() {
+        uint32_t base = 0, nb = 1;
+        if (GetBits(1)) { base = 1; do { base *= 2; } while (GetBits(1) && ++nb != 32u); }
+        return base | GetBits(nb);
+    }
+    uint32_t GetY() { uint32_t nb = GetX(); return nb ? ((1u << nb) | GetBits(nb)) : GetBits(1); }
+    uint32_t GetZ(int B) {
+        if (B == 0) return GetY();
+        uint32_t bits = GetBits((uint32_t)B);
+        return bits + (GetY() << B);
+    }
+};
+
+struct AddBytesFilter {
+    BitReader bitreader_;
+    uint32_t offset_ = 0;
+    void DecodeOne(uint32_t* copy_offset, uint32_t* start_offset, uint32_t* num_delta) {
+        *copy_offset = bitreader_.GetY();
+        if (*copy_offset) {
+            *num_delta = bitreader_.GetZ(8);
+            *start_offset = offset_ + bitreader_.GetZ(8);
+            offset_ = *num_delta + *start_offset;
+        }
+    }
+    bool Process(const uint8_t* data, uint32_t dlen, const uint8_t* in, uint32_t insize, uint8_t* out) {
+        bitreader_.Initialize(data, dlen);
+        if (insize <= 263u) return false;
+        const uint8_t* in_end = in + insize;
+        const uint8_t* in_org = in;
+        for (size_t i = 0; i != 255; i++) out[i] = in[i];
+        in += 255; out += 255;
+        while (in != in_end) {
+            uint32_t copy_offset, start_offset = insize, num_delta = 0;
+            DecodeOne(&copy_offset, &start_offset, &num_delta);
+            if (copy_offset) num_delta += 8u;
+            uint32_t ncopy = (uint32_t)(start_offset - (uint32_t)(in - in_org));
+            if (ncopy) {
+                if (in + ncopy > in_end) return false;
+                std::memcpy(out, in, ncopy);
+                in += ncopy; out += ncopy;
+            }
+            const uint8_t* ine = in + num_delta;
+            if (ine > in_end) return false;
+            intptr_t offs = -(intptr_t)copy_offset;
+            while (in != ine) { out[0] = (uint8_t)(out[offs] + in[0]); in++; out++; }
+        }
+        return true;
+    }
+};
+
+}  // namespace
+
+bool NzAddBytesFilter(const uint8_t* p1data, uint32_t p1len,
+                      const uint8_t* in, uint32_t in_size, uint8_t* out) {
+    AddBytesFilter f;
+    return f.Process(p1data, p1len, in, in_size, out);
+}
