@@ -7,6 +7,8 @@
 // two means the port is wrong.
 
 #include "lzpf_arith.h"
+#include "nz_cd_tokens.h"
+#include "cd_token_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -753,6 +755,36 @@ void TestLmsInterChannel() {
     }
 }
 
+// Native -cd token reconstruction (FUN_08099050). Canonical single-token case
+// captured from the binary: token {lit_run=5, sel=7, raw_len=991} + literals
+// "ABCDA" reconstructs "ABCDABCD" repeated to 1000 bytes (byte-exact vs binary).
+void TestCdReconstruct() {
+    const std::uint32_t tok[3] = {5u, 7u, 991u};
+    const std::uint8_t lit[5] = {'A', 'B', 'C', 'D', 'A'};
+    std::uint8_t out[1000 + 16] = {0};
+    std::uint32_t n = nzr::cd::NzCdReconstruct(tok, 1, lit, out, 1000);
+    bool ok = (n == 1000);
+    for (std::uint32_t i = 0; ok && i < 1000; ++i)
+        if (out[i] != static_cast<std::uint8_t>("ABCDABCD"[i % 8])) ok = false;
+    Expect(ok, "CD recon: token {5,7,991}+\"ABCDA\" -> ABCDABCD x125");
+}
+
+// Native -cd token assembler (FUN_080aa070). Replays the captured first 256
+// tokens of t.nz batch-0 (3 column streams + shared bitstream + per-field
+// slot/model tables) and checks the FNV-1a of the produced token fields against
+// the value computed from the REAL binary's token output.
+void TestCdTokenAssemble() {
+    nzr::cd::NzCdField fl{kCdSlotLit, kCdModelLit, kCdTokThrLit};
+    nzr::cd::NzCdField fo{kCdSlotOff, kCdModelOff, kCdTokThrOff};
+    nzr::cd::NzCdField fn{kCdSlotLen, kCdModelLen, kCdTokThrLen};
+    std::vector<std::uint32_t> toks(kCdTokN * 3);
+    nzr::cd::NzCdTokenAssemble(kCdTokN, kCdColLit, kCdColOff, kCdColLen,
+                               kCdBitstream, kCdBitstreamLen, fl, fo, fn, toks.data());
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t v : toks) { h ^= v; h *= 16777619u; }
+    Expect(h == kCdTokGoldenFnv, "CD token assembler matches binary (256-token FNV)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -772,6 +804,8 @@ int main() {
     TestDecodeBufferText();
     TestLz77Repeats256();
     TestLmsInterChannel();
+    TestCdReconstruct();
+    TestCdTokenAssemble();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
