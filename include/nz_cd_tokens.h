@@ -61,5 +61,13 @@ void NzCdTokenAssemble(std::uint32_t num_tokens,
                        const NzCdField& field_len,
                        std::uint32_t* out_tokens);
 
+// param14 post-recon text transform (FUN_080a0ff0). Re-inserts word-boundary
+// spaces into the LZ output using a fixed 256-entry character-class table (the
+// output of FUN_080b7600, embedded). Returns bytes written to `dst` (0 if it
+// would overflow `dst_cap`). `dst` must hold up to ~1.3x `src_len` + slack.
+// Validated byte-exact against the binary (full 12 KB chunks and a 1 KB slice).
+std::uint32_t NzCdParam14(const std::uint8_t* src, std::uint32_t src_len,
+                          std::uint8_t* dst, std::uint32_t dst_cap);
+
 }  // namespace cd
 }  // namespace nzr

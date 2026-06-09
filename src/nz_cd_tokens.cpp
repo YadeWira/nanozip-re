@@ -116,5 +116,121 @@ void NzCdTokenAssemble(std::uint32_t num_tokens,
     }
 }
 
+// ---------------------------------------------------------------------------
+// param14 (FUN_080a0ff0): char-class space-insertion text transform.
+namespace {
+// Character-class table — the deterministic output of FUN_080b7600.
+// Class flags tested by the transform: &1, &2, &4, &8.
+static const unsigned char kClassTable[256] = {
+    6,6,6,6,6,6,6,6,6,2,3,6,6,6,6,6,
+    6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+    2,7,3,2,6,6,2,3,2,7,2,2,7,3,5,3,
+    8,8,8,8,8,8,8,8,8,8,3,3,3,2,3,7,
+    6,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
+    4,4,4,4,4,4,4,4,4,4,4,2,2,3,6,2,
+    6,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,12,12,12,8,12,2,3,3,6,6,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+}  // namespace
+
+std::uint32_t NzCdParam14(const std::uint8_t* src, std::uint32_t src_len,
+                          std::uint8_t* dst, std::uint32_t dst_cap) {
+    const unsigned char* CLS = kClassTable;
+    if (src_len == 0) return 0;
+    const std::uint8_t* pbVar1 = dst + dst_cap + 1;
+    std::uint32_t uVar4 = src[0];
+    std::uint8_t* pbVar2 = dst;
+    const std::uint8_t* param_1 = src;
+    int param_2 = static_cast<int>(src_len);
+    std::uint8_t *pbVar5 = nullptr, *pbVar6 = nullptr;
+    const std::uint8_t* pbVar8 = nullptr;
+    std::uint32_t uVar3 = 0;
+    int iVar7 = 0;
+LOOP:
+    while (true) {
+        if (pbVar1 <= pbVar2) return 0;
+        *pbVar2 = static_cast<std::uint8_t>(uVar4);
+        pbVar5 = pbVar2 + 1;
+        iVar7 = param_2 - 1;
+        pbVar6 = pbVar5;
+        if (iVar7 == 0) goto L_115a;
+        pbVar8 = param_1 + 1;
+        uVar3 = *pbVar8;
+        if (uVar3 > 0x7f && uVar4 > 0x7f) {
+            *pbVar5 = static_cast<std::uint8_t>(uVar3);
+            pbVar2[2] = 0x20;
+            pbVar6 = pbVar2 + 3;
+            iVar7 = param_2 - 2;
+            if (iVar7 == 0) goto L_115a;
+            pbVar8 = param_1 + 2;
+            uVar4 = *pbVar8;
+            if (uVar4 == 0x20) {
+            L_10d0:
+                pbVar6 = pbVar6 - 1;
+                iVar7 = iVar7 - 1;
+                if (iVar7 == 0) goto L_115a;
+                pbVar8 = pbVar8 + 1;
+            L_10df:
+                uVar4 = *pbVar8;
+                pbVar2 = pbVar6;
+                param_2 = iVar7;
+                param_1 = pbVar8;
+            } else {
+                pbVar2 = pbVar2 + (((CLS[uVar4] & 1) == 0) ? 1 : 0) + 2;
+                param_2 = iVar7;
+                param_1 = pbVar8;
+            }
+            goto LOOP;
+        L_10d0_entry: goto L_10d0;
+        L_10df_entry: goto L_10df;
+        }
+        param_2 = iVar7;
+        if (((CLS[uVar4] & 4) != 0) ||
+            ((uVar3 < 0x80 && uVar4 > 0x7f) &&
+             (uVar3 != 0x20 || (static_cast<std::int8_t>(param_1[2]) >= 0)) && (iVar7 != 1))) {
+            *pbVar5 = 0x20;
+            pbVar6 = pbVar2 + 2;
+            if (uVar3 == 0x20) goto L_10d0_entry;
+            if ((CLS[uVar3] & 1) == 0) goto L_10df_entry;
+            uVar4 = *pbVar8;
+            pbVar2 = pbVar2 + 1;
+            param_1 = pbVar8;
+        } else {
+            uVar4 = uVar3;
+            pbVar2 = pbVar5;
+            param_1 = pbVar8;
+            if ((CLS[uVar3] & 8) != 0) {
+                while (true) {
+                    param_2 = iVar7 - 1;
+                    *pbVar5 = static_cast<std::uint8_t>(uVar3);
+                    pbVar6 = pbVar5 + 1;
+                    if (param_2 == 0) goto L_115a;
+                    param_1 = pbVar8 + 1;
+                    if (pbVar1 <= pbVar6) { uVar4 = *param_1; pbVar2 = pbVar6; goto LOOP; }
+                    if ((CLS[uVar3] & 2) != 0) break;
+                    uVar3 = *param_1;
+                    pbVar5 = pbVar6;
+                    iVar7 = param_2;
+                    pbVar8 = param_1;
+                }
+                uVar4 = *pbVar8;
+                pbVar2 = pbVar5;
+                param_2 = iVar7;
+                param_1 = pbVar8;
+            }
+        }
+    }
+L_115a:
+    return (pbVar6 < pbVar1) ? static_cast<std::uint32_t>(pbVar6 - dst) : 0u;
+}
+
 }  // namespace cd
 }  // namespace nzr

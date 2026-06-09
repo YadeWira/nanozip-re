@@ -785,6 +785,18 @@ void TestCdTokenAssemble() {
     Expect(h == kCdTokGoldenFnv, "CD token assembler matches binary (256-token FNV)");
 }
 
+// Native -cd param14 text transform (FUN_080a0ff0). Replays a 1 KB slice of real
+// recon output (captured by calling the binary's FUN_080a0ff0 in-process) and
+// checks byte-exact reconstruction.
+void TestCdParam14() {
+    std::vector<std::uint8_t> out(kCdP14InLen * 2 + 64, 0);
+    std::uint32_t n = nzr::cd::NzCdParam14(kCdP14In, kCdP14InLen,
+                                           out.data(), static_cast<std::uint32_t>(out.size() - 1));
+    bool ok = (n == kCdP14OutLen) &&
+              (std::memcmp(out.data(), kCdP14Out, kCdP14OutLen) == 0);
+    Expect(ok, "CD param14 transform matches binary (1KB slice, byte-exact)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -806,6 +818,7 @@ int main() {
     TestLmsInterChannel();
     TestCdReconstruct();
     TestCdTokenAssemble();
+    TestCdParam14();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
