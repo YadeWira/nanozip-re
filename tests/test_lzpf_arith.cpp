@@ -699,6 +699,60 @@ void TestLz77Repeats256() {
     Expect(match, "DecodeLz77VariantA[repeats] output");
 }
 
+// Inter-channel LMS predictor (FUN_08096e20, scalar path). Golden vectors and
+// checksums captured by calling the real linux32/nz FUN_08096e20 in-process via
+// GDB with controlled residuals (DAT_081835b8==0 => scalar path active). The
+// LCG residual generator below reproduces the exact inputs that were fed.
+void TestLmsInterChannel() {
+    auto gen = [](int count, std::uint32_t seed, int mod,
+                  std::vector<std::int32_t>& r1, std::vector<std::int32_t>& r2) {
+        r1.resize(count); r2.resize(count);
+        std::uint32_t x = seed;
+        for (int i = 0; i < count; ++i) {
+            x = x * 1103515245u + 12345u; x &= 0x7fffffffu; r1[i] = (std::int32_t)(x % (std::uint32_t)mod) - (mod >> 1);
+            x = x * 1103515245u + 12345u; x &= 0x7fffffffu; r2[i] = (std::int32_t)(x % (std::uint32_t)mod) - (mod >> 1);
+        }
+    };
+    auto run = [](std::vector<std::int32_t>& r1, std::vector<std::int32_t>& r2) {
+        nzr::lzpf::LmsObject o1, o2; o1.Init(); o2.Init();
+        nzr::lzpf::ApplyLmsInterChannel(r1.data(), r2.data(), r1.size(), &o1, &o2);
+    };
+    auto fnv = [](const std::vector<std::int32_t>& v) {
+        std::uint32_t h = 2166136261u;
+        for (std::int32_t e : v) { h ^= (std::uint32_t)e; h *= 16777619u; }
+        return h;
+    };
+    // Case "s": seed=1 mod=801 count=64 — full golden vectors (byte-exact vs binary).
+    static const std::int32_t kS1[64] = {
+        -97,189,81,-333,-203,376,-177,-111,171,151,-14,-234,356,-314,-216,337,67,268,-53,281,
+        -272,-215,155,52,168,-285,37,-142,-359,383,-117,-382,306,79,179,-13,334,-122,304,162,
+        -256,-117,353,149,-228,170,-338,21,107,-356,208,96,-67,-46,-234,-114,187,228,-170,288,
+        347,396,273,-108 };
+    static const std::int32_t kS2[64] = {
+        -388,-306,73,-77,71,-224,253,117,122,211,385,-350,-213,205,249,-181,-176,-173,322,71,
+        256,36,-161,183,-83,32,-317,101,-323,301,-217,-251,216,177,-335,-329,-32,159,315,-303,
+        362,-394,59,274,391,7,11,332,339,-87,-215,-238,-254,-127,-296,-68,-149,-384,264,392,
+        235,291,312,-30 };
+    {
+        std::vector<std::int32_t> r1, r2; gen(64, 1, 801, r1, r2); run(r1, r2);
+        bool ok = true;
+        for (int i = 0; i < 64; ++i) if (r1[i] != kS1[i] || r2[i] != kS2[i]) { ok = false; break; }
+        Expect(ok, "LMS inter-channel matches binary (64-sample golden)");
+    }
+    // Case "L": seed=2 mod=801 count=5000 — checksum (exercises ring wrap).
+    {
+        std::vector<std::int32_t> r1, r2; gen(5000, 2, 801, r1, r2); run(r1, r2);
+        Expect(fnv(r1) == 0x02e821afu && fnv(r2) == 0x0210cca6u,
+               "LMS inter-channel checksum (5000, ring wrap)");
+    }
+    // Case "X": seed=5 mod=50001 count=9000 — checksum (coeff saturation + wraps).
+    {
+        std::vector<std::int32_t> r1, r2; gen(9000, 5, 50001, r1, r2); run(r1, r2);
+        Expect(fnv(r1) == 0x47e118feu && fnv(r2) == 0xbbbadd05u,
+               "LMS inter-channel checksum (9000, saturation)");
+    }
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -717,6 +771,7 @@ int main() {
     TestDecodeBufferRepeats();
     TestDecodeBufferText();
     TestLz77Repeats256();
+    TestLmsInterChannel();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

@@ -1835,81 +1835,100 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
 // The legacy code uses a 64-byte MMX register window over coeffs+sign+ring
 // (16 i16 = 32 bytes per stage, fits in one MMX register). The scalar port
 // walks the same data manually.
+// --- Faithful scalar port of the legacy LMS helpers ------------------------
+// FUN_080be8e0 / FUN_080be820 / FUN_080beaa0 / FUN_080beae0. The legacy MMX
+// path (selected when DAT_081835b8 != 0) is numerically identical to this
+// scalar fallback (CPU-feature dispatch of the same arithmetic).
+
+static inline std::int16_t LmsSat16(std::int32_t v) {
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return static_cast<std::int16_t>(v);
+}
+
+// Byte offset -> ring[] index. Ring spans byte [0x10, 0x1020).
+static inline std::int16_t& LmsRing(LmsStage& s, int byte_off) {
+    return s.ring[(byte_off - 0x10) >> 1];
+}
+
+// FUN_080be8e0: push sample x into the stage ring, store its sign 8 bytes
+// ahead, then compute the 4-tap dot product into s.dot.
+static void LmsRun(LmsStage& s, std::int32_t x) {
+    s.ptr -= 2;
+    // sign = ((x >> 30) & 2) - 1  ->  +1 if x<0, -1 otherwise.
+    std::int16_t sgn = static_cast<std::int16_t>(
+        ((static_cast<std::uint32_t>(x >> 30) & 2u)) - 1u);
+    if (s.ptr < 0x10) {
+        // Ring underflow: reset to the top, carrying the 3 surviving samples
+        // and their signs so the sliding window stays continuous.
+        s.ptr = 0x1010;
+        LmsRing(s, 0x1012) = LmsRing(s, 0x10);
+        LmsRing(s, 0x1014) = LmsRing(s, 0x12);
+        LmsRing(s, 0x1016) = LmsRing(s, 0x14);
+        LmsRing(s, 0x101a) = LmsRing(s, 0x18);
+        LmsRing(s, 0x101c) = LmsRing(s, 0x1a);
+        LmsRing(s, 0x101e) = LmsRing(s, 0x1c);
+        LmsRing(s, 0x1010) = static_cast<std::int16_t>(x);
+        LmsRing(s, 0x1018) = sgn;
+    } else {
+        LmsRing(s, s.ptr)     = static_cast<std::int16_t>(x);
+        LmsRing(s, s.ptr + 8) = sgn;
+    }
+    std::int32_t acc = 0;
+    for (int k = 0; k < 4; ++k)
+        acc += static_cast<std::int32_t>(s.coeffs[k]) *
+               static_cast<std::int32_t>(LmsRing(s, s.ptr + k * 2));
+    s.dot = acc;
+}
+
+// FUN_080be820: sign-sign coefficient adaptation driven by `driver`'s sign.
+static void LmsAdapt(LmsStage& s, std::int32_t driver) {
+    if (driver >= 0) {
+        if (driver != 0)
+            for (int k = 0; k < 4; ++k)
+                s.coeffs[k] = LmsSat16(static_cast<std::int32_t>(s.coeffs[k]) -
+                                       static_cast<std::int32_t>(LmsRing(s, s.ptr + 8 + k * 2)));
+    } else {
+        for (int k = 0; k < 4; ++k)
+            s.coeffs[k] = LmsSat16(static_cast<std::int32_t>(LmsRing(s, s.ptr + 8 + k * 2)) +
+                                   static_cast<std::int32_t>(s.coeffs[k]));
+    }
+}
+
+// FUN_080beaa0: run stage 2 on x, then predict = (dot2 + dot1) >> shift.
+static std::int32_t LmsPredict(LmsObject& o, std::int32_t x) {
+    LmsRun(o.st[1], x);
+    std::int32_t pr = o.st[1].dot + o.st[0].dot;
+    return pr >> (o.shift & 0x1f);
+}
+
+// FUN_080beae0: adapt stage1 by residual, run stage1 on the reconstructed
+// sample, then adapt stage2 by residual.
+static void LmsUpdate(LmsObject& o, std::int32_t sample, std::int32_t residual) {
+    LmsAdapt(o.st[0], residual);
+    LmsRun(o.st[0], sample);
+    LmsAdapt(o.st[1], residual);
+}
+
+// FUN_08096e20 (scalar path). Reconstructs interleaved ch1/ch2 samples in
+// place. `carry` (legacy iVar5) chains across channels: ch2 predicts from
+// ch1's just-reconstructed sample (inter-channel decorrelation), and the
+// next ch1 sample predicts from the previous ch2 sample.
 void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residuals,
                           std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2) {
-    if (n == 0 || ch1_residuals == nullptr || ch2_residuals == nullptr) return;
-    auto satsub = [](std::int32_t a, std::int32_t b) -> std::int16_t {
-        std::int32_t d = a - b;
-        if (d > 32767) d = 32767;
-        if (d < -32768) d = -32768;
-        return static_cast<std::int16_t>(d);
-    };
-    auto satadd = [](std::int32_t a, std::int32_t b) -> std::int16_t {
-        std::int32_t s = a + b;
-        if (s > 32767) s = 32767;
-        if (s < -32768) s = -32768;
-        return static_cast<std::int16_t>(s);
-    };
-    // The legacy processes samples in reverse via iVar5 = -param_4 .. 0
-    // and uses param_2+iVar5*4 indexing. Net effect = forward iteration
-    // since the same memory is accessed; below we walk 0..n-1.
+    if (n == 0 || ch1_residuals == nullptr || ch2_residuals == nullptr ||
+        obj_ch1 == nullptr || obj_ch2 == nullptr) return;
+    std::int32_t carry = 0;  // iVar5
     for (std::size_t i = 0; i < n; ++i) {
-        // --- Channel 1: predict from ring history (intra), update from residual ---
         std::int32_t res1 = ch1_residuals[i];
-        // dot1 = sum(coeffs1[0..3] * ring1[ptr-3..ptr])  (i32 widened)
-        std::int32_t d1 = 0;
-        for (int k = 0; k < 4; ++k) {
-            std::int32_t r_idx = (obj_ch1->ptr1 - 3 + k) & 1023;
-            d1 += static_cast<std::int32_t>(obj_ch1->coeffs1[k]) *
-                  static_cast<std::int32_t>(obj_ch1->ring1[r_idx]);
-        }
-        obj_ch1->dot1 = d1;
-        // sample1 = residual + (dot1 >> shift)
-        std::uint32_t sh = obj_ch1->shift & 0x1fu;
-        std::int32_t sample1 = res1 + (d1 >> sh);
-        ch1_residuals[i] = sample1;
-        // sign of original residual
-        std::int16_t sgn_res = (res1 < 0) ? std::int16_t(1) :
-                               (res1 > 0) ? std::int16_t(-1) : std::int16_t(0);
-        // Update coeffs1/sign1 by sgn_res
-        for (int k = 0; k < 4; ++k) {
-            obj_ch1->coeffs1[k] = satsub(obj_ch1->coeffs1[k], sgn_res);
-            obj_ch1->sign1[k]   = satsub(obj_ch1->sign1[k],   sgn_res);
-        }
-        // Push sample1 into ring1
-        obj_ch1->ring1[obj_ch1->ptr1] = static_cast<std::int16_t>(sample1);
-        obj_ch1->ptr1 = (obj_ch1->ptr1 + 1) & 1023;
-        // sign of reconstructed sample
-        std::int16_t sgn1 = (sample1 < 0) ? std::int16_t(0xffff) :
-                            (sample1 > 0) ? std::int16_t(2) : std::int16_t(1);
-        // Stage 2 dot with new ring entries
-        std::int32_t d1b = 0;
-        for (int k = 0; k < 4; ++k) {
-            std::int32_t r_idx = (obj_ch1->ptr1 - 3 + k) & 1023;
-            d1b += static_cast<std::int32_t>(obj_ch1->coeffs2[k]) *
-                   static_cast<std::int32_t>(obj_ch1->ring1[r_idx]);
-        }
-        (void)sgn1; (void)d1b; // stage 2 is updated in next iter
+        carry = LmsPredict(*obj_ch1, carry) + res1;
+        LmsUpdate(*obj_ch1, carry, res1);
+        ch1_residuals[i] = carry;
 
-        // --- Channel 2: predict from ch1 reconstructed, update from ch2 residual ---
         std::int32_t res2 = ch2_residuals[i];
-        std::int32_t d2 = 0;
-        for (int k = 0; k < 4; ++k) {
-            std::int32_t r_idx = (obj_ch2->ptr2 - 3 + k) & 1023;
-            d2 += static_cast<std::int32_t>(obj_ch2->coeffs2[k]) *
-                  static_cast<std::int32_t>(obj_ch2->ring2[r_idx]);
-        }
-        obj_ch2->dot2 = d2;
-        std::int32_t sample2 = res2 + (d2 >> sh);
-        ch2_residuals[i] = sample2;
-        std::int16_t sgn_res2 = (res2 < 0) ? std::int16_t(1) :
-                                (res2 > 0) ? std::int16_t(-1) : std::int16_t(0);
-        for (int k = 0; k < 4; ++k) {
-            obj_ch2->coeffs2[k] = satsub(obj_ch2->coeffs2[k], sgn_res2);
-            obj_ch2->sign2[k]   = satsub(obj_ch2->sign2[k],   sgn_res2);
-        }
-        obj_ch2->ring2[obj_ch2->ptr2] = static_cast<std::int16_t>(sample2);
-        obj_ch2->ptr2 = (obj_ch2->ptr2 + 1) & 1023;
+        carry = LmsPredict(*obj_ch2, carry) + res2;
+        LmsUpdate(*obj_ch2, carry, res2);
+        ch2_residuals[i] = carry;
     }
 }
 

@@ -303,25 +303,29 @@ void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
 // ch2); the ch2 instance reads ch1's reconstructed sample as its "input" and
 // updates from the ch2 residual. State persists across blocks at the call
 // site (allocate once per archive, reuse for every prefilter block).
+// One cascade stage (legacy stride 0x1030 bytes). Mirrors the byte offsets
+// that FUN_080be8e0/FUN_080be820 index: coeffs @+0x00 (4×i16), ring window
+// @[0x10,0x1020) (each sample's sign stored 8 bytes ahead), ptr @+0x1020 (a
+// byte offset within the stage that decrements by 2 and wraps to 0x1010),
+// dot @+0x1024.
+struct LmsStage {
+    std::int16_t coeffs[4]{};   // +0x00
+    std::int16_t ring[0x808]{}; // [0x10,0x1020): sample window + interleaved signs
+    std::int32_t ptr{0x1010};   // byte offset; --=2 per sample, wraps to 0x1010
+    std::int32_t dot{0};        // last 4-tap dot product
+};
+
+// Inter-channel LMS predictor state = 2 cascade stages + shift (0x2070 bytes,
+// matches the legacy per-channel context stride). One per channel; ch2 reads
+// ch1's reconstructed sample as its predictor input.
 struct LmsObject {
-    // Stage 1: coeffs[4] (i16), sign[4] (i16), ring[1024] (i16), ptr (i32), dot (i32)
-    std::int16_t coeffs1[4]{};
-    std::int16_t sign1[4]{};
-    std::int16_t ring1[1024]{};
-    std::int32_t ptr1{0};
-    std::int32_t dot1{0};
-    // Stage 2: same layout, offset +0x1030
-    std::int16_t coeffs2[4]{};
-    std::int16_t sign2[4]{};
-    std::int16_t ring2[1024]{};
-    std::int32_t ptr2{0};
-    std::int32_t dot2{0};
-    // shift byte at +0x2060 (init 0xd)
-    std::uint8_t shift{0xd};
+    LmsStage st[2]{};           // stage1 @+0x00, stage2 (cascade) @+0x1030
+    std::uint8_t shift{0x0d};   // +0x2060
 
     void Init() {
-        std::memset(this, 0, sizeof(LmsObject));
-        shift = 0xd;
+        st[0] = LmsStage{};
+        st[1] = LmsStage{};
+        shift = 0x0d;
     }
 };
 
