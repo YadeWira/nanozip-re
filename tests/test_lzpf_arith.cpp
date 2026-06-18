@@ -797,6 +797,18 @@ void TestCdParam14() {
     Expect(ok, "CD param14 transform matches binary (1KB slice, byte-exact)");
 }
 
+// Native -cd column RLE run-expander (FUN_080acb90). Replays a real column from
+// map.txt.nz (arith output + size-region bit stream) and checks byte-exact expand.
+void TestCdRleExpand() {
+    std::vector<std::uint8_t> out(kCdRleOutLen + 256, 0);
+    std::uint32_t n = nzr::cd::NzCdRleExpand(kCdRleSrc, kCdRleCount, out.data(),
+                                             static_cast<std::uint32_t>(out.size()),
+                                             0u, kCdRleBits, kCdRleBitsLen);
+    bool ok = (n == kCdRleOutLen) &&
+              (std::memcmp(out.data(), kCdRleOut, kCdRleOutLen) == 0);
+    Expect(ok, "CD RLE run-expander matches binary (real column, byte-exact)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -819,6 +831,7 @@ int main() {
     TestCdReconstruct();
     TestCdTokenAssemble();
     TestCdParam14();
+    TestCdRleExpand();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

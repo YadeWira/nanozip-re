@@ -69,5 +69,16 @@ void NzCdTokenAssemble(std::uint32_t num_tokens,
 std::uint32_t NzCdParam14(const std::uint8_t* src, std::uint32_t src_len,
                           std::uint8_t* dst, std::uint32_t dst_cap);
 
+// Per-column RLE run-expander (FUN_080acb90 + length coder FUN_08090070). After a
+// column's arith decode, runs are expanded: literals pass through, and on a detected
+// run of equal bytes the run length is read as `(1<<k) | ReadBits(k)` (k = detected
+// run prefix) from the lzpf bit reader over `rle_bits` (the per-column size-region).
+// `thr` = the run threshold (column header). Returns bytes written to `dst`.
+// Validated byte-exact against the binary on 3 real columns (map.txt.nz). The byte
+// history uses a rolling 4-byte window (`CONCAT31`): `win = (win << 8) | byte`.
+std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
+                            std::uint8_t* dst, std::uint32_t dst_cap, std::uint32_t thr,
+                            const std::uint8_t* rle_bits, std::size_t rle_bits_len);
+
 }  // namespace cd
 }  // namespace nzr

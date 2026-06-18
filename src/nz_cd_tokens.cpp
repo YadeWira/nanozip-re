@@ -1,6 +1,7 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
 #include "nz_cd_tokens.h"
+#include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
 
 #include <cstring>
 
@@ -230,6 +231,69 @@ LOOP:
     }
 L_115a:
     return (pbVar6 < pbVar1) ? static_cast<std::uint32_t>(pbVar6 - dst) : 0u;
+}
+
+// ---------------------------------------------------------------------------
+// param14 ends above.  Per-column RLE run-expander (FUN_080acb90).
+std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
+                            std::uint8_t* dst, std::uint32_t dst_cap, std::uint32_t thr,
+                            const std::uint8_t* rle_bits, std::size_t rle_bits_len) {
+    if (count == 0) return 0;
+    nzr::lzpf::BitReader br{};
+    nzr::lzpf::Init(br, rle_bits, rle_bits_len);
+    // FUN_08090070: run length = (1<<k) | ReadBits(k), or ReadBits(1) when k==0.
+    auto coder = [&](std::uint32_t k) -> std::uint32_t {
+        return k ? (nzr::lzpf::ReadBits(br, k) | (1u << k)) : nzr::lzpf::ReadBits(br, 1);
+    };
+    long cap = static_cast<long>(dst_cap);
+    if (cap < static_cast<long>(count)) return 0;
+    const std::uint8_t* p1 = src;
+    long p2 = static_cast<long>(count) + 1;
+    std::uint8_t* p8 = dst;
+    std::uint8_t* local_28 = dst;
+    std::uint32_t win = 0;          // rolling 4-byte window (CONCAT31)
+    std::uint32_t w5 = 0;
+    long pcVar9 = 0;
+    while (true) {
+        p2 -= 1;
+        pcVar9 = 0;
+        w5 = win;
+        if (p2 != 0) {
+            std::uint8_t cur = *p1; w5 = (win << 8) | cur; p1++;
+            *p8 = cur; p8++;
+            std::uint8_t prev = static_cast<std::uint8_t>(win);
+            int thr_cd = static_cast<int>(thr);
+            win = w5;
+            if (cur != prev) continue;               // no run
+            bool ended = false;
+            while (true) {
+                pcVar9 = p2 - 1;
+                if (pcVar9 == 0) break;
+                cur = *p1; win = (w5 & 0xffffff00u) | cur; p1++;
+                *p8 = cur; p8++;
+                p2 = pcVar9;
+                if (cur != static_cast<std::uint8_t>(w5 >> 8)) { ended = true; break; }
+                bool cont = (0 < thr_cd); thr_cd -= 1; w5 = win;
+                if (!cont) break;
+            }
+            if (ended) continue;
+        }
+        win = w5 & 0xff;
+        if (pcVar9 == 0) break;                       // done
+        p1 -= 1;
+        long pcVar3 = pcVar9;
+        while (true) { p1++; pcVar3--; if (pcVar3 == 0) break; if (static_cast<std::uint8_t>(w5) != *p1) break; }
+        pcVar3 = pcVar9 + (-1 - pcVar3);
+        if (pcVar3 > 0x1e) break;                     // overlong run -> stop
+        cap = (local_28 - dst) + (cap - (p8 - dst));
+        std::uint32_t len = coder(static_cast<std::uint32_t>(pcVar3));
+        p2 = pcVar9 - pcVar3;
+        if (cap < p2 + static_cast<long>(len) - 1) break;
+        local_28 = p8;
+        for (std::uint32_t i = 0; i < len; ++i) p8[i] = static_cast<std::uint8_t>(w5);
+        p8 += len;
+    }
+    return static_cast<std::uint32_t>(p8 - dst);
 }
 
 }  // namespace cd
