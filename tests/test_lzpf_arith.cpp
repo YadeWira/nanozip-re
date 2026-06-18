@@ -809,6 +809,20 @@ void TestCdRleExpand() {
     Expect(ok, "CD RLE run-expander matches binary (real column, byte-exact)");
 }
 
+// Integrated -cd LZ chunk decoder (NzCdDecodeLzChunk): full pipeline from a real
+// raw block (header parse + 3 cols arith/RLE + token assemble + literals + recon).
+// Checks the 32 KB LZ window against the binary via FNV (last byte = word-copy edge).
+void TestCdDecodeLzChunk() {
+    std::vector<std::uint8_t> out(kCdChunkOutLen + 64, 0);
+    std::size_t pos = 0;
+    std::uint32_t n = nzr::cd::NzCdDecodeLzChunk(kCdBlock, kCdBlockLen, &pos,
+                                                 out.data(), kCdChunkOutLen + 64);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i + 1 < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdChunkOutLen && h == kCdChunkFnv,
+           "CD integrated LZ chunk decode matches binary (real block, 32KB window)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -832,6 +846,7 @@ int main() {
     TestCdTokenAssemble();
     TestCdParam14();
     TestCdRleExpand();
+    TestCdDecodeLzChunk();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

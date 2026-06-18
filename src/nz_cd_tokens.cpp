@@ -4,6 +4,7 @@
 #include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
 
 #include <cstring>
+#include <vector>
 
 namespace nzr {
 namespace cd {
@@ -294,6 +295,151 @@ std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
         p8 += len;
     }
     return static_cast<std::uint32_t>(p8 - dst);
+}
+
+
+// ---------------------------------------------------------------------------
+// Integrated single-chunk -cd LZ decoder (header parse + cols + tokens + recon).
+namespace {
+static const unsigned char g_kCdSlotLit[256] = {
+    0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,
+    32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+static const unsigned char g_kCdModelLit[64] = {
+    0,1,1,1,2,2,3,3,4,4,5,5,6,6,7,7,
+    8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,
+    16,16,17,17,18,18,19,19,20,20,21,21,22,22,23,23,
+    24,24,25,25,26,26,27,27,28,28,29,29,30,30,31,31,
+};
+static const unsigned char g_kCdSlotOff[256] = {
+    0,0,2,2,4,4,4,4,6,6,6,6,8,8,8,8,
+    10,10,10,10,12,12,12,12,14,14,14,14,16,16,16,16,
+    18,18,18,18,20,20,20,20,22,22,22,22,24,24,24,24,
+    26,26,26,26,28,28,28,28,30,30,30,30,32,32,32,32,
+    34,34,34,34,36,36,36,36,38,38,38,38,40,40,40,40,
+    42,44,46,48,50,52,54,56,58,60,62,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+static const unsigned char g_kCdModelOff[64] = {
+    0,0,2,0,4,0,8,1,12,2,16,3,20,4,24,5,
+    28,6,32,7,36,8,40,9,44,10,48,11,52,12,56,13,
+    60,14,64,15,68,16,72,17,76,19,80,21,81,22,82,23,
+    83,24,84,25,85,26,86,27,87,28,88,29,89,30,90,31,
+};
+static const unsigned char g_kCdSlotLen[256] = {
+    0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,
+    32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+static const unsigned char g_kCdModelLen[64] = {
+    0,1,1,1,2,2,3,3,4,4,5,5,6,6,7,7,
+    8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,
+    16,16,17,17,18,18,19,19,20,20,21,21,22,22,23,23,
+    24,24,25,25,26,26,27,27,28,28,29,29,30,30,31,31,
+};
+// FUN_080b1dc0: bounded LEB-ish varint over a byte cursor (limit bounds byte count).
+struct CdRd { const std::uint8_t* cur; const std::uint8_t* end; };
+static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
+    std::uint8_t b = (r.cur < r.end) ? *r.cur++ : 0;
+    if (limit < 0x101u) return b;
+    std::uint32_t acc = 0, sh = 0;
+    while (true) {
+        if (!(b & 0x80u)) return (static_cast<std::uint32_t>(b & 0x7fu) << sh) | acc;
+        acc |= static_cast<std::uint32_t>(b & 0x7fu) << sh; sh += 7;
+        limit = ((limit & 0x7fu) ? 1u : 0u) + (limit >> 7);
+        b = (r.cur < r.end) ? *r.cur++ : 0;
+        if (limit < 0x101u) return (static_cast<std::uint32_t>(b) << sh) | acc;
+    }
+}
+}  // namespace
+
+std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
+                                std::size_t* block_pos,
+                                std::uint8_t* out, std::uint32_t out_cap) {
+    CdRd r{block + *block_pos, block + block_len};
+    std::uint32_t chunk = CdReadVar(r, 0x80010u);
+    std::uint32_t size = chunk >> 4;            // (flags = chunk & 0xf, unused here)
+    if (size) size -= 1; else size = 0x8000u;
+    std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
+    std::uint32_t out_size = v2 + size;
+    if (out_size == 0 || out_size > out_cap) return 0;
+    std::uint32_t N = CdReadVar(r, out_size - 1);
+    (void)CdReadVar(r, out_size);               // v6 (unused)
+
+    auto decode_col = [&](std::uint32_t out_n) -> std::vector<std::uint8_t> {
+        std::uint8_t b0 = (r.cur < r.end) ? *r.cur++ : 0;
+        std::uint32_t sf = b0 >> 1;             // size-field (RLE bits length)
+        const std::uint8_t* rle = nullptr; std::uint32_t rlen = 0, acount;
+        if (sf) { rle = r.cur; rlen = sf; r.cur += sf; acount = CdReadVar(r, out_size); }
+        else acount = out_n;
+        std::vector<std::uint8_t> ar(acount + 64, 0);
+        std::size_t c = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
+                                                     ar.data(), acount, 12u);
+        r.cur += c;
+        if (sf) {
+            std::vector<std::uint8_t> o(out_n + 256, 0);
+            std::uint32_t m = NzCdRleExpand(ar.data(), acount, o.data(), out_n + 256, 0, rle, rlen);
+            o.resize(m); return o;
+        }
+        ar.resize(acount); return ar;
+    };
+    std::vector<std::uint8_t> lit = decode_col(N + 1); (void)CdReadVar(r, out_size);
+    std::vector<std::uint8_t> len = decode_col(N);     (void)CdReadVar(r, out_size);
+    std::vector<std::uint8_t> off = decode_col(N);
+    std::uint32_t bs_size = CdReadVar(r, out_size * 4u);
+    const std::uint8_t* bs = r.cur; r.cur += bs_size;
+
+    NzCdField fl{g_kCdSlotLit, g_kCdModelLit, 8u};
+    NzCdField fo{g_kCdSlotOff, g_kCdModelOff, 4u};
+    NzCdField fn{g_kCdSlotLen, g_kCdModelLen, 14u};
+    std::vector<std::uint32_t> toks(static_cast<std::size_t>(N) * 3);
+    NzCdTokenAssemble(N, lit.data(), off.data(), len.data(), bs, bs_size, fl, fo, fn, toks.data());
+
+    std::uint32_t litsum = 0;
+    for (std::uint32_t i = 0; i < N; ++i) litsum += toks[i * 3];
+    std::vector<std::uint8_t> literals(litsum + 64, 0);
+    nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
+                                 literals.data(), litsum, 12u);
+
+    std::uint32_t n = NzCdReconstruct(toks.data(), N, literals.data(), out, out_size);
+    *block_pos = static_cast<std::size_t>(r.cur - block);
+    return n;
 }
 
 }  // namespace cd

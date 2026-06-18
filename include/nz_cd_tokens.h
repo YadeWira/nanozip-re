@@ -80,5 +80,17 @@ std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
                             std::uint8_t* dst, std::uint32_t dst_cap, std::uint32_t thr,
                             const std::uint8_t* rle_bits, std::size_t rle_bits_len);
 
+// Decode ONE `-cd` LZ chunk from a raw block: parses the chunk header (bounded
+// varints, FUN_080b1dc0), decodes the 3 token columns (arith + RLE), the token
+// bitstream and literal stream, assembles tokens and reconstructs the chunk's LZ
+// output window (the ~32 KB pre-param14/tt08 bytes). `*block_pos` is advanced past
+// the consumed bytes. Returns the number of output bytes written to `out` (the
+// chunk out_size), or 0 on malformed input. Uses the embedded deterministic
+// model/slot tables (the output of FUN_080b7600-class init). Validated byte-exact
+// against the binary on a real `-cd` block (map.txt.nz batch 0).
+std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
+                                std::size_t* block_pos,
+                                std::uint8_t* out, std::uint32_t out_cap);
+
 }  // namespace cd
 }  // namespace nzr
