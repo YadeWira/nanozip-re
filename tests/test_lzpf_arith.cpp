@@ -924,6 +924,19 @@ void TestCdDecodeBlockTextPipeline() {
            "CD full file decode matches original (atoll &8 text pipeline, 92197 B, ring wrap)");
 }
 
+// Single-chunk &8 text block exercising the bit-0x8 WORD DICTIONARY transform
+// (NzCdDict): param 0x88 = param14 then dict. Decodes a real -cd block (GPL-3 text)
+// byte-exact. Guards the dict port (incl. the -O3 misaligned-access fix).
+void TestCdDecodeBlockDict() {
+    std::vector<std::uint8_t> out(kCdDictFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdDictBlock, kCdDictBlockLen, out.data(),
+                                               kCdDictFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdDictFileLen && h == kCdDictFileFnv,
+           "CD full file decode matches original (&8 word-dictionary, 24000 B, param 0x88)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -956,6 +969,7 @@ int main() {
     TestCdExeUnfilter();
     TestCdTextPipeline();
     TestCdDecodeBlockTextPipeline();
+    TestCdDecodeBlockDict();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

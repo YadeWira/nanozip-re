@@ -2,6 +2,7 @@
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
 #include "nz_cd_tokens.h"
 #include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
+#include "nz_cd_texttransform_dict.h"   // &8 bit 0x8 word-dictionary transform
 
 #include <cstring>
 #include <vector>
@@ -536,18 +537,22 @@ std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
 }  // namespace
 
 // &8 text pipeline (FUN_080a3c90): a param bitmask selects an ordered sequence of text
-// transforms applied with double-buffering. Supported bits: 0x80 param14, 0x20 line-RLE
-// (FUN_080a2f20), 0x1 CRLF EOL (FUN_080a19b0), applied in that dispatch order. Any other
-// bit set means a transform not yet ported -> return 0 so the caller bridges.
+// transforms applied with double-buffering. Supported bits: 0x80 param14, 0x8 word
+// dictionary (NzCdDict; reorder_ascii=true for -cd, type!=7), 0x20 line-RLE
+// (FUN_080a2f20), 0x1 CRLF EOL (FUN_080a19b0), applied in that dispatch order (the
+// reference order is 0x80,0x10,0x8,0x4,0x2,0x20,0x40,0x1). Any other bit set means a
+// transform not yet ported (0x10 tt16-num, 0x4 html, 0x2 insert-LF) -> return 0 so the
+// caller bridges. Every text stage EXPANDS, so each intermediate <= the final output.
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
-    const std::uint32_t kSupported = 0x80u | 0x20u | 0x1u;
+    const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x1u;
     if (param & ~kSupported) return 0;
     std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
     const std::uint8_t* cur = src;
     std::uint32_t n = size; int bi = 0;
     if (param & 0x80u) { std::uint32_t m = NzCdParam14(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    if (param & 0x08u) { std::uint32_t m = NzCdDict(cur, n, bufs[bi], out_cap, false); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (param & 0x20u) { std::uint32_t m = NzCdLineRle(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (param & 0x01u) { std::uint32_t m = NzCdCrlf(cur, n, bufs[bi], out_cap);    if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (n > out_cap) n = out_cap;

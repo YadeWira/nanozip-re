@@ -14,6 +14,7 @@ set(RECON_SOURCES
     src/nz_cm.cpp
     src/nz_lzhd.cpp
     src/nz_cd_tokens.cpp
+    src/nz_cd_texttransform_dict.cpp
     src/nz_text_transform.cpp
     src/nz_postfilter.cpp
     src/nz_texttransform_num.cpp
@@ -40,6 +41,7 @@ add_executable(test_lzpf_arith
     tests/test_lzpf_arith.cpp
     src/lzpf_arith.cpp
     src/nz_cd_tokens.cpp
+    src/nz_cd_texttransform_dict.cpp
 )
 target_include_directories(test_lzpf_arith PRIVATE include)
 if(NOT MSVC)
