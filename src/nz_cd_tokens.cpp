@@ -556,14 +556,81 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
 }
 
 namespace {
-// Decode one chunk. The LZ output is reconstructed into `recon + recon_off` so its
-// matches can reference the recon output of PRIOR chunks: the sliding window spans
-// chunk boundaries in the recon (pre-block-RLE) domain (verified byte-exact). For a
-// block-RLE chunk (flag &2) the chunk's recon slice is then re-expanded into `out`;
-// otherwise the recon slice IS the output and is copied through. `*recon_advance`
-// receives the recon (collapsed) size so the caller can advance `recon_off`.
+// --- 64 KB cross-chunk ring window (FUN_08099050, obj+0x978) -----------------
+// The decoder keeps the LZ window in a fixed 64 KB ring (size 0x10000, mask
+// 0xffff), NOT a contiguous buffer. Each chunk's COMPACT recon is written at the
+// chunk's ring base (`base`) wrapping mod 65536; matches read the ring with the
+// same wrap (the unsigned `base+pos-offset` underflow & 0xffff gives the index —
+// e.g. base=0,pos=2,offset=15480 -> 50058, verified byte-exact vs the binary).
+// The chunk base advances by the chunk's OUTPUT size for text (&8) chunks and by
+// the COMPACT recon size otherwise (block-RLE &2 advances by compact: elf ring
+// progression 0,21597,30634; text &8 advances by output: atoll 0,32768,0).
+inline void RingWrite(std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
+                      const std::uint8_t* src, std::uint32_t n) {
+    for (std::uint32_t i = 0; i < n; ++i) ring[(base + i) & mask] = src[i];
+}
+inline void RingRead(const std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
+                     std::uint8_t* dst, std::uint32_t n) {
+    for (std::uint32_t i = 0; i < n; ++i) dst[i] = ring[(base + i) & mask];
+}
+
+// Ring-aware variant of NzCdReconstruct: identical token semantics, but reads and
+// writes the 64 KB ring at `base` (wrapping) so matches resolve into prior chunks'
+// compact recon. Writes the chunk's out_size compact bytes into the ring.
+std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
+                              const std::uint32_t* tokens, std::uint32_t num_tokens,
+                              const std::uint8_t* literals, std::uint32_t out_size) {
+    std::uint32_t rep[4] = {1, 1, 1, 1};
+    std::uint32_t pos = 0;
+    const std::uint8_t* lp = literals;
+    for (std::uint32_t t = 0; t < num_tokens && pos < out_size; ++t) {
+        std::uint32_t lit_run = tokens[t * 3 + 0];
+        std::uint32_t sel     = tokens[t * 3 + 1];
+        std::uint32_t raw_len = tokens[t * 3 + 2];
+        std::uint32_t old_rm0 = rep[0];
+        std::uint32_t offset, mlen;
+        if (sel >= 4) {
+            offset = sel - 3;
+            rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = old_rm0; rep[0] = offset;
+            mlen = raw_len + 4 + (offset > 0x63ffu) + (offset > 0x4ffu);
+        } else {
+            offset = rep[sel];
+            mlen = raw_len + 2;
+            if (sel == 1)      { rep[1] = rep[0]; }
+            else if (sel == 2) { rep[2] = rep[1]; rep[1] = rep[0]; }
+            else if (sel == 3) { rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; }
+            rep[0] = offset;
+        }
+        if (lit_run) {
+            std::uint32_t run = lit_run;
+            if (pos + run > out_size) run = out_size - pos;
+            for (std::uint32_t i = 0; i < run; ++i) ring[(base + pos + i) & mask] = lp[i];
+            lp += tokens[t * 3 + 0];            // advance by the full (unclamped) run
+            pos += run;
+            if (pos >= out_size) break;
+        }
+        if (pos + mlen > out_size) mlen = out_size - pos;
+        for (std::uint32_t i = 0; i < mlen; ++i)   // overlap-safe, ring-wrapped
+            ring[(base + pos + i) & mask] = ring[(base + pos + i - offset) & mask];
+        pos += mlen;
+    }
+    if (pos < out_size) {                       // trailing literal flush
+        for (std::uint32_t i = 0, e = out_size - pos; i < e; ++i)
+            ring[(base + pos + i) & mask] = lp[i];
+        pos = out_size;
+    }
+    return pos;
+}
+
+// Decode one chunk. The LZ output is reconstructed into the 64 KB ring at
+// `ring_pos` (wrapping) so its matches can reference the recon output of PRIOR
+// chunks: the sliding window spans chunk boundaries in the recon (pre-post-filter)
+// domain (verified byte-exact). The chunk's compact recon slice is extracted from
+// the ring and then post-filtered into `out` (block-RLE &2 re-expand, text &8
+// pipeline, exe &4 un-transform, or a straight copy). `*recon_advance` receives the
+// amount to advance the ring base by: the chunk OUTPUT size for &8, else compact.
 std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std::size_t* block_pos,
-                          std::uint8_t* recon, std::uint32_t recon_off, std::uint32_t recon_cap,
+                          std::uint8_t* ring, std::uint32_t ring_pos, std::uint32_t ring_mask,
                           std::uint8_t* out, std::uint32_t out_cap, std::uint32_t out_pos,
                           std::uint32_t* recon_advance) {
     *recon_advance = 0;
@@ -587,7 +654,9 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
         out_size = v2 + size; pure_literal = (v2 == 0u);
     }
-    if (out_size == 0 || recon_off + out_size > recon_cap) return 0;
+    if (out_size == 0) return 0;     // out_size <= 0x8001 always fits the 64 KB ring
+    std::uint32_t base = ring_pos & ring_mask;       // this chunk's ring write/match base
+    std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
     auto decode_literals = [&](std::uint8_t* dst, std::uint32_t n) {
@@ -602,23 +671,17 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         }
     };
 
+    const std::uint8_t* brle_bits = nullptr;   // block-RLE (&2) run-length bit-stream
+    std::uint32_t brle_len = 0;
+    std::uint32_t text_param = 0;              // text-pipeline (&8) transform bitmask
+
     if (pure_literal) {
         // The window IS the literal stream (out_size bytes); no cols/tokens/recon.
-        decode_literals(recon + recon_off, out_size);
-        const std::uint8_t* brle_bits = nullptr; std::uint32_t brle_len = 0;
+        decode_literals(slice.data(), out_size);
         if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
-        *recon_advance = out_size;
-        *block_pos = static_cast<std::size_t>(r.cur - block);
-        if (flags & 8u)
-            return NzCdParam14(recon + recon_off, out_size, out, out_cap);
-        if (flags & 2u)
-            return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
-        std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
-        std::memcpy(out, recon + recon_off, n);
-        if (flags & 4u)
-            NzCdExeUnfilter(out, n, out_pos + 4u);
-        return n;
-    }
+        if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
+        RingWrite(ring, ring_mask, base, slice.data(), out_size);  // window keeps the compact recon
+    } else {
 
     std::uint32_t N = CdReadVar(r, out_size - 1);
     (void)CdReadVar(r, out_size);               // v6 (unused)
@@ -681,69 +744,72 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     std::vector<std::uint8_t> literals(total_lit + 64, 0);
     decode_literals(literals.data(), total_lit);
 
-    // Block-RLE post-filter (chunk flag &2): after the literal stream comes a
-    // bounded-varint length (limit 0x1001) + that many bytes of run-length bits.
-    // The recon window's collapsed zero-runs are re-expanded by NzCdRleExpand with
-    // thr=1 (dispatcher LAB_08099a90: FUN_080c10a0(...,1) then FUN_080ac9e0).
-    const std::uint8_t* brle_bits = nullptr; std::uint32_t brle_len = 0;
-    if (flags & 2u) {
-        brle_len = CdReadVar(r, 0x1001u);
-        brle_bits = r.cur; r.cur += brle_len;
-    }
-    // Text-pipeline param (flag &8): a single byte trailing the literals (and the
-    // block-RLE bits, if &2) — the bitmask selecting the transform sequence applied
-    // by FUN_080a3c90 (its arg5). Must be consumed so the next chunk parses.
-    std::uint32_t text_param = 0;
+    // Block-RLE (&2) run bits then text (&8) param trail the literals (same order
+    // the dispatcher consumes them); both must be read so the next chunk parses.
+    if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
     if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
 
-    // Reconstruct into the contiguous recon buffer (window spans prior chunks).
-    NzCdReconstruct(toks.data(), N, literals.data(), recon + recon_off, out_size);
-    *recon_advance = out_size;
+    // Reconstruct into the 64 KB ring at this chunk's base (matches reach prior
+    // chunks via the wrap), then linearise the chunk's compact recon into `slice`.
+    ReconstructRing(ring, ring_mask, base, toks.data(), N, literals.data(), out_size);
+    RingRead(ring, ring_mask, base, slice.data(), out_size);
+    }
+
     *block_pos = static_cast<std::size_t>(r.cur - block);
 
-    // Text pipeline (&8): the per-chunk transforms (NzCdLineRle / NzCdCrlf / param14,
-    // selected by `text_param`) are byte-exact in isolation (see NzCdTextPipeline), but
-    // the cross-chunk LZ window domain for a chunk FOLLOWING a text chunk is not yet
-    // resolved (it is neither the compact recon nor the expanded output) — applying the
-    // pipeline would corrupt multi-chunk text files (right size, wrong content, which
-    // the dispatcher size-check would NOT catch). So bridge for now. TODO(#22).
-    if (flags & 8u) { (void)text_param; return 0; }
-    if (flags & 2u)   // block-RLE: re-expand collapsed zero-runs
-        return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
+    // Post-filter the compact recon slice into `out`, and advance the ring base: by
+    // the chunk OUTPUT size for text (&8), else by the compact recon size. Per-flag
+    // advance verified vs the binary (elf &2: 0,21597,30634 compact; atoll &8:
+    // 0,32768,0 output). The window holds COMPACT recon for every chunk type.
+    if (flags & 8u) {   // text pipeline: param14 / line-RLE / CRLF (NzCdTextPipeline)
+        std::uint32_t n = NzCdTextPipeline(slice.data(), out_size, out, out_cap, text_param);
+        *recon_advance = n;
+        return n;
+    }
+    *recon_advance = out_size;
+    if (flags & 2u)     // block-RLE: re-expand collapsed zero-runs
+        return NzCdRleExpand(slice.data(), out_size, out, out_cap, 1u, brle_bits, brle_len);
     std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
-    std::memcpy(out, recon + recon_off, n);
-    if (flags & 4u)   // exe: x86 E8/E9 address un-transform (in place on the output)
+    std::memcpy(out, slice.data(), n);
+    if (flags & 4u)     // exe: x86 E8/E9 address un-transform (in place on the output)
         NzCdExeUnfilter(out, n, out_pos + 4u);
     return n;
 }
 }  // namespace
 
+// The cross-chunk LZ window is a fixed 64 KB ring (FUN_08099050, obj+0x978).
+static const std::uint32_t kCdRingSize = 0x10000u;
+static const std::uint32_t kCdRingMask = 0xffffu;
+
 std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
                                 std::size_t* block_pos,
                                 std::uint8_t* out, std::uint32_t out_cap) {
-    // Standalone single chunk: no preceding window context (recon_off = 0).
-    std::vector<std::uint8_t> recon(out_cap + 64, 0);
+    // Standalone single chunk: empty window (ring zero-filled, base 0).
+    std::vector<std::uint8_t> ring(kCdRingSize, 0);
     std::uint32_t adv = 0;
     return DecodeChunk(block, block_len, block_pos,
-                       recon.data(), 0u, static_cast<std::uint32_t>(recon.size()),
+                       ring.data(), 0u, kCdRingMask,
                        out, out_cap, 0u, &adv);
 }
 
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap) {
-    // One contiguous recon buffer for the whole block so the LZ window spans chunks.
-    std::vector<std::uint8_t> recon(out_cap + 64, 0);
+    // 64 KB ring window shared across chunks: each chunk writes its compact recon at
+    // the current ring base (wrapping) and matches reach prior chunks through the
+    // wrap. The base advances per chunk by `adv` (OUTPUT size for text &8 chunks,
+    // compact recon size otherwise) — see DecodeChunk. `out` is the linear output.
+    std::vector<std::uint8_t> ring(kCdRingSize, 0);
     std::size_t pos = 0;
-    std::uint32_t written = 0, recon_off = 0;
+    std::uint32_t written = 0, ring_pos = 0;
     while (pos < block_len && written < out_cap) {
         std::size_t prev = pos;
         std::uint32_t adv = 0;
         std::uint32_t n = DecodeChunk(block, block_len, &pos,
-                                      recon.data(), recon_off, static_cast<std::uint32_t>(recon.size()),
+                                      ring.data(), ring_pos, kCdRingMask,
                                       out + written, out_cap - written, written, &adv);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
-        recon_off += adv;
+        ring_pos = (ring_pos + adv) & kCdRingMask;
     }
     return written;
 }

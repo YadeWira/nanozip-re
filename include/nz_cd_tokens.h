@@ -9,9 +9,10 @@
 //   NzCdReconstruct    <-  FUN_08099050  (LZMA-style token->bytes reconstruction)
 //
 // They are pure functions (no global state) so they can be unit-tested in
-// isolation. They are NOT yet wired into the archive dispatcher — full native
-// `-cd` additionally needs the block sub-stream framing, the param14 text
-// transform (FUN_080a0ff0), and the tt08 dictionary expand. See
+// isolation. NzCdDecodeBlock wires them into the archive dispatcher
+// (TryDecodeLegacyLzhd) and handles pure-LZ, block-RLE (&2), exe (&4) and text-
+// pipeline (&8, line-RLE/CRLF) chunks across a 64 KB cross-chunk ring. Remaining
+// `-cd` gaps that still bridge: tt08/reorder text bits, and CM/BWT sub-chunks. See
 // work/reports/decomp_lzhd/ARCHITECTURE_cd.md for the complete map.
 #pragma once
 #include <cstdint>
@@ -93,10 +94,10 @@ void NzCdExeUnfilter(std::uint8_t* buf, std::uint32_t size, std::uint32_t pos_ba
 // 0x80 param14 (NzCdParam14), 0x20 line-RLE (FUN_080a2f20: newline-terminated runs +
 // >0xE0 repeat-previous-line back-refs), 0x1 EOL->CRLF (FUN_080a19b0). Each stage is
 // validated byte-exact vs the binary. Returns the transformed size, or 0 if `param`
-// uses a not-yet-ported bit. NOTE: ported but NOT yet wired into the extract dispatcher
-// — the cross-chunk LZ window domain for a chunk following a text chunk is unresolved
-// (see work/reports/decomp_lzhd/text_pipeline_ports.md), so multi-chunk text files
-// would corrupt; the &8 path bridges until that is solved.
+// uses a not-yet-ported bit (e.g. 0x8 reorder / tt08 dict — those chunks still bridge).
+// WIRED into DecodeChunk: applied to the chunk's compact recon slice; the 64 KB ring
+// base then advances by this OUTPUT size so a following chunk's matches reach back into
+// the (compact) text chunk through the ring wrap (validated on atoll/f18 end-to-end).
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param);
 
@@ -112,13 +113,15 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
                                 std::size_t* block_pos,
                                 std::uint8_t* out, std::uint32_t out_cap);
 
-// Decode a whole `-cd` LZ block (loop NzCdDecodeLzChunk over its 32 KB chunks)
-// into `out`. Returns total bytes produced. Suitable for `-cd` blocks whose chunks
-// are the pure-LZ form (no per-chunk CM/BWT/param14/tt08 post-filter); those are
-// handled by the dispatcher around this. Validated byte-exact on the full
-// map.txt.nz file (69689 bytes, 3 chunks). The recon sliding window spans chunks
-// (matches reference into prior chunk output), so `out` must be the contiguous
-// full-file buffer.
+// Decode a whole `-cd` LZ block (loop DecodeChunk over its 32 KB chunks) into `out`.
+// Returns total bytes produced. Handles pure-LZ, block-RLE (&2), exe (&4) and text-
+// pipeline (&8, line-RLE/CRLF) chunks; chunks using a not-yet-ported post-filter
+// (tt08/reorder/CM/BWT) make a chunk return 0 and the dispatcher bridges. The LZ
+// window is a 64 KB RING (FUN_08099050): each chunk's COMPACT recon is written at the
+// ring base (wrapping mod 65536) and matches resolve into prior chunks through the
+// wrap; the base advances by the chunk OUTPUT size for &8 and the compact size
+// otherwise. `out` is the linear full-file output (separate from the ring). Validated
+// byte-exact on map.txt (69689 B, 3 chunks, wraps), elf.bin (&2), and atoll/f18 (&8).
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap);
 

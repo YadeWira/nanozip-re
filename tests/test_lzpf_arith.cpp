@@ -910,6 +910,20 @@ void TestCdTextPipeline() {
            "CD text pipeline (&8 line-RLE+CRLF) matches binary (atoll.fld chunk, 32768 B)");
 }
 
+// Full multi-chunk decode of a TEXT-PIPELINE (&8) block (atoll/f18) — exercises the
+// 64 KB cross-chunk ring: a &8 chunk's recon is compact but the ring base advances by
+// the chunk OUTPUT size, so a following chunk's matches resolve into it through the
+// wrap. This is the path that a contiguous/compact-advance buffer decodes wrong.
+void TestCdDecodeBlockTextPipeline() {
+    std::vector<std::uint8_t> out(kCdTextBlockFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdTextBlock, kCdTextBlockLen, out.data(),
+                                               kCdTextBlockFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdTextBlockFileLen && h == kCdTextBlockFileFnv,
+           "CD full file decode matches original (atoll &8 text pipeline, 92197 B, ring wrap)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -941,6 +955,7 @@ int main() {
     TestCdDecodeBlockPureLiteral();
     TestCdExeUnfilter();
     TestCdTextPipeline();
+    TestCdDecodeBlockTextPipeline();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
