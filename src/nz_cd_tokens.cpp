@@ -46,6 +46,15 @@ std::uint32_t NzCdReconstruct(const std::uint32_t* tokens, std::uint32_t num_tok
         for (std::uint32_t i = 0; i < mlen; ++i) dst[i] = src[i];  // overlap-safe
         pos += mlen;
     }
+    // Trailing literal flush: the legacy recon loops until out_size bytes are
+    // produced (FUN_08099050: `while (local_58 != 0)`). When the token stream does
+    // not exactly fill the chunk, the remaining bytes are copied straight from the
+    // literal stream. `literals` must hold these extra bytes (see total-literal
+    // count in DecodeChunk: out_size - sum(match lengths)).
+    if (pos < out_size) {
+        std::memcpy(out + pos, lp, out_size - pos);
+        pos = out_size;
+    }
     return pos;
 }
 
@@ -389,20 +398,33 @@ static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
 }
 }  // namespace
 
-std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
-                                std::size_t* block_pos,
-                                std::uint8_t* out, std::uint32_t out_cap) {
+namespace {
+// Decode one chunk. The LZ output is reconstructed into `recon + recon_off` so its
+// matches can reference the recon output of PRIOR chunks: the sliding window spans
+// chunk boundaries in the recon (pre-block-RLE) domain (verified byte-exact). For a
+// block-RLE chunk (flag &2) the chunk's recon slice is then re-expanded into `out`;
+// otherwise the recon slice IS the output and is copied through. `*recon_advance`
+// receives the recon (collapsed) size so the caller can advance `recon_off`.
+std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std::size_t* block_pos,
+                          std::uint8_t* recon, std::uint32_t recon_off, std::uint32_t recon_cap,
+                          std::uint8_t* out, std::uint32_t out_cap,
+                          std::uint32_t* recon_advance) {
+    *recon_advance = 0;
     CdRd r{block + *block_pos, block + block_len};
     std::uint32_t chunk = CdReadVar(r, 0x80010u);
-    std::uint32_t size = chunk >> 4;            // (flags = chunk & 0xf, unused here)
+    std::uint32_t flags = chunk & 0xfu;         // &1=LZ, &2=block-RLE, &4=exe, &8=param14
+    std::uint32_t size = chunk >> 4;
     if (size) size -= 1; else size = 0x8000u;
     std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
     std::uint32_t out_size = v2 + size;
-    if (out_size == 0 || out_size > out_cap) return 0;
+    if (out_size == 0 || recon_off + out_size > recon_cap) return 0;
     std::uint32_t N = CdReadVar(r, out_size - 1);
     (void)CdReadVar(r, out_size);               // v6 (unused)
 
-    auto decode_col = [&](std::uint32_t out_n) -> std::vector<std::uint8_t> {
+    // thr = the RLE run threshold passed by the assembler per column ROLE. The
+    // binary hardcodes thr=1 for the LEN column and thr=0 for LIT/OFF
+    // (FUN_080aa070 sets the descriptor field; see 0x80aa167 `mov [..+0x20],1`).
+    auto decode_col = [&](std::uint32_t out_n, std::uint32_t thr) -> std::vector<std::uint8_t> {
         std::uint8_t b0 = (r.cur < r.end) ? *r.cur++ : 0;
         std::uint32_t sf = b0 >> 1;             // size-field (RLE bits length)
         const std::uint8_t* rle = nullptr; std::uint32_t rlen = 0, acount;
@@ -414,14 +436,14 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
         r.cur += c;
         if (sf) {
             std::vector<std::uint8_t> o(out_n + 256, 0);
-            std::uint32_t m = NzCdRleExpand(ar.data(), acount, o.data(), out_n + 256, 0, rle, rlen);
+            std::uint32_t m = NzCdRleExpand(ar.data(), acount, o.data(), out_n + 256, thr, rle, rlen);
             o.resize(m); return o;
         }
         ar.resize(acount); return ar;
     };
-    std::vector<std::uint8_t> lit = decode_col(N + 1); (void)CdReadVar(r, out_size);
-    std::vector<std::uint8_t> len = decode_col(N);     (void)CdReadVar(r, out_size);
-    std::vector<std::uint8_t> off = decode_col(N);
+    std::vector<std::uint8_t> lit = decode_col(N + 1, 0u); (void)CdReadVar(r, out_size);
+    std::vector<std::uint8_t> len = decode_col(N, 1u);     (void)CdReadVar(r, out_size);
+    std::vector<std::uint8_t> off = decode_col(N, 0u);
     std::uint32_t bs_size = CdReadVar(r, out_size * 4u);
     const std::uint8_t* bs = r.cur; r.cur += bs_size;
 
@@ -431,27 +453,72 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
     std::vector<std::uint32_t> toks(static_cast<std::size_t>(N) * 3);
     NzCdTokenAssemble(N, lit.data(), off.data(), len.data(), bs, bs_size, fl, fo, fn, toks.data());
 
-    std::uint32_t litsum = 0;
-    for (std::uint32_t i = 0; i < N; ++i) litsum += toks[i * 3];
-    std::vector<std::uint8_t> literals(litsum + 64, 0);
+    // Total literals consumed by recon = out_size - (sum of match lengths): per-token
+    // lit_run plus the trailing flush. (Match length doesn't depend on the rep[] MTF,
+    // only on sel/raw, so it can be summed here without replaying offsets.)
+    std::uint32_t litsum = 0, summlen = 0;
+    for (std::uint32_t i = 0; i < N; ++i) {
+        litsum += toks[i * 3];
+        std::uint32_t sel = toks[i * 3 + 1], raw = toks[i * 3 + 2];
+        if (sel >= 4u) { std::uint32_t off = sel - 3u; summlen += raw + 4u + (off > 0x63ffu) + (off > 0x4ffu); }
+        else summlen += raw + 2u;
+    }
+    std::uint32_t total_lit = litsum;
+    if (out_size > summlen && out_size - summlen > litsum) total_lit = out_size - summlen;
+    std::vector<std::uint8_t> literals(total_lit + 64, 0);
     std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
-                                                  literals.data(), litsum, 12u);
-    r.cur += lc;  // advance past the literal arith stream (next chunk follows)
+                                                  literals.data(), total_lit, 12u);
+    r.cur += lc;  // advance past the literal arith stream
 
-    std::uint32_t n = NzCdReconstruct(toks.data(), N, literals.data(), out, out_size);
+    // Block-RLE post-filter (chunk flag &2): after the literal stream comes a
+    // bounded-varint length (limit 0x1001) + that many bytes of run-length bits.
+    // The recon window's collapsed zero-runs are re-expanded by NzCdRleExpand with
+    // thr=1 (dispatcher LAB_08099a90: FUN_080c10a0(...,1) then FUN_080ac9e0).
+    const std::uint8_t* brle_bits = nullptr; std::uint32_t brle_len = 0;
+    if (flags & 2u) {
+        brle_len = CdReadVar(r, 0x1001u);
+        brle_bits = r.cur; r.cur += brle_len;
+    }
+
+    // Reconstruct into the contiguous recon buffer (window spans prior chunks).
+    NzCdReconstruct(toks.data(), N, literals.data(), recon + recon_off, out_size);
+    *recon_advance = out_size;
     *block_pos = static_cast<std::size_t>(r.cur - block);
+
+    if (flags & 2u)
+        return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
+    std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
+    std::memcpy(out, recon + recon_off, n);
     return n;
+}
+}  // namespace
+
+std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
+                                std::size_t* block_pos,
+                                std::uint8_t* out, std::uint32_t out_cap) {
+    // Standalone single chunk: no preceding window context (recon_off = 0).
+    std::vector<std::uint8_t> recon(out_cap + 64, 0);
+    std::uint32_t adv = 0;
+    return DecodeChunk(block, block_len, block_pos,
+                       recon.data(), 0u, static_cast<std::uint32_t>(recon.size()),
+                       out, out_cap, &adv);
 }
 
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap) {
+    // One contiguous recon buffer for the whole block so the LZ window spans chunks.
+    std::vector<std::uint8_t> recon(out_cap + 64, 0);
     std::size_t pos = 0;
-    std::uint32_t written = 0;
+    std::uint32_t written = 0, recon_off = 0;
     while (pos < block_len && written < out_cap) {
         std::size_t prev = pos;
-        std::uint32_t n = NzCdDecodeLzChunk(block, block_len, &pos, out + written, out_cap - written);
+        std::uint32_t adv = 0;
+        std::uint32_t n = DecodeChunk(block, block_len, &pos,
+                                      recon.data(), recon_off, static_cast<std::uint32_t>(recon.size()),
+                                      out + written, out_cap - written, &adv);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
+        recon_off += adv;
     }
     return written;
 }

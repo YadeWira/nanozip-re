@@ -847,6 +847,19 @@ void TestCdDecodeBlockBinary() {
            "CD full file decode matches original (image.cat binary, 41304 B, 2 chunks)");
 }
 
+// 3rd full-file decode exercising the block-RLE post-filter (chunk flag &2) +
+// trailing literal flush + cross-chunk recon window (elf.bin, flags=3). Each chunk's
+// collapsed LZ window is re-expanded (NzCdRleExpand, thr=1) into the output.
+void TestCdDecodeBlockBlockRle() {
+    std::vector<std::uint8_t> out(kCdElfFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdElfBlock, kCdElfBlockLen, out.data(),
+                                               kCdElfFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdElfFileLen && h == kCdElfFileFnv,
+           "CD full file decode matches original (elf.bin block-RLE &2, 94744 B, 3 chunks)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -873,6 +886,7 @@ int main() {
     TestCdDecodeLzChunk();
     TestCdDecodeBlock();
     TestCdDecodeBlockBinary();
+    TestCdDecodeBlockBlockRle();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
