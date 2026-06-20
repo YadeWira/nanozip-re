@@ -660,7 +660,10 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         out_size = v2 + size; pure_literal = (v2 == 0u);
     }
     if (out_size == 0) return 0;     // out_size <= 0x8001 always fits the 64 KB ring
-    std::uint32_t base = ring_pos & ring_mask;       // this chunk's ring write/match base
+    // The ring write base RESETS to 0 when this chunk would not fit before the ring
+    // end (verified vs the binary's obj+0x980: f18 chunk2 53707+26661 > 65536 -> base
+    // 0; all chunks that fit keep advancing). Cross-chunk matches still wrap (& mask).
+    std::uint32_t base = (ring_pos + out_size > ring_mask + 1u) ? 0u : (ring_pos & ring_mask);
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
@@ -762,16 +765,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     *block_pos = static_cast<std::size_t>(r.cur - block);
 
-    // Post-filter the compact recon slice into `out`, and advance the ring base: by
-    // the chunk OUTPUT size for text (&8), else by the compact recon size. Per-flag
-    // advance verified vs the binary (elf &2: 0,21597,30634 compact; atoll &8:
-    // 0,32768,0 output). The window holds COMPACT recon for every chunk type.
-    if (flags & 8u) {   // text pipeline: param14 / line-RLE / CRLF (NzCdTextPipeline)
+    // Post-filter the compact recon slice into `out`. The ring base advances by the
+    // COMPACT recon size (out_size) for EVERY chunk type — text/&2/exe expand only the
+    // file OUTPUT, not the LZ window (verified vs the binary's obj+0x980: f18 chunk1
+    // &8 advances 20939=recon, not 32768=output). `*recon_advance` is the NEW absolute
+    // ring position (base + out_size, where base may have reset to 0 above).
+    *recon_advance = base + out_size;
+    if (flags & 8u) {   // text pipeline: param14 / line-RLE / CRLF / word-dict
         std::uint32_t n = NzCdTextPipeline(slice.data(), out_size, out, out_cap, text_param);
-        *recon_advance = n;
         return n;
     }
-    *recon_advance = out_size;
     if (flags & 2u)     // block-RLE: re-expand collapsed zero-runs
         return NzCdRleExpand(slice.data(), out_size, out, out_cap, 1u, brle_bits, brle_len);
     std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
@@ -801,8 +804,9 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap) {
     // 64 KB ring window shared across chunks: each chunk writes its compact recon at
     // the current ring base (wrapping) and matches reach prior chunks through the
-    // wrap. The base advances per chunk by `adv` (OUTPUT size for text &8 chunks,
-    // compact recon size otherwise) — see DecodeChunk. `out` is the linear output.
+    // wrap. Per chunk the base advances by the COMPACT recon size and resets to 0 when
+    // a chunk would not fit before the ring end; DecodeChunk returns the NEW absolute
+    // ring position in `adv` (already incl. that reset). `out` is the linear output.
     std::vector<std::uint8_t> ring(kCdRingSize, 0);
     std::size_t pos = 0;
     std::uint32_t written = 0, ring_pos = 0;
@@ -814,7 +818,7 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                                       out + written, out_cap - written, written, &adv);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
-        ring_pos = (ring_pos + adv) & kCdRingMask;
+        ring_pos = adv;                     // adv is the new absolute ring position
     }
     return written;
 }

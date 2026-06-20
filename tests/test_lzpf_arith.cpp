@@ -937,6 +937,19 @@ void TestCdDecodeBlockDict() {
            "CD full file decode matches original (&8 word-dictionary, 24000 B, param 0x88)");
 }
 
+// Multi-chunk text: a token-LZ chunk AFTER an &8 text chunk cross-references the
+// text chunk's COMPACT recon. Guards the ring RECON-advance + reset-when-full model
+// (the cross-chunk window fix) — decodes text_50k byte-exact (was bridging).
+void TestCdDecodeBlockMultiText() {
+    std::vector<std::uint8_t> out(kCdMtextFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdMtextBlock, kCdMtextBlockLen, out.data(),
+                                               kCdMtextFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdMtextFileLen && h == kCdMtextFileFnv,
+           "CD full file decode matches original (multi-chunk text, 45600 B, ring recon-advance+reset)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -970,6 +983,7 @@ int main() {
     TestCdTextPipeline();
     TestCdDecodeBlockTextPipeline();
     TestCdDecodeBlockDict();
+    TestCdDecodeBlockMultiText();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
