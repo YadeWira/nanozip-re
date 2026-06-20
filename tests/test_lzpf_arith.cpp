@@ -860,6 +860,30 @@ void TestCdDecodeBlockBlockRle() {
            "CD full file decode matches original (elf.bin block-RLE &2, 94744 B, 3 chunks)");
 }
 
+// flag &1-clear raw-store path: a column with b0 even (raw bytes) AND a raw
+// (non-arith) literal stream — incompressible data (f21, a PNG; flags=0).
+void TestCdDecodeBlockRawStore() {
+    std::vector<std::uint8_t> out(kCdRawFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdRawBlock, kCdRawBlockLen, out.data(),
+                                               kCdRawFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdRawFileLen && h == kCdRawFileFnv,
+           "CD raw-store chunk decode matches original (flags=0 raw col+literals, 8262 B)");
+}
+
+// pure-literal chunk: incompressible data => no LZ tokens, the window is one arith
+// literal stream of out_size bytes (generator decides via v2==0 / size_field==0).
+void TestCdDecodeBlockPureLiteral() {
+    std::vector<std::uint8_t> out(kCdPlitFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdPlitBlock, kCdPlitBlockLen, out.data(),
+                                               kCdPlitFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdPlitFileLen && h == kCdPlitFileFnv,
+           "CD pure-literal chunk decode matches original (no tokens, 5000 B)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -887,6 +911,8 @@ int main() {
     TestCdDecodeBlock();
     TestCdDecodeBlockBinary();
     TestCdDecodeBlockBlockRle();
+    TestCdDecodeBlockRawStore();
+    TestCdDecodeBlockPureLiteral();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

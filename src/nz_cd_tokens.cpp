@@ -413,11 +413,52 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     CdRd r{block + *block_pos, block + block_len};
     std::uint32_t chunk = CdReadVar(r, 0x80010u);
     std::uint32_t flags = chunk & 0xfu;         // &1=LZ, &2=block-RLE, &4=exe, &8=param14
+    // out_size: size_field==0 is a full 32768 chunk encoded WITHOUT a v2 delta
+    // (generator FUN_08098cf0 @0x8098d33: `test edx,edx; je` -> `[..+0x2c]=0x8000`).
+    // Otherwise out_size = (size_field-1) + v2, v2 a bounded varint (limit 0x8001-base).
+    // A chunk is "pure-literal" (no LZ tokens — the whole window is one literal
+    // stream) iff size_field==0 (full 32768) or v2==0. Generator FUN_08098cf0 decides
+    // at 0x8098f6b (`cmp out_size,(size_field-1); jbe` -> literal) and the size_field==0
+    // branch at 0x8098d8b. Otherwise it is the token-LZ form (cols + tokens + recon).
     std::uint32_t size = chunk >> 4;
-    if (size) size -= 1; else size = 0x8000u;
-    std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
-    std::uint32_t out_size = v2 + size;
+    std::uint32_t out_size;
+    bool pure_literal;
+    if (size == 0) {
+        out_size = 0x8000u; pure_literal = true;
+    } else {
+        size -= 1;
+        std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
+        out_size = v2 + size; pure_literal = (v2 == 0u);
+    }
     if (out_size == 0 || recon_off + out_size > recon_cap) return 0;
+
+    // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
+    auto decode_literals = [&](std::uint8_t* dst, std::uint32_t n) {
+        if (flags & 1u) {
+            std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
+                                                          dst, n, 12u);
+            r.cur += lc;
+        } else {
+            std::uint32_t take = (static_cast<std::size_t>(r.end - r.cur) >= n)
+                                 ? n : static_cast<std::uint32_t>(r.end - r.cur);
+            std::memcpy(dst, r.cur, take); r.cur += take;
+        }
+    };
+
+    if (pure_literal) {
+        // The window IS the literal stream (out_size bytes); no cols/tokens/recon.
+        decode_literals(recon + recon_off, out_size);
+        const std::uint8_t* brle_bits = nullptr; std::uint32_t brle_len = 0;
+        if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
+        *recon_advance = out_size;
+        *block_pos = static_cast<std::size_t>(r.cur - block);
+        if (flags & 2u)
+            return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
+        std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
+        std::memcpy(out, recon + recon_off, n);
+        return n;
+    }
+
     std::uint32_t N = CdReadVar(r, out_size - 1);
     (void)CdReadVar(r, out_size);               // v6 (unused)
 
@@ -426,6 +467,17 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // (FUN_080aa070 sets the descriptor field; see 0x80aa167 `mov [..+0x20],1`).
     auto decode_col = [&](std::uint32_t out_n, std::uint32_t thr) -> std::vector<std::uint8_t> {
         std::uint8_t b0 = (r.cur < r.end) ? *r.cur++ : 0;
+        // b0 bit0 selects the column codec: 1 = arith-coded (the normal case; an
+        // arith column with no RLE has b0==1), 0 = raw-store (FUN_080b1c30 path,
+        // taken at 0x80a9e18 when `[esp+0x40]&1`==0) — used for incompressible
+        // columns. Raw = out_n verbatim bytes.
+        if ((b0 & 1u) == 0u) {
+            std::vector<std::uint8_t> raw(out_n + 64, 0);
+            std::uint32_t take = (static_cast<std::size_t>(r.end - r.cur) >= out_n)
+                                 ? out_n : static_cast<std::uint32_t>(r.end - r.cur);
+            std::memcpy(raw.data(), r.cur, take); r.cur += take;
+            raw.resize(out_n); return raw;
+        }
         std::uint32_t sf = b0 >> 1;             // size-field (RLE bits length)
         const std::uint8_t* rle = nullptr; std::uint32_t rlen = 0, acount;
         if (sf) { rle = r.cur; rlen = sf; r.cur += sf; acount = CdReadVar(r, out_size); }
@@ -466,9 +518,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     std::uint32_t total_lit = litsum;
     if (out_size > summlen && out_size - summlen > litsum) total_lit = out_size - summlen;
     std::vector<std::uint8_t> literals(total_lit + 64, 0);
-    std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
-                                                  literals.data(), total_lit, 12u);
-    r.cur += lc;  // advance past the literal arith stream
+    decode_literals(literals.data(), total_lit);
 
     // Block-RLE post-filter (chunk flag &2): after the literal stream comes a
     // bounded-varint length (limit 0x1001) + that many bytes of run-length bits.
@@ -485,7 +535,11 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     *recon_advance = out_size;
     *block_pos = static_cast<std::size_t>(r.cur - block);
 
-    if (flags & 2u)
+    // Post-recon filters (dispatcher order &8 -> &2). The cross-chunk window stays in
+    // the recon domain (recon_advance = out_size); the filter output goes to `out`.
+    if (flags & 8u)   // param14: word-boundary space re-insertion (expands)
+        return NzCdParam14(recon + recon_off, out_size, out, out_cap);
+    if (flags & 2u)   // block-RLE: re-expand collapsed zero-runs
         return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
     std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
     std::memcpy(out, recon + recon_off, n);
