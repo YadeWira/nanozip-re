@@ -92,5 +92,15 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
                                 std::size_t* block_pos,
                                 std::uint8_t* out, std::uint32_t out_cap);
 
+// Decode a whole `-cd` LZ block (loop NzCdDecodeLzChunk over its 32 KB chunks)
+// into `out`. Returns total bytes produced. Suitable for `-cd` blocks whose chunks
+// are the pure-LZ form (no per-chunk CM/BWT/param14/tt08 post-filter); those are
+// handled by the dispatcher around this. Validated byte-exact on the full
+// map.txt.nz file (69689 bytes, 3 chunks). The recon sliding window spans chunks
+// (matches reference into prior chunk output), so `out` must be the contiguous
+// full-file buffer.
+std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
+                              std::uint8_t* out, std::uint32_t out_cap);
+
 }  // namespace cd
 }  // namespace nzr

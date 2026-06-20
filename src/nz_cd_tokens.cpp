@@ -434,12 +434,26 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
     std::uint32_t litsum = 0;
     for (std::uint32_t i = 0; i < N; ++i) litsum += toks[i * 3];
     std::vector<std::uint8_t> literals(litsum + 64, 0);
-    nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
-                                 literals.data(), litsum, 12u);
+    std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
+                                                  literals.data(), litsum, 12u);
+    r.cur += lc;  // advance past the literal arith stream (next chunk follows)
 
     std::uint32_t n = NzCdReconstruct(toks.data(), N, literals.data(), out, out_size);
     *block_pos = static_cast<std::size_t>(r.cur - block);
     return n;
+}
+
+std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
+                              std::uint8_t* out, std::uint32_t out_cap) {
+    std::size_t pos = 0;
+    std::uint32_t written = 0;
+    while (pos < block_len && written < out_cap) {
+        std::uint32_t n = NzCdDecodeLzChunk(block, block_len, &pos, out + written, out_cap - written);
+        if (n == 0) break;
+        written += n;
+        if (n < 0x8000u) break;   // final chunk is short (< 32 KB)
+    }
+    return written;
 }
 
 }  // namespace cd

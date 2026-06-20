@@ -823,6 +823,30 @@ void TestCdDecodeLzChunk() {
            "CD integrated LZ chunk decode matches binary (real block, 32KB window)");
 }
 
+// Full -cd file decode (NzCdDecodeBlock multi-chunk loop) from a real block ->
+// the complete original file. map.txt.nz = 3 chunks, 69689 bytes, no post-filters.
+void TestCdDecodeBlock() {
+    std::vector<std::uint8_t> out(kCdFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdBlock, kCdBlockLen, out.data(),
+                                               kCdFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdFileLen && h == kCdFileFnv,
+           "CD full file decode matches original (map.txt, 69689 B, 3 chunks)");
+}
+
+// 2nd full-file decode on binary content (image.cat) — confirms NzCdDecodeBlock is
+// not text-specific; pure-LZ -cd across content types.
+void TestCdDecodeBlockBinary() {
+    std::vector<std::uint8_t> out(kCdImgFileLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdDecodeBlock(kCdImgBlock, kCdImgBlockLen, out.data(),
+                                               kCdImgFileLen + 65536);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdImgFileLen && h == kCdImgFileFnv,
+           "CD full file decode matches original (image.cat binary, 41304 B, 2 chunks)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -847,6 +871,8 @@ int main() {
     TestCdParam14();
     TestCdRleExpand();
     TestCdDecodeLzChunk();
+    TestCdDecodeBlock();
+    TestCdDecodeBlockBinary();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
