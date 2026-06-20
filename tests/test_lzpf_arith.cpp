@@ -884,6 +884,18 @@ void TestCdDecodeBlockPureLiteral() {
            "CD pure-literal chunk decode matches original (no tokens, 5000 B)");
 }
 
+// Exe post-filter (chunk flag &4): BCJ-style x86 E8/E9 address un-transform. Replays
+// the first 3686 B of play.exe's exe chunk (6 transforms) and checks byte-exact vs the
+// binary's own filter output (NzCdExeUnfilter operates in place).
+void TestCdExeUnfilter() {
+    std::vector<std::uint8_t> buf(kCdExeIn, kCdExeIn + kCdExeLen);
+    nzr::cd::NzCdExeUnfilter(buf.data(), kCdExeLen, kCdExePosBase);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < kCdExeLen; ++i) { h ^= buf[i]; h *= 16777619u; }
+    Expect(h == kCdExeOutFnv,
+           "CD exe filter (&4) matches binary (x86 E8/E9 un-transform, 6 sites)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -913,6 +925,7 @@ int main() {
     TestCdDecodeBlockBlockRle();
     TestCdDecodeBlockRawStore();
     TestCdDecodeBlockPureLiteral();
+    TestCdExeUnfilter();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

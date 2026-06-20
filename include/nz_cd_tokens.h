@@ -80,6 +80,14 @@ std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
                             std::uint8_t* dst, std::uint32_t dst_cap, std::uint32_t thr,
                             const std::uint8_t* rle_bits, std::size_t rle_bits_len);
 
+// Exe post-filter (chunk flag &4, FUN_080c0540). A BCJ-style x86 E8/E9 call/jmp
+// address un-transform applied in place to a decoded window: each E8/E9 whose
+// following 4-byte little-endian address has a high byte of 0x00/0xFF is converted
+// back to absolute by subtracting the position (`(addr_offset + pos_base) & 0xffffff`)
+// and sign-extending bit 24. After every E8/E9 the 4 address bytes are skipped.
+// `pos_base` = 4 + the chunk's output offset. Validated byte-exact vs the binary.
+void NzCdExeUnfilter(std::uint8_t* buf, std::uint32_t size, std::uint32_t pos_base);
+
 // Decode ONE `-cd` LZ chunk from a raw block: parses the chunk header (bounded
 // varints, FUN_080b1dc0), decodes the 3 token columns (arith + RLE), the token
 // bitstream and literal stream, assembles tokens and reconstructs the chunk's LZ

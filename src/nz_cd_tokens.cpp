@@ -396,7 +396,37 @@ static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
         if (limit < 0x101u) return (static_cast<std::uint32_t>(b) << sh) | acc;
     }
 }
+// Exe filter (chunk flag &4, FUN_080c0540): a BCJ-style x86 E8/E9 call/jmp address
+// un-transform. Scans for E8/E9 opcodes; when the 4-byte little-endian address that
+// follows has a high byte of 0x00 or 0xFF (a near address), it converts the stored
+// value back to absolute by subtracting the current position (& 0xffffff) and
+// sign-extends bit 24 into the high byte. After every E8/E9 the 4 address bytes are
+// skipped (even when not transformed). `pos_base` = 4 + the chunk's output offset
+// (the dispatcher's running *param_1, seeded at 4). Operates in place on `buf`.
 }  // namespace
+void NzCdExeUnfilter(std::uint8_t* buf, std::uint32_t size, std::uint32_t pos_base) {
+    if (size <= 9) return;
+    long end = static_cast<long>(size) - 6;
+    long i = 0;
+    while (i < end) {
+        if (buf[i] != 0xE8u && buf[i] != 0xE9u) { ++i; continue; }
+        long ap = i + 1;                              // address bytes at ap..ap+3
+        std::uint8_t hi = buf[ap + 3];
+        if (hi == 0x00u || hi == 0xFFu) {
+            std::uint32_t addr = static_cast<std::uint32_t>(buf[ap]) |
+                                 (static_cast<std::uint32_t>(buf[ap + 1]) << 8) |
+                                 (static_cast<std::uint32_t>(buf[ap + 2]) << 16) |
+                                 (static_cast<std::uint32_t>(buf[ap + 3]) << 24);
+            std::uint32_t p = (static_cast<std::uint32_t>(ap) + pos_base) & 0xffffffu;
+            addr -= p;
+            buf[ap]     = addr & 0xffu;
+            buf[ap + 1] = (addr >> 8) & 0xffu;
+            buf[ap + 2] = (addr >> 16) & 0xffu;
+            buf[ap + 3] = (addr & 0x01000000u) ? 0xffu : 0x00u;
+        }
+        i = ap + 4;
+    }
+}
 
 namespace {
 // Decode one chunk. The LZ output is reconstructed into `recon + recon_off` so its
@@ -407,7 +437,7 @@ namespace {
 // receives the recon (collapsed) size so the caller can advance `recon_off`.
 std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std::size_t* block_pos,
                           std::uint8_t* recon, std::uint32_t recon_off, std::uint32_t recon_cap,
-                          std::uint8_t* out, std::uint32_t out_cap,
+                          std::uint8_t* out, std::uint32_t out_cap, std::uint32_t out_pos,
                           std::uint32_t* recon_advance) {
     *recon_advance = 0;
     CdRd r{block + *block_pos, block + block_len};
@@ -452,10 +482,14 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
         *recon_advance = out_size;
         *block_pos = static_cast<std::size_t>(r.cur - block);
+        if (flags & 8u)
+            return NzCdParam14(recon + recon_off, out_size, out, out_cap);
         if (flags & 2u)
             return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
         std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
         std::memcpy(out, recon + recon_off, n);
+        if (flags & 4u)
+            NzCdExeUnfilter(out, n, out_pos + 4u);
         return n;
     }
 
@@ -543,6 +577,8 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
     std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
     std::memcpy(out, recon + recon_off, n);
+    if (flags & 4u)   // exe: x86 E8/E9 address un-transform (in place on the output)
+        NzCdExeUnfilter(out, n, out_pos + 4u);
     return n;
 }
 }  // namespace
@@ -555,7 +591,7 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
     std::uint32_t adv = 0;
     return DecodeChunk(block, block_len, block_pos,
                        recon.data(), 0u, static_cast<std::uint32_t>(recon.size()),
-                       out, out_cap, &adv);
+                       out, out_cap, 0u, &adv);
 }
 
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
@@ -569,7 +605,7 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
         std::uint32_t adv = 0;
         std::uint32_t n = DecodeChunk(block, block_len, &pos,
                                       recon.data(), recon_off, static_cast<std::uint32_t>(recon.size()),
-                                      out + written, out_cap - written, &adv);
+                                      out + written, out_cap - written, written, &adv);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
         recon_off += adv;
