@@ -561,28 +561,32 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
 }
 
 namespace {
-// --- 64 KB cross-chunk ring window (FUN_08099050, obj+0x978) -----------------
-// The decoder keeps the LZ window in a fixed 64 KB ring (size 0x10000, mask
-// 0xffff), NOT a contiguous buffer. Each chunk's COMPACT recon is written at the
-// chunk's ring base (`base`) wrapping mod 65536; matches read the ring with the
-// same wrap (the unsigned `base+pos-offset` underflow & 0xffff gives the index —
-// e.g. base=0,pos=2,offset=15480 -> 50058, verified byte-exact vs the binary).
-// The chunk base advances by the chunk's OUTPUT size for text (&8) chunks and by
-// the COMPACT recon size otherwise (block-RLE &2 advances by compact: elf ring
-// progression 0,21597,30634; text &8 advances by output: atoll 0,32768,0).
-inline void RingWrite(std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
-                      const std::uint8_t* src, std::uint32_t n) {
-    for (std::uint32_t i = 0; i < n; ++i) ring[(base + i) & mask] = src[i];
+// --- cross-chunk LZ ring window (FUN_08099050, obj+0x978) --------------------
+// The LZ window is a ring whose size is PER-ARCHIVE: ring_size = (method_p1+1)*0x10000
+// (64 KB, 128 KB, 192 KB, ...; the same dictionary-size rule as lzpf, sfx_archive.cpp
+// uses for -cf). It is a multiple of 0x10000 but NOT necessarily a power of two
+// (192 KB = 3*64 KB), so indices wrap by MODULAR add/subtract, not a bitmask.
+// Each chunk's COMPACT recon is written at the chunk base; the base advances by the
+// COMPACT out_size and resets to 0 when a chunk would not fit before the ring end
+// (GDB-verified vs the binary across f18/text50/elf/map/source: ringsz 65536 -> f18
+// chunk2 resets; ringsz 196608 -> sfx chunks advance 0,32768,...,163840 then chunk6
+// resets). Matches read ring[(base+pos-offset) mod ring_size].
+inline std::uint32_t RingReduce(std::uint32_t idx, std::uint32_t ring_size) {
+    return idx >= ring_size ? idx - ring_size : idx;   // idx < 2*ring_size by construction
 }
-inline void RingRead(const std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
+inline void RingWrite(std::uint8_t* ring, std::uint32_t ring_size, std::uint32_t base,
+                      const std::uint8_t* src, std::uint32_t n) {
+    for (std::uint32_t i = 0; i < n; ++i) ring[RingReduce(base + i, ring_size)] = src[i];
+}
+inline void RingRead(const std::uint8_t* ring, std::uint32_t ring_size, std::uint32_t base,
                      std::uint8_t* dst, std::uint32_t n) {
-    for (std::uint32_t i = 0; i < n; ++i) dst[i] = ring[(base + i) & mask];
+    for (std::uint32_t i = 0; i < n; ++i) dst[i] = ring[RingReduce(base + i, ring_size)];
 }
 
 // Ring-aware variant of NzCdReconstruct: identical token semantics, but reads and
-// writes the 64 KB ring at `base` (wrapping) so matches resolve into prior chunks'
-// compact recon. Writes the chunk's out_size compact bytes into the ring.
-std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t mask, std::uint32_t base,
+// writes the ring (size ring_size) at `base` (modular wrap) so matches resolve into
+// prior chunks' compact recon. Writes the chunk's out_size compact bytes into the ring.
+std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::uint32_t base,
                               const std::uint32_t* tokens, std::uint32_t num_tokens,
                               const std::uint8_t* literals, std::uint32_t out_size) {
     std::uint32_t rep[4] = {1, 1, 1, 1};
@@ -609,19 +613,22 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t mask, std::uint3
         if (lit_run) {
             std::uint32_t run = lit_run;
             if (pos + run > out_size) run = out_size - pos;
-            for (std::uint32_t i = 0; i < run; ++i) ring[(base + pos + i) & mask] = lp[i];
+            for (std::uint32_t i = 0; i < run; ++i) ring[RingReduce(base + pos + i, ring_size)] = lp[i];
             lp += tokens[t * 3 + 0];            // advance by the full (unclamped) run
             pos += run;
             if (pos >= out_size) break;
         }
         if (pos + mlen > out_size) mlen = out_size - pos;
-        for (std::uint32_t i = 0; i < mlen; ++i)   // overlap-safe, ring-wrapped
-            ring[(base + pos + i) & mask] = ring[(base + pos + i - offset) & mask];
+        for (std::uint32_t i = 0; i < mlen; ++i) {   // overlap-safe, modular-ring-wrapped
+            std::uint32_t wi = RingReduce(base + pos + i, ring_size);
+            std::uint32_t ri = (offset <= wi) ? (wi - offset) : (wi + ring_size - offset);
+            ring[wi] = ring[ri];
+        }
         pos += mlen;
     }
     if (pos < out_size) {                       // trailing literal flush
         for (std::uint32_t i = 0, e = out_size - pos; i < e; ++i)
-            ring[(base + pos + i) & mask] = lp[i];
+            ring[RingReduce(base + pos + i, ring_size)] = lp[i];
         pos = out_size;
     }
     return pos;
@@ -635,7 +642,7 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t mask, std::uint3
 // pipeline, exe &4 un-transform, or a straight copy). `*recon_advance` receives the
 // amount to advance the ring base by: the chunk OUTPUT size for &8, else compact.
 std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std::size_t* block_pos,
-                          std::uint8_t* ring, std::uint32_t ring_pos, std::uint32_t ring_mask,
+                          std::uint8_t* ring, std::uint32_t ring_pos, std::uint32_t ring_size,
                           std::uint8_t* out, std::uint32_t out_cap, std::uint32_t out_pos,
                           std::uint32_t* recon_advance) {
     *recon_advance = 0;
@@ -663,7 +670,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // The ring write base RESETS to 0 when this chunk would not fit before the ring
     // end (verified vs the binary's obj+0x980: f18 chunk2 53707+26661 > 65536 -> base
     // 0; all chunks that fit keep advancing). Cross-chunk matches still wrap (& mask).
-    std::uint32_t base = (ring_pos + out_size > ring_mask + 1u) ? 0u : (ring_pos & ring_mask);
+    std::uint32_t base = (ring_pos + out_size > ring_size) ? 0u : ring_pos;
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
@@ -688,7 +695,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         decode_literals(slice.data(), out_size);
         if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
         if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
-        RingWrite(ring, ring_mask, base, slice.data(), out_size);  // window keeps the compact recon
+        RingWrite(ring, ring_size, base, slice.data(), out_size);  // window keeps the compact recon
     } else {
 
     std::uint32_t N = CdReadVar(r, out_size - 1);
@@ -759,8 +766,8 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     // Reconstruct into the 64 KB ring at this chunk's base (matches reach prior
     // chunks via the wrap), then linearise the chunk's compact recon into `slice`.
-    ReconstructRing(ring, ring_mask, base, toks.data(), N, literals.data(), out_size);
-    RingRead(ring, ring_mask, base, slice.data(), out_size);
+    ReconstructRing(ring, ring_size, base, toks.data(), N, literals.data(), out_size);
+    RingRead(ring, ring_size, base, slice.data(), out_size);
     }
 
     *block_pos = static_cast<std::size_t>(r.cur - block);
@@ -785,42 +792,64 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 }
 }  // namespace
 
-// The cross-chunk LZ window is a fixed 64 KB ring (FUN_08099050, obj+0x978).
-static const std::uint32_t kCdRingSize = 0x10000u;
-static const std::uint32_t kCdRingMask = 0xffffu;
+// The cross-chunk LZ window is a ring whose size is PER-ARCHIVE (FUN_08099050,
+// obj+0x978): ring_size = (method_p1+1) * 0x10000 — 64 KB when p1=0, 128 KB when
+// p1=1, 192 KB when p1=2, ... (same rule as the lzpf dict size). 192 KB = 0x30000
+// is not a power of two, so the ring uses modular (not bitmask) wrap.
+static const std::uint32_t kCdRingSizeDefault = 0x10000u;
 
 std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
                                 std::size_t* block_pos,
-                                std::uint8_t* out, std::uint32_t out_cap) {
+                                std::uint8_t* out, std::uint32_t out_cap,
+                                std::uint32_t ring_size) {
     // Standalone single chunk: empty window (ring zero-filled, base 0).
-    std::vector<std::uint8_t> ring(kCdRingSize, 0);
+    if (ring_size == 0) ring_size = kCdRingSizeDefault;
+    std::vector<std::uint8_t> ring(ring_size, 0);
     std::uint32_t adv = 0;
     return DecodeChunk(block, block_len, block_pos,
-                       ring.data(), 0u, kCdRingMask,
+                       ring.data(), 0u, ring_size,
                        out, out_cap, 0u, &adv);
 }
 
-std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
-                              std::uint8_t* out, std::uint32_t out_cap) {
-    // 64 KB ring window shared across chunks: each chunk writes its compact recon at
-    // the current ring base (wrapping) and matches reach prior chunks through the
-    // wrap. Per chunk the base advances by the COMPACT recon size and resets to 0 when
-    // a chunk would not fit before the ring end; DecodeChunk returns the NEW absolute
-    // ring position in `adv` (already incl. that reset). `out` is the linear output.
-    std::vector<std::uint8_t> ring(kCdRingSize, 0);
+std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
+                               std::uint8_t* out, std::uint32_t out_cap,
+                               std::uint8_t* ring, std::uint32_t ring_size,
+                               std::uint32_t* ring_pos, std::uint32_t out_pos_base) {
+    // Decode one -cd stream into `out` using a CALLER-OWNED ring that PERSISTS across
+    // streams (the binary keeps ONE window object for the whole archive; large files
+    // split output into 1 MB streams that match into each other through this ring).
+    // Each chunk writes its compact recon at the current ring base (wrapping) and
+    // matches reach prior chunks/streams through the wrap; the base advances by the
+    // COMPACT recon size and resets to 0 when a chunk would not fit before the ring
+    // end. `*ring_pos` is the absolute ring position (in/out). `out_pos_base` is this
+    // stream's file-absolute output offset (the &4 exe filter needs the file offset).
+    if (ring == nullptr || ring_size == 0 || ring_pos == nullptr) return 0;
     std::size_t pos = 0;
-    std::uint32_t written = 0, ring_pos = 0;
+    std::uint32_t written = 0;
     while (pos < block_len && written < out_cap) {
         std::size_t prev = pos;
         std::uint32_t adv = 0;
         std::uint32_t n = DecodeChunk(block, block_len, &pos,
-                                      ring.data(), ring_pos, kCdRingMask,
-                                      out + written, out_cap - written, written, &adv);
+                                      ring, *ring_pos, ring_size,
+                                      out + written, out_cap - written,
+                                      out_pos_base + written, &adv);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
-        ring_pos = adv;                     // adv is the new absolute ring position
+        *ring_pos = adv;                    // adv is the new absolute ring position
     }
     return written;
+}
+
+std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
+                              std::uint8_t* out, std::uint32_t out_cap,
+                              std::uint32_t ring_size) {
+    // Single-stream convenience (tests / standalone): a fresh ring, base 0, file
+    // offset 0. The dispatcher uses NzCdDecodeStream directly to persist the ring.
+    if (ring_size == 0) ring_size = kCdRingSizeDefault;
+    std::vector<std::uint8_t> ring(ring_size, 0);
+    std::uint32_t ring_pos = 0;
+    return NzCdDecodeStream(block, block_len, out, out_cap,
+                            ring.data(), ring_size, &ring_pos, 0u);
 }
 
 }  // namespace cd

@@ -3550,6 +3550,16 @@ static bool TryDecodeLegacyLzhd(
     std::size_t written = 0u;
     bool ok = true;
 
+    // The cross-stream LZ window is a single per-archive ring (the binary's window
+    // object persists across streams): ring_size = (method_p1+1)*0x10000 (the lzpf
+    // dict-size rule). Large files split output into 1 MB streams that reference each
+    // other through this shared ring, so it is allocated ONCE and `ring_pos` threads
+    // across stream iterations.
+    const std::uint32_t ring_size =
+        (static_cast<std::uint32_t>(legacy.legacy_method_p1) + 1u) * 0x10000u;
+    std::vector<std::uint8_t> ring(ring_size, 0u);
+    std::uint32_t ring_pos = 0u;
+
     // Each type-0 chunk is one stream: stream_tag varint followed by
     // stream_bytes bytes of raw DecLZ compressed data.
     while (pos < raw_len && written < total_out) {
@@ -3583,8 +3593,9 @@ static bool TryDecodeLegacyLzhd(
         // produce fewer bytes here; the size-mismatch check below rejects them so
         // they fall back to the bridge until those stages are wired.
         const std::uint32_t block_cap = static_cast<std::uint32_t>(total_out - written);
-        std::uint32_t produced = nzr::cd::NzCdDecodeBlock(
-            block_in, block_in_size, window_base + written, block_cap);
+        std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+            block_in, block_in_size, window_base + written, block_cap,
+            ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written));
         if (produced == 0u) { ok = false; break; }
         written += produced;
     }
@@ -3596,6 +3607,31 @@ static bool TryDecodeLegacyLzhd(
     if (written != total_out) {
         if (out_error_message) *out_error_message = "lzhd: output size mismatch";
         return false;
+    }
+    // Verify the decoded output against the archive's stored per-file checksum(s).
+    // The native -cd ring model is byte-exact for the common case but has a residual
+    // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
+    // mismatch here makes the caller fall through to the bridge so the user still
+    // gets byte-exact output (no silent corruption, no double-decode of correct
+    // files), and turns NZ_NO_BRIDGE native-only into a provable correctness signal.
+    // Skipped only when the archive carries no usable checksum.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        std::size_t cursor = 0;
+        for (const LegacyCnEntry& e : legacy.entries) {
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (cursor + n > total_out) break;
+            if (e.has_checksum) {
+                const std::uint32_t got =
+                    ComputeBufferChecksum(legacy.checksum_mode, window_base + cursor, n);
+                if (got != e.checksum) {
+                    if (out_error_message) *out_error_message = "lzhd: checksum mismatch";
+                    return false;
+                }
+            }
+            cursor += n;
+        }
     }
     out_data->assign(window_base, window_base + total_out);
     return true;

@@ -111,19 +111,34 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
 // against the binary on a real `-cd` block (map.txt.nz batch 0).
 std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len,
                                 std::size_t* block_pos,
-                                std::uint8_t* out, std::uint32_t out_cap);
+                                std::uint8_t* out, std::uint32_t out_cap,
+                                std::uint32_t ring_size = 0x10000u);
 
 // Decode a whole `-cd` LZ block (loop DecodeChunk over its 32 KB chunks) into `out`.
 // Returns total bytes produced. Handles pure-LZ, block-RLE (&2), exe (&4) and text-
 // pipeline (&8, line-RLE/CRLF) chunks; chunks using a not-yet-ported post-filter
 // (tt08/reorder/CM/BWT) make a chunk return 0 and the dispatcher bridges. The LZ
-// window is a 64 KB RING (FUN_08099050): each chunk's COMPACT recon is written at the
-// ring base (wrapping mod 65536) and matches resolve into prior chunks through the
-// wrap; the base advances by the chunk OUTPUT size for &8 and the compact size
-// otherwise. `out` is the linear full-file output (separate from the ring). Validated
-// byte-exact on map.txt (69689 B, 3 chunks, wraps), elf.bin (&2), and atoll/f18 (&8).
+// window is a per-archive RING (FUN_08099050): ring_size = (method_p1+1)*0x10000
+// (64 KB/128 KB/192 KB...). Each chunk's COMPACT recon is written at the ring base
+// (wrapping mod ring_size) and matches resolve into prior chunks through the wrap;
+// the base advances by the COMPACT recon size and resets to 0 when a chunk would not
+// fit before the ring end. `out` is the linear full-file output (separate from the
+// ring). Validated byte-exact on map.txt (3 chunks, 64 KB ring) and source.cpp
+// (7 chunks, 192 KB ring). ring_size defaults to 64 KB (p1=0).
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
-                              std::uint8_t* out, std::uint32_t out_cap);
+                              std::uint8_t* out, std::uint32_t out_cap,
+                              std::uint32_t ring_size = 0x10000u);
+
+// Decode one -cd stream into `out` using a CALLER-OWNED ring window that PERSISTS
+// across streams. Large files split their output into 1 MB streams whose LZ matches
+// reference prior streams through this shared ring, so the dispatcher allocates the
+// ring once (size = (method_p1+1)*0x10000) and threads `*ring_pos` across calls.
+// `out_pos_base` is this stream's file-absolute output offset (used by the &4 exe
+// filter). Returns bytes written. NzCdDecodeBlock is the single-stream wrapper.
+std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
+                               std::uint8_t* out, std::uint32_t out_cap,
+                               std::uint8_t* ring, std::uint32_t ring_size,
+                               std::uint32_t* ring_pos, std::uint32_t out_pos_base);
 
 }  // namespace cd
 }  // namespace nzr
