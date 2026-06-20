@@ -88,6 +88,18 @@ std::uint32_t NzCdRleExpand(const std::uint8_t* src, std::uint32_t count,
 // `pos_base` = 4 + the chunk's output offset. Validated byte-exact vs the binary.
 void NzCdExeUnfilter(std::uint8_t* buf, std::uint32_t size, std::uint32_t pos_base);
 
+// Text pipeline (chunk flag &8, FUN_080a3c90). A per-chunk param bitmask selects an
+// ordered sequence of text transforms applied with double-buffering. Supported bits:
+// 0x80 param14 (NzCdParam14), 0x20 line-RLE (FUN_080a2f20: newline-terminated runs +
+// >0xE0 repeat-previous-line back-refs), 0x1 EOL->CRLF (FUN_080a19b0). Each stage is
+// validated byte-exact vs the binary. Returns the transformed size, or 0 if `param`
+// uses a not-yet-ported bit. NOTE: ported but NOT yet wired into the extract dispatcher
+// — the cross-chunk LZ window domain for a chunk following a text chunk is unresolved
+// (see work/reports/decomp_lzhd/text_pipeline_ports.md), so multi-chunk text files
+// would corrupt; the &8 path bridges until that is solved.
+std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
+                               std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param);
+
 // Decode ONE `-cd` LZ chunk from a raw block: parses the chunk header (bounded
 // varints, FUN_080b1dc0), decodes the 3 token columns (arith + RLE), the token
 // bitstream and literal stream, assembles tokens and reconstructs the chunk's LZ

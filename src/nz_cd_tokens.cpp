@@ -429,6 +429,133 @@ void NzCdExeUnfilter(std::uint8_t* buf, std::uint32_t size, std::uint32_t pos_ba
 }
 
 namespace {
+// FUN_080a2f20 — line-level RLE / back-reference text expander (the bit-5 stage of
+// the &8 text pipeline). The first input byte is the line terminator ("match" byte,
+// usually '\n'); literal bytes are copied until that terminator, after which the next
+// byte selects: <0xE0 = start of a new line (set the back-ref base to here); ==0xE0 =
+// skip marker; >0xE0 = copy (byte-0xE0) bytes from the back-ref base (repeat the prior
+// line content). Byte-exact vs the binary. `prev` is a pointer into the OUTPUT.
+std::uint32_t NzCdLineRle(const std::uint8_t* src0, std::uint32_t size,
+                          std::uint8_t* dst, std::uint32_t cap) {
+    if (size <= 1) return 0;
+    std::uint8_t* dst_end = dst + cap;
+    const std::uint8_t* src = src0;
+    std::uint8_t match = *src++;
+    long counter = static_cast<long>(size) - 1;
+    std::uint8_t* out = dst;
+    std::uint8_t* prev = dst;
+    while (true) {
+        long remaining = static_cast<long>(dst_end - out);
+        long n = (counter < remaining) ? counter : remaining;
+        const std::uint8_t* s = src;
+        long c = n;
+        std::uint8_t dl = 0;
+        while (true) {
+            dl = *s++; *out++ = dl; c--;
+            if (c == 0) break;
+            if (dl != match) continue;
+            break;
+        }
+        counter -= (n - c);
+        src = s;
+        if (counter == 0) break;
+        if (c == 0) return 0;
+        std::uint8_t nb = *src;
+        if (nb > 0xe0u) {
+            std::uint32_t cnt = static_cast<std::uint32_t>(nb) - 0xe0u;
+            std::uint8_t* nout = out + cnt;
+            if (dst_end < nout) return 0;
+            for (std::uint32_t i = 0; i < cnt; ++i) out[i] = prev[i];
+            counter -= 1;
+            if (counter == 0) { out = nout; break; }
+            src += 1; prev = out; out = nout;
+        } else if (nb == 0xe0u) {
+            counter -= 1;
+            if (counter == 0) break;
+            src += 1; prev = out;
+        } else {
+            prev = out;
+        }
+    }
+    return static_cast<std::uint32_t>(out - dst);
+}
+
+// FUN_080a19b0 — EOL normalizer (the bit-0 stage): a small state machine that copies
+// text and rewrites line endings to CRLF (\r, \n, \r\n -> \r\n), with one-byte
+// lookahead. Byte-exact vs the binary.
+std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
+                       std::uint8_t* dst, std::uint32_t cap) {
+    if (cap == 0 || insz == 0) return 0;
+    const std::uint8_t* ebp = src;
+    std::uint8_t* ecx = dst;            // committed out
+    std::uint8_t* eax = dst;            // working out
+    long s14 = static_cast<long>(cap) + 1;
+    std::uint8_t s13 = 0, sb = 0;
+    long s1c = 0, s0 = insz;
+    const std::uint8_t* s4 = nullptr;
+    while (true) {
+        long esi = (s0 < s14) ? s0 : s14;
+        eax = ecx;
+        long edi = esi;
+        std::uint8_t cl = sb, bl = 0;
+        while (true) {
+            bl = cl; cl = *ebp++; *eax++ = cl; edi--;
+            if (edi == 0) break;
+            if (cl > 0x0d) continue;
+            if (cl != 0x0d && cl != 0x0a) continue;
+            break;
+        }
+        esi -= edi;
+        s14 -= esi;
+        sb = cl; ecx = eax; s4 = ebp; s13 = bl;
+        if (s14 == 0) return 0;
+        s0 -= esi;
+        if (s0 == 0) return static_cast<std::uint32_t>(eax - dst);
+        if (s1c == 1) {
+            if (sb == 0x0a) {
+                eax[-1] = 0x0d; eax[0] = 0x0a; s14 -= 1;
+                if (s14 == 0) return 0;
+                ecx += 1; sb = 0; continue;
+            } else {
+                eax[-1] = *s4; s0 -= 1;
+                if (s0 == 0) return static_cast<std::uint32_t>(eax - dst);
+                ebp += 1; sb = 0; s1c = 0; continue;
+            }
+        } else if (s1c == 2) {
+            if (sb == 0x0a) { eax[-1] = 0x0d; sb = 0; continue; }
+            eax[-1] = 0x0a; sb = 0; s1c = 0; continue;
+        } else if (sb == 0x0a) {
+            if (s13 != 0x0d) continue;
+            s1c = 1; continue;
+        } else if (sb == 0x0d) {
+            if (*s4 <= 0x0d) continue;
+            s1c = 2; continue;
+        } else continue;
+    }
+}
+}  // namespace
+
+// &8 text pipeline (FUN_080a3c90): a param bitmask selects an ordered sequence of text
+// transforms applied with double-buffering. Supported bits: 0x80 param14, 0x20 line-RLE
+// (FUN_080a2f20), 0x1 CRLF EOL (FUN_080a19b0), applied in that dispatch order. Any other
+// bit set means a transform not yet ported -> return 0 so the caller bridges.
+std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
+                               std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
+    const std::uint32_t kSupported = 0x80u | 0x20u | 0x1u;
+    if (param & ~kSupported) return 0;
+    std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
+    std::uint8_t* bufs[2] = {sa.data(), sb.data()};
+    const std::uint8_t* cur = src;
+    std::uint32_t n = size; int bi = 0;
+    if (param & 0x80u) { std::uint32_t m = NzCdParam14(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    if (param & 0x20u) { std::uint32_t m = NzCdLineRle(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    if (param & 0x01u) { std::uint32_t m = NzCdCrlf(cur, n, bufs[bi], out_cap);    if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    if (n > out_cap) n = out_cap;
+    std::memcpy(out, cur, n);
+    return n;
+}
+
+namespace {
 // Decode one chunk. The LZ output is reconstructed into `recon + recon_off` so its
 // matches can reference the recon output of PRIOR chunks: the sliding window spans
 // chunk boundaries in the recon (pre-block-RLE) domain (verified byte-exact). For a
@@ -563,16 +690,24 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         brle_len = CdReadVar(r, 0x1001u);
         brle_bits = r.cur; r.cur += brle_len;
     }
+    // Text-pipeline param (flag &8): a single byte trailing the literals (and the
+    // block-RLE bits, if &2) — the bitmask selecting the transform sequence applied
+    // by FUN_080a3c90 (its arg5). Must be consumed so the next chunk parses.
+    std::uint32_t text_param = 0;
+    if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
 
     // Reconstruct into the contiguous recon buffer (window spans prior chunks).
     NzCdReconstruct(toks.data(), N, literals.data(), recon + recon_off, out_size);
     *recon_advance = out_size;
     *block_pos = static_cast<std::size_t>(r.cur - block);
 
-    // Post-recon filters (dispatcher order &8 -> &2). The cross-chunk window stays in
-    // the recon domain (recon_advance = out_size); the filter output goes to `out`.
-    if (flags & 8u)   // param14: word-boundary space re-insertion (expands)
-        return NzCdParam14(recon + recon_off, out_size, out, out_cap);
+    // Text pipeline (&8): the per-chunk transforms (NzCdLineRle / NzCdCrlf / param14,
+    // selected by `text_param`) are byte-exact in isolation (see NzCdTextPipeline), but
+    // the cross-chunk LZ window domain for a chunk FOLLOWING a text chunk is not yet
+    // resolved (it is neither the compact recon nor the expanded output) — applying the
+    // pipeline would corrupt multi-chunk text files (right size, wrong content, which
+    // the dispatcher size-check would NOT catch). So bridge for now. TODO(#22).
+    if (flags & 8u) { (void)text_param; return 0; }
     if (flags & 2u)   // block-RLE: re-expand collapsed zero-runs
         return NzCdRleExpand(recon + recon_off, out_size, out, out_cap, 1u, brle_bits, brle_len);
     std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;

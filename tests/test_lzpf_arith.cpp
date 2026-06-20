@@ -896,6 +896,20 @@ void TestCdExeUnfilter() {
            "CD exe filter (&4) matches binary (x86 E8/E9 un-transform, 6 sites)");
 }
 
+// Text pipeline (chunk flag &8): line-RLE (FUN_080a2f20) then EOL->CRLF (FUN_080a19b0),
+// selected by param 0x21. Replays atoll.fld's &8 chunk recon (20939 B) -> final text
+// (32768 B), byte-exact vs the binary. (The stages are validated here even though the
+// &8 dispatcher path still bridges pending the multi-chunk window resolution.)
+void TestCdTextPipeline() {
+    std::vector<std::uint8_t> out(kCdTextOutLen + 65536, 0);
+    std::uint32_t n = nzr::cd::NzCdTextPipeline(kCdTextIn, kCdTextInLen, out.data(),
+                                                kCdTextOutLen + 65536, kCdTextParam);
+    std::uint32_t h = 2166136261u;
+    for (std::uint32_t i = 0; i < n; ++i) { h ^= out[i]; h *= 16777619u; }
+    Expect(n == kCdTextOutLen && h == kCdTextOutFnv,
+           "CD text pipeline (&8 line-RLE+CRLF) matches binary (atoll.fld chunk, 32768 B)");
+}
+
 int main() {
     TestMaskTable();
     TestCounterInit();
@@ -926,6 +940,7 @@ int main() {
     TestCdDecodeBlockRawStore();
     TestCdDecodeBlockPureLiteral();
     TestCdExeUnfilter();
+    TestCdTextPipeline();
     std::printf("test_lzpf_arith: %d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }
