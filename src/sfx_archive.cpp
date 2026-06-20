@@ -3551,12 +3551,19 @@ static bool TryDecodeLegacyLzhd(
     bool ok = true;
 
     // The cross-stream LZ window is a single per-archive ring (the binary's window
-    // object persists across streams): ring_size = (method_p1+1)*0x10000 (the lzpf
-    // dict-size rule). Large files split output into 1 MB streams that reference each
-    // other through this shared ring, so it is allocated ONCE and `ring_pos` threads
-    // across stream iterations.
-    const std::uint32_t ring_size =
-        (static_cast<std::uint32_t>(legacy.legacy_method_p1) + 1u) * 0x10000u;
+    // object persists across streams). GDB on FUN_08099050 (obj+0x978) shows the ring
+    // size = round(total_output / 0x10000) * 0x10000 (min 0x10000): the encoder sizes
+    // the window to hold the whole COMPACT recon, so the ring cursor (obj+0x980)
+    // advances monotonically and NEVER wraps for real archives (verified across
+    // text50/source.cpp/big_code/repeat_3M = 1/3/19/46 * 64 KB). Large files split the
+    // output into 1 MB streams that reference each other through this shared ring, so
+    // it is allocated ONCE and `ring_pos` threads across stream iterations. (The old
+    // (method_p1+1)*0x10000 lzpf rule under-sized the ring for large files and forced
+    // a wrap the binary never does.)
+    std::uint32_t ring_units = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(total_out) + 0x8000u) / 0x10000u);
+    if (ring_units == 0u) ring_units = 1u;
+    const std::uint32_t ring_size = ring_units * 0x10000u;
     std::vector<std::uint8_t> ring(ring_size, 0u);
     std::uint32_t ring_pos = 0u;
 
