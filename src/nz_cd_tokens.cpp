@@ -448,10 +448,10 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
     std::size_t pos = 0;
     std::uint32_t written = 0;
     while (pos < block_len && written < out_cap) {
+        std::size_t prev = pos;
         std::uint32_t n = NzCdDecodeLzChunk(block, block_len, &pos, out + written, out_cap - written);
-        if (n == 0) break;
+        if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
-        if (n < 0x8000u) break;   // final chunk is short (< 32 KB)
     }
     return written;
 }

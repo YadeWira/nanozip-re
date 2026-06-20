@@ -2,6 +2,7 @@
 #include "lzpf_arith.h"
 #include "nz_cm.h"
 #include "nz_lzhd.h"
+#include "nz_cd_tokens.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_texttransform_num.h"
@@ -3456,13 +3457,16 @@ bool TryParseLegacyCnArchive(
                 bytes.begin() + static_cast<std::ptrdiff_t>(literal_data_offset + literal_data_size));
         }
     } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
-               method == 0x4bu && method_p0 == 7u &&
+               ((method == 0x4bu && method_p0 == 7u) ||
+                (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u))) &&
                payload_start < bytes.size()) {
-        // For native CM decode: store the raw compressed stream so
-        // TryDecodeLegacyCm can parse stream_tag + block headers directly.
-        // NOTE: -co/-cO (0x3b) and -cd (0x2b) are NOT populated — large blocks use
-        // a virtual-stream LZ framing (not flat payload_size) that crashes a flat
-        // DecLZ call; they bridge until that framing is reverse-engineered.
+        // Store the raw compressed stream so the native decoders can parse the
+        // stream_tag + block directly:
+        //  - 0x4b p0=7  -> TryDecodeLegacyCm (CM)
+        //  - 0x2b p0=3/4 -> TryDecodeLegacyLzhd (the real coroutine token-LZ, now
+        //    ported as NzCdDecodeBlock; the old "virtual-stream framing crashes a
+        //    flat DecLZ" note is obsolete — pure-LZ -cd decodes byte-exact).
+        // -co/-cO (0x3b) still bridge.
         ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
                         bytes.end());
     }
@@ -3542,12 +3546,6 @@ static bool TryDecodeLegacyLzhd(
     std::vector<unsigned char> buf(kWindowPad + total_out, 0u);
     unsigned char* const window_base = buf.data() + kWindowPad;
 
-    NzLzhdDecoder* dec = NzLzhdCreate();
-    if (!dec) {
-        if (out_error_message) *out_error_message = "lzhd: allocation failed";
-        return false;
-    }
-
     std::size_t pos = 0u;
     std::size_t written = 0u;
     bool ok = true;
@@ -3579,16 +3577,17 @@ static bool TryDecodeLegacyLzhd(
         const std::uint32_t block_in_size = static_cast<std::uint32_t>(stream_bytes);
         pos += static_cast<std::size_t>(stream_bytes);
 
-        // out_size for this block: everything remaining (single-block archives)
-        // or a per-block portion.  We pass what's left; DecLZ stops when done.
-        const std::uint32_t block_out = static_cast<std::uint32_t>(total_out - written);
-
-        NzLzhdDecode(dec, block_in, block_in_size,
-                     window_base + written, block_out, window_base);
-        written += block_out;
+        // Native -cd LZ block decode (NzCdDecodeBlock): loops the block's 32 KB
+        // chunks into the contiguous output. Handles pure-LZ -cd (recon output ==
+        // file). Blocks whose chunks carry a tt08/param14/CM/BWT post-filter
+        // produce fewer bytes here; the size-mismatch check below rejects them so
+        // they fall back to the bridge until those stages are wired.
+        const std::uint32_t block_cap = static_cast<std::uint32_t>(total_out - written);
+        std::uint32_t produced = nzr::cd::NzCdDecodeBlock(
+            block_in, block_in_size, window_base + written, block_cap);
+        if (produced == 0u) { ok = false; break; }
+        written += produced;
     }
-
-    NzLzhdDestroy(dec);
 
     if (!ok) {
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
