@@ -3049,6 +3049,7 @@ bool TryParseLegacyCnArchive(
                     std::size_t input_pos = bp;
                     bool decode_ok = true;
                     nzr::lzpf::LpcPredictor pf_pred{};
+                    nzr::lzpf::LpcPredictor pf_pred2{};   // ch2 LPC state (stereo planar), persists across blocks
                     // LMS inter-channel state (FUN_08096e20) persists across blocks
                     // when the prefilter is stereo-split. Zero-init; reset only at
                     // the start of a new archive (the outer parse function allocates
@@ -3125,7 +3126,8 @@ bool TryParseLegacyCnArchive(
                                 is_stereo_pf,
                                 &pf_pred,
                                 is_stereo_pf ? &pf_lms_ch1 : nullptr,
-                                is_stereo_pf ? &pf_lms_ch2 : nullptr);
+                                is_stereo_pf ? &pf_lms_ch2 : nullptr,
+                                is_stereo_pf ? &pf_pred2 : nullptr);
                             if (pf_consumed == 0) { decode_ok = false; break; }
                             input_pos += pf_consumed;
                             window_cursor += static_cast<std::size_t>(block_out_size);

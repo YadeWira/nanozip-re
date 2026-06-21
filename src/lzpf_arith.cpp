@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1605,6 +1606,60 @@ void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
     }
 }
 
+// FUN_080a50c0 — STEREO branch. ch1/ch2 are PLANAR residual halves (per_chan each);
+// each channel is delta-integrated (cumsum) and the pair is reconstructed and
+// interleaved. channels==1 = L/R, channels==2 = mid/side; both fast paths require
+// flag_a && sample_width==2 && endian (LE int16). Otherwise a generic per-channel
+// cumsum + width/endian interleave.
+void ReconstructStereoSamples(std::uint8_t* out, const std::int32_t* ch1,
+                              const std::int32_t* ch2, std::uint32_t per_chan,
+                              const PrefilterParams* p) {
+    const bool fast = (p->flag_a && p->sample_width == 2u && p->endian != 0u);
+    std::int32_t acc1 = 0, acc2 = 0;
+    std::uint8_t* dst = out;
+    if (fast && p->channels == 2) {            // mid/side
+        for (std::uint32_t k = 0; k < per_chan; ++k) {
+            acc1 += ch1[k]; acc2 += ch2[k];    // acc1=mid, acc2=side
+            std::int16_t s = static_cast<std::int16_t>(
+                static_cast<std::int16_t>(acc2) - static_cast<std::int16_t>(acc1 >> 1));
+            std::int16_t l = static_cast<std::int16_t>(s + static_cast<std::int16_t>(acc1));
+            std::memcpy(dst, &l, 2); std::memcpy(dst + 2, &s, 2); dst += 4;
+        }
+        return;
+    }
+    if (fast && p->channels == 1) {            // L/R
+        for (std::uint32_t k = 0; k < per_chan; ++k) {
+            acc1 += ch1[k]; acc2 += ch2[k];
+            std::int16_t l = static_cast<std::int16_t>(acc1);
+            std::int16_t r = static_cast<std::int16_t>(acc2);
+            std::memcpy(dst, &l, 2); std::memcpy(dst + 2, &r, 2); dst += 4;
+        }
+        return;
+    }
+    // Generic: per-channel cumsum, interleave with sample_width/endian byte order.
+    auto put = [&](std::int32_t v) {
+        if (p->sample_width == 1u) { *dst++ = static_cast<std::uint8_t>(v); }
+        else if (p->sample_width == 2u) {
+            if (p->endian == 0u) { dst[0] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+                                   dst[1] = static_cast<std::uint8_t>(v & 0xff); }
+            else { std::uint16_t v16 = static_cast<std::uint16_t>(v); std::memcpy(dst, &v16, 2); }
+            dst += 2;
+        } else {
+            if (p->endian == 0u) { dst[0] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+                                   dst[1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+                                   dst[2] = static_cast<std::uint8_t>(v & 0xff); }
+            else { dst[0] = static_cast<std::uint8_t>(v & 0xff);
+                   dst[1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+                   dst[2] = static_cast<std::uint8_t>((v >> 16) & 0xff); }
+            dst += 3;
+        }
+    };
+    for (std::uint32_t k = 0; k < per_chan; ++k) {
+        acc1 += ch1[k]; acc2 += ch2[k];
+        put(acc1); put(acc2);
+    }
+}
+
 // FUN_080a5330 — core prefilter block decoder (internal implementation).
 // `pred` carries LPC predictor state across successive blocks.
 // `lms_ch1` / `lms_ch2` carry LMS inter-channel state (only used when
@@ -1613,7 +1668,8 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
                                   std::uint8_t* output, std::size_t output_size,
                                   bool is_stereo_variant, LpcPredictor* pred,
                                   LmsObject* lms_ch1 = nullptr,
-                                  LmsObject* lms_ch2 = nullptr) {
+                                  LmsObject* lms_ch2 = nullptr,
+                                  LpcPredictor* pred2 = nullptr) {
     if (input_size == 0 || output_size == 0) return 0;
 
     // Header byte → packed format params (FUN_080a5330 lines 44-101).
@@ -1660,13 +1716,30 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     std::uint32_t aligned_out = avail - remainder;
     std::uint32_t n_elems    = aligned_out / sw; // = uStack_5007c
 
-    // Arith-decode residual bytes.
+    // For stereo (channels != 0) everything downstream is PLANAR: ch1 occupies
+    // [0, per_chan), ch2 occupies [per_chan, 2*per_chan).
+    const bool stereo_split = (is_stereo_variant && p.channels != 0 && n_elems >= 2u);
+    const std::uint32_t per_chan = stereo_split ? (n_elems / 2u) : n_elems;
+
+    // Arith-decode residual bytes. FUN_080a5330 decodes stereo as TWO per-channel
+    // FUN_080a4ea0 calls (each reads its own Huffman header), writing PLANAR halves;
+    // a single n_elems call would read only one header and mis-locate the side stream.
     std::vector<std::uint8_t> arith_buf(n_elems);
     std::size_t consumed_arith = 0;
     if (n_elems > 0) {
-        consumed_arith = DecodeArithBuffer(ptr, remaining, arith_buf.data(),
-                                           n_elems, 12u);
-        if (consumed_arith == 0) return 0;
+        if (!stereo_split) {
+            consumed_arith = DecodeArithBuffer(ptr, remaining, arith_buf.data(),
+                                               n_elems, 12u);
+            if (consumed_arith == 0) return 0;
+        } else {
+            std::size_t c0 = DecodeArithBuffer(ptr, remaining, arith_buf.data(),
+                                               per_chan, 12u);
+            if (c0 == 0) return 0;
+            std::size_t c1 = DecodeArithBuffer(ptr + c0, remaining - c0,
+                                               arith_buf.data() + per_chan, per_chan, 12u);
+            if (c1 == 0) return 0;
+            consumed_arith = c0 + c1;
+        }
         ptr += consumed_arith; remaining -= consumed_arith;
     }
 
@@ -1683,20 +1756,36 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     // 1 bit: predictor active flag; if 1, 3 more bits give order_bits such
     // that order = shift = order_bits + 8 (confirmed GDB: byte 0x80 → bit=1,
     // order_bits=0 → order=8, shift=8 for ramp16_cf.nz).
-    std::uint32_t predictor_bit   = 0u;
+    // For stereo (channels != 0) the residual array is PLANAR: ch1=[0,per_chan),
+    // ch2=[per_chan,2*per_chan). The predictor-init bit layout differs by channel
+    // count (FUN_080a5330 lines 216-254): mono reads [active(1), order(3 if active)];
+    // stereo reads a leading bit G then, per channel, [active(1), order(3 if active)]
+    // (order = bits + 8). Verified by GDB: stereo side-bit sequence [1,1,3,1,3] = 9
+    // bits, both channels active with order 8 (order_bits 0) for stereo_lms_cf.nz.
+    std::uint32_t predictor_bit   = 0u;   // mono predictor-active flag
     std::uint32_t predictor_order = 0u;
-    {
+    std::uint32_t lms_enable      = 0u;   // stereo leading bit G (gates inter-channel LMS)
+    std::uint32_t ch_active[2]    = {0u, 0u};
+    std::uint32_t ch_order[2]     = {8u, 8u};
+    if (!stereo_split) {
         predictor_bit = ReadSideBits(&br, 1u);
         if (predictor_bit != 0u)
             predictor_order = ReadSideBits(&br, 3u) + 8u;
-    }
-    // Residual decode → int32 array.
-    std::vector<std::int32_t> residuals(n_elems);
-    if (!is_stereo_variant) {
-        DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
     } else {
-        DecodeResidualsStereo(residuals.data(), n_elems, arith_buf.data(), &br);
+        lms_enable = ReadSideBits(&br, 1u);
+        for (int c = 0; c < 2; ++c) {
+            ch_active[c] = ReadSideBits(&br, 1u);
+            if (ch_active[c] != 0u)
+                ch_order[c] = ReadSideBits(&br, 3u) + 8u;
+        }
     }
+    // Residual decode → int32 array. FUN_0809baa0 is the UNIVERSAL (channel-agnostic)
+    // residual decoder used for BOTH mono and stereo: it reads one arith byte per
+    // element (escapes ≥0xe0 pull extra bits from the side stream) and the n_elems
+    // results are laid out PLANAR for stereo (ch1=[0,per_chan), ch2=[per_chan,2*per_chan)).
+    // The old speculative DecodeResidualsStereo (even/odd) was never the real path.
+    std::vector<std::int32_t> residuals(n_elems);
+    DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
     // Side-stream bytes consumed (FUN_080a5330 line 263).
     // Uses signed arithmetic: (7 - n_valid) can be negative when n_valid > 7.
     std::int32_t side_bits_signed =
@@ -1707,40 +1796,39 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
         : 0u;
     if (side_consumed > remaining) side_consumed = remaining;
 
-    // LPC inverse filter (FUN_08095d90, 4-tap path): in-place residuals+prediction.
+    // FUN_080a5330 applies LPC per planar channel (separate predictor state), then the
+    // inter-channel LMS, then FUN_080a50c0 (cumsum + L/R | mid/side interleave).
+    LpcPredictor local_pred2{};
+    LpcPredictor* p2 = (pred2 != nullptr) ? pred2 : &local_pred2;
+
+    // LPC inverse filter (FUN_08095d90, 4-tap path): in-place per planar channel.
     if (pred != nullptr) {
-        if (predictor_bit) {
-            pred->shift = predictor_order;
-            pred->Run(residuals.data(), n_per_chan);
+        if (!stereo_split) {
+            if (predictor_bit) { pred->shift = predictor_order; pred->Run(residuals.data(), per_chan); }
+            else               { pred->ResetState(); }
         } else {
-            pred->ResetState();
+            if (ch_active[0]) { pred->shift = ch_order[0]; pred->Run(residuals.data(), per_chan); }
+            else              { pred->ResetState(); }
+            if (ch_active[1]) { p2->shift = ch_order[1]; p2->Run(residuals.data() + per_chan, per_chan); }
+            else              { p2->ResetState(); }
         }
     }
 
-    // LMS inter-channel predictor (FUN_08096e20). Only fires when the
-    // lzpf-context flag *param_1 & 0x10 is set (gated externally via
-    // is_stereo_variant) AND channels != 0 (stereo split) AND the
-    // LPC predictor_bit was active in this block. The split is detected
-    // here: for stereo-split, `n_elems` = 2*n_per_chan, and residuals
-    // alternate ch1,ch2,ch1,ch2,... Apply LMS on the two halves.
-    if (is_stereo_variant && p.channels != 0 && predictor_bit != 0u &&
-        lms_ch1 != nullptr && lms_ch2 != nullptr && n_per_chan > 0u &&
-        n_elems == 2u * n_per_chan) {
-        // Split residuals into ch1 (even) and ch2 (odd) — gather, run LMS, scatter.
-        std::vector<std::int32_t> c1(n_per_chan), c2(n_per_chan);
-        for (std::uint32_t k = 0; k < n_per_chan; ++k) {
-            c1[k] = residuals[2u * k];
-            c2[k] = residuals[2u * k + 1u];
-        }
-        ApplyLmsInterChannel(c1.data(), c2.data(), n_per_chan, lms_ch1, lms_ch2);
-        for (std::uint32_t k = 0; k < n_per_chan; ++k) {
-            residuals[2u * k] = c1[k];
-            residuals[2u * k + 1u] = c2[k];
-        }
+    // LMS inter-channel predictor (FUN_08096e20) on the PLANAR halves, gated by the
+    // stereo leading bit G (lms_enable) AND the lzpf-context stereo flag.
+    if (stereo_split && lms_enable != 0u &&
+        lms_ch1 != nullptr && lms_ch2 != nullptr && per_chan > 0u) {
+        ApplyLmsInterChannel(residuals.data(), residuals.data() + per_chan,
+                             per_chan, lms_ch1, lms_ch2);
     }
 
-    // Output reconstruction.
-    ReconstructOutputSamples(output + prefix, aligned_out, residuals.data(), &p);
+    // Output reconstruction (FUN_080a50c0).
+    if (stereo_split) {
+        ReconstructStereoSamples(output + prefix, residuals.data(),
+                                 residuals.data() + per_chan, per_chan, &p);
+    } else {
+        ReconstructOutputSamples(output + prefix, aligned_out, residuals.data(), &p);
+    }
 
     return static_cast<std::size_t>(ptr - input) + side_consumed;
 }
@@ -1781,10 +1869,12 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
                                    bool is_stereo_variant,
                                    LpcPredictor* persistent_pred,
                                    LmsObject* persistent_lms_ch1,
-                                   LmsObject* persistent_lms_ch2) {
+                                   LmsObject* persistent_lms_ch2,
+                                   LpcPredictor* persistent_pred2) {
     if (output_size == 0) return 0;
-    LpcPredictor local_pred{};
-    LpcPredictor* pred = persistent_pred ? persistent_pred : &local_pred;
+    LpcPredictor local_pred{}, local_pred2b{};
+    LpcPredictor* pred  = persistent_pred  ? persistent_pred  : &local_pred;
+    LpcPredictor* pred2 = persistent_pred2 ? persistent_pred2 : &local_pred2b;
     LmsObject local_lms1{}, local_lms2{};
     if (persistent_lms_ch1 == nullptr) { local_lms1.Init(); persistent_lms_ch1 = &local_lms1; }
     if (persistent_lms_ch2 == nullptr) { local_lms2.Init(); persistent_lms_ch2 = &local_lms2; }
@@ -1794,7 +1884,7 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
         std::size_t used  = DecodePFBlock(
             input + in_off, input_size - in_off,
             output + out_off, chunk, is_stereo_variant, pred,
-            persistent_lms_ch1, persistent_lms_ch2);
+            persistent_lms_ch1, persistent_lms_ch2, pred2);
         if (used == 0) return 0;
         in_off  += used;
         out_off += chunk;

@@ -374,6 +374,7 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
                                    bool is_stereo_variant,
                                    LpcPredictor* persistent_pred,
                                    LmsObject* persistent_lms_ch1,
-                                   LmsObject* persistent_lms_ch2);
+                                   LmsObject* persistent_lms_ch2,
+                                   LpcPredictor* persistent_pred2 = nullptr);
 
 }  // namespace nzr::lzpf
