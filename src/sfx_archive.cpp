@@ -1544,6 +1544,60 @@ void WriteLegacyVarint(std::uint64_t value, std::vector<unsigned char>* out_byte
     }
 }
 
+// Walk a multi-block "stored" (-cn, method_p0==0) payload. NanoZip splits a
+// large stored file into several blocks: each block is [varint (len<<4)|0]
+// [len raw bytes], and every block except the last is followed by a per-block
+// checksum trailer (one tag byte + checksum_bytes). Single-block stores (the
+// common case) are handled by the simpler tail scan; this covers files large
+// enough to split (e.g. a 215 KB source file -> 196608 + 18566). On success
+// *out holds the concatenated raw payload (exactly `total` bytes) and the walk
+// consumes the buffer up to EOF, which makes the starting offset unambiguous.
+bool TryAssembleStoredBlocks(
+    const std::vector<unsigned char>& bytes,
+    std::size_t first_prefix,
+    std::uint64_t total,
+    std::size_t trailer_bytes,
+    std::vector<unsigned char>* out) {
+    if (out == nullptr || first_prefix > bytes.size() || total == 0u) {
+        return false;
+    }
+    std::vector<unsigned char> buf;
+    buf.reserve(static_cast<std::size_t>(total));
+    std::size_t p = first_prefix;
+    std::uint64_t acc = 0;
+    while (acc < total) {
+        std::size_t q = p;
+        std::uint64_t tag = 0;
+        if (!ReadLegacyVarint(bytes, &q, bytes.size(), &tag)) {
+            return false;
+        }
+        if ((tag & 0x0fu) != 0u) {
+            return false;  // stored blocks always carry flags == 0
+        }
+        const std::uint64_t len = tag >> 4u;
+        if (len == 0u || len > total - acc ||
+            static_cast<std::uint64_t>(bytes.size() - q) < len) {
+            return false;
+        }
+        const std::size_t ln = static_cast<std::size_t>(len);
+        buf.insert(buf.end(), bytes.begin() + static_cast<std::ptrdiff_t>(q),
+                   bytes.begin() + static_cast<std::ptrdiff_t>(q + ln));
+        acc += len;
+        p = q + ln;
+        if (acc < total) {
+            if (trailer_bytes > bytes.size() - p) {
+                return false;
+            }
+            p += trailer_bytes;  // skip the inter-block checksum trailer
+        }
+    }
+    if (acc != total || p != bytes.size()) {
+        return false;
+    }
+    *out = std::move(buf);
+    return true;
+}
+
 bool ReadLegacyTableSpan(
     const std::vector<unsigned char>& bytes,
     std::size_t* io_pos,
@@ -2599,6 +2653,11 @@ bool TryParseLegacyCnArchive(
     std::size_t metadata_end = bytes.size();
     std::size_t payload_start = bytes.size();
 
+    // For stored payloads (-cn) that split across several blocks, the raw file
+    // bytes are not a contiguous tail of the archive, so we assemble them here.
+    bool store_multiblock = false;
+    std::vector<unsigned char> store_blocks_buffer;
+
     if (native_store_payload) {
         data_offset_u64 = static_cast<std::uint64_t>(bytes.size()) - total_data_size;
         if (data_offset_u64 < table_end) {
@@ -2627,13 +2686,35 @@ bool TryParseLegacyCnArchive(
             }
         }
         if (!prefix_found) {
-            if (out_error_message != nullptr) {
-                *out_error_message = "Legacy stream prefix is not recognized.";
+            // Multi-block store: walk [varint len<<4|0][raw][checksum trailer]
+            // from the first block prefix (just past the per-file metadata) and
+            // assemble the raw payload. The trailer width follows checksum_mode
+            // (one tag byte + checksum bytes; none when checksums are disabled).
+            const std::size_t store_checksum_bytes =
+                (checksum_mode == ChecksumMode::kCrc16) ? 2u :
+                (checksum_mode == ChecksumMode::kNone) ? 0u : 4u;
+            const std::size_t store_trailer_bytes =
+                (checksum_mode == ChecksumMode::kNone) ? 0u : (1u + store_checksum_bytes);
+            for (std::size_t s = table_end; s <= data_offset; ++s) {
+                if (TryAssembleStoredBlocks(bytes, s, total_data_size,
+                                            store_trailer_bytes, &store_blocks_buffer)) {
+                    store_multiblock = true;
+                    metadata_end = s;
+                    payload_start = s;
+                    break;
+                }
             }
-            return false;
+            if (!store_multiblock) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "Legacy stream prefix is not recognized.";
+                }
+                return false;
+            }
+        } else {
+            metadata_end = prefix_start;
+            payload_start = data_offset;
         }
-        metadata_end = prefix_start;
-        payload_start = data_offset;
+        if (!store_multiblock) {
 
         // Parse checksums from the end of metadata.
         const std::size_t checksum_bytes_per_file =
@@ -2671,6 +2752,7 @@ bool TryParseLegacyCnArchive(
                 }
             }
         }
+        }  // if (!store_multiblock)
     }
 
     // Best-effort metadata extraction (single-file path is the most reliable).
@@ -3447,11 +3529,16 @@ bool TryParseLegacyCnArchive(
         ctx.payload_mode = LegacyPayloadMode::kUnknown;
     }
     ctx.entries = std::move(entries);
-    ctx.data_offset = native_store_payload ? data_offset_u64 : 0u;
+    ctx.data_offset = (native_store_payload && !store_multiblock) ? data_offset_u64 : 0u;
     ctx.total_data_size = total_data_size;
     if (native_store_payload) {
-        const std::size_t data_offset = static_cast<std::size_t>(data_offset_u64);
-        ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(data_offset), bytes.end());
+        if (store_multiblock) {
+            // Raw payload was reassembled from multiple stored blocks.
+            ctx.data = std::move(store_blocks_buffer);
+        } else {
+            const std::size_t data_offset = static_cast<std::size_t>(data_offset_u64);
+            ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(data_offset), bytes.end());
+        }
     } else if (native_literal_payload) {
         if (literal_data_owned) {
             ctx.data_offset = 0u;
