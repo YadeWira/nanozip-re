@@ -3050,6 +3050,10 @@ bool TryParseLegacyCnArchive(
                     bool decode_ok = true;
                     nzr::lzpf::LpcPredictor pf_pred{};
                     nzr::lzpf::LpcPredictor pf_pred2{};   // ch2 LPC state (stereo planar), persists across blocks
+                    // LPC filter order (FUN_08095d90 obj+0x1c08): nz_lzpf (variant A)
+                    // = 4-tap, nz_lzpf_large (variant B) = 8-tap. GDB-confirmed.
+                    pf_pred.taps  = is_variant_b ? 8u : 4u;
+                    pf_pred2.taps = is_variant_b ? 8u : 4u;
                     // LMS inter-channel state (FUN_08096e20) persists across blocks
                     // when the prefilter is stereo-split. Zero-init; reset only at
                     // the start of a new archive (the outer parse function allocates

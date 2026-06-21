@@ -15,12 +15,17 @@ namespace nzr::lzpf {
 // samples per loop iteration: factors are updated only on the first sample of
 // each pair. This halves the effective convergence rate vs a naive per-sample
 // update. Sign convention: positive decoded → -1, negative → +1, zero → 0.
+// `taps` selects the filter order field obj+0x1c08 (FUN_08095d90): 4 for nz_lzpf
+// (variant A, the <8 MMX path — two samples/iter, adapt only the first) and 8 for
+// nz_lzpf_large (variant B, the ==8 MMX path — one sample/iter, adapt every sample).
+// `shift` is obj+0x1c0a (8 in practice). Arrays sized for the max (8 taps).
 struct LpcPredictor {
     std::int32_t  predicted_value{0};
     std::uint32_t shift{0};
-    std::int16_t  hist[4]{};
-    std::int16_t  sign_hist[4]{};
-    std::int16_t  factors[4]{};
+    std::uint32_t taps{4};
+    std::int16_t  hist[8]{};
+    std::int16_t  sign_hist[8]{};
+    std::int16_t  factors[8]{};
 
     void Init(std::uint32_t sh) {
         shift = sh;
@@ -38,10 +43,17 @@ struct LpcPredictor {
     }
 
     void Run(std::int32_t* samples, std::uint32_t n) {
-        for (std::uint32_t i = 0; i < n; ) {
-            step(samples[i++], /*update_factors=*/true);
-            if (i < n)
-                step(samples[i++], /*update_factors=*/false);
+        if (taps >= 8u) {
+            // ==8 path: adapt factors on EVERY sample.
+            for (std::uint32_t i = 0; i < n; ++i)
+                step(samples[i], /*update_factors=*/true);
+        } else {
+            // <8 path: two samples/iter, adapt only the first of each pair.
+            for (std::uint32_t i = 0; i < n; ) {
+                step(samples[i++], /*update_factors=*/true);
+                if (i < n)
+                    step(samples[i++], /*update_factors=*/false);
+            }
         }
     }
 
@@ -53,24 +65,26 @@ private:
     }
 
     void step(std::int32_t& sample, bool update_factors) noexcept {
+        const std::uint32_t t = (taps >= 8u) ? 8u : 4u;
         const std::int32_t decoded = sample + predicted_value;
         sample = decoded;
         if (update_factors) {
             if (predicted_value < decoded) {
-                for (int k = 0; k < 4; k++)
+                for (std::uint32_t k = 0; k < t; k++)
                     factors[k] = static_cast<std::int16_t>(factors[k] - sign_hist[k]);
             } else {
-                for (int k = 0; k < 4; k++)
+                for (std::uint32_t k = 0; k < t; k++)
                     factors[k] = static_cast<std::int16_t>(factors[k] + sign_hist[k]);
             }
         }
         const std::int16_t h16 = static_cast<std::int16_t>(decoded);
-        hist[3] = hist[2]; hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = h16;
+        for (std::uint32_t k = t - 1u; k > 0u; --k) hist[k] = hist[k - 1u];
+        hist[0] = h16;
         const std::int16_t s16 = sign16(h16);
-        sign_hist[3] = sign_hist[2]; sign_hist[2] = sign_hist[1];
-        sign_hist[1] = sign_hist[0]; sign_hist[0] = s16;
+        for (std::uint32_t k = t - 1u; k > 0u; --k) sign_hist[k] = sign_hist[k - 1u];
+        sign_hist[0] = s16;
         std::int32_t sum = 0;
-        for (int k = 0; k < 4; k++)
+        for (std::uint32_t k = 0; k < t; k++)
             sum += static_cast<std::int32_t>(hist[k]) * static_cast<std::int32_t>(factors[k]);
         predicted_value = sum >> (shift & 0x1fu);
     }
