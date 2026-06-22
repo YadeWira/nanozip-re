@@ -10,9 +10,17 @@
 // ---------------------------------------------------------------------------
 
 static void* nz_aligned_malloc(size_t size, size_t align) {
+#if defined(_WIN32)
+    // x86-64 malloc is already 16-byte aligned and the CM decoder uses no SIMD,
+    // so plain malloc satisfies the alignment the original mirrored. Crucially it
+    // stays freeable with plain free() (MSVCRT's _aligned_malloc is not).
+    (void)align;
+    return malloc(size);
+#else
     void* p = nullptr;
     if (posix_memalign(&p, align, size) != 0) return nullptr;
     return p;
+#endif
 }
 
 #define _rotr(v, n) (((v) >> (n)) | ((v) << (32 - (n))))
