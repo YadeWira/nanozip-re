@@ -3097,12 +3097,49 @@ bool TryParseLegacyCnArchive(
                     // persists across blocks. last_lz_dest re-initialised
                     // to -1 per block (FUN_08097570 line 138).
                     const std::size_t window_left_pad = 4u;
-                    const std::size_t window_capacity =
-                        (static_cast<std::size_t>(method_p1) + 1u) * 0x10000u;
+                    // Dict (sliding-window) capacity. GDB on legacy (FUN_080b6bb0
+                    // reads cap at obj+4) shows the dict size is always one of
+                    // three values, depending on the encoder's threading/chunking:
+                    //   (a) (p1+1)*64KiB                 — small single members,
+                    //   (b) floor(total/128KiB)*128KiB   — some large members,
+                    //   (c) ceil(total/128KiB)*128KiB    — most large members.
+                    // The exact choice is not recoverable from the header alone,
+                    // so we try each candidate and adopt the first whose decode
+                    // passes the checksum gate below. The wrong capacity only
+                    // changes output once a sliding-window wrap occurs, and that
+                    // is exactly what the checksum rejects — so this never emits
+                    // wrong bytes. The legacy buffer is cap + 0x8000 (the wrap
+                    // memset in FUN_080b6bb0 zeroes [cursor, cap+0x8000)).
+                    std::vector<std::size_t> cap_candidates;
+                    {
+                        const std::size_t t = static_cast<std::size_t>(total_data_size);
+                        const std::size_t units = t / 0x20000u;
+                        // Ordered so the common no-wrap case (a capacity at or
+                        // above total) verifies on the first decode: ceil first,
+                        // then the genuinely-wrapping floor case, then the
+                        // small-member (p1+1)*64KiB value.
+                        const std::size_t cands[3] = {
+                            (units + 1u) * 0x20000u,
+                            units * 0x20000u,
+                            (static_cast<std::size_t>(method_p1) + 1u) * 0x10000u,
+                        };
+                        for (std::size_t c : cands) {
+                            if (c == 0u) continue;
+                            bool dup = false;
+                            for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
+                            if (!dup) cap_candidates.push_back(c);
+                        }
+                    }
                     const std::size_t window_wrap_threshold = 0x8000u;  // 32 KiB
+                  for (const std::size_t window_capacity : cap_candidates) {
+                    if (native_literal_payload) break;
+                    stream_data_start = sp;
+                    stream_data_end = sp + static_cast<std::size_t>(stream_bytes);
+                    bp = stream_data_start;
+                    const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
                     const std::size_t window_initial_cursor = 4u;
                     std::vector<std::uint8_t> window_alloc(
-                        window_left_pad + window_capacity, 0);
+                        window_left_pad + window_capacity + window_tail_slack, 0);
                     std::uint8_t* const window = window_alloc.data() + window_left_pad;
                     std::vector<unsigned char> decoded(
                         static_cast<std::size_t>(total_data_size), 0);
@@ -3152,6 +3189,21 @@ bool TryParseLegacyCnArchive(
                             if (input_pos != stream_data_end) {
                                 decode_ok = false; break;
                             }
+                            // A checksum record (tag 0x45 Fletcher / 0x47 crc32 /
+                            // 0x26 crc16 + width bytes) can sit between streams.
+                            // It carries the whole-output checksum (verified once
+                            // after the full decode, see below), so here we just
+                            // consume it to continue walking the stream chain.
+                            while (input_pos < bytes.size()) {
+                                const std::uint8_t tb = bytes[input_pos];
+                                std::size_t tw;
+                                if      (tb == 0x45u) tw = 4u;
+                                else if (tb == 0x47u) tw = 4u;
+                                else if (tb == 0x26u) tw = 2u;
+                                else break;
+                                if (input_pos + 1u + tw > bytes.size()) break;
+                                input_pos += 1u + tw;
+                            }
                             std::uint64_t next_tag = 0;
                             if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
                                 (next_tag & 0x0fu) != 0u) {
@@ -3181,6 +3233,19 @@ bool TryParseLegacyCnArchive(
                         const bool mode_prefilter = ((uvar9 & 7u) == 4u);
                         const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
                         const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
+                        // Sliding-window wrap (legacy FUN_080b6bb0, called once
+                        // per block before the payload is decoded): when fewer
+                        // than 32 KiB remain before the dict capacity, zero the
+                        // tail [cursor, cap+0x8000) and reset the cursor to 0.
+                        // The zeroing matters: post-wrap back-references that
+                        // reach into the freed tail must read 0 (the encoder
+                        // zeroed it too), and the dispatcher's hash_at_minus2
+                        // read at cursor 0 lands in the 4-byte left pad.
+                        if (window_capacity - window_cursor < window_wrap_threshold) {
+                            std::memset(window + window_cursor, 0,
+                                        window_capacity + window_tail_slack - window_cursor);
+                            window_cursor = 0;
+                        }
                         if (mode_prefilter) {
                             // uVar18 (bit 3 of uvar9) selects lzpf (0) vs lzhd-large (1) core.
                             // lzhd-large prefilter (FUN_080a9ca0) not yet ported.
@@ -3191,9 +3256,6 @@ bool TryParseLegacyCnArchive(
                             if (block_out_size > 0x8001u) { decode_ok = false; break; }
                             if (total_written + block_out_size > total_data_size) {
                                 decode_ok = false; break;
-                            }
-                            if (window_capacity - window_cursor < window_wrap_threshold) {
-                                window_cursor = 0;
                             }
                             const std::size_t block_start_in_window = window_cursor;
                             const std::size_t avail_in = stream_data_end - input_pos;
@@ -3237,10 +3299,6 @@ bool TryParseLegacyCnArchive(
                             if (input_pos + block_out_size > stream_data_end) {
                                 decode_ok = false; break;
                             }
-                            // Pre-block sliding-window wrap.
-                            if (window_capacity - window_cursor < window_wrap_threshold) {
-                                window_cursor = 0;
-                            }
                             const std::size_t block_start_in_window = window_cursor;
                             std::memcpy(window + block_start_in_window,
                                         bytes.data() + input_pos,
@@ -3267,13 +3325,6 @@ bool TryParseLegacyCnArchive(
                             decode_ok = false; break;
                         }
                         input_pos += consumed;
-                        // Pre-block sliding-window wrap (mirrors FUN_080b6bb0
-                        // — wraps cursor to 0, re-using the leading bytes of
-                        // the dict; the 4-byte left-pad allocated outside
-                        // ensures hash_at_minus2 reads stay in-bounds).
-                        if (window_capacity - window_cursor < window_wrap_threshold) {
-                            window_cursor = 0;
-                        }
                         const std::size_t block_start_in_window = window_cursor;
                         std::int32_t last_lz_dest = -1;  // re-init per block
                         const bool dispatch_ok = is_variant_b
@@ -3300,7 +3351,63 @@ bool TryParseLegacyCnArchive(
                         total_written += static_cast<std::size_t>(block_out_size);
                     }
                     if (decode_ok && total_written == total_data_size) {
-                        bool vok = validate_decoded_candidate(decoded);
+                        // Whole-output checksum gate. Every nz_lzpf member
+                        // embeds a checksum record [tag][value] over its ENTIRE
+                        // output (tag 0x45 Fletcher32 / 0x47 crc32 / 0x26 crc16;
+                        // it is the per-file checksum, stored in the metadata for
+                        // small members and mid-chain for large multi-stream ones).
+                        // We require that the checksum of our decoded output is
+                        // present in the archive so a wrong decode — e.g. an
+                        // unmodelled sliding-window wrap when the true dict
+                        // capacity differs from our estimate — is rejected rather
+                        // than emitted. This is what makes large multi-stream
+                        // archives safe to decode natively.
+                        bool whole_ok = false;
+                        {
+                            std::uint8_t tag = 0;
+                            std::size_t cw = 0;
+                            switch (checksum_mode) {
+                                case ChecksumMode::kFletcher32: tag = 0x45u; cw = 4u; break;
+                                case ChecksumMode::kFletcher16: tag = 0x45u; cw = 2u; break;
+                                case ChecksumMode::kCrc32:      tag = 0x47u; cw = 4u; break;
+                                case ChecksumMode::kCrc16:      tag = 0x26u; cw = 2u; break;
+                                case ChecksumMode::kNone:       break;
+                            }
+                            if (cw != 0u) {
+                                const std::uint32_t c = ComputeBufferChecksum(
+                                    checksum_mode, decoded.data(), decoded.size());
+                                std::array<std::uint8_t, 5> pat{};
+                                pat[0] = tag;
+                                for (std::size_t k = 0; k < cw; ++k)
+                                    pat[1u + k] = static_cast<std::uint8_t>((c >> (8u * k)) & 0xffu);
+                                const std::size_t patlen = 1u + cw;
+                                if (bytes.size() >= patlen) {
+                                    for (std::size_t q = 0; q + patlen <= bytes.size(); ++q) {
+                                        if (std::memcmp(bytes.data() + q, pat.data(), patlen) == 0) {
+                                            whole_ok = true; break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // When the archive carries per-entry checksums,
+                        // validate_decoded_candidate has already verified the
+                        // bytes against them, so the whole-output gate is not
+                        // also required (small single-stream members embed only
+                        // the per-entry checksum). The whole-output gate is the
+                        // safety net specifically for large multi-stream members
+                        // whose entries carry no per-file checksum (has_checksum
+                        // == false), where a size-only match is otherwise
+                        // unverified and an unmodelled sliding-window wrap could
+                        // slip through.
+                        bool entries_have_checksum = false;
+                        if (checksum_verification_supported) {
+                            for (const LegacyCnEntry& e : entries) {
+                                if (e.has_checksum) { entries_have_checksum = true; break; }
+                            }
+                        }
+                        bool vok = validate_decoded_candidate(decoded) &&
+                                   (entries_have_checksum || whole_ok);
                         if (vok) {
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -3322,6 +3429,7 @@ bool TryParseLegacyCnArchive(
                         // that the current single-stream literal detector
                         // rejects). Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
                     }
+                  }  // end cap-candidate loop
                 }
 
                 // `-cd/-cD` literal-only substream:
