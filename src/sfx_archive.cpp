@@ -2275,6 +2275,237 @@ const char* LegacyPayloadModeLabel(LegacyPayloadMode mode) {
     }
 }
 
+// Decode one nz_lzpf member: a chain of [stream] segments beginning at
+// `first_block_pos` (the first lzpf block header — for the single-stream layout
+// this is just past the leading stream tag; for a parallel-container type-0
+// chunk it is the chunk start), the first segment spanning `first_stream_len`
+// bytes, producing `total` output bytes. The true sliding-window dict capacity
+// is not recoverable from the header, so this tries each candidate capacity and
+// returns the first decode for which verify(decoded) is true. Returns true and
+// fills *out on success; returns false (out untouched) otherwise. This is the
+// shared core behind both single-stream and parallel-container lzpf decode.
+template <typename Verify>
+bool DecodeLzpfMember(
+    const std::vector<unsigned char>& bytes,
+    std::size_t first_block_pos,
+    std::size_t first_stream_len,
+    std::uint64_t total,
+    bool is_variant_b,
+    unsigned method_p1,
+    Verify&& verify,
+    std::vector<unsigned char>* out) {
+    if (first_block_pos + first_stream_len > bytes.size()) return false;
+    auto decode_lzpf_header = [&](std::size_t& pos, std::uint32_t& out_uvar9) -> bool {
+        if (pos >= bytes.size()) return false;
+        std::uint8_t b0 = bytes[pos++];
+        std::uint32_t v = static_cast<std::uint32_t>(b0) ^ (b0 & 0x80u);
+        if ((b0 & 0x80u) != 0u) {
+            if (pos >= bytes.size()) return false;
+            std::uint8_t b1 = bytes[pos++];
+            v = (static_cast<std::uint32_t>(b1) ^ (b1 & 0x80u)) * 0x80u + 0x80u + v;
+            if ((b1 & 0x80u) != 0u) {
+                if (pos >= bytes.size()) return false;
+                std::uint8_t b2 = bytes[pos++];
+                v = static_cast<std::uint32_t>(b2) * 0x4000u + 0x4000u + v;
+            }
+        }
+        out_uvar9 = v;
+        return true;
+    };
+
+    const std::size_t window_left_pad = 4u;
+    // The dict capacity is always a multiple of 64 KiB, but the multiplier the
+    // encoder chose is not recoverable from the header. GDB across many archives
+    // shows it is one of: ceil/floor(total / 64 KiB)·64 KiB (parallel slices),
+    // ceil/floor(total / 128 KiB)·128 KiB (large single-stream members), or
+    // (p1+1)·64 KiB (small single-stream members). We try each and keep the
+    // first whose decode passes verify(); a wrong capacity only matters once a
+    // window wrap occurs, which the checksum rejects.
+    std::vector<std::size_t> cap_candidates;
+    {
+        const std::size_t t = static_cast<std::size_t>(total);
+        const std::size_t u64 = t / 0x10000u;
+        const std::size_t u128 = t / 0x20000u;
+        const std::size_t cands[] = {
+            ((t + 0xffffu) / 0x10000u) * 0x10000u,  // ceil 64 KiB
+            u64 * 0x10000u,                          // floor 64 KiB
+            (u128 + 1u) * 0x20000u,                  // ceil 128 KiB
+            u128 * 0x20000u,                         // floor 128 KiB
+            (static_cast<std::size_t>(method_p1) + 1u) * 0x10000u,
+        };
+        for (std::size_t c : cands) {
+            if (c == 0u) continue;
+            bool dup = false;
+            for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
+            if (!dup) cap_candidates.push_back(c);
+        }
+    }
+    const std::size_t window_wrap_threshold = 0x8000u;  // 32 KiB
+    const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
+    const std::size_t window_initial_cursor = 4u;
+
+    for (const std::size_t window_capacity : cap_candidates) {
+        std::size_t stream_data_end = first_block_pos + first_stream_len;
+        std::vector<std::uint8_t> window_alloc(
+            window_left_pad + window_capacity + window_tail_slack, 0);
+        std::uint8_t* const window = window_alloc.data() + window_left_pad;
+        std::vector<unsigned char> decoded(static_cast<std::size_t>(total), 0);
+        std::vector<std::int32_t> hash_table(
+            is_variant_b ? std::size_t{0x1000000u} : std::size_t{8192u}, std::int32_t{3});
+        std::vector<std::uint8_t> byte_buffer_b(
+            is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
+        std::size_t window_cursor = window_initial_cursor;
+        std::size_t total_written = 0;
+        std::size_t input_pos = first_block_pos;
+        bool decode_ok = true;
+        nzr::lzpf::LpcPredictor pf_pred{};
+        nzr::lzpf::LpcPredictor pf_pred2{};
+        pf_pred.taps  = is_variant_b ? 8u : 4u;
+        pf_pred2.taps = is_variant_b ? 8u : 4u;
+        nzr::lzpf::LmsObject pf_lms_ch1{};
+        nzr::lzpf::LmsObject pf_lms_ch2{};
+        pf_lms_ch1.Init();
+        pf_lms_ch2.Init();
+        while (total_written < total) {
+            if (input_pos >= stream_data_end) {
+                if (input_pos != stream_data_end) { decode_ok = false; break; }
+                // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
+                // + width) before the next stream tag.
+                while (input_pos < bytes.size()) {
+                    const std::uint8_t tb = bytes[input_pos];
+                    std::size_t tw;
+                    if      (tb == 0x45u) tw = 4u;
+                    else if (tb == 0x47u) tw = 4u;
+                    else if (tb == 0x26u) tw = 2u;
+                    else break;
+                    if (input_pos + 1u + tw > bytes.size()) break;
+                    input_pos += 1u + tw;
+                }
+                std::uint64_t next_tag = 0;
+                if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
+                    (next_tag & 0x0fu) != 0u) { decode_ok = false; break; }
+                const std::uint64_t next_bytes = next_tag >> 4u;
+                if (next_bytes == 0u ||
+                    next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos)) {
+                    decode_ok = false; break;
+                }
+                stream_data_end = input_pos + static_cast<std::size_t>(next_bytes);
+            }
+            std::uint32_t uvar9 = 0;
+            if (!decode_lzpf_header(input_pos, uvar9)) { decode_ok = false; break; }
+            const bool mode_prefilter = ((uvar9 & 7u) == 4u);
+            const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
+            const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
+            // Raw-bytecode LZ77 (FUN_08097570: (uVar9 & 2) set, (uVar9 & 1) clear):
+            // the LZ77 opcode stream is the input bytes directly — no u16 count,
+            // no arith side stream. The dispatcher consumes opcodes until the
+            // block output is produced and reports how many input bytes it read.
+            const bool mode_lz77_raw = !mode_prefilter && (uvar9 & 2u) && !(uvar9 & 1u);
+            // Sliding-window wrap (legacy FUN_080b6bb0): zero [cursor, cap+0x8000)
+            // then reset the cursor to 0 when fewer than 32 KiB remain.
+            if (window_capacity - window_cursor < window_wrap_threshold) {
+                std::memset(window + window_cursor, 0,
+                            window_capacity + window_tail_slack - window_cursor);
+                window_cursor = 0;
+            }
+            if (mode_prefilter) {
+                const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;
+                if (uvar18 != 0u) { decode_ok = false; break; }
+                std::uint64_t block_out_size = uvar9 >> 4u;
+                if (block_out_size == 0u) block_out_size = 0x8000u;
+                if (block_out_size > 0x8001u) { decode_ok = false; break; }
+                if (total_written + block_out_size > total) { decode_ok = false; break; }
+                const std::size_t block_start_in_window = window_cursor;
+                const std::size_t avail_in = stream_data_end - input_pos;
+                const std::uint8_t pf_hdr = bytes[input_pos];
+                const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
+                const bool is_stereo_pf = (pf_channels != 0u);
+                const std::size_t pf_consumed = nzr::lzpf::DecodePrefilterStream(
+                    bytes.data() + input_pos, avail_in,
+                    window + block_start_in_window,
+                    static_cast<std::size_t>(block_out_size),
+                    is_stereo_pf, &pf_pred,
+                    is_stereo_pf ? &pf_lms_ch1 : nullptr,
+                    is_stereo_pf ? &pf_lms_ch2 : nullptr,
+                    is_stereo_pf ? &pf_pred2 : nullptr);
+                if (pf_consumed == 0) { decode_ok = false; break; }
+                input_pos += pf_consumed;
+                window_cursor += static_cast<std::size_t>(block_out_size);
+                std::memcpy(decoded.data() + total_written, window + block_start_in_window,
+                            static_cast<std::size_t>(block_out_size));
+                total_written += static_cast<std::size_t>(block_out_size);
+                continue;
+            }
+            if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { decode_ok = false; break; }
+            std::uint64_t block_out_size = uvar9 >> 3u;
+            if (block_out_size == 0u) block_out_size = 0x8000u;
+            if (block_out_size > 0x8001u) { decode_ok = false; break; }
+            if (total_written + block_out_size > total) { decode_ok = false; break; }
+            if (mode_literal) {
+                if (input_pos + block_out_size > stream_data_end) { decode_ok = false; break; }
+                const std::size_t block_start_in_window = window_cursor;
+                std::memcpy(window + block_start_in_window, bytes.data() + input_pos,
+                            static_cast<std::size_t>(block_out_size));
+                std::memcpy(decoded.data() + total_written, bytes.data() + input_pos,
+                            static_cast<std::size_t>(block_out_size));
+                window_cursor += static_cast<std::size_t>(block_out_size);
+                input_pos += static_cast<std::size_t>(block_out_size);
+                total_written += static_cast<std::size_t>(block_out_size);
+                continue;
+            }
+            // Obtain the LZ77 opcode bytecode: either arith-decoded from a
+            // [u16 count][arith] side stream, or the raw input bytes directly.
+            const std::uint8_t* bc_ptr = nullptr;
+            std::size_t bc_len = 0;
+            std::vector<std::uint8_t> bytecode;  // owns arith-decoded bytes
+            std::size_t* raw_consumed_ptr = nullptr;
+            std::size_t raw_consumed = 0;
+            if (mode_lz77_side) {
+                if (input_pos + 2u > stream_data_end) { decode_ok = false; break; }
+                const std::uint16_t side_count =
+                    static_cast<std::uint16_t>(bytes[input_pos]) |
+                    (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
+                input_pos += 2u;
+                const std::size_t arith_size = stream_data_end - input_pos;
+                bytecode.assign(side_count + 16u, 0);
+                const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
+                    bytes.data() + input_pos, arith_size,
+                    bytecode.data(), side_count, /*max_len=*/12);
+                if (consumed == 0 || consumed > arith_size) { decode_ok = false; break; }
+                input_pos += consumed;
+                bc_ptr = bytecode.data();
+                bc_len = side_count;
+            } else {  // mode_lz77_raw
+                bc_ptr = bytes.data() + input_pos;
+                bc_len = stream_data_end - input_pos;
+                raw_consumed_ptr = &raw_consumed;
+            }
+            const std::size_t block_start_in_window = window_cursor;
+            std::int32_t last_lz_dest = -1;
+            const bool dispatch_ok = is_variant_b
+                ? nzr::lzpf::DecodeLz77VariantB(
+                      bc_ptr, bc_len, window, window_capacity,
+                      &window_cursor, static_cast<std::size_t>(block_out_size),
+                      hash_table.data(), byte_buffer_b.data(), &last_lz_dest, raw_consumed_ptr)
+                : nzr::lzpf::DecodeLz77VariantA(
+                      bc_ptr, bc_len, window, window_capacity,
+                      &window_cursor, static_cast<std::size_t>(block_out_size),
+                      hash_table.data(), &last_lz_dest, raw_consumed_ptr);
+            if (!dispatch_ok) { decode_ok = false; break; }
+            if (mode_lz77_raw) input_pos += raw_consumed;
+            if (window_cursor != block_start_in_window + block_out_size) { decode_ok = false; break; }
+            std::memcpy(decoded.data() + total_written, window + block_start_in_window,
+                        static_cast<std::size_t>(block_out_size));
+            total_written += static_cast<std::size_t>(block_out_size);
+        }
+        if (decode_ok && total_written == total && verify(decoded)) {
+            *out = std::move(decoded);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
     LegacyCnContext* out_context,
@@ -2991,6 +3222,137 @@ bool TryParseLegacyCnArchive(
     };
 
     if (!native_store_payload && !entries.empty() && payload_start <= bytes.size()) {
+                // Parallel multi-stream container (header flag byte 0x0f, used by
+                // the multi-threaded encoder for inputs >~8 MB). The output is cut
+                // into N independent nz_lzpf streams; each is serialised as a group
+                // of chunk records keyed by a stream id:
+                //   type-1  = slice output size      (varint, first field)
+                //   type-10 = slice output offset    (u32 LE, first 4 of 8 bytes)
+                //   type-5/7/6 = slice checksum       (Fletcher32 / crc32 / crc16)
+                //   type-0  = the compressed lzpf stream (block headers, no tag)
+                // We decode each type-0 stream into its slice (verifying it against
+                // the slice checksum, which also selects the dict capacity), place
+                // it at its offset, and require the slices to tile the whole output
+                // exactly. Every byte is checksum-verified, so a wrong decode is
+                // rejected rather than emitted.
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 1u || method_p0 == 2u)) {
+                    std::size_t magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu) {
+                        const bool is_variant_b = (method_p0 == 2u);
+                        struct PStream {
+                            // A stream's compressed payload may be split across
+                            // several type-0 chunks (one per ~1 MB output sub-
+                            // stream); they form one logical lzpf stream and are
+                            // concatenated before decode.
+                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                        };
+                        std::map<unsigned, PStream> ps;
+                        std::size_t p = magic + 3u;
+                        bool parse_ok = true;
+                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            std::size_t csz = static_cast<std::size_t>(r >> 4u);
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            PStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                std::size_t tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                s.chunks.emplace_back(p, csz);
+                            }
+                            p += csz;
+                        }
+                        std::vector<unsigned char> assembled(
+                            static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = parse_ok && !ps.empty();
+                        std::uint64_t covered = 0;
+                        for (auto& kv : ps) {
+                            PStream& s = kv.second;
+                            if (s.chunks.empty()) continue;
+                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+                            // Concatenate this stream's type-0 chunks into one
+                            // contiguous lzpf payload (blocks continue seamlessly
+                            // across chunk boundaries, sharing the dict state).
+                            std::vector<unsigned char> payload;
+                            std::size_t plen = 0;
+                            for (const auto& c : s.chunks) plen += c.second;
+                            payload.reserve(plen);
+                            for (const auto& c : s.chunks)
+                                payload.insert(payload.end(), bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                            const ChecksumMode cm = s.cmode;
+                            const std::uint32_t cv = s.cval;
+                            auto slice_verify = [&](const std::vector<unsigned char>& dec) -> bool {
+                                return ComputeBufferChecksum(cm, dec.data(), dec.size()) == cv;
+                            };
+                            std::vector<unsigned char> slice;
+                            if (!DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
+                                                  is_variant_b, method_p1, slice_verify, &slice)) {
+                                all_ok = false; break;
+                            }
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
+                                        slice.data(), slice.size());
+                            covered += s.osz;
+                        }
+                        if (all_ok && covered == total_data_size &&
+                            validate_decoded_candidate(assembled)) {
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
         std::size_t sp = payload_start;
         std::uint64_t stream_tag = 0;
         if (ReadLegacyVarint(bytes, &sp, bytes.size(), &stream_tag) &&
@@ -3044,392 +3406,53 @@ bool TryParseLegacyCnArchive(
                 // opcode 0xf5 with secondary 8 KiB byte buffer). Both ported
                 // natively (task #26). Variant B allocates a 64 MiB hash table
                 // lazily — costly but matches legacy `nz_lzpf_large`.
+
+
                 if (!native_literal_payload &&
                     method == 0x2bu &&
                     (method_p0 == 1u || method_p0 == 2u) &&
                     sp + static_cast<std::size_t>(stream_bytes) <= bytes.size()) {
                     const bool is_variant_b = (method_p0 == 2u);
-                    // Multi-stream support: the encoder may chain multiple
-                    // [stream_tag][stream_data] segments back-to-back when
-                    // the file is large (legacy-observed for big.nz, p1=15:
-                    // stream 1 = 576 B, stream 2 = 19 B). All streams share
-                    // the same dict + hash_table state.
-                    std::size_t stream_data_start = sp;
-                    std::size_t stream_data_end = sp + static_cast<std::size_t>(stream_bytes);
-                    std::size_t bp = stream_data_start;
-                    // Decode the lzpf block-header varint (1-3 bytes, custom encoding).
-                    auto decode_lzpf_header = [&](std::size_t& pos, std::uint32_t& out_uvar9) -> bool {
-                        if (pos >= bytes.size()) return false;
-                        std::uint8_t b0 = bytes[pos++];
-                        std::uint32_t v = static_cast<std::uint32_t>(b0) ^ (b0 & 0x80u);
-                        if ((b0 & 0x80u) != 0u) {
-                            if (pos >= bytes.size()) return false;
-                            std::uint8_t b1 = bytes[pos++];
-                            v = (static_cast<std::uint32_t>(b1) ^ (b1 & 0x80u)) * 0x80u +
-                                0x80u + v;
-                            if ((b1 & 0x80u) != 0u) {
-                                if (pos >= bytes.size()) return false;
-                                std::uint8_t b2 = bytes[pos++];
-                                v = static_cast<std::uint32_t>(b2) * 0x4000u + 0x4000u + v;
-                            }
+                    // Verifier: the member's whole-output checksum, embedded as
+                    // [tag][value] (the per-file checksum). For members that also
+                    // carry a per-entry checksum, validate_decoded_candidate has
+                    // already verified the bytes, so the embedded scan is skipped.
+                    bool entries_have_checksum = false;
+                    if (checksum_verification_supported) {
+                        for (const LegacyCnEntry& e : entries)
+                            if (e.has_checksum) { entries_have_checksum = true; break; }
+                    }
+                    auto member_verify = [&](const std::vector<unsigned char>& dec) -> bool {
+                        if (!validate_decoded_candidate(dec)) return false;
+                        if (entries_have_checksum) return true;
+                        std::uint8_t tag = 0; std::size_t cw = 0;
+                        switch (checksum_mode) {
+                            case ChecksumMode::kFletcher32: tag = 0x45u; cw = 4u; break;
+                            case ChecksumMode::kFletcher16: tag = 0x45u; cw = 2u; break;
+                            case ChecksumMode::kCrc32:      tag = 0x47u; cw = 4u; break;
+                            case ChecksumMode::kCrc16:      tag = 0x26u; cw = 2u; break;
+                            case ChecksumMode::kNone:       return false;
                         }
-                        out_uvar9 = v;
-                        return true;
+                        const std::uint32_t c = ComputeBufferChecksum(checksum_mode, dec.data(), dec.size());
+                        std::array<std::uint8_t, 5> pat{};
+                        pat[0] = tag;
+                        for (std::size_t k = 0; k < cw; ++k)
+                            pat[1u + k] = static_cast<std::uint8_t>((c >> (8u * k)) & 0xffu);
+                        const std::size_t patlen = 1u + cw;
+                        for (std::size_t q = 0; q + patlen <= bytes.size(); ++q)
+                            if (std::memcmp(bytes.data() + q, pat.data(), patlen) == 0) return true;
+                        return false;
                     };
-                    // Multi-block loop. Each block produces up to 32 KiB into
-                    // a sliding-window dict whose size is method_p1-dependent
-                    // (legacy `param_1[1]`):
-                    //   dict_size = (p1 + 1) * 64 KiB
-                    // Empirically observed via gdb on legacy:
-                    //   p1=0 → 64 KiB, p1=1 → 128 KiB, p1=3 → 256 KiB, p1=15 → 1 MiB.
-                    // NOTE: earlier notes incorrectly said p1=0 → 128 KiB; the
-                    // actual wrap behaviour (cursor hits 65536-32772=32764<32768
-                    // after one block) confirms 64 KiB for p1=0.
-                    // Layout: 4-byte left-pad (zero) before dict_base so the
-                    // dispatcher's `hash_at_minus2(out)` read at cursor=0
-                    // (post-wrap) is safe. Initial cursor = 4 — the encoder's
-                    // dict starts as if 4 bytes were already "written"
-                    // (initial pad). src_off in bytecode is relative to
-                    // dict_base; position N in bytecode reads source[N-4].
-                    // Cursor wraps to 0 when remaining < 32 KiB (mirrors
-                    // legacy FUN_080b6bb0 — overwrites the leading 4 bytes
-                    // of dict with new block data, no copy). Hash table
-                    // persists across blocks. last_lz_dest re-initialised
-                    // to -1 per block (FUN_08097570 line 138).
-                    const std::size_t window_left_pad = 4u;
-                    // Dict (sliding-window) capacity. GDB on legacy (FUN_080b6bb0
-                    // reads cap at obj+4) shows the dict size is always one of
-                    // three values, depending on the encoder's threading/chunking:
-                    //   (a) (p1+1)*64KiB                 — small single members,
-                    //   (b) floor(total/128KiB)*128KiB   — some large members,
-                    //   (c) ceil(total/128KiB)*128KiB    — most large members.
-                    // The exact choice is not recoverable from the header alone,
-                    // so we try each candidate and adopt the first whose decode
-                    // passes the checksum gate below. The wrong capacity only
-                    // changes output once a sliding-window wrap occurs, and that
-                    // is exactly what the checksum rejects — so this never emits
-                    // wrong bytes. The legacy buffer is cap + 0x8000 (the wrap
-                    // memset in FUN_080b6bb0 zeroes [cursor, cap+0x8000)).
-                    std::vector<std::size_t> cap_candidates;
-                    {
-                        const std::size_t t = static_cast<std::size_t>(total_data_size);
-                        const std::size_t units = t / 0x20000u;
-                        // Ordered so the common no-wrap case (a capacity at or
-                        // above total) verifies on the first decode: ceil first,
-                        // then the genuinely-wrapping floor case, then the
-                        // small-member (p1+1)*64KiB value.
-                        const std::size_t cands[3] = {
-                            (units + 1u) * 0x20000u,
-                            units * 0x20000u,
-                            (static_cast<std::size_t>(method_p1) + 1u) * 0x10000u,
-                        };
-                        for (std::size_t c : cands) {
-                            if (c == 0u) continue;
-                            bool dup = false;
-                            for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
-                            if (!dup) cap_candidates.push_back(c);
-                        }
+                    std::vector<unsigned char> member_out;
+                    if (DecodeLzpfMember(bytes, sp, static_cast<std::size_t>(stream_bytes),
+                                         total_data_size, is_variant_b, method_p1,
+                                         member_verify, &member_out)) {
+                        native_literal_payload = true;
+                        literal_data_offset = 0u;
+                        literal_data_size = member_out.size();
+                        literal_data_owned = true;
+                        literal_data_buffer = std::move(member_out);
                     }
-                    const std::size_t window_wrap_threshold = 0x8000u;  // 32 KiB
-                  for (const std::size_t window_capacity : cap_candidates) {
-                    if (native_literal_payload) break;
-                    stream_data_start = sp;
-                    stream_data_end = sp + static_cast<std::size_t>(stream_bytes);
-                    bp = stream_data_start;
-                    const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
-                    const std::size_t window_initial_cursor = 4u;
-                    std::vector<std::uint8_t> window_alloc(
-                        window_left_pad + window_capacity + window_tail_slack, 0);
-                    std::uint8_t* const window = window_alloc.data() + window_left_pad;
-                    std::vector<unsigned char> decoded(
-                        static_cast<std::size_t>(total_data_size), 0);
-                    // Hash table sizing differs by variant:
-                    //   A: 8192 × i32 = 32 KiB (13-bit hash).
-                    //   B: 16M × i32 = 64 MiB (24-bit hash) + 8 KiB byte buffer.
-                    // The variant-B allocation is large but matches the legacy
-                    // `nz_lzpf_large` codec footprint. Allocated lazily — only
-                    // when method_p0 == 2.
-                    //
-                    // BOTH variants initialize the hash table to 3, NOT 0.
-                    // GDB trace (2026-06-04) on linux32/nz confirms that
-                    // nz_lzpf_large also fills the hash table with the value
-                    // 3 before any block is processed. Using 0 for variant B
-                    // (the previous default) caused silent data corruption
-                    // for multi-file archives with mixed random/repeat/zero
-                    // files (regression fixture
-                    // tests/fixtures/lzpf/regression_cF_multi.nz).
-                    std::vector<std::int32_t> hash_table(
-                        is_variant_b ? std::size_t{0x1000000u} : std::size_t{8192u},
-                        std::int32_t{3});
-                    std::vector<std::uint8_t> byte_buffer_b(
-                        is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
-                    std::size_t window_cursor = window_initial_cursor;
-                    std::size_t total_written = 0;
-                    std::size_t input_pos = bp;
-                    bool decode_ok = true;
-                    nzr::lzpf::LpcPredictor pf_pred{};
-                    nzr::lzpf::LpcPredictor pf_pred2{};   // ch2 LPC state (stereo planar), persists across blocks
-                    // LPC filter order (FUN_08095d90 obj+0x1c08): nz_lzpf (variant A)
-                    // = 4-tap, nz_lzpf_large (variant B) = 8-tap. GDB-confirmed.
-                    pf_pred.taps  = is_variant_b ? 8u : 4u;
-                    pf_pred2.taps = is_variant_b ? 8u : 4u;
-                    // LMS inter-channel state (FUN_08096e20) persists across blocks
-                    // when the prefilter is stereo-split. Zero-init; reset only at
-                    // the start of a new archive (the outer parse function allocates
-                    // these afresh per archive).
-                    nzr::lzpf::LmsObject pf_lms_ch1{};
-                    nzr::lzpf::LmsObject pf_lms_ch2{};
-                    pf_lms_ch1.Init();
-                    pf_lms_ch2.Init();
-                    while (total_written < total_data_size) {
-                        // If we've consumed the current stream's bytes and
-                        // there's more output to produce, advance to the
-                        // next stream tag in the chain.
-                        if (input_pos >= stream_data_end) {
-                            if (input_pos != stream_data_end) {
-                                decode_ok = false; break;
-                            }
-                            // A checksum record (tag 0x45 Fletcher / 0x47 crc32 /
-                            // 0x26 crc16 + width bytes) can sit between streams.
-                            // It carries the whole-output checksum (verified once
-                            // after the full decode, see below), so here we just
-                            // consume it to continue walking the stream chain.
-                            while (input_pos < bytes.size()) {
-                                const std::uint8_t tb = bytes[input_pos];
-                                std::size_t tw;
-                                if      (tb == 0x45u) tw = 4u;
-                                else if (tb == 0x47u) tw = 4u;
-                                else if (tb == 0x26u) tw = 2u;
-                                else break;
-                                if (input_pos + 1u + tw > bytes.size()) break;
-                                input_pos += 1u + tw;
-                            }
-                            std::uint64_t next_tag = 0;
-                            if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
-                                (next_tag & 0x0fu) != 0u) {
-                                decode_ok = false; break;
-                            }
-                            const std::uint64_t next_bytes = next_tag >> 4u;
-                            if (next_bytes == 0u ||
-                                next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos)) {
-                                decode_ok = false; break;
-                            }
-                            stream_data_start = input_pos;
-                            stream_data_end = input_pos + static_cast<std::size_t>(next_bytes);
-                        }
-                        std::uint32_t uvar9 = 0;
-                        if (!decode_lzpf_header(input_pos, uvar9)) {
-                            decode_ok = false; break;
-                        }
-                        // Only LZ77+side-stream mode is implemented natively.
-                        // Other modes (`uVar9 & 7 == 4` prefilter+arith, or
-                        // `& 1 == 0` raw bytecode without side-stream) fall
-                        // through to the bridge.
-                        // Mode dispatch (per FUN_08097570):
-                        //   (uvar9 & 7) == 4: prefilter+arith → bridge (task #13)
-                        //   (uvar9 & 2) == 0: literal block (memcpy raw bytes)
-                        //   (uvar9 & 2) != 0 + (uvar9 & 1): LZ77 + arith side-stream
-                        //   (uvar9 & 2) != 0 + !(uvar9 & 1): LZ77, raw bytecode (no side-stream)
-                        const bool mode_prefilter = ((uvar9 & 7u) == 4u);
-                        const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
-                        const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
-                        // Sliding-window wrap (legacy FUN_080b6bb0, called once
-                        // per block before the payload is decoded): when fewer
-                        // than 32 KiB remain before the dict capacity, zero the
-                        // tail [cursor, cap+0x8000) and reset the cursor to 0.
-                        // The zeroing matters: post-wrap back-references that
-                        // reach into the freed tail must read 0 (the encoder
-                        // zeroed it too), and the dispatcher's hash_at_minus2
-                        // read at cursor 0 lands in the 4-byte left pad.
-                        if (window_capacity - window_cursor < window_wrap_threshold) {
-                            std::memset(window + window_cursor, 0,
-                                        window_capacity + window_tail_slack - window_cursor);
-                            window_cursor = 0;
-                        }
-                        if (mode_prefilter) {
-                            // uVar18 (bit 3 of uvar9) selects lzpf (0) vs lzhd-large (1) core.
-                            // lzhd-large prefilter (FUN_080a9ca0) not yet ported.
-                            const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;
-                            if (uvar18 != 0u) { decode_ok = false; break; }
-                            std::uint64_t block_out_size = uvar9 >> 4u;
-                            if (block_out_size == 0u) block_out_size = 0x8000u;
-                            if (block_out_size > 0x8001u) { decode_ok = false; break; }
-                            if (total_written + block_out_size > total_data_size) {
-                                decode_ok = false; break;
-                            }
-                            const std::size_t block_start_in_window = window_cursor;
-                            const std::size_t avail_in = stream_data_end - input_pos;
-                            // Auto-detect stereo split from the prefilter header byte
-                            // (FUN_080a5330 line 50: channels = (hdr>>1) % 3).
-                            // If channels != 0, is_stereo_variant must be true so the
-                            // LMS inter-channel predictor (FUN_08096e20) runs. The LMS
-                            // objects persist across blocks in the outer loop.
-                            const std::uint8_t pf_hdr = bytes[input_pos];
-                            const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
-                            const bool is_stereo_pf = (pf_channels != 0u);
-                            const std::size_t pf_consumed = nzr::lzpf::DecodePrefilterStream(
-                                bytes.data() + input_pos, avail_in,
-                                window + block_start_in_window,
-                                static_cast<std::size_t>(block_out_size),
-                                is_stereo_pf,
-                                &pf_pred,
-                                is_stereo_pf ? &pf_lms_ch1 : nullptr,
-                                is_stereo_pf ? &pf_lms_ch2 : nullptr,
-                                is_stereo_pf ? &pf_pred2 : nullptr);
-                            if (pf_consumed == 0) { decode_ok = false; break; }
-                            input_pos += pf_consumed;
-                            window_cursor += static_cast<std::size_t>(block_out_size);
-                            std::memcpy(decoded.data() + total_written,
-                                        window + block_start_in_window,
-                                        static_cast<std::size_t>(block_out_size));
-                            total_written += static_cast<std::size_t>(block_out_size);
-                            continue;
-                        }
-                        // Raw-bytecode LZ77 (no side stream) not yet ported.
-                        if (!mode_literal && !mode_lz77_side) { decode_ok = false; break; }
-                        std::uint64_t block_out_size = uvar9 >> 3u;
-                        if (block_out_size == 0u) block_out_size = 0x8000u;
-                        if (block_out_size > 0x8001u) { decode_ok = false; break; }
-                        if (total_written + block_out_size > total_data_size) {
-                            decode_ok = false; break;
-                        }
-                        if (mode_literal) {
-                            // LITERAL: copy block_out_size bytes from input → user output AND dict.
-                            // (Mirrors FUN_08097570 lines 81-95.)
-                            if (input_pos + block_out_size > stream_data_end) {
-                                decode_ok = false; break;
-                            }
-                            const std::size_t block_start_in_window = window_cursor;
-                            std::memcpy(window + block_start_in_window,
-                                        bytes.data() + input_pos,
-                                        static_cast<std::size_t>(block_out_size));
-                            std::memcpy(decoded.data() + total_written,
-                                        bytes.data() + input_pos,
-                                        static_cast<std::size_t>(block_out_size));
-                            window_cursor += static_cast<std::size_t>(block_out_size);
-                            input_pos += static_cast<std::size_t>(block_out_size);
-                            total_written += static_cast<std::size_t>(block_out_size);
-                            continue;
-                        }
-                        if (input_pos + 2u > stream_data_end) { decode_ok = false; break; }
-                        const std::uint16_t side_count =
-                            static_cast<std::uint16_t>(bytes[input_pos]) |
-                            (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
-                        input_pos += 2u;
-                        const std::size_t arith_size = stream_data_end - input_pos;
-                        std::vector<std::uint8_t> bytecode(side_count + 16u, 0);
-                        const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
-                            bytes.data() + input_pos, arith_size,
-                            bytecode.data(), side_count, /*max_len=*/12);
-                        if (consumed == 0 || consumed > arith_size) {
-                            decode_ok = false; break;
-                        }
-                        input_pos += consumed;
-                        const std::size_t block_start_in_window = window_cursor;
-                        std::int32_t last_lz_dest = -1;  // re-init per block
-                        const bool dispatch_ok = is_variant_b
-                            ? nzr::lzpf::DecodeLz77VariantB(
-                                  bytecode.data(), side_count,
-                                  window, window_capacity,
-                                  &window_cursor, static_cast<std::size_t>(block_out_size),
-                                  hash_table.data(), byte_buffer_b.data(),
-                                  &last_lz_dest)
-                            : nzr::lzpf::DecodeLz77VariantA(
-                                  bytecode.data(), side_count,
-                                  window, window_capacity,
-                                  &window_cursor, static_cast<std::size_t>(block_out_size),
-                                  hash_table.data(), &last_lz_dest);
-                        if (!dispatch_ok) {
-                            decode_ok = false; break;
-                        }
-                        if (window_cursor != block_start_in_window + block_out_size) {
-                            decode_ok = false; break;
-                        }
-                        std::memcpy(decoded.data() + total_written,
-                                    window + block_start_in_window,
-                                    static_cast<std::size_t>(block_out_size));
-                        total_written += static_cast<std::size_t>(block_out_size);
-                    }
-                    if (decode_ok && total_written == total_data_size) {
-                        // Whole-output checksum gate. Every nz_lzpf member
-                        // embeds a checksum record [tag][value] over its ENTIRE
-                        // output (tag 0x45 Fletcher32 / 0x47 crc32 / 0x26 crc16;
-                        // it is the per-file checksum, stored in the metadata for
-                        // small members and mid-chain for large multi-stream ones).
-                        // We require that the checksum of our decoded output is
-                        // present in the archive so a wrong decode — e.g. an
-                        // unmodelled sliding-window wrap when the true dict
-                        // capacity differs from our estimate — is rejected rather
-                        // than emitted. This is what makes large multi-stream
-                        // archives safe to decode natively.
-                        bool whole_ok = false;
-                        {
-                            std::uint8_t tag = 0;
-                            std::size_t cw = 0;
-                            switch (checksum_mode) {
-                                case ChecksumMode::kFletcher32: tag = 0x45u; cw = 4u; break;
-                                case ChecksumMode::kFletcher16: tag = 0x45u; cw = 2u; break;
-                                case ChecksumMode::kCrc32:      tag = 0x47u; cw = 4u; break;
-                                case ChecksumMode::kCrc16:      tag = 0x26u; cw = 2u; break;
-                                case ChecksumMode::kNone:       break;
-                            }
-                            if (cw != 0u) {
-                                const std::uint32_t c = ComputeBufferChecksum(
-                                    checksum_mode, decoded.data(), decoded.size());
-                                std::array<std::uint8_t, 5> pat{};
-                                pat[0] = tag;
-                                for (std::size_t k = 0; k < cw; ++k)
-                                    pat[1u + k] = static_cast<std::uint8_t>((c >> (8u * k)) & 0xffu);
-                                const std::size_t patlen = 1u + cw;
-                                if (bytes.size() >= patlen) {
-                                    for (std::size_t q = 0; q + patlen <= bytes.size(); ++q) {
-                                        if (std::memcmp(bytes.data() + q, pat.data(), patlen) == 0) {
-                                            whole_ok = true; break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // When the archive carries per-entry checksums,
-                        // validate_decoded_candidate has already verified the
-                        // bytes against them, so the whole-output gate is not
-                        // also required (small single-stream members embed only
-                        // the per-entry checksum). The whole-output gate is the
-                        // safety net specifically for large multi-stream members
-                        // whose entries carry no per-file checksum (has_checksum
-                        // == false), where a size-only match is otherwise
-                        // unverified and an unmodelled sliding-window wrap could
-                        // slip through.
-                        bool entries_have_checksum = false;
-                        if (checksum_verification_supported) {
-                            for (const LegacyCnEntry& e : entries) {
-                                if (e.has_checksum) { entries_have_checksum = true; break; }
-                            }
-                        }
-                        bool vok = validate_decoded_candidate(decoded) &&
-                                   (entries_have_checksum || whole_ok);
-                        if (vok) {
-                            native_literal_payload = true;
-                            literal_data_offset = 0u;
-                            literal_data_size = decoded.size();
-                            literal_data_owned = true;
-                            literal_data_buffer = std::move(decoded);
-                        }
-                        // Defensive cross-check: when the native LZ77+arith
-                        // path produces a size-correct candidate but its
-                        // checksums do not match (or no checksums exist),
-                        // leave native_literal_payload=false. The caller in
-                        // RunLegacyCnExtractOrTest will then attempt the
-                        // legacy extract-bridge and adopt its output if the
-                        // bridge produces a checksum-valid candidate. This
-                        // guarantees byte-exact decode for -cf/-cF even if
-                        // the native LZ77 dispatcher drifts on inputs that
-                        // don't have per-entry checksums (e.g. multi-file
-                        // archives with literal-only substream segments
-                        // that the current single-stream literal detector
-                        // rejects). Skippable via NZ_DISABLE_LZPF_BRIDGE=1.
-                    }
-                  }  // end cap-candidate loop
                 }
 
                 // `-cd/-cD` literal-only substream:

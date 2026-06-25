@@ -222,11 +222,16 @@ std::uint32_t ReadCodeLengthsPass1(BitReader& br,
 // (initialise to -1 on first call).
 //
 // Returns true on success; false on bytecode underflow or output overflow.
+// `bytecode_consumed` (optional): on success, receives the number of bytecode
+// bytes read. Needed by the raw-bytecode block mode, where the bytecode is the
+// stream's input directly (no arith side stream) and the caller must advance the
+// input cursor by exactly the consumed amount.
 bool DecodeLz77VariantA(const std::uint8_t* bytecode, std::size_t bytecode_size,
                         std::uint8_t* dict, std::size_t dict_capacity,
                         std::size_t* dict_cursor, std::size_t output_size,
                         std::int32_t* hash_table,
-                        std::int32_t* last_lz_dest);
+                        std::int32_t* last_lz_dest,
+                        std::size_t* bytecode_consumed = nullptr);
 
 // LZ77 bytecode dispatcher — variant B (= `nz_lzpf_large`, where `*ctx != 0`).
 //
@@ -247,7 +252,8 @@ bool DecodeLz77VariantB(const std::uint8_t* bytecode, std::size_t bytecode_size,
                         std::size_t* dict_cursor, std::size_t output_size,
                         std::int32_t* hash_table_24bit,
                         std::uint8_t* byte_buffer_8k,
-                        std::int32_t* last_lz_dest);
+                        std::int32_t* last_lz_dest,
+                        std::size_t* bytecode_consumed = nullptr);
 
 // Top-level wrapper that decodes `output_count` arith-coded bytes. Mirrors
 // FUN_080a4ea0:

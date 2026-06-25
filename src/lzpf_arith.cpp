@@ -730,7 +730,9 @@ bool DecodeLz77VariantA(const std::uint8_t* bytecode, std::size_t bytecode_size,
                         std::uint8_t* dict, std::size_t dict_capacity,
                         std::size_t* dict_cursor, std::size_t output_size,
                         std::int32_t* hash_table,
-                        std::int32_t* last_lz_dest) {
+                        std::int32_t* last_lz_dest,
+                        std::size_t* bytecode_consumed) {
+    if (bytecode_consumed) *bytecode_consumed = 0;
     if (output_size == 0) return true;
     if (*dict_cursor + output_size > dict_capacity) return false;
 
@@ -897,6 +899,7 @@ bool DecodeLz77VariantA(const std::uint8_t* bytecode, std::size_t bytecode_size,
 done:
     *dict_cursor = static_cast<std::size_t>(out - dict_base);
     *last_lz_dest = local_50;
+    if (bytecode_consumed) *bytecode_consumed = static_cast<std::size_t>(bp - bytecode);
     return true;
 }
 
@@ -905,7 +908,9 @@ bool DecodeLz77VariantB(const std::uint8_t* bytecode, std::size_t bytecode_size,
                         std::size_t* dict_cursor, std::size_t output_size,
                         std::int32_t* hash_table_24bit,
                         std::uint8_t* byte_buffer_8k,
-                        std::int32_t* last_lz_dest) {
+                        std::int32_t* last_lz_dest,
+                        std::size_t* bytecode_consumed) {
+    if (bytecode_consumed) *bytecode_consumed = 0;
     if (output_size == 0) return true;
     if (*dict_cursor + output_size > dict_capacity) return false;
 
@@ -1042,6 +1047,7 @@ bool DecodeLz77VariantB(const std::uint8_t* bytecode, std::size_t bytecode_size,
 done:
     *dict_cursor = static_cast<std::size_t>(out - dict_base);
     *last_lz_dest = local_48;
+    if (bytecode_consumed) *bytecode_consumed = static_cast<std::size_t>(bp - bytecode);
     return true;
 }
 
