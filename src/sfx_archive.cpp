@@ -2449,6 +2449,34 @@ bool DecodeLzpfMember(
                 std::memcpy(decoded.data() + total_written, bytes.data() + input_pos,
                             static_cast<std::size_t>(block_out_size));
                 window_cursor += static_cast<std::size_t>(block_out_size);
+                // Backfill hash_table for the literal bytes just written
+                // (legacy FUN_080b6d90 / FUN_080b6cf0, called after every
+                // literal block — NOT called for LZ77 blocks, which insert
+                // per-opcode inline instead). Without this, later blocks that
+                // reference a hash bucket only ever touched during a literal
+                // run read the table's untouched init value (3) instead of a
+                // real offset, corrupting f6/f8/medium-match copies.
+                // (uvar9 & 1) selects: 0 -> sparse (every 101 bytes, stopping
+                // 100 bytes short of the block end), 1 -> dense (every byte).
+                {
+                    const std::size_t bstart = block_start_in_window;
+                    const std::size_t bend = block_start_in_window + static_cast<std::size_t>(block_out_size);
+                    const std::size_t step = (uvar9 & 1u) ? 1u : 101u;
+                    const std::size_t hstop = (uvar9 & 1u) ? bend : (bend > 100u ? bend - 100u : bstart);
+                    for (std::size_t pos = bstart; pos < hstop; pos += step) {
+                        const std::uint32_t h = is_variant_b
+                            ? (*reinterpret_cast<const std::uint32_t*>(window + pos - 3) & 0xffffffu)
+                            : (*reinterpret_cast<const std::uint32_t*>(window + pos - 2) & 0x1fffu);
+                        hash_table[h] = static_cast<std::int32_t>(pos);
+                    }
+                    // Variant B additionally resets the entire byte_buffer_8k
+                    // side-table to 0 after every literal block (legacy
+                    // FUN_080b6c20, called unconditionally from the tail of
+                    // both FUN_080b6d90/FUN_080b6cf0's variant-B branch).
+                    if (is_variant_b) {
+                        std::memset(byte_buffer_b.data(), 0, byte_buffer_b.size());
+                    }
+                }
                 input_pos += static_cast<std::size_t>(block_out_size);
                 total_written += static_cast<std::size_t>(block_out_size);
                 continue;
@@ -2803,7 +2831,16 @@ bool TryParseLegacyCnArchive(
         return s.size() >= 6u && has_dot;
     };
     bool multiblock_scanner_added_entries = false;
-    if (!native_store_payload) {
+    // Skip the heuristic multi-block table scanner for parallel (-pN) archives:
+    // size_accum already gives the true per-file size by summing every
+    // stream's own type-1 table (see above), so total_data_size is already
+    // correct here. The scanner's [table_span][filename_table] shape probe is
+    // explicitly documented as spoofable by noisy compressed bytes (see
+    // comment above `path_looks_like_real_legacy_entry`); running it anyway
+    // on a parallel container's many per-stream compressed chunks measurably
+    // produces false-positive phantom entries that corrupt total_data_size
+    // (observed: a 9 MB tar under -cf falsely gained a phantom 114-byte entry).
+    if (!native_store_payload && size_accum.empty()) {
         std::size_t scan_pos = table_end;
         while (scan_pos < bytes.size()) {
             bool found_additional = false;
