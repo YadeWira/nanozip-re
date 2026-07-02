@@ -41,6 +41,12 @@ std::uint32_t NzCdReconstruct(const std::uint32_t* tokens, std::uint32_t num_tok
             pos += lit_run;
             if (pos >= out_size) break;
         }
+        // Sanity: a match can only reference bytes already produced in `out`
+        // (offset in [1, pos]). Garbage/mismatched bytecode can decode an
+        // out-of-range offset; unchecked, `out + pos - offset` would point
+        // before the buffer and read/write out of bounds. Refuse (0 sentinel,
+        // safe: normal completion always returns out_size > 0 below) instead.
+        if (offset == 0 || offset > pos) return 0;
         std::uint8_t* dst = out + pos;
         const std::uint8_t* src = out + pos - offset;
         if (pos + mlen > out_size) mlen = out_size - pos;
@@ -610,6 +616,16 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::
             else if (sel == 3) { rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; }
             rep[0] = offset;
         }
+        // Sanity: a match offset must reference already-written ring history
+        // (at most one full ring back). Garbage or format-mismatched bytecode
+        // (e.g. nz_lzhds fed through this nz_lzhd token decoder) can produce
+        // an offset far beyond the ring; left unchecked, the wrap arithmetic
+        // below (`wi + ring_size - offset`) underflows to a huge uint32 and
+        // indexes `ring[]` far out of bounds -> crash. Refuse rather than
+        // crash or corrupt: signal failure to the caller via a 0 return (safe
+        // sentinel — normal completion always returns out_size > 0, enforced
+        // below by the trailing literal flush).
+        if (offset == 0 || offset > ring_size) return 0;
         if (lit_run) {
             std::uint32_t run = lit_run;
             if (pos + run > out_size) run = out_size - pos;
@@ -766,7 +782,13 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     // Reconstruct into the 64 KB ring at this chunk's base (matches reach prior
     // chunks via the wrap), then linearise the chunk's compact recon into `slice`.
-    ReconstructRing(ring, ring_size, base, toks.data(), N, literals.data(), out_size);
+    // A 0 return means ReconstructRing hit an out-of-range match offset (garbage
+    // or format-mismatched bytecode, e.g. nz_lzhds mistakenly fed through this
+    // nz_lzhd token decoder) and refused rather than risk an OOB ring access;
+    // propagate that failure so the caller rejects the chunk instead of reading
+    // an incomplete/undefined ring back out.
+    if (ReconstructRing(ring, ring_size, base, toks.data(), N, literals.data(), out_size) == 0)
+        return 0;
     RingRead(ring, ring_size, base, slice.data(), out_size);
     }
 
