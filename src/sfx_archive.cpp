@@ -3390,6 +3390,168 @@ bool TryParseLegacyCnArchive(
                     }
                 }
 
+                // `-cd/-cD` parallel multi-stream container (same header flag
+                // byte 0x0f / same chunk-record scheme as the -cf/-cF parallel
+                // container above, used by the multi-threaded encoder for
+                // inputs >~8 MB). The stream-descriptor parsing loop below is
+                // byte-for-byte identical to the -cf/-cF branch (shared
+                // infrastructure, not lzpf-specific); only the per-stream
+                // downstream decode differs: each of a stream's type-0 chunk
+                // records is one raw nz_cd (DecLZ) block (unlike -cf/-cF's
+                // lzpf bitstream, a -cd stream's chunks are NOT continuous and
+                // need no concatenation), decoded with NzCdDecodeStream one
+                // chunk at a time into a FRESH per-stream ring (confirmed:
+                // each parallel-encoder thread owned its own nz_cd instance /
+                // ring, unlike the single-container case in
+                // TryDecodeLegacyLzhd which shares one ring across the whole
+                // archive). The ring is sized round(slice_osz/0x10000)*0x10000
+                // (min 0x10000), matching the single-container formula but
+                // applied per-slice. Every slice is checksum-verified before
+                // being placed into the assembled output, so a wrong decode
+                // is rejected rather than emitted.
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 3u || method_p0 == 4u)) {
+                    std::size_t magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu) {
+                        struct PCdStream {
+                            // Each entry is one raw nz_cd block: (offset, size)
+                            // into `bytes`, decoded in order into the slice.
+                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                        };
+                        std::map<unsigned, PCdStream> ps;
+                        std::size_t p = magic + 3u;
+                        bool parse_ok = true;
+                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            std::size_t csz = static_cast<std::size_t>(r >> 4u);
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            PCdStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                std::size_t tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                s.chunks.emplace_back(p, csz);
+                            }
+                            p += csz;
+                        }
+                        std::vector<unsigned char> assembled(
+                            static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = parse_ok && !ps.empty();
+                        std::uint64_t covered = 0;
+                        static constexpr std::size_t kCdWindowPad = 16u;
+                        for (auto& kv : ps) {
+                            PCdStream& s = kv.second;
+                            if (s.chunks.empty()) continue;
+                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+
+                            const std::size_t slice_total = static_cast<std::size_t>(s.osz);
+                            std::vector<unsigned char> slice_buf(kCdWindowPad + slice_total, 0u);
+                            unsigned char* const slice_window = slice_buf.data() + kCdWindowPad;
+
+                            // Fresh, independent per-stream ring (hypothesis:
+                            // each parallel-encoder thread had its own nz_cd
+                            // instance), sized to this stream's own slice
+                            // output via the same round(slice/0x10000)*0x10000
+                            // formula used for the single-container case.
+                            std::uint32_t sring_units = static_cast<std::uint32_t>(
+                                (static_cast<std::uint64_t>(slice_total) + 0x8000u) / 0x10000u);
+                            if (sring_units == 0u) sring_units = 1u;
+                            const std::uint32_t sring_size = sring_units * 0x10000u;
+                            std::vector<std::uint8_t> sring(sring_size, 0u);
+                            std::uint32_t sring_pos = 0u;
+
+                            // Each type-0 chunk record IS one raw nz_cd
+                            // (DecLZ) block already delimited by the outer
+                            // record parser above (its `csz` is exactly the
+                            // compressed byte length, no embedded stream_tag
+                            // inside it) -- unlike the -cf/-cF lzpf payload,
+                            // whose bitstream is continuous across chunk
+                            // boundaries and must be concatenated before a
+                            // single decode call. Here each chunk maps 1:1 to
+                            // one NzCdDecodeStream() call, threading the
+                            // per-stream ring + output cursor across chunks,
+                            // exactly like TryDecodeLegacyLzhd's per-stream_tag
+                            // loop in the single-container case.
+                            std::size_t pwritten = 0u;
+                            bool sok = true;
+                            for (const auto& c : s.chunks) {
+                                if (pwritten >= slice_total) break;
+                                const std::uint8_t* blk_in = bytes.data() + c.first;
+                                const std::uint32_t blk_in_size = static_cast<std::uint32_t>(c.second);
+                                const std::uint32_t blk_cap = static_cast<std::uint32_t>(slice_total - pwritten);
+                                std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+                                    blk_in, blk_in_size, slice_window + pwritten, blk_cap,
+                                    sring.data(), sring_size, &sring_pos,
+                                    static_cast<std::uint32_t>(pwritten));
+                                if (produced == 0u) { sok = false; break; }
+                                pwritten += produced;
+                            }
+                            if (!sok || pwritten != slice_total) { all_ok = false; break; }
+                            if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) {
+                                all_ok = false; break;
+                            }
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
+                                        slice_window, slice_total);
+                            covered += s.osz;
+                        }
+                        if (all_ok && covered == total_data_size &&
+                            validate_decoded_candidate(assembled)) {
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
         std::size_t sp = payload_start;
         std::uint64_t stream_tag = 0;
         if (ReadLegacyVarint(bytes, &sp, bytes.size(), &stream_tag) &&
