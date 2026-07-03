@@ -3,6 +3,7 @@
 #include "nz_cm.h"
 #include "nz_lzhd.h"
 #include "nz_cd_tokens.h"
+#include "nz_lzhds.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_texttransform_num.h"
@@ -3507,6 +3508,20 @@ bool TryParseLegacyCnArchive(
                             std::vector<std::uint8_t> sring(sring_size, 0u);
                             std::uint32_t sring_pos = 0u;
 
+                            // `-cD` parallel streams: each thread owned its own
+                            // nz_lzhds instance (same "fresh per-stream ring"
+                            // hypothesis as above), so the MTF-context table is
+                            // fresh per slice too, not shared across streams.
+                            const bool s_is_lzhds = (method_p0 == 4u);
+                            std::vector<std::uint8_t> s_lzhds_ctx;
+                            std::uint32_t s_lzhds_ctx_index = 0u;
+                            std::uint8_t* s_lzhds_ctx_ptr = nullptr;
+                            if (s_is_lzhds) {
+                                s_lzhds_ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+                                nzr::cd::NzLzhdsInitCtxTable(s_lzhds_ctx.data());
+                                s_lzhds_ctx_ptr = s_lzhds_ctx.data();
+                            }
+
                             // Each type-0 chunk record IS one raw nz_cd
                             // (DecLZ) block already delimited by the outer
                             // record parser above (its `csz` is exactly the
@@ -3529,7 +3544,8 @@ bool TryParseLegacyCnArchive(
                                 std::uint32_t produced = nzr::cd::NzCdDecodeStream(
                                     blk_in, blk_in_size, slice_window + pwritten, blk_cap,
                                     sring.data(), sring_size, &sring_pos,
-                                    static_cast<std::uint32_t>(pwritten));
+                                    static_cast<std::uint32_t>(pwritten),
+                                    s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index);
                                 if (produced == 0u) { sok = false; break; }
                                 pwritten += produced;
                             }
@@ -3990,6 +4006,20 @@ static bool TryDecodeLegacyLzhd(
     std::vector<std::uint8_t> ring(ring_size, 0u);
     std::uint32_t ring_pos = 0u;
 
+    // `-cD` (method_p0==4, nz_lzhds) selects the per-context MTF+adaptive-
+    // predictor literal model (nz_lzhds.h) instead of `-cd`'s raw literal copy.
+    // The context table is per-archive persistent state (like `ring`): init
+    // once here, then thread across every stream/chunk in this archive.
+    const bool is_lzhds = (legacy.legacy_method_p0 == 4u);
+    std::vector<std::uint8_t> lzhds_ctx;
+    std::uint32_t lzhds_ctx_index = 0u;
+    std::uint8_t* lzhds_ctx_ptr = nullptr;
+    if (is_lzhds) {
+        lzhds_ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+        nzr::cd::NzLzhdsInitCtxTable(lzhds_ctx.data());
+        lzhds_ctx_ptr = lzhds_ctx.data();
+    }
+
     // Each type-0 chunk is one stream: stream_tag varint followed by
     // stream_bytes bytes of raw DecLZ compressed data.
     while (pos < raw_len && written < total_out) {
@@ -4025,7 +4055,8 @@ static bool TryDecodeLegacyLzhd(
         const std::uint32_t block_cap = static_cast<std::uint32_t>(total_out - written);
         std::uint32_t produced = nzr::cd::NzCdDecodeStream(
             block_in, block_in_size, window_base + written, block_cap,
-            ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written));
+            ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
+            is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index);
         if (produced == 0u) { ok = false; break; }
         written += produced;
     }

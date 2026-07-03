@@ -3,6 +3,7 @@
 #include "nz_cd_tokens.h"
 #include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
 #include "nz_cd_texttransform_dict.h"   // &8 bit 0x8 word-dictionary transform
+#include "nz_lzhds.h"     // -cD (nz_lzhds) literal model
 
 #include <cstring>
 #include <vector>
@@ -660,7 +661,8 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::
 std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std::size_t* block_pos,
                           std::uint8_t* ring, std::uint32_t ring_pos, std::uint32_t ring_size,
                           std::uint8_t* out, std::uint32_t out_cap, std::uint32_t out_pos,
-                          std::uint32_t* recon_advance) {
+                          std::uint32_t* recon_advance,
+                          bool is_lzhds, std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index) {
     *recon_advance = 0;
     CdRd r{block + *block_pos, block + block_len};
     std::uint32_t chunk = CdReadVar(r, 0x80010u);
@@ -754,6 +756,20 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     std::uint32_t bs_size = CdReadVar(r, out_size * 4u);
     const std::uint8_t* bs = r.cur; r.cur += bs_size;
 
+    // `-cD` (nz_lzhds) ONLY: a brand-new, length-prefixed control field
+    // ("ratebits" -- the Exp-Golomb run-length/order stream NzLzhdsReconstruct's
+    // literal model reads) sits immediately after `bs` and immediately before
+    // `literals`: one raw, unconditional length byte `L` (NOT a CdReadVar
+    // varint), followed by exactly `L` raw bytes. GDB-verified byte-for-byte
+    // against the binary (research session; FUN_080bf5a0/FUN_080b1c30).
+    const std::uint8_t* ratebits = nullptr;
+    std::uint32_t ratebits_len = 0;
+    if (is_lzhds) {
+        ratebits_len = (r.cur < r.end) ? *r.cur++ : 0u;
+        ratebits = r.cur;
+        r.cur += ratebits_len;
+    }
+
     NzCdField fl{g_kCdSlotLit, g_kCdModelLit, 8u};
     NzCdField fo{g_kCdSlotOff, g_kCdModelOff, 4u};
     NzCdField fn{g_kCdSlotLen, g_kCdModelLen, 14u};
@@ -762,12 +778,20 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     // Total literals consumed by recon = out_size - (sum of match lengths): per-token
     // lit_run plus the trailing flush. (Match length doesn't depend on the rep[] MTF,
-    // only on sel/raw, so it can be summed here without replaying offsets.)
+    // only on sel/raw, so it can be summed here without replaying offsets.) `-cD`
+    // uses DIFFERENT match-length-class thresholds than `-cd` (FUN_080982e0:
+    // `uVar10=sel-3; mlen=raw+4+(uVar10>0x3ff)+(uVar10>0x3fff)+(uVar10>0x7fffff)`,
+    // three classes, vs `-cd`'s two at 0x4ff/0x63ff).
     std::uint32_t litsum = 0, summlen = 0;
     for (std::uint32_t i = 0; i < N; ++i) {
         litsum += toks[i * 3];
         std::uint32_t sel = toks[i * 3 + 1], raw = toks[i * 3 + 2];
-        if (sel >= 4u) { std::uint32_t off = sel - 3u; summlen += raw + 4u + (off > 0x63ffu) + (off > 0x4ffu); }
+        if (sel >= 4u) {
+            std::uint32_t off = sel - 3u;
+            summlen += is_lzhds
+                ? raw + 4u + (off > 0x3ffu) + (off > 0x3fffu) + (off > 0x7fffffu)
+                : raw + 4u + (off > 0x63ffu) + (off > 0x4ffu);
+        }
         else summlen += raw + 2u;
     }
     std::uint32_t total_lit = litsum;
@@ -782,13 +806,20 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     // Reconstruct into the 64 KB ring at this chunk's base (matches reach prior
     // chunks via the wrap), then linearise the chunk's compact recon into `slice`.
-    // A 0 return means ReconstructRing hit an out-of-range match offset (garbage
-    // or format-mismatched bytecode, e.g. nz_lzhds mistakenly fed through this
-    // nz_lzhd token decoder) and refused rather than risk an OOB ring access;
-    // propagate that failure so the caller rejects the chunk instead of reading
-    // an incomplete/undefined ring back out.
-    if (ReconstructRing(ring, ring_size, base, toks.data(), N, literals.data(), out_size) == 0)
-        return 0;
+    // A 0 return means the reconstruction hit an out-of-range match offset
+    // (garbage or format-mismatched bytecode) and refused rather than risk an
+    // OOB ring access; propagate that failure so the caller rejects the chunk
+    // instead of reading an incomplete/undefined ring back out.
+    if (is_lzhds) {
+        if (NzLzhdsReconstruct(toks.data(), N, literals.data(), literals.size(),
+                               ratebits, ratebits_len,
+                               ring, ring_size, base, out_size,
+                               lzhds_ctx_table, lzhds_ctx_index) == 0)
+            return 0;
+    } else {
+        if (ReconstructRing(ring, ring_size, base, toks.data(), N, literals.data(), out_size) == 0)
+            return 0;
+    }
     RingRead(ring, ring_size, base, slice.data(), out_size);
     }
 
@@ -830,14 +861,17 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
     std::uint32_t adv = 0;
     return DecodeChunk(block, block_len, block_pos,
                        ring.data(), 0u, ring_size,
-                       out, out_cap, 0u, &adv);
+                       out, out_cap, 0u, &adv,
+                       false, nullptr, nullptr);
 }
 
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* out, std::uint32_t out_cap,
                                std::uint8_t* ring, std::uint32_t ring_size,
-                               std::uint32_t* ring_pos, std::uint32_t out_pos_base) {
-    // Decode one -cd stream into `out` using a CALLER-OWNED ring that PERSISTS across
+                               std::uint32_t* ring_pos, std::uint32_t out_pos_base,
+                               bool is_lzhds,
+                               std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index) {
+    // Decode one -cd/-cD stream into `out` using a CALLER-OWNED ring that PERSISTS across
     // streams (the binary keeps ONE window object for the whole archive; large files
     // split output into 1 MB streams that match into each other through this ring).
     // Each chunk writes its compact recon at the current ring base (wrapping) and
@@ -846,6 +880,7 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
     // end. `*ring_pos` is the absolute ring position (in/out). `out_pos_base` is this
     // stream's file-absolute output offset (the &4 exe filter needs the file offset).
     if (ring == nullptr || ring_size == 0 || ring_pos == nullptr) return 0;
+    if (is_lzhds && (lzhds_ctx_table == nullptr || lzhds_ctx_index == nullptr)) return 0;
     std::size_t pos = 0;
     std::uint32_t written = 0;
     while (pos < block_len && written < out_cap) {
@@ -854,7 +889,8 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
         std::uint32_t n = DecodeChunk(block, block_len, &pos,
                                       ring, *ring_pos, ring_size,
                                       out + written, out_cap - written,
-                                      out_pos_base + written, &adv);
+                                      out_pos_base + written, &adv,
+                                      is_lzhds, lzhds_ctx_table, lzhds_ctx_index);
         if (n == 0 || pos <= prev) break;   // malformed / no progress
         written += n;
         *ring_pos = adv;                    // adv is the new absolute ring position
@@ -864,14 +900,23 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
 
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap,
-                              std::uint32_t ring_size) {
+                              std::uint32_t ring_size, bool is_lzhds) {
     // Single-stream convenience (tests / standalone): a fresh ring, base 0, file
     // offset 0. The dispatcher uses NzCdDecodeStream directly to persist the ring.
     if (ring_size == 0) ring_size = kCdRingSizeDefault;
     std::vector<std::uint8_t> ring(ring_size, 0);
     std::uint32_t ring_pos = 0;
+    std::vector<std::uint8_t> lzhds_ctx;
+    std::uint32_t lzhds_ctx_index = 0;
+    std::uint8_t* ctx_ptr = nullptr;
+    if (is_lzhds) {
+        lzhds_ctx.assign(kLzhdsCtxTableSize, 0u);
+        NzLzhdsInitCtxTable(lzhds_ctx.data());
+        ctx_ptr = lzhds_ctx.data();
+    }
     return NzCdDecodeStream(block, block_len, out, out_cap,
-                            ring.data(), ring_size, &ring_pos, 0u);
+                            ring.data(), ring_size, &ring_pos, 0u,
+                            is_lzhds, ctx_ptr, &lzhds_ctx_index);
 }
 
 }  // namespace cd

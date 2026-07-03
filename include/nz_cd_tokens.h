@@ -128,7 +128,8 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
 // standalone single-stream path; the dispatcher passes the round() value.
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap,
-                              std::uint32_t ring_size = 0x10000u);
+                              std::uint32_t ring_size = 0x10000u,
+                              bool is_lzhds = false);
 
 // Decode one -cd stream into `out` using a CALLER-OWNED ring window that PERSISTS
 // across streams. Large files split their output into 1 MB streams whose LZ matches
@@ -137,10 +138,19 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
 // across calls. `out_pos_base` is this stream's file-absolute output offset (used by
 // the &4 exe filter). Returns bytes written. NzCdDecodeBlock is the single-stream
 // wrapper.
+// `is_lzhds`/`lzhds_ctx_table`/`lzhds_ctx_index` select the `-cD` (nz_lzhds)
+// literal model instead of `-cd`'s raw-copy literal handler (see nz_lzhds.h).
+// `lzhds_ctx_table` must point at kLzhdsCtxTableSize (16 KB) bytes, initialized
+// once via NzLzhdsInitCtxTable and threaded (along with `*lzhds_ctx_index`)
+// across every NzCdDecodeStream call for the whole `-cD` archive/stream. Both
+// are ignored when `is_lzhds` is false.
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* out, std::uint32_t out_cap,
                                std::uint8_t* ring, std::uint32_t ring_size,
-                               std::uint32_t* ring_pos, std::uint32_t out_pos_base);
+                               std::uint32_t* ring_pos, std::uint32_t out_pos_base,
+                               bool is_lzhds = false,
+                               std::uint8_t* lzhds_ctx_table = nullptr,
+                               std::uint32_t* lzhds_ctx_index = nullptr);
 
 }  // namespace cd
 }  // namespace nzr
