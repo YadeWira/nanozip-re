@@ -4369,14 +4369,22 @@ static bool TryDecodeLegacyCm(
     return true;
 }
 
-// Decode -co/-cO (nz_optimum1/2) natively. These use the same flat block framing
-// as -cc (chunk-header "stream_tag" + per-block Header: payload_size u32, decr_param,
-// param6, size18, staged, params, tt, dece) but the core codec is DecLZ (decr_param
-// == 1), driven through a persistent raw window (LZ back-references span blocks).
-// The reference (nzdec_v0) decodes -cO via DecodeLZ; the ported DecLZ is byte-exact
-// against it. The decoded raw stream is then run through the param2/param1/tt/dece
-// post-filter pipeline (same as -cc). decr_param == 0 (BWT) blocks are not yet
-// ported and cause a decline -> bridge.
+// Decode -co/-cO (nz_optimum1/2) natively -- CURRENTLY NOT WORKING, see the
+// long NOTE at this function's only (unwired) call site in
+// RunLegacyCnExtractOrTest for the full story. Summary: this function's outer
+// block-header framing (payload_size u32, decr_param, param6, size18, staged,
+// params, tt, dece -- the same flat framing -cc uses) IS confirmed correct
+// (the field walk lands exactly on stream_end/EOF for every fixture tried).
+// What is NOT correct is the assumption below that decr_param == 1 selects
+// nzdec_v0's DecLZ core codec: live GDB tracing of the real linux32/nz binary
+// proves that assumption false (FUN_080b5240 is never called for a real -co
+// decode of any size tried, from 200 bytes to 700 KB output). The real -co/-cO
+// LZ core is a different, polymorphic virtual-dispatch mixing framework that
+// has not been reverse-engineered yet. decr_param == 0 (BWT) blocks are also
+// not yet ported and cause a decline -> bridge, same as decr_param == 1.
+// This function is kept (unwired, `[[maybe_unused]]`) as a documented,
+// checksum/size-gated dead end for whoever picks up the real RE work next,
+// and because its header-framing walk is itself validated and reusable.
 [[maybe_unused]] static bool TryDecodeLegacyOptimum(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
@@ -4526,9 +4534,14 @@ static bool TryDecodeLegacyCm(
 
         if (!param6 || out_size == 0u) continue;
 
-        // Decode this block's LZ payload into the persistent window.
+        // Decode this block's LZ payload into the persistent window. A false
+        // return means the bitstream produced an out-of-window match (see
+        // nz_lzhd.h) -- decline cleanly rather than trust a partially-written
+        // buffer.
         if (raw_pos + out_size > window_cap) { ok = false; break; }
-        NzLzhdDecode(dec, payload, payload_size, window_base + raw_pos, out_size, window_base);
+        if (!NzLzhdDecode(dec, payload, payload_size, window_base + raw_pos, out_size, window_base)) {
+            ok = false; break;
+        }
         std::vector<std::uint8_t> work(window_base + raw_pos, window_base + raw_pos + out_size);
         raw_pos += out_size;
         std::uint32_t cur_size = out_size;
@@ -4612,12 +4625,41 @@ int RunLegacyCnExtractOrTest(
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
-        // NOTE: native -co/-cO (TryDecodeLegacyOptimum) is intentionally NOT wired
-        // in. Small -cO blocks use a flat DecLZ framing that decodes natively, but
-        // larger -cO files switch to the same virtual-stream LZ framing as -cd
-        // (the reference nzdec_ref also crashes on them), which makes a flat DecLZ
-        // call wild-read and SIGSEGV. Until the virtual-stream framing is reversed,
-        // -co/-cO route to the bridge. See PROGRESO_2026-06-08.md §optimum.
+        // NOTE (updated by a dedicated GDB-capture session, superseding the older
+        // "virtual-stream framing" theory below and PROGRESO_2026-06-08.md
+        // §optimum): native -co/-cO (TryDecodeLegacyOptimum) is intentionally NOT
+        // wired in. TryDecodeLegacyOptimum's LZ path (decr_param == 1) calls
+        // NzLzhdDecode(), a port of the *community reference* nzdec_v0 DecLZ
+        // (FUN_080b5240 per that reference's own address annotations). Live GDB
+        // call-tracing of the real linux32/nz binary (ASLR disabled, single-
+        // threaded via -t1, syscall-anchored to the exact byte range of a
+        // decr_param==1 block's compressed payload, `nexti`-stepped over calls to
+        // stay at manageable granularity) proves this address is simply never
+        // reached during a real -co decode -- confirmed on both a trivial 3-byte-
+        // payload/48-byte-output block and a realistic 107-byte-payload/273366-
+        // byte-output block (gen/aaa200_co.nz, gen/text_700K_co.nz). The real
+        // per-block LZ decode is a *polymorphic, per-model virtual-dispatch mixing
+        // framework* -- entered through a dispatcher around 0x080aa870-0x080aa9e1
+        // (immediately before the already-identified param2/param1/tt/dece filter-
+        // verify cascade at 0x080aaa70-0x080aacd6, call-verified via the shared
+        // 0x080c0220 checker with per-stage error codes) -- structurally different
+        // from nzdec_v0's monolithic DecLZ struct: it dispatches through ~8 model
+        // objects via vtable slots (`call *0x4(%esi)` / `call *(%eax)` pairs
+        // repeating per bit, matching this port's predictors[0..7] shape
+        // conceptually but NOT byte-for-byte), none of which correspond to
+        // FUN_080b5240. This also independently reproduces (with a concrete
+        // mechanism) the prior research phase's finding that NzLzhdDecode
+        // diverges into garbage at the first token on every real -co/-cO fixture:
+        // it isn't a framing bug, it's simply the wrong decoder entirely. Porting
+        // the real one needs a dedicated multi-session RE effort (mapping every
+        // model class's predict/update pair), mirroring the -cd/-cD effort -- not
+        // attempted in this session. `nz_lzhd.cpp`'s DecLZ::decode() was hardened
+        // (now returns bool, bounds-checks match offset/length before the copy
+        // loop) so that if this path is ever exercised again (e.g. by a research
+        // harness) it declines instead of the SIGSEGV the old code above documents;
+        // this is defense-in-depth only and changes no shipped behavior, since the
+        // function remains unreachable from this dispatcher. -co/-cO continue to
+        // route to the bridge.
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
         const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);

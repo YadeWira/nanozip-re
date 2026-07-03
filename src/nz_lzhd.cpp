@@ -183,7 +183,7 @@ struct DecLZ {
     uint32_t position_history[65536];
 
     DecLZ();
-    void decode(const uint8_t* in,  uint32_t in_size,
+    bool decode(const uint8_t* in,  uint32_t in_size,
                 uint8_t*       out, uint32_t out_size,
                 uint8_t*       window_base);
 };
@@ -219,7 +219,7 @@ DecLZ::DecLZ() {
     }
 }
 
-void DecLZ::decode(const uint8_t* inx, uint32_t in_size,
+bool DecLZ::decode(const uint8_t* inx, uint32_t in_size,
                    uint8_t* out, uint32_t out_size, uint8_t* window_base) {
     uint32_t repmatch[4];
     uint8_t* out_end = out + out_size;
@@ -631,6 +631,21 @@ void DecLZ::decode(const uint8_t* inx, uint32_t in_size,
                     repmatch[0] = offset;
                 }
 
+                // Safety guard (not part of the ported algorithm): a bogus
+                // offset/matchlen -- e.g. from feeding this decoder a
+                // bitstream it doesn't actually understand -- must not be
+                // allowed to read before window_base or write past out_end.
+                // Reject cleanly instead of the wild pointer arithmetic that
+                // used to SIGSEGV here (see nz_lzhd.h). We return immediately
+                // on failure (the caller must discard this whole decode()
+                // call, not just this token) so it's harmless that `repmatch[]`
+                // above was already updated with the bad value.
+                const std::size_t avail = static_cast<std::size_t>(out - window_base);
+                if (static_cast<std::uint64_t>(offset) >= avail ||
+                    matchlen > static_cast<uint32_t>(out_end - out)) {
+                    return false;
+                }
+
                 auto delta = -static_cast<ptrdiff_t>(offset) - 1;
                 for (uint32_t i = 0u; i < matchlen; ++i)
                     out[i] = out[static_cast<ptrdiff_t>(i) + delta];
@@ -643,6 +658,7 @@ void DecLZ::decode(const uint8_t* inx, uint32_t in_size,
             }
         } while (round_bytes_left != 0u);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -662,9 +678,9 @@ void NzLzhdDestroy(NzLzhdDecoder* dec) {
     }
 }
 
-void NzLzhdDecode(NzLzhdDecoder* dec,
+bool NzLzhdDecode(NzLzhdDecoder* dec,
                   const uint8_t* in,  uint32_t in_size,
                   uint8_t*       out, uint32_t out_size,
                   uint8_t*       window_base) {
-    dec->decode(in, in_size, out, out_size, window_base);
+    return dec->decode(in, in_size, out, out_size, window_base);
 }
