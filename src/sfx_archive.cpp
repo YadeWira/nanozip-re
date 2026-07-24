@@ -4,6 +4,7 @@
 #include "nz_lzhd.h"
 #include "nz_cd_tokens.h"
 #include "nz_lzhds.h"
+#include "nz_optimum_lz.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_texttransform_num.h"
@@ -3897,7 +3898,8 @@ bool TryParseLegacyCnArchive(
         }
     } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
                ((method == 0x4bu && method_p0 == 7u) ||
-                (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u))) &&
+                (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) ||
+                (method == 0x3bu && method_p0 == 5u)) &&
                payload_start < bytes.size()) {
         // Store the raw compressed stream so the native decoders can parse the
         // stream_tag + block directly:
@@ -3905,7 +3907,9 @@ bool TryParseLegacyCnArchive(
         //  - 0x2b p0=3/4 -> TryDecodeLegacyLzhd (the real coroutine token-LZ, now
         //    ported as NzCdDecodeBlock; the old "virtual-stream framing crashes a
         //    flat DecLZ" note is obsolete — pure-LZ -cd decodes byte-exact).
-        // -co/-cO (0x3b) still bridge.
+        //  - 0x3b p0=5 (-co, nz_optimum1) -> TryDecodeLegacyOptimum, now backed by
+        //    NzOptimumLzDecoder (FUN_0809e600 port). -cO (0x3b p0=6, FUN_080a5d90)
+        //    still bridges -- that engine is a separate, not-yet-ported design.
         ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
                         bytes.end());
     }
@@ -4369,31 +4373,44 @@ static bool TryDecodeLegacyCm(
     return true;
 }
 
-// Decode -co/-cO (nz_optimum1/2) natively -- CURRENTLY NOT WORKING, see the
-// long NOTE at this function's only (unwired) call site in
-// RunLegacyCnExtractOrTest for the full story. Summary: this function's outer
-// block-header framing (payload_size u32, decr_param, param6, size18, staged,
-// params, tt, dece -- the same flat framing -cc uses) IS confirmed correct
-// (the field walk lands exactly on stream_end/EOF for every fixture tried).
-// What is NOT correct is the assumption below that decr_param == 1 selects
-// nzdec_v0's DecLZ core codec: live GDB tracing of the real linux32/nz binary
-// proves that assumption false (FUN_080b5240 is never called for a real -co
-// decode of any size tried, from 200 bytes to 700 KB output). The real -co/-cO
-// LZ core is a different, polymorphic virtual-dispatch mixing framework that
-// has not been reverse-engineered yet. decr_param == 0 (BWT) blocks are also
-// not yet ported and cause a decline -> bridge, same as decr_param == 1.
-// This function is kept (unwired, `[[maybe_unused]]`) as a documented,
-// checksum/size-gated dead end for whoever picks up the real RE work next,
-// and because its header-framing walk is itself validated and reusable.
-[[maybe_unused]] static bool TryDecodeLegacyOptimum(
+// Decode -co (nz_optimum1, method_p0==5) natively via NzOptimumLzDecoder
+// (src/nz_optimum_lz.cpp, a byte-exact transcription of the real linux32/nz
+// binary's FUN_0809e600 -- see include/nz_optimum_lz.h and
+// work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md for the full RE
+// provenance). This function's outer block-header framing (payload_size u32,
+// decr_param, param6, size18, staged, params, tt, dece -- the same flat
+// framing -cc uses) was already confirmed correct in an earlier session (the
+// field walk lands exactly on stream_end/EOF for every fixture tried); what
+// changed is the decr_param==1 payload decoder itself: it used to call
+// NzLzhdDecode() (a port of the community reference's DecLZ), which live GDB
+// tracing proved is never reached by the real binary for -co content. The
+// real per-block LZ/CM core is FUN_0809e600, now ported and validated
+// byte-exact against 4 isolated golden vectors (matchfix_co/bigdist_co/
+// smalldist_co/hientropy_co -- see tests/test_optimum_lz.cpp) covering
+// literal runs, small/large-distance matches (slots 0-18), rep-offset reuse,
+// and a high-entropy literal stress segment.
+//
+// Scope: SINGLE-CONTAINER only (archive header flag 0x05) -- one
+// NzOptimumLzDecoder instance is constructed per call (i.e. per container
+// stream) and threaded across every decr_param==1 block in this stream's
+// sequence, matching the real binary's per-stream-persistent ring/adaptive-
+// table state. method_p0==6u (-cO / nz_optimum2, FUN_080a5d90) is a distinct,
+// not-yet-ported engine and is declined here so it keeps routing to the
+// bridge. decr_param==0 (BWT) blocks are also not yet ported and decline.
+//
+// Safety: every candidate is checksum-gated below (mirroring -cd/-cD/-cc's
+// own self-verify pattern) before being trusted by the caller; any mismatch,
+// malformed framing, or DecodeBlock-reported inconsistency cleanly declines
+// (returns false) so RunLegacyCnExtractOrTest falls through to the bridge --
+// never a partial/corrupt native result.
+static bool TryDecodeLegacyOptimum(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
     std::string* out_error_message) {
     if (out_data == nullptr) return false;
     out_data->clear();
 
-    if (legacy.legacy_method != 0x3bu ||
-        (legacy.legacy_method_p0 != 5u && legacy.legacy_method_p0 != 6u))
+    if (legacy.legacy_method != 0x3bu || legacy.legacy_method_p0 != 5u)
         return false;
     if (legacy.data.empty()) return false;
 
@@ -4418,21 +4435,19 @@ static bool TryDecodeLegacyCm(
     if (stream_bytes > raw_len - pos) return false;
     const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
 
-    // Persistent raw window for DecLZ. Sum(size18) <= total_data_size because the
-    // post-transforms (param2 RLE / tt dict+number) only expand. Reserve generously
-    // and bounds-check so a reallocation can never move window_base mid-decode.
-    // DecLZ reads context bytes before the cursor (cur_ptr[-2..-6]) and copies
-    // matches from earlier output, so the window needs leading zero-padding
-    // (the reference MemBlocks pads data_org by 64 bytes).
-    static constexpr std::size_t kWindowPad = 64u;
-    const std::size_t window_cap =
-        static_cast<std::size_t>(legacy.total_data_size) + (1u << 20);
-    std::vector<std::uint8_t> rawbuf(kWindowPad + window_cap, 0u);
-    std::uint8_t* const window_base = rawbuf.data() + kWindowPad;
-    std::size_t raw_pos = 0;
-
-    NzLzhdDecoder* dec = NzLzhdCreate();
-    if (!dec) { return false; }
+    // One persistent decoder for this whole (single-container) stream: its
+    // ring/dictionary window and every adaptive probability table carry over
+    // from one decr_param==1 block to the next, exactly like the real
+    // binary's per-container-stream subengine object.
+    const std::uint32_t window_capacity =
+        nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
+    if (window_capacity == 0u) return false;
+    if (getenv("NZOPT_TRACE_TDO")) {
+        fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
+                legacy.legacy_method_p1, window_capacity,
+                (unsigned long long)legacy.total_data_size);
+    }
+    nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
 
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
     bool ok = true;
@@ -4466,6 +4481,10 @@ static bool TryDecodeLegacyCm(
         const std::uint8_t staged_count = raw[pos++];
         if (pos + staged_count > stream_end) { ok = false; break; }
         pos += staged_count;
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u param6=%u out_size=%u staged_count=%u pos=%zu stream_end=%zu\n",
+                    payload_size, decr_param, param6, out_size, staged_count, pos, stream_end);
+        }
 
         // decr_param == 0 (BWT) path not yet ported.
         if (decr_param == 0u) { ok = false; break; }
@@ -4520,6 +4539,10 @@ static bool TryDecodeLegacyCm(
             if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
             if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
         }
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u tt16_data.size=%zu pos=%zu stream_end=%zu\n",
+                    param2_flag, param1_flag, tt_enabled, tt_flags, tt16_data.size(), pos, stream_end);
+        }
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t dece_param = raw[pos++];
         if (dece_param) {
@@ -4531,19 +4554,35 @@ static bool TryDecodeLegacyCm(
             pos += 4u + vlen;
             if (pos > stream_end) { ok = false; break; }
         }
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] dece_param=%u pos=%zu stream_end=%zu param6=%u out_size=%u\n",
+                    dece_param, pos, stream_end, param6, out_size);
+        }
 
         if (!param6 || out_size == 0u) continue;
 
-        // Decode this block's LZ payload into the persistent window. A false
-        // return means the bitstream produced an out-of-window match (see
-        // nz_lzhd.h) -- decline cleanly rather than trust a partially-written
-        // buffer.
-        if (raw_pos + out_size > window_cap) { ok = false; break; }
-        if (!NzLzhdDecode(dec, payload, payload_size, window_base + raw_pos, out_size, window_base)) {
+        if (const char* dpp = getenv("NZOPT_DUMP_PAYLOAD")) {
+            FILE* f = fopen(dpp, "wb");
+            fwrite(payload, 1, payload_size, f);
+            fclose(f);
+            fprintf(stderr, "[TDO] dumped payload (%u bytes) to %s, out_size=%u window_capacity=%u\n",
+                    payload_size, dpp, out_size, window_capacity);
+        }
+
+        // Decode this block's LZ/CM payload via the persistent per-stream
+        // decoder. A false return means the bitstream produced a malformed
+        // dispatch bit, an out-of-window match, or any other detected
+        // inconsistency -- decline cleanly rather than trust a partially-
+        // written buffer (DecodeBlock never touches `work` before it is sure).
+        std::vector<std::uint8_t> work(out_size);
+        const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
+                    payload_size, out_size, decode_block_ok ? 1 : 0);
+        }
+        if (!decode_block_ok) {
             ok = false; break;
         }
-        std::vector<std::uint8_t> work(window_base + raw_pos, window_base + raw_pos + out_size);
-        raw_pos += out_size;
         std::uint32_t cur_size = out_size;
 
         const std::size_t prev_size = out_data->size();
@@ -4561,7 +4600,10 @@ static bool TryDecodeLegacyCm(
             exp.resize(esz); work.swap(exp); cur_size = esz;
         }
         if (param1_flag) { ok = false; break; }
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u))) { ok = false; break; }
+        // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
+        // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x20 are ported so far;
+        // any other bit set (0x80/4/2/0x40/1) declines cleanly.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x20u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
@@ -4590,17 +4632,80 @@ static bool TryDecodeLegacyCm(
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
+        if (tt_enabled && (tt_flags & 0x20u)) {
+            // Escape+run-length repeat transform (NzTextTransformRle, ported
+            // from TransformText_4 -- see include/nz_text_transform.h). Pure
+            // byte post-filter, no side-channel data, order-independent of
+            // the entropy coder (verified against real -co archives whose
+            // literal payload didn't warrant the word dictionary).
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
         if (dece_param) { ok = false; break; }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
+                    cur_size, out_data->size(), (unsigned long long)legacy.total_data_size,
+                    param2_flag, param1_flag, tt_enabled, tt_flags, dece_param);
+        }
     }
-
-    NzLzhdDestroy(dec);
 
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
         out_data->clear();
         if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
+    }
+
+    // Checksum self-verify (mirrors TryDecodeLegacyLzhd's own gate above): a
+    // stored per-file checksum mismatch means "decline, let the caller fall
+    // back to the bridge" rather than "trust it anyway".
+    //
+    // History: an earlier pass through this session found a live,
+    // reproducible bug in the literal 4-context mixer's ctxC seed formula
+    // (NzOptimumLzDecoder::DecodeBlock, the `(local_81 & 1u) == 0u` branch
+    // right after a match): on a real 246KB C++ source file
+    // (arc_source.cpp.nz-style archive), byte 132408 decoded as 0x64 instead
+    // of the correct 0x69, with the range-coder `code` register and every
+    // mixer/rep-array input up to that point confirmed bit-for-bit identical
+    // to the real linux32/nz binary via GDB, and `lo`/`hi` silently
+    // diverging only after that literal. Root-caused via disassembly at
+    // 0x0809eb9e-0x0809ebb5: the real binary computes
+    // `signshift = (uint8_t)prevHi >> 7` (a `movzx eax,al` before the
+    // `sar eax,7`, i.e. eax is always in [0,255], so the shift just extracts
+    // bit 7 as 0/1) but this port instead sign-extended `prevHi` to
+    // `int8_t` first, giving -1 instead of +1 whenever bit 7 was set --
+    // fixed in-place (see the comment at that branch). Re-validated against
+    // all 4 golden vectors, the previously-failing real archive, freshly
+    // regenerated matchfix/bigdist/smalldist/hientropy engineered-repeat
+    // archives, and tests/native_only_v2.sh with zero regressions, so the
+    // checksum gate below now follows the same shape as the sibling
+    // -cd/-cD/-cc gates (skip verification only when the archive truly
+    // carries no usable checksum) rather than an extra-conservative
+    // unconditional decline.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        std::size_t cursor = 0;
+        for (const LegacyCnEntry& e : legacy.entries) {
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (cursor + n > out_data->size()) break;
+            if (!e.has_checksum) {
+                out_data->clear();
+                if (out_error_message) *out_error_message = "optimum: entry missing checksum, declining";
+                return false;
+            }
+            const std::uint32_t got =
+                ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
+            if (got != e.checksum) {
+                out_data->clear();
+                if (out_error_message) *out_error_message = "optimum: checksum mismatch";
+                return false;
+            }
+            cursor += n;
+        }
     }
     return true;
 }
@@ -4625,41 +4730,40 @@ int RunLegacyCnExtractOrTest(
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
-        // NOTE (updated by a dedicated GDB-capture session, superseding the older
-        // "virtual-stream framing" theory below and PROGRESO_2026-06-08.md
-        // §optimum): native -co/-cO (TryDecodeLegacyOptimum) is intentionally NOT
-        // wired in. TryDecodeLegacyOptimum's LZ path (decr_param == 1) calls
-        // NzLzhdDecode(), a port of the *community reference* nzdec_v0 DecLZ
-        // (FUN_080b5240 per that reference's own address annotations). Live GDB
-        // call-tracing of the real linux32/nz binary (ASLR disabled, single-
-        // threaded via -t1, syscall-anchored to the exact byte range of a
-        // decr_param==1 block's compressed payload, `nexti`-stepped over calls to
-        // stay at manageable granularity) proves this address is simply never
-        // reached during a real -co decode -- confirmed on both a trivial 3-byte-
-        // payload/48-byte-output block and a realistic 107-byte-payload/273366-
-        // byte-output block (gen/aaa200_co.nz, gen/text_700K_co.nz). The real
-        // per-block LZ decode is a *polymorphic, per-model virtual-dispatch mixing
-        // framework* -- entered through a dispatcher around 0x080aa870-0x080aa9e1
-        // (immediately before the already-identified param2/param1/tt/dece filter-
-        // verify cascade at 0x080aaa70-0x080aacd6, call-verified via the shared
-        // 0x080c0220 checker with per-stage error codes) -- structurally different
-        // from nzdec_v0's monolithic DecLZ struct: it dispatches through ~8 model
-        // objects via vtable slots (`call *0x4(%esi)` / `call *(%eax)` pairs
-        // repeating per bit, matching this port's predictors[0..7] shape
-        // conceptually but NOT byte-for-byte), none of which correspond to
-        // FUN_080b5240. This also independently reproduces (with a concrete
-        // mechanism) the prior research phase's finding that NzLzhdDecode
-        // diverges into garbage at the first token on every real -co/-cO fixture:
-        // it isn't a framing bug, it's simply the wrong decoder entirely. Porting
-        // the real one needs a dedicated multi-session RE effort (mapping every
-        // model class's predict/update pair), mirroring the -cd/-cD effort -- not
-        // attempted in this session. `nz_lzhd.cpp`'s DecLZ::decode() was hardened
-        // (now returns bool, bounds-checks match offset/length before the copy
-        // loop) so that if this path is ever exercised again (e.g. by a research
-        // harness) it declines instead of the SIGSEGV the old code above documents;
-        // this is defense-in-depth only and changes no shipped behavior, since the
-        // function remains unreachable from this dispatcher. -co/-cO continue to
-        // route to the bridge.
+        // Native -co (nz_optimum1, method_p0==5, single-container flag 0x05)
+        // via TryDecodeLegacyOptimum, now backed by NzOptimumLzDecoder (a
+        // byte-exact port of the real binary's FUN_0809e600, validated against
+        // 4 isolated golden vectors -- see tests/test_optimum_lz.cpp and
+        // work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md). This
+        // supersedes the long-standing "wrong decoder" finding from an earlier
+        // session (NzLzhdDecode/DecLZ is never reached by a real -co decode;
+        // the real per-block core is FUN_0809e600, not FUN_080b5240).
+        // TryDecodeLegacyOptimum checksum-gates its own result internally
+        // (mirroring TryDecodeLegacyLzhd immediately above), so a mismatch or
+        // any malformed-bitstream/out-of-window condition already declines
+        // before reaching here -- no extra bridge cross-check needed.
+        // -cO (method_p0==6, FUN_080a5d90) remains unported and continues to
+        // route to the bridge below, as does the parallel-container (flag
+        // 0x0f) case for -co (TryDecodeLegacyOptimum only parses a single
+        // stream_tag's worth of blocks; parallel-container framing would fail
+        // that parse and decline harmlessly, or in the unlikely event it
+        // doesn't, the checksum gate still catches it).
+        std::string optimum_decode_error;
+        std::vector<unsigned char> optimum_native_data;
+        if (TryDecodeLegacyOptimum(legacy, &optimum_native_data, &optimum_decode_error)) {
+            LegacyCnContext bridged = legacy;
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.data = std::move(optimum_native_data);
+            if (options.verbose) {
+                os << "[native] decoded -co payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+        } else if (options.verbose && !optimum_decode_error.empty()) {
+            os << "[native] -co native decode declined: " << optimum_decode_error << '\n';
+        }
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
         const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);

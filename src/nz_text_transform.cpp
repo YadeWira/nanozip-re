@@ -1,5 +1,7 @@
 #include "nz_text_transform.h"
 #include "nz_extab.h"
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <cstdint>
 
@@ -266,4 +268,55 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
     if (in > in_end || out[-1] != 0x20u)
         return 0;
     return static_cast<uint32_t>(out - 1 - out_org);
+}
+
+// Port of TransformText_4 from NZ_TextTransforms.cpp (tt_flags & 0x20).
+// Bounds-checked at every write (the reference's unsigned `size_t n_copy`
+// do-while can execute its body once even when the computed budget is 0;
+// this port turns that edge into a clean decline instead of an OOB write).
+uint32_t NzTextTransformRle(const uint8_t* in, uint32_t in_size,
+                            uint8_t* out, uint32_t allocated) {
+    if (in_size <= 1) return 0;
+    const uint8_t* in_end = in + in_size;
+    uint8_t* out_end = out + allocated;
+    uint8_t* out_org = out;
+
+    const uint8_t escape_char = *in++;
+    uint8_t* copy_from = out;
+
+    for (;;) {
+        std::ptrdiff_t avail_out = out_end - out;
+        std::ptrdiff_t avail_in = in_end - in;
+        std::ptrdiff_t n_copy = std::min(avail_out, avail_in);
+        if (n_copy <= 0) return 0;  // would be an OOB first write in the reference
+        uint8_t v;
+        do {
+            v = *in++;
+            *out++ = v;
+        } while (--n_copy && v != escape_char);
+
+        if (in == in_end) break;
+        if (n_copy == 0) return 0;  // ran out of budget without an escape hit
+
+        if (*in <= 224u) {
+            if (*in == 224u) {
+                ++in;
+                if (in == in_end) break;
+            } else {
+                copy_from = out;
+            }
+        } else {
+            std::uint32_t run = static_cast<std::uint32_t>(*in) - 224u;
+            if (static_cast<std::ptrdiff_t>(run) > out_end - out) return 0;
+            const uint8_t* tmp_copy_from = copy_from;
+            copy_from = out;
+            do {
+                *out++ = *tmp_copy_from++;
+            } while (--run);
+            ++in;
+            if (in == in_end) break;
+        }
+    }
+
+    return static_cast<uint32_t>(out - out_org);
 }
