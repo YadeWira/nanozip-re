@@ -215,8 +215,20 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
 
         if (b > 127u) {
             c = *in++;
-            // buf layout: [0..13] writable space, [14] = wp_org, always 14 bytes max word
-            uint8_t buf[6 + 6 + 2 + 2 + 1];
+            // buf layout: [0..13] writable space, [14] = wp_org, always 14 bytes max word.
+            // The trailing "+ 16" is pure padding (never written): CopyDictEntWithCase
+            // always reads a fixed 8 or 16 bytes starting at wp regardless of the
+            // actual word length wl, exactly mirroring the reference's own
+            // TransformText_1_Dictionary/CopyDictEntWithCase (which relies on
+            // whatever slack its compiler happened to leave after the equivalent
+            // stack buffer). Found via ASan while validating tt_flags&0x02 fixtures:
+            // for a short word (wl as low as 3) wp sits close to the tail of buf, and
+            // the unconditional 8-byte read can run up to 2 bytes past a tightly-sized
+            // 17-byte buffer. The extra bytes read are never meaningful (only the
+            // first wl bytes of the copy matter; anything past that gets overwritten
+            // by the next character(s) in the outer loop), so padding buf costs
+            // nothing and removes the UB without changing behavior.
+            uint8_t buf[6 + 6 + 2 + 2 + 1 + 16];
             uint8_t* wp = buf + 6 + 6 + 2;
             uint32_t dict_index;
             if (c > 127u) {
@@ -319,4 +331,305 @@ uint32_t NzTextTransformRle(const uint8_t* in, uint32_t in_size,
     }
 
     return static_cast<uint32_t>(out - out_org);
+}
+
+// ---------------------------------------------------------------------------
+// tt_flags & 0x02: InsertLF (TransformText_3_InsertLF)
+//
+// Ported near-verbatim from NZ_TextTransforms.cpp. Reuses the exact same
+// ArithDec / InterpolateLut / CreateModelLut idiom already ported for tt16
+// in nz_texttransform_num.cpp; transcribed here (rather than shared across
+// translation units) since that file keeps the pattern private to an
+// anonymous namespace, matching that file's own porting convention.
+
+// kModelInterpolation/kModelLutLookup are built once by NzCmInitAll() /
+// Build_kModelInterpolation() (nz_cm.cpp) and shared read-only by every
+// text-transform port in this project (see nz_texttransform_num.cpp,
+// nz_lzhd.cpp for the same extern-declaration pattern).
+extern uint16_t kModelInterpolation[4096];
+extern uint16_t kModelLutLookup[4096];
+
+namespace {
+
+// CreateModelLut -- identical to reference NZ.cpp.
+void CreateModelLutLf(uint16_t* out, uint32_t rows, uint32_t cols, uint32_t step, uint32_t first) {
+    out[0] = 0;
+    out[cols - 1] = 0xffffu;
+    const uint16_t* tp = &kModelLutLookup[first];
+    for (uint32_t i = 1; i < cols - 1; ++i, tp += step)
+        out[i] = static_cast<uint16_t>(tp[0] << 4);
+    uint16_t* dp = &out[cols];
+    for (uint32_t n = cols * (rows - 1); n; --n)
+        *dp++ = *out++;
+}
+
+struct ArithDecLf {
+    uint32_t range_hi_, range_lo_, bitbuff_;
+    const uint8_t *data_, *data_end_;
+
+    uint32_t ReadByte() { return (data_ != data_end_ ? *data_++ : 0u); }
+
+    void InitializeX(const uint8_t* d, const uint8_t* e) {
+        data_ = d; data_end_ = e;
+        range_lo_ = 0; range_hi_ = 0xffffffffu; bitbuff_ = 0;
+    }
+    void FillBuffer() {
+        for (int i = 0; i != 4; ++i) bitbuff_ = (bitbuff_ << 8) | ReadByte();
+    }
+    void Renormalize() {
+        while ((range_lo_ ^ range_hi_) < 0x1000000u) {
+            range_lo_ <<= 8;
+            range_hi_ = (range_hi_ << 8) + 0xffu;
+            bitbuff_ = (bitbuff_ << 8) | ReadByte();
+        }
+    }
+    bool ReadNoShift(uint32_t model) {
+        uint32_t compare = range_lo_ + ((range_hi_ - range_lo_) >> 12) * model;
+        bool flag = (bitbuff_ <= compare);
+        range_hi_ -= flag ? (range_hi_ - compare) : 0u;
+        range_lo_ -= flag ? 0u : (range_lo_ - (compare + 1u));
+        Renormalize();
+        return flag;
+    }
+    bool Read(uint32_t model) { return ReadNoShift(model >> 4); }
+};
+
+template<int Scale>
+inline uint32_t xInterpolateModelLf(uint16_t* model_base, uint32_t value, uint32_t index, uint16_t** out_ptr) {
+    uint32_t hv = kModelInterpolation[value >> 4] * (Scale - 1);
+    uint16_t* model = &model_base[(hv >> 12) + Scale * index];
+    uint32_t interpolated = (model[0] * (0x1000u - (hv & 0xfffu)) + model[1] * (hv & 0xfffu)) >> 12;
+    model += (hv & 0xfffu) >> 11;
+    *out_ptr = model;
+    return interpolated;
+}
+
+template<int W, int Scale>
+struct InterpolateLutLf {
+    uint16_t lut[W * Scale];
+    void Initialize(int a, int b) {
+        CreateModelLutLf(lut, W, Scale, static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+    }
+    uint32_t Get(uint32_t v, uint32_t idx, uint16_t** out_ptr) {
+        return xInterpolateModelLf<Scale>(lut, v, idx, out_ptr);
+    }
+};
+
+inline void Memset32Lf(void* dst, uint32_t value, size_t n) {
+    uint32_t* p = static_cast<uint32_t*>(dst);
+    for (size_t i = 0; i < n; ++i) p[i] = value;
+}
+
+// kCharacterTraits_9: 1 if the byte is a "word split" delimiter for the
+// look-ahead word-length scan (space and tab only). Verbatim from Tables.h.
+const uint8_t kCharacterTraits_9[256] = {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+// kCharacterTraits_12: gate on the byte immediately after the candidate
+// split point (line_start's next char) -- 1 for most printable bytes.
+// Verbatim from Tables.h.
+const uint8_t kCharacterTraits_12[256] = {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+// kCharacterTraits_14: gate on the byte immediately before the candidate
+// split point (the char preceding the copied space/LF). Verbatim from Tables.h.
+const uint8_t kCharacterTraits_14[256] = {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+// kNextCharToMdl: 3-bit model-index contribution keyed on the next byte
+// (*in). Verbatim from Tables.h.
+const uint8_t kNextCharToMdl[256] = {
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  1, 4, 5, 0, 0, 0, 0, 5, 6, 6, 0, 0, 4, 7, 4, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 6, 0, 6, 4,
+  0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+  3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 6, 0, 6, 0, 0,
+  0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 6, 0, 6, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+// kPrevCharToMdl: model-index contribution (bits 3-6, i.e. multiples of 8)
+// keyed on the previous byte. Verbatim from Tables.h.
+const uint8_t kPrevCharToMdl[256] = {
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x08, 0x78, 0x60, 0x08, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x08, 0x28, 0x38, 0x58, 0x60, 0x58, 0x58, 0x30, 0x40, 0x40, 0x58, 0x58, 0x48, 0x50, 0x20, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x48, 0x48, 0x40, 0x68, 0x40, 0x28,
+  0x58, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
+  0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x40, 0x60, 0x40, 0x70, 0x78,
+  0x60, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+  0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x40, 0x60, 0x40, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+  0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78, 0x60, 0x68, 0x70, 0x78,
+};
+
+// kLineLengthToMdl: 3-bit model-index contribution (bits 7-9 after <<7)
+// keyed on how far the projected line length is from the running average.
+// Verbatim from Tables.h.
+const uint8_t kLineLengthToMdl[128] = {
+  1, 2, 3, 4, 5, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+}  // namespace
+
+// Port of TransformText_3_InsertLF from NZ_TextTransforms.cpp (tt_flags & 0x02).
+uint32_t NzTextTransformInsertLf(const uint8_t* side, uint32_t side_len,
+                                 const uint8_t* in, uint32_t in_size,
+                                 uint8_t* out, uint32_t allocated) {
+    if (in_size == 0) return 0;
+    // Byte-count-preserving transform (see header comment): every write
+    // below mirrors a byte already consumed from `in`, so this single
+    // upfront check makes every subsequent `*out++` provably in-bounds.
+    if (allocated < in_size) return 0;
+
+    const uint8_t* out_org = out;
+    uint16_t x_arr[1024];
+    Memset32Lf(x_arr, 0x80008000u, sizeof(x_arr) / 4);
+
+    InterpolateLutLf<64, 14> lut_1; lut_1.Initialize(0x13B, 0x13A);
+    InterpolateLutLf<8, 11> lut_2;  lut_2.Initialize(0x199, 0x198);
+    InterpolateLutLf<128, 11> lut_3; lut_3.Initialize(0x199, 0x198);
+
+    uint8_t linelen_hist[32];
+    uint32_t linelen_sum = 70u * 32u;
+    uint32_t linelen_pos = 0;
+    memset(linelen_hist, 70, sizeof(linelen_hist));
+
+    uint32_t line_len_min = 40u, line_len_max = 96u, line_len_min_hard = 0u;
+
+    ArithDecLf adec;
+    adec.InitializeX(side, side + side_len);
+    {
+        uint32_t x = adec.ReadByte();
+        line_len_min_hard = x >> 1;
+        if (x & 1u) {
+            line_len_min = adec.ReadByte();
+            line_len_max = line_len_min + 1u + adec.ReadByte();
+        }
+    }
+    adec.FillBuffer();
+
+    uint8_t c = 0, prev = 0;
+    uint8_t* line_start = out;
+    for (;;) {
+        do {
+            prev = c;
+            c = *in++;
+            *out++ = c;
+        } while (--in_size && (c > 32u || (c != 10u && c != 32u)));
+
+        if (!in_size)
+            return static_cast<uint32_t>(out - out_org);
+
+        uint32_t linelen = static_cast<uint32_t>(out - line_start);
+        if (linelen < line_len_min_hard ||
+            in_size <= 1u ||
+            !kCharacterTraits_12[*in] ||
+            !kCharacterTraits_14[prev]) {
+            if (c != 0x20u) line_start = out;
+            continue;
+        }
+
+        uint32_t wl = 1;
+        while (wl < in_size && !kCharacterTraits_9[in[wl - 1]]) wl++;
+
+        uint32_t x_ix =
+            (static_cast<uint32_t>(kLineLengthToMdl[(linelen + wl - ((linelen_sum + 16u) >> 5)) & 0x7Fu]) << 7) |
+            kPrevCharToMdl[prev] | kNextCharToMdl[*in];
+
+        uint16_t* x_ptr = &x_arr[x_ix];
+        uint16_t *lut2_ptr, *lut1_ptr, *lut3_ptr;
+        uint32_t v = lut_2.Get(*x_ptr, x_ix >> 7, &lut2_ptr);
+        v = lut_1.Get(v, std::min<uint32_t>((linelen - line_len_min_hard) >> 1, 63u), &lut1_ptr);
+        v = lut_3.Get(v, x_ix & 0x3Fu, &lut3_ptr);
+
+        bool insert_lf = adec.Read(v);
+        *x_ptr = static_cast<uint16_t>(*x_ptr + ((0x10000u * insert_lf + 8u - *x_ptr) >> 4));
+        *lut2_ptr = static_cast<uint16_t>(*lut2_ptr + ((0x100FEu * insert_lf - *lut2_ptr) >> 8));
+        *lut1_ptr = static_cast<uint16_t>(*lut1_ptr + ((0x1003Eu * insert_lf - *lut1_ptr) >> 6));
+        *lut3_ptr = static_cast<uint16_t>(*lut3_ptr + ((0x100FEu * insert_lf - *lut3_ptr) >> 8));
+
+        if (insert_lf) {
+            out[-1] = 10;
+            if (linelen >= line_len_min && linelen <= line_len_max) {
+                uint32_t x = ++linelen_pos & 0x1Fu;
+                linelen_sum += linelen - linelen_hist[x];
+                linelen_hist[x] = static_cast<uint8_t>(linelen);
+            }
+            c = 10;
+            line_start = out;
+        } else {
+            if (c != 0x20u) line_start = out;
+        }
+    }
 }

@@ -4328,9 +4328,10 @@ static bool TryDecodeLegacyCm(
         }
 
         // Text transforms, applied in reference order: 0x10 (number transform),
-        // then 0x08 (dictionary). Other bits (0x80/0x04/0x02/0x20/0x40/0x01) not
-        // yet ported -> decline so the caller can bridge.
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u))) { ok = false; break; }
+        // then 0x08 (dictionary), then 0x02 (insert-LF). Other bits
+        // (0x80/0x04/0x20/0x40/0x01) not yet ported -> decline so the caller
+        // can bridge.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x02u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformNumber(
@@ -4343,13 +4344,42 @@ static bool TryDecodeLegacyCm(
         }
         if (tt_enabled && (tt_flags & 0x08u)) {
             // word-dict encoded; expand with dictionary transform.
-            std::vector<std::uint8_t> tbuf(remaining);
+            //
+            // NzTextTransformDict's CopyDictEntWithCase (like the reference
+            // TransformText_1_Dictionary it's ported from) writes a fixed
+            // 8 or 16 bytes per multi-byte dict word starting at the word's
+            // logical output position, even when the word itself is shorter
+            // -- the reference relies on caller-provided output slack to
+            // absorb that intentional over-write (bytes beyond the word's
+            // true length get overwritten by the next characters anyway).
+            // Found live via ASan while validating tt_flags&0x02 real-archive
+            // fixtures: a short (~3-byte) final dict word landing at the
+            // exact tail of a tight `remaining`-sized buffer over-wrote past
+            // the vector's allocation, corrupting the heap allocator
+            // (glibc "double free or corruption" on free). +16 bytes of
+            // slack is more than the max possible per-word overshoot (7
+            // bytes) and costs nothing since the buffer is resized down
+            // immediately after.
+            std::vector<std::uint8_t> tbuf(remaining + 16u);
             const std::uint32_t expanded = NzTextTransformDict(
                 work.data(), cur_size, tbuf.data(), remaining);
             if (expanded == 0) { ok = false; break; }
             tbuf.resize(expanded);
             work.swap(tbuf);
             cur_size = expanded;
+        }
+        if (tt_enabled && (tt_flags & 0x02u)) {
+            // Insert-LF transform (NzTextTransformInsertLf, ported from
+            // TransformText_3_InsertLF). Byte-count-preserving pure byte
+            // post-filter driven by the tt2_data side stream.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformInsertLf(
+                tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
+                work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
         }
 
         if (dece_param) { ok = false; break; }
@@ -4520,7 +4550,7 @@ static bool TryDecodeLegacyOptimum(
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t tt_enabled = raw[pos++];
         std::uint8_t tt_flags = 0;
-        std::vector<std::uint8_t> tt16_data;
+        std::vector<std::uint8_t> tt16_data, tt2_data;
         if (tt_enabled) {
             if (pos >= stream_end) { ok = false; break; }
             tt_flags = raw[pos++];
@@ -4535,7 +4565,6 @@ static bool TryDecodeLegacyOptimum(
                 if (pos + n > stream_end) return false;
                 dst.assign(raw + pos, raw + pos + n); pos += n; return true;
             };
-            std::vector<std::uint8_t> tt2_data;
             if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
             if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
         }
@@ -4601,9 +4630,9 @@ static bool TryDecodeLegacyOptimum(
         }
         if (param1_flag) { ok = false; break; }
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
-        // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x20 are ported so far;
-        // any other bit set (0x80/4/2/0x40/1) declines cleanly.
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x20u))) { ok = false; break; }
+        // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
+        // far; any other bit set (0x80/4/0x40/1) declines cleanly.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x02u | 0x20u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
@@ -4627,8 +4656,25 @@ static bool TryDecodeLegacyOptimum(
                 224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239, 240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
             };
             for (std::uint32_t i = 0; i < cur_size; ++i) work[i] = kReorderAscii[work[i]];
-            std::vector<std::uint8_t> tbuf(remaining);
+            // +16 bytes of slack: see the matching comment at the -cc
+            // NzTextTransformDict call site above (CopyDictEntWithCase's
+            // intentional fixed-width over-write needs caller-provided
+            // headroom past the logical output size).
+            std::vector<std::uint8_t> tbuf(remaining + 16u);
             const std::uint32_t n = NzTextTransformDict(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x02u)) {
+            // Insert-LF transform (NzTextTransformInsertLf, ported from
+            // TransformText_3_InsertLF -- see include/nz_text_transform.h).
+            // Byte-count-preserving pure byte post-filter driven by the
+            // tt2_data side stream (its own embedded arithmetic decoder,
+            // independent of the CM/LZ entropy coder).
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformInsertLf(
+                tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
+                work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
