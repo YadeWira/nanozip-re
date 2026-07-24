@@ -2536,6 +2536,17 @@ bool DecodeLzpfMember(
     return false;
 }
 
+// Forward declaration: defined further below (near TryDecodeLegacyOptimum,
+// which it was extracted from), but also needed here by the -co parallel-
+// container branch inside TryParseLegacyCnArchive.
+static bool DecodeOptimumBlockSequence(
+    const unsigned char* raw,
+    std::size_t blocks_begin,
+    std::size_t blocks_end,
+    std::uint64_t total_size_hint,
+    nzr::optimum::NzOptimumLzDecoder& dec,
+    std::vector<unsigned char>* out_data);
+
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
     LegacyCnContext* out_context,
@@ -3569,6 +3580,160 @@ bool TryParseLegacyCnArchive(
                     }
                 }
 
+                // `-co` (nz_optimum1, method_p0==5 only -- NOT -cO/method_p0==6,
+                // which is out of scope here) parallel multi-stream container
+                // (same header flag 0x0f / same generic chunk-record scheme as
+                // the -cf/-cF and -cd/-cD parallel branches above; shared
+                // infrastructure, not codec-specific). Empirically confirmed
+                // (real 8-15MB -co archives, GDB-free -- just byte inspection +
+                // the checksum gate as arbiter): each stream's type-0 chunk(s)
+                // contain the SAME "sequence of block records" body that
+                // TryDecodeLegacyOptimum's single-container path decodes after
+                // its own leading stream_tag varint -- i.e. a chunk begins
+                // directly with a block's payload_size (u32 LE), NOT with
+                // another stream_tag, and (unlike -cd/-cD, where a chunk is
+                // exactly one block) a single chunk here can itself contain
+                // several back-to-back block records. Each parallel stream
+                // gets its own FRESH NzOptimumLzDecoder (mirrors -cd/-cD's
+                // "each encoder thread owned its own subengine instance"
+                // finding), but all streams share the archive-wide window
+                // capacity derived from method_p1 -- there is only one such
+                // byte in the whole container header, so every stream almost
+                // certainly used the same ring size; a wrong guess here would
+                // simply make DecodeOptimumBlockSequence fail or the
+                // per-slice checksum mismatch, so it's safe to try.
+                if (!native_literal_payload &&
+                    method == 0x3bu &&
+                    method_p0 == 5u) {
+                    std::size_t magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu) {
+                        struct POptStream {
+                            // Each entry is one contiguous block-record range
+                            // (offset, size) into `bytes`; usually just one,
+                            // but concatenated in order if a stream is ever
+                            // split across more than one type-0 chunk.
+                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                        };
+                        std::map<unsigned, POptStream> ps;
+                        std::size_t p = magic + 3u;
+                        bool parse_ok = true;
+                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            std::size_t csz = static_cast<std::size_t>(r >> 4u);
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            POptStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                std::size_t tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                s.chunks.emplace_back(p, csz);
+                            }
+                            p += csz;
+                        }
+                        const std::uint32_t popt_window_capacity =
+                            nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
+                        std::vector<unsigned char> assembled(
+                            static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = parse_ok && !ps.empty() && popt_window_capacity != 0u;
+                        std::uint64_t covered = 0;
+                        for (auto& kv : ps) {
+                            if (!all_ok) break;
+                            POptStream& s = kv.second;
+                            if (s.chunks.empty()) continue;
+                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+
+                            nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
+                            std::vector<unsigned char> slice;
+                            slice.reserve(static_cast<std::size_t>(s.osz));
+                            bool sok = true;
+                            if (s.chunks.size() == 1u) {
+                                const auto& c = s.chunks.front();
+                                sok = DecodeOptimumBlockSequence(
+                                    bytes.data(), c.first, c.first + c.second,
+                                    s.osz, sdec, &slice);
+                            } else {
+                                // Defensive path: not observed in practice
+                                // (every real -co parallel archive fixture so
+                                // far emits exactly one type-0 chunk per
+                                // stream), but concatenate in order and decode
+                                // as one contiguous block-record range, same
+                                // shape as -cf/-cF's lzpf payload handling.
+                                std::vector<unsigned char> concat;
+                                std::size_t clen = 0;
+                                for (const auto& c : s.chunks) clen += c.second;
+                                concat.reserve(clen);
+                                for (const auto& c : s.chunks)
+                                    concat.insert(concat.end(),
+                                                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                sok = DecodeOptimumBlockSequence(
+                                    concat.data(), 0u, concat.size(), s.osz, sdec, &slice);
+                            }
+                            if (!sok || slice.size() != s.osz) { all_ok = false; break; }
+                            if (ComputeBufferChecksum(s.cmode, slice.data(), slice.size()) != s.cval) {
+                                all_ok = false; break;
+                            }
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
+                                        slice.data(), slice.size());
+                            covered += s.osz;
+                        }
+                        if (all_ok && covered == total_data_size &&
+                            validate_decoded_candidate(assembled)) {
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
         std::size_t sp = payload_start;
         std::uint64_t stream_tag = 0;
         if (ReadLegacyVarint(bytes, &sp, bytes.size(), &stream_tag) &&
@@ -4433,53 +4598,29 @@ static bool TryDecodeLegacyCm(
 // malformed framing, or DecodeBlock-reported inconsistency cleanly declines
 // (returns false) so RunLegacyCnExtractOrTest falls through to the bridge --
 // never a partial/corrupt native result.
-static bool TryDecodeLegacyOptimum(
-    const LegacyCnContext& legacy,
-    std::vector<unsigned char>* out_data,
-    std::string* out_error_message) {
-    if (out_data == nullptr) return false;
-    out_data->clear();
-
-    if (legacy.legacy_method != 0x3bu || legacy.legacy_method_p0 != 5u)
-        return false;
-    if (legacy.data.empty()) return false;
-
-    const auto* raw = legacy.data.data();
-    const std::size_t raw_len = legacy.data.size();
-
-    std::size_t pos = 0;
-    std::uint64_t stream_tag = 0;
-    {
-        unsigned shift = 7;
-        unsigned char c = raw[pos++];
-        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
-        while ((c & 0x80u) != 0u) {
-            if (pos >= raw_len || shift >= 63u) { return false; }
-            c = raw[pos++];
-            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
-            shift += 7u;
-        }
-    }
-    if ((stream_tag & 0x0fu) != 0u) return false;
-    const std::uint64_t stream_bytes = stream_tag >> 4u;
-    if (stream_bytes > raw_len - pos) return false;
-    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
-
-    // One persistent decoder for this whole (single-container) stream: its
-    // ring/dictionary window and every adaptive probability table carry over
-    // from one decr_param==1 block to the next, exactly like the real
-    // binary's per-container-stream subengine object.
-    const std::uint32_t window_capacity =
-        nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
-    if (window_capacity == 0u) return false;
-    if (getenv("NZOPT_TRACE_TDO")) {
-        fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
-                legacy.legacy_method_p1, window_capacity,
-                (unsigned long long)legacy.total_data_size);
-    }
-    nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
-
-    out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
+// Decode a sequence of -co (nz_optimum1) block records occupying
+// [blocks_begin, blocks_end) within `raw` -- NO leading stream_tag (callers
+// that have one, e.g. the single-container path below, must consume it
+// first and pass just the block-sequence body that follows). Appends
+// decoded bytes to *out_data, which may already contain bytes from a prior
+// call against the same stream/decoder (e.g. a parallel stream whose data
+// is split across more than one type-0 chunk record). `total_size_hint` is
+// this stream's ultimate total decoded size -- used only to size the
+// "remaining" scratch buffers the post-filters need; it does not by itself
+// decide when decoding stops (the caller controls that via `blocks_end`).
+// `dec` must already be constructed with this stream's window capacity and
+// must be threaded across every call belonging to the same stream: its
+// ring and every adaptive probability table persist across block
+// boundaries (only the range coder and 4 rep-offsets reset per block).
+static bool DecodeOptimumBlockSequence(
+    const unsigned char* raw,
+    std::size_t blocks_begin,
+    std::size_t blocks_end,
+    std::uint64_t total_size_hint,
+    nzr::optimum::NzOptimumLzDecoder& dec,
+    std::vector<unsigned char>* out_data) {
+    std::size_t pos = blocks_begin;
+    const std::size_t stream_end = blocks_end;
     bool ok = true;
 
     while (pos < stream_end) {
@@ -4594,8 +4735,8 @@ static bool TryDecodeLegacyOptimum(
             FILE* f = fopen(dpp, "wb");
             fwrite(payload, 1, payload_size, f);
             fclose(f);
-            fprintf(stderr, "[TDO] dumped payload (%u bytes) to %s, out_size=%u window_capacity=%u\n",
-                    payload_size, dpp, out_size, window_capacity);
+            fprintf(stderr, "[TDO] dumped payload (%u bytes) to %s, out_size=%u\n",
+                    payload_size, dpp, out_size);
         }
 
         // Decode this block's LZ/CM payload via the persistent per-stream
@@ -4616,7 +4757,7 @@ static bool TryDecodeLegacyOptimum(
 
         const std::size_t prev_size = out_data->size();
         const std::uint32_t remaining =
-            static_cast<std::uint32_t>(legacy.total_data_size) -
+            static_cast<std::uint32_t>(total_size_hint) -
             static_cast<std::uint32_t>(prev_size);
 
         if (param2_flag) {
@@ -4694,10 +4835,63 @@ static bool TryDecodeLegacyOptimum(
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
-                    cur_size, out_data->size(), (unsigned long long)legacy.total_data_size,
+                    cur_size, out_data->size(), (unsigned long long)total_size_hint,
                     param2_flag, param1_flag, tt_enabled, tt_flags, dece_param);
         }
     }
+
+    return ok;
+}
+
+static bool TryDecodeLegacyOptimum(
+    const LegacyCnContext& legacy,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message) {
+    if (out_data == nullptr) return false;
+    out_data->clear();
+
+    if (legacy.legacy_method != 0x3bu || legacy.legacy_method_p0 != 5u)
+        return false;
+    if (legacy.data.empty()) return false;
+
+    const auto* raw = legacy.data.data();
+    const std::size_t raw_len = legacy.data.size();
+
+    std::size_t pos = 0;
+    std::uint64_t stream_tag = 0;
+    {
+        unsigned shift = 7;
+        unsigned char c = raw[pos++];
+        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+        while ((c & 0x80u) != 0u) {
+            if (pos >= raw_len || shift >= 63u) { return false; }
+            c = raw[pos++];
+            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            shift += 7u;
+        }
+    }
+    if ((stream_tag & 0x0fu) != 0u) return false;
+    const std::uint64_t stream_bytes = stream_tag >> 4u;
+    if (stream_bytes > raw_len - pos) return false;
+    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
+
+    // One persistent decoder for this whole (single-container) stream: its
+    // ring/dictionary window and every adaptive probability table carry over
+    // from one decr_param==1 block to the next, exactly like the real
+    // binary's per-container-stream subengine object.
+    const std::uint32_t window_capacity =
+        nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
+    if (window_capacity == 0u) return false;
+    if (getenv("NZOPT_TRACE_TDO")) {
+        fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
+                legacy.legacy_method_p1, window_capacity,
+                (unsigned long long)legacy.total_data_size);
+    }
+    nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
+
+    out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
+    const bool ok = DecodeOptimumBlockSequence(
+        raw, pos, stream_end, legacy.total_data_size, dec, out_data);
 
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
         out_data->clear();

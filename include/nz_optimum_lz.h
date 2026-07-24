@@ -37,10 +37,21 @@
 // alive for an entire stream's sequence of blocks, not construct a fresh one per
 // block.
 //
-// Scope of this port: the SINGLE-CONTAINER case (archive header flag 0x05) only.
-// The parallel-container case (flag 0x0f, >8MB) is not wired up by this port,
-// even though it plausibly could reuse this same per-stream decoder instance --
-// see sfx_archive.cpp's TryDecodeLegacyOptimum for where that would slot in.
+// Scope of this port: both the SINGLE-CONTAINER case (archive header flag
+// 0x05) and the PARALLEL-CONTAINER case (flag 0x0f, >8MB, used by the
+// multi-threaded encoder) are wired up. Confirmed empirically: a parallel
+// stream's type-0 chunk record holds the exact same "sequence of block
+// records" body the single-container path decodes after its own leading
+// stream_tag varint (no extra stream_tag inside the chunk), and each
+// parallel stream gets a FRESH NzOptimumLzDecoder (same "each encoder
+// thread owned its own subengine instance" pattern already established for
+// -cd/-cD's parallel branch), all sharing the one archive-wide window
+// capacity derived from method_p1. See sfx_archive.cpp's
+// DecodeOptimumBlockSequence (the extracted, reusable block-record decode
+// loop) and the -co parallel branch inside TryParseLegacyCnArchive that
+// calls it per stream. Only method_p0==5 (-co, nz_optimum1) is wired this
+// way; method_p0==6 (-cO, nz_optimum2) parallel containers still decline
+// cleanly (the literal-mixer variant differs and hasn't been ported).
 #pragma once
 #include <cstdint>
 #include <cstddef>
