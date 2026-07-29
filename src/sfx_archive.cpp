@@ -2297,6 +2297,10 @@ bool DecodeLzpfMember(
     Verify&& verify,
     std::vector<unsigned char>* out) {
     if (first_block_pos + first_stream_len > bytes.size()) return false;
+    // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
+    // header fields) plus the decline point — the fastest way to tell whether a
+    // failing member even reaches the stereo prefilter path.
+    const bool trace_lzpf = (std::getenv("NZOPT_TRACE_LZPF") != nullptr);
     auto decode_lzpf_header = [&](std::size_t& pos, std::uint32_t& out_uvar9) -> bool {
         if (pos >= bytes.size()) return false;
         std::uint8_t b0 = bytes[pos++];
@@ -2360,6 +2364,7 @@ bool DecodeLzpfMember(
         std::size_t total_written = 0;
         std::size_t input_pos = first_block_pos;
         bool decode_ok = true;
+        std::size_t blk_idx = 0;
         nzr::lzpf::LpcPredictor pf_pred{};
         nzr::lzpf::LpcPredictor pf_pred2{};
         pf_pred.taps  = is_variant_b ? 8u : 4u;
@@ -2430,6 +2435,20 @@ bool DecodeLzpfMember(
                     is_stereo_pf ? &pf_lms_ch1 : nullptr,
                     is_stereo_pf ? &pf_lms_ch2 : nullptr,
                     is_stereo_pf ? &pf_pred2 : nullptr);
+                if (trace_lzpf) {
+                    const std::uint32_t c1 = (pf_hdr >> 1u) / 3u;
+                    const std::uint32_t wq = c1 / 5u;
+                    const std::uint32_t wr = c1 - wq * 5u;
+                    const unsigned sw = wr ? (unsigned)((((wr - 1u) >> 1u) + 1u) + 1u) : 1u;
+                    const unsigned en = wr ? (unsigned)((wr - 1u) & 1u) : 0u;
+                    fprintf(stderr,
+                            "[lzpf] blk#%zu pf out=%llu hdr=%02x ch=%u fa=%u sw=%u end=%u "
+                            "pfx=%u consumed=%zu\n",
+                            blk_idx, (unsigned long long)block_out_size,
+                            (unsigned)pf_hdr, pf_channels, (unsigned)(pf_hdr & 1u),
+                            sw, en, wq, pf_consumed);
+                }
+                ++blk_idx;
                 if (pf_consumed == 0) { decode_ok = false; break; }
                 input_pos += pf_consumed;
                 window_cursor += static_cast<std::size_t>(block_out_size);
@@ -2439,6 +2458,12 @@ bool DecodeLzpfMember(
                 continue;
             }
             if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { decode_ok = false; break; }
+            if (trace_lzpf) {
+                fprintf(stderr, "[lzpf] blk#%zu %s uvar9=%u out=%llu\n", blk_idx,
+                        mode_literal ? "lit" : (mode_lz77_side ? "lz-side" : "lz-raw"),
+                        uvar9, (unsigned long long)(uvar9 >> 3u));
+            }
+            ++blk_idx;
             std::uint64_t block_out_size = uvar9 >> 3u;
             if (block_out_size == 0u) block_out_size = 0x8000u;
             if (block_out_size > 0x8001u) { decode_ok = false; break; }
@@ -2527,6 +2552,20 @@ bool DecodeLzpfMember(
             std::memcpy(decoded.data() + total_written, window + block_start_in_window,
                         static_cast<std::size_t>(block_out_size));
             total_written += static_cast<std::size_t>(block_out_size);
+        }
+        if (trace_lzpf) {
+            if (const char* dp = std::getenv("NZOPT_DUMP_LZPF")) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s.cap%zu", dp, window_capacity);
+                if (FILE* fp = fopen(path, "wb")) {
+                    fwrite(decoded.data(), 1, total_written, fp);
+                    fclose(fp);
+                }
+            }
+            fprintf(stderr, "[lzpf] cap=%zu blocks=%zu ok=%d written=%zu/%llu verify=%d\n",
+                    window_capacity, blk_idx, (int)decode_ok, total_written,
+                    (unsigned long long)total,
+                    (decode_ok && total_written == total) ? (int)verify(decoded) : -1);
         }
         if (decode_ok && total_written == total && verify(decoded)) {
             *out = std::move(decoded);
@@ -4564,6 +4603,48 @@ static bool TryDecodeLegacyCm(
         out_data->clear();
         if (out_error_message) *out_error_message = "cm: output size mismatch";
         return false;
+    }
+
+    // Checksum self-verify, mirroring the sibling TryDecodeLegacyLzhd and
+    // TryDecodeLegacyOptimum gates: a stored per-file checksum mismatch means
+    // "decline and let the caller fall back to the bridge", never "emit it
+    // anyway".
+    //
+    // This gate was missing until a real-world corpus sweep found the hole it
+    // left. The caller's own CM handling cross-checks native output against a
+    // bridge decode, but ONLY when a bridge is actually available -- with
+    // NZ_NO_BRIDGE=1 (or simply no legacy binary present, which is this
+    // project's whole goal) it took `cm_native_ok` at face value and emitted
+    // whatever this function returned. Sweeping 56 real files x 8 methods
+    // surfaced one archive (a ~10 MB game-data blob under -cc) where this
+    // function returns true with 394113 wrong bytes, so the extractor wrote a
+    // silently corrupt file instead of declining. Output size alone is not a
+    // correctness signal for CM: the block framing can parse cleanly and the
+    // sizes can add up exactly while the entropy-decoded content diverges.
+    //
+    // The underlying CM divergence on that archive is a separate, still-open
+    // bug; this gate is what makes it a clean decline rather than corruption.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        std::size_t cursor = 0;
+        for (const LegacyCnEntry& e : legacy.entries) {
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (cursor + n > out_data->size()) break;
+            if (!e.has_checksum) {
+                out_data->clear();
+                if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
+                return false;
+            }
+            const std::uint32_t got =
+                ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
+            if (got != e.checksum) {
+                out_data->clear();
+                if (out_error_message) *out_error_message = "cm: checksum mismatch";
+                return false;
+            }
+            cursor += n;
+        }
     }
     return true;
 }
