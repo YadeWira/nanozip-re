@@ -1660,9 +1660,21 @@ void ReconstructStereoSamples(std::uint8_t* out, const std::int32_t* ch1,
             dst += 3;
         }
     };
+    // FUN_080a50c0 LAB_080a5117: the generic path implements mid/side too
+    // (channels==2), but in full int32 arithmetic rather than the int16 of the
+    // sample_width==2 fast path -- which matters for sample_width==3, where bits
+    // 16..23 of the untruncated result are actually stored. Previously the generic
+    // path always did a plain L/R interleave, so every mid/side block that missed
+    // the fast path (8-bit, 24-bit, or big-endian stereo) decoded wrong.
+    const bool mid_side = (p->channels == 2);
     for (std::uint32_t k = 0; k < per_chan; ++k) {
-        acc1 += ch1[k]; acc2 += ch2[k];
-        put(acc1); put(acc2);
+        acc1 += ch1[k]; acc2 += ch2[k];      // acc1 = mid, acc2 = side accumulator
+        if (mid_side) {
+            const std::int32_t side = acc2 - (acc1 >> 1);
+            put(side + acc1); put(side);
+        } else {
+            put(acc1); put(acc2);
+        }
     }
 }
 
@@ -1722,6 +1734,23 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     std::uint32_t aligned_out = avail - remainder;
     std::uint32_t n_elems    = aligned_out / sw; // = uStack_5007c
 
+    // FUN_080a5330 lines 111-133: the `remainder` bytes that do not fill a whole
+    // (sample_width x channel-pair) group are NOT modelled at all — they are
+    // copied VERBATIM from the input, straight after the literal prefix, to the
+    // very END of the block's output (output + prefix + aligned_out), and the
+    // input cursor advances past them so the arith payload starts `remainder`
+    // bytes later. Omitting this desynchronises the arith stream from the first
+    // residual byte onward (and, via the under-reported consumed count, the whole
+    // lzpf block-header chain), which is why any member whose final partial block
+    // was not an exact multiple of sample_width*2 decoded wrong.
+    if (remainder != 0u) {
+        if (remainder > remaining) return 0;
+        if (static_cast<std::size_t>(prefix) + aligned_out + remainder > output_size) return 0;
+        __builtin_memcpy(output + prefix + aligned_out, ptr, remainder);
+        ptr += remainder;
+        remaining -= remainder;
+    }
+
     // For stereo (channels != 0) everything downstream is PLANAR: ch1 occupies
     // [0, per_chan), ch2 occupies [per_chan, 2*per_chan).
     const bool stereo_split = (is_stereo_variant && p.channels != 0 && n_elems >= 2u);
@@ -1779,6 +1808,26 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
             predictor_order = ReadSideBits(&br, 3u) + 8u;
     } else {
         lms_enable = ReadSideBits(&br, 1u);
+        // FUN_080a5330 lines 194-210: G is not just a gate. When G == 0 BOTH LMS
+        // objects are reset (FUN_080beb60 = FUN_080bea10 twice) and no further bits
+        // are read; when G != 0 the block carries the two per-object adaptation
+        // shifts as 3 bits each, biased by +7 (FUN_080beb90 stores them at
+        // obj+0x2060 and obj+0x40d0 -- i.e. ch1.shift and ch2.shift, the objects
+        // being 0x2070 bytes apart). This is the (*ctx & 0x10) branch, the one whose
+        // apply function is FUN_08096e20 -- the variant this port implements.
+        // Previously neither the 6 shift bits nor the G==0 reset were handled, so any
+        // member that ever set G desynchronised the side-bit stream from the first
+        // residual escape onward (the single stereo fixture happened to keep G at 0
+        // for every block, which is why the omission went unnoticed).
+        if (lms_enable == 0u) {
+            if (lms_ch1 != nullptr) lms_ch1->Init();
+            if (lms_ch2 != nullptr) lms_ch2->Init();
+        } else {
+            const std::uint32_t s1 = ReadSideBits(&br, 3u) + 7u;
+            const std::uint32_t s2 = ReadSideBits(&br, 3u) + 7u;
+            if (lms_ch1 != nullptr) lms_ch1->shift = static_cast<std::uint8_t>(s1);
+            if (lms_ch2 != nullptr) lms_ch2->shift = static_cast<std::uint8_t>(s2);
+        }
         for (int c = 0; c < 2; ++c) {
             ch_active[c] = ReadSideBits(&br, 1u);
             if (ch_active[c] != 0u)
@@ -1802,6 +1851,15 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
         : 0u;
     if (side_consumed > remaining) side_consumed = remaining;
 
+    if (std::getenv("NZOPT_TRACE_PF") != nullptr) {
+        fprintf(stderr,
+                "[pf] hdr=%02x fa=%u ch=%d sw=%u end=%u pfx=%u avail=%u nel=%u per=%u rem=%u "
+                "G=%u a0=%u o0=%u a1=%u o1=%u arith=%zu side=%zu\n",
+                (unsigned)hdr, (unsigned)p.flag_a, (int)p.channels, sw, (unsigned)p.endian,
+                prefix, avail, n_elems, per_chan, remainder, lms_enable,
+                ch_active[0], ch_order[0], ch_active[1], ch_order[1],
+                consumed_arith, side_consumed);
+    }
     // FUN_080a5330 applies LPC per planar channel (separate predictor state), then the
     // inter-channel LMS, then FUN_080a50c0 (cumsum + L/R | mid/side interleave).
     LpcPredictor local_pred2{};

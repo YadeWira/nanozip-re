@@ -2464,6 +2464,26 @@ bool DecodeLzpfMember(
                         uvar9, (unsigned long long)(uvar9 >> 3u));
             }
             ++blk_idx;
+            // Any non-prefilter block (literal or LZ77) resets the whole audio-model
+            // context (both per-channel LPC predictors AND both LMS objects) -- confirmed
+            // by GDB against the real binary (FUN_08095d90 breakpoint, st_2ch24b48000_
+            // scifi.wav): the per-channel predictor object's address is stable across all
+            // 16 prefilter-block calls in the stream (same param_1 pointer throughout, so
+            // state is never reallocated), yet its entering state (predicted_value +
+            // factors[4]) is exactly zero for every prefilter block immediately preceded
+            // by a literal block, and non-zero (carried forward) for every prefilter block
+            // immediately preceded by ANOTHER prefilter block with no literal in between --
+            // a 16-for-16 exact match across this fixture's block sequence. FUN_080b1950
+            // (the model-init routine) resets both LPC (6 channel slots, FUN_080bdac0 x6)
+            // and LMS (FUN_080be670 + FUN_080beb60) together as a single primitive, which
+            // is the natural candidate for what actually fires here; LMS reset piggybacks
+            // on that same evidence (no fixture in this corpus ever has lms_enable=1 to
+            // test it directly, but leaving LMS state stale while LPC resets would be an
+            // odd asymmetry the real binary's bundled reset function does not exhibit).
+            pf_pred.ResetState();
+            pf_pred2.ResetState();
+            pf_lms_ch1.Init();
+            pf_lms_ch2.Init();
             std::uint64_t block_out_size = uvar9 >> 3u;
             if (block_out_size == 0u) block_out_size = 0x8000u;
             if (block_out_size > 0x8001u) { decode_ok = false; break; }
