@@ -5049,28 +5049,39 @@ static bool TryDecodeLegacyOptimum(
     const auto* raw = legacy.data.data();
     const std::size_t raw_len = legacy.data.size();
 
-    std::size_t pos = 0;
-    std::uint64_t stream_tag = 0;
-    {
+    // Read one top-level `stream_tag` varint: (stream_bytes<<4)|0, giving the
+    // byte range of one segment's block-record sequence. Real single-
+    // container -co/-cO archives can contain MORE THAN ONE of these back to
+    // back, directly concatenated with no separator/checksum record between
+    // them (unlike -cf/-cd's own chain mode, which has an inter-segment
+    // whole-output checksum) -- confirmed empirically on a real 60 KB .doc
+    // file whose first segment only covered 10229 of the entry's 60416
+    // declared output bytes: the very next byte was a second, independently
+    // valid `stream_tag` varint (low nibble 0, in-bounds stream_bytes)
+    // immediately following the first segment's end. An earlier RE session's
+    // "chain mode doesn't exist for -co" conclusion was apparently reached
+    // from insufficient (large-synthetic-file-only) fixtures.
+    auto read_stream_tag = [raw, raw_len](std::size_t* p, std::uint64_t* out_tag) -> bool {
         unsigned shift = 7;
-        unsigned char c = raw[pos++];
-        stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+        if (*p >= raw_len) return false;
+        unsigned char c = raw[(*p)++];
+        std::uint64_t tag = static_cast<std::uint64_t>(c & 0x7fu);
         while ((c & 0x80u) != 0u) {
-            if (pos >= raw_len || shift >= 63u) { return false; }
-            c = raw[pos++];
-            stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            if (*p >= raw_len || shift >= 63u) return false;
+            c = raw[(*p)++];
+            tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
             shift += 7u;
         }
-    }
-    if ((stream_tag & 0x0fu) != 0u) return false;
-    const std::uint64_t stream_bytes = stream_tag >> 4u;
-    if (stream_bytes > raw_len - pos) return false;
-    const std::size_t stream_end = pos + static_cast<std::size_t>(stream_bytes);
+        *out_tag = tag;
+        return true;
+    };
 
-    // One persistent decoder for this whole (single-container) stream: its
+    // One persistent decoder for this whole (single-container) entry: its
     // ring/dictionary window and every adaptive probability table carry over
-    // from one decr_param==1 block to the next, exactly like the real
-    // binary's per-container-stream subengine object.
+    // from one decr_param==1 block to the next -- INCLUDING across chain
+    // segments, exactly like the real binary's per-container-stream
+    // subengine object (there is only one such object for the whole entry,
+    // not one per segment).
     const std::uint32_t window_capacity =
         nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
     if (window_capacity == 0u) return false;
@@ -5085,14 +5096,40 @@ static bool TryDecodeLegacyOptimum(
     // Both share the exact same block-record framing/post-filter loop
     // (DecodeOptimumBlockSequence, templated on the decoder type) and the
     // same window-size-from-method_p1 formula -- only the per-block LZ/CM
-    // engine construction differs.
-    bool ok;
+    // engine construction differs. The decoder type is fixed for the whole
+    // entry, so select it once via a small closure (mirrors the
+    // parallel-container branch's own pattern below) rather than
+    // duplicating the chain loop per type.
+    const std::uint64_t total_size_hint = legacy.total_data_size;
+    std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
-        nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
-        ok = DecodeOptimumBlockSequence(raw, pos, stream_end, legacy.total_data_size, dec, out_data);
+        auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
+        decode_seq = [raw, dec, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, out);
+        };
     } else {
-        nzr::optimum2::NzOptimum2LzDecoder dec(window_capacity);
-        ok = DecodeOptimumBlockSequence(raw, pos, stream_end, legacy.total_data_size, dec, out_data);
+        auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
+        decode_seq = [raw, dec, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, out);
+        };
+    }
+
+    std::size_t seg_pos = 0;
+    bool ok = true;
+    while (out_data->size() < static_cast<std::size_t>(legacy.total_data_size)) {
+        std::size_t p = seg_pos;
+        std::uint64_t stream_tag = 0;
+        if (!read_stream_tag(&p, &stream_tag)) { ok = false; break; }
+        if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
+        const std::uint64_t stream_bytes = stream_tag >> 4u;
+        if (stream_bytes > raw_len - p) { ok = false; break; }
+        const std::size_t stream_end = p + static_cast<std::size_t>(stream_bytes);
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] chain segment: p=%zu stream_end=%zu out_data_size_before=%zu\n",
+                    p, stream_end, out_data->size());
+        }
+        if (!decode_seq(p, stream_end, out_data)) { ok = false; break; }
+        seg_pos = stream_end;
     }
 
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
