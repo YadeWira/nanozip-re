@@ -1367,3 +1367,10 @@ void NzCmDecode(NzCmDecoder* cm, const uint8_t* in, uint32_t in_size,
                 uint8_t* out, uint32_t out_size) {
     CM_Decode(reinterpret_cast<CM*>(cm), in, in_size, out, out_size);
 }
+
+void NzCmFeedByte(NzCmDecoder* cm, uint8_t byte) {
+    CM* c = reinterpret_cast<CM*>(cm);
+    for (int i = 7; i >= 0; --i) {
+        CM_Input_Bit(c, (uint32_t)((byte >> i) & 1u));
+    }
+}

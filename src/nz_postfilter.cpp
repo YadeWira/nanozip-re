@@ -2,6 +2,8 @@
 // (BwtRleExpander) and nz.h (ArithmeticDecoder). Faithful reimplementation.
 #include "nz_postfilter.h"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -66,9 +68,15 @@ struct BwtRleExpander {
 
     // u32-wise RLE: pairs of equal u32 words introduce a coded run of additional copies.
     bool DecodeU32(const uint8_t* in, uint32_t in_size, uint8_t* out, uint32_t* out_size_ptr) {
+        const bool trace = std::getenv("NZOPT_TRACE_RLE") != nullptr;
+        const uint32_t out_size_orig = *out_size_ptr;
         uint32_t out_size_u32 = *out_size_ptr >> 2;
         uint32_t in_size_u32 = in_size >> 2;
-        if (in_size_u32 > out_size_u32) { *out_size_ptr = 0; return false; }
+        if (in_size_u32 > out_size_u32) {
+            if (trace) fprintf(stderr, "[RLE] fail@entry in_size=%u out_size=%u in_size_u32=%u out_size_u32=%u\n",
+                                in_size, out_size_orig, in_size_u32, out_size_u32);
+            *out_size_ptr = 0; return false;
+        }
         const uint8_t* in32 = in;                       // byte cursors, read as u32 via memcpy
         const uint8_t* in32_end = in + in_size_u32 * 4u;
         uint8_t* out32 = out;
@@ -76,7 +84,9 @@ struct BwtRleExpander {
         auto ld = [](const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; };
         auto st = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
         uint32_t v = 0;
+        int iter = 0;
         for (;;) {
+            ++iter;
             uint32_t last_v = v;
             bool brk = false;
             for (int round = 0; round < 6; ++round) {
@@ -89,9 +99,26 @@ struct BwtRleExpander {
                 const uint8_t* start_run = in32;
                 while (in32 != in32_end && ld(in32) == last_v) in32 += 4;
                 uint32_t run_len = (uint32_t)((in32 - start_run) / 4);
-                if (run_len > 30u) { *out_size_ptr = 0; return false; }
+                if (run_len > 30u) {
+                    if (trace) {
+                        fprintf(stderr, "[RLE] fail@run_len iter=%d run_len=%u in_off=%zu last_v=0x%08x in_size=%u\n",
+                                iter, run_len, (size_t)(in32 - in), last_v, in_size);
+                        fprintf(stderr, "[RLE] context bytes around start_run (in_off=%zu):", (size_t)(start_run - in));
+                        for (std::size_t k = (start_run - in >= 8 ? (size_t)(start_run - in) - 8 : 0);
+                             k < (size_t)(start_run - in) + 24 && k < in_size; ++k) {
+                            fprintf(stderr, " %02x", in[k]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    *out_size_ptr = 0; return false;
+                }
                 uint32_t new_len = DecodeInt(run_len);
-                if ((uint32_t)((out32_end - out32) / 4) < (uint32_t)((in32_end - in32) / 4) + new_len) {
+                const uint32_t out_words_left = (uint32_t)((out32_end - out32) / 4);
+                const uint32_t in_words_left = (uint32_t)((in32_end - in32) / 4);
+                if (out_words_left < in_words_left + new_len) {
+                    if (trace) fprintf(stderr, "[RLE] fail@space iter=%d run_len=%u new_len=%u out_words_left=%u in_words_left=%u in_off=%zu out_off=%zu\n",
+                                        iter, run_len, new_len, out_words_left, in_words_left,
+                                        (size_t)(in32 - in), (size_t)(out32 - out));
                     *out_size_ptr = 0; return false;
                 }
                 for (uint32_t i = 0; i != new_len; ++i) { st(out32, last_v); out32 += 4; }
@@ -101,9 +128,14 @@ struct BwtRleExpander {
         // copy trailing (sub-word) bytes verbatim
         const uint8_t* in_end = in + in_size;
         uint8_t* out_end = out + *out_size_ptr;
-        if ((in_end - in32) > (out_end - out32)) { *out_size_ptr = 0; return false; }
+        if ((in_end - in32) > (out_end - out32)) {
+            if (trace) fprintf(stderr, "[RLE] fail@tail in_left=%zu out_left=%zu\n",
+                                (size_t)(in_end - in32), (size_t)(out_end - out32));
+            *out_size_ptr = 0; return false;
+        }
         while (in32 != in_end) *out32++ = *in32++;
         *out_size_ptr = (uint32_t)(out32 - out);
+        if (trace) fprintf(stderr, "[RLE] ok final_size=%u iters=%d\n", *out_size_ptr, iter);
         return true;
     }
 };

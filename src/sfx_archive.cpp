@@ -4541,7 +4541,25 @@ static bool TryDecodeLegacyCm(
         // entropy / incompressible data), so the payload bytes are the raw output
         // verbatim. (The reference decoder rejects these with param6 != 1; the
         // linux32 binary stores them.)
+        //
+        // The CM model observes every byte of the decompressed *output* stream in
+        // position order, not just the bytes it actually entropy-codes: its rolling
+        // byte-history window/hash context (used for LZP-style match prediction)
+        // must stay in sync with the true output position even across a stored
+        // span, or a later decr_param==0 ("don't reset") CM block will decode
+        // correctly for a while (its bit-level predictions are still individually
+        // plausible) and then desync once the stale context finally drives a wrong
+        // decision -- confirmed via a differential trace against an independently
+        // built copy of the reference NZ_CM.cpp: feeding the stored bytes through
+        // CM_Input_Bit (no entropy coding, model-update only) between two CM_Decode
+        // calls made the second block's output round-trip byte-exact through
+        // param2, where omitting the feed produced the same corruption this port
+        // was producing. Feed the model here so any subsequent CM block sees the
+        // context an unbroken pass over the file would have produced.
         if (!param6 || out_size == 0u) {
+            for (std::uint32_t i = 0; i < payload_size; ++i) {
+                NzCmFeedByte(cm, payload[i]);
+            }
             out_data->insert(out_data->end(), payload, payload + payload_size);
             continue;
         }
