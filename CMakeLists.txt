@@ -21,6 +21,8 @@ set(RECON_SOURCES
     src/nz_texttransform_num.cpp
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_tables.cpp
+    src/nz_optimum2_lz.cpp
+    src/nz_optimum2_lz_tables.cpp
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
@@ -64,4 +66,19 @@ add_executable(test_optimum_lz
 target_include_directories(test_optimum_lz PRIVATE include)
 if(NOT MSVC)
     target_compile_options(test_optimum_lz PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Standalone isolation test for the -cO (nz_optimum2) LZ/CM engine port,
+# validated against captured golden vectors before being wired into the live
+# dispatcher (mirrors test_optimum_lz's own convention).
+add_executable(test_optimum2_lz
+    tests/test_optimum2_lz.cpp
+    src/nz_optimum2_lz.cpp
+    src/nz_optimum2_lz_tables.cpp
+    src/nz_optimum_lz_tables.cpp
+    src/nz_cm.cpp
+)
+target_include_directories(test_optimum2_lz PRIVATE include)
+if(NOT MSVC)
+    target_compile_options(test_optimum2_lz PRIVATE -Wall -Wextra -Wpedantic)
 endif()

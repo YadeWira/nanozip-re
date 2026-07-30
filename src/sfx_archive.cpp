@@ -5,6 +5,7 @@
 #include "nz_cd_tokens.h"
 #include "nz_lzhds.h"
 #include "nz_optimum_lz.h"
+#include "nz_optimum2_lz.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_texttransform_num.h"
@@ -2597,13 +2598,18 @@ bool DecodeLzpfMember(
 
 // Forward declaration: defined further below (near TryDecodeLegacyOptimum,
 // which it was extracted from), but also needed here by the -co parallel-
-// container branch inside TryParseLegacyCnArchive.
+// container branch inside TryParseLegacyCnArchive. Templated on the decoder
+// type since it now also serves -cO's NzOptimum2LzDecoder (single-container
+// path only, in TryDecodeLegacyOptimum) -- the parallel-container branch
+// below only ever instantiates it with NzOptimumLzDecoder (-co parallel
+// containers only; -cO parallel containers remain out of scope).
+template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
     const unsigned char* raw,
     std::size_t blocks_begin,
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
-    nzr::optimum::NzOptimumLzDecoder& dec,
+    OptimumDecoder& dec,
     std::vector<unsigned char>* out_data);
 
 bool TryParseLegacyCnArchive(
@@ -4123,7 +4129,7 @@ bool TryParseLegacyCnArchive(
     } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
                ((method == 0x4bu && method_p0 == 7u) ||
                 (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) ||
-                (method == 0x3bu && method_p0 == 5u)) &&
+                (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u))) &&
                payload_start < bytes.size()) {
         // Store the raw compressed stream so the native decoders can parse the
         // stream_tag + block directly:
@@ -4131,9 +4137,12 @@ bool TryParseLegacyCnArchive(
         //  - 0x2b p0=3/4 -> TryDecodeLegacyLzhd (the real coroutine token-LZ, now
         //    ported as NzCdDecodeBlock; the old "virtual-stream framing crashes a
         //    flat DecLZ" note is obsolete — pure-LZ -cd decodes byte-exact).
-        //  - 0x3b p0=5 (-co, nz_optimum1) -> TryDecodeLegacyOptimum, now backed by
-        //    NzOptimumLzDecoder (FUN_0809e600 port). -cO (0x3b p0=6, FUN_080a5d90)
-        //    still bridges -- that engine is a separate, not-yet-ported design.
+        //  - 0x3b p0=5 (-co, nz_optimum1) -> TryDecodeLegacyOptimum, backed by
+        //    NzOptimumLzDecoder (FUN_0809e600 port).
+        //  - 0x3b p0=6 (-cO, nz_optimum2) -> TryDecodeLegacyOptimum, backed by
+        //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
+        //    parallel-container -cO (flag 0x0f) and decr_param==0 (BWT) still
+        //    bridge (see nz_optimum2_lz.h for scope).
         ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
                         bytes.end());
     }
@@ -4671,28 +4680,39 @@ static bool TryDecodeLegacyCm(
 
 // Decode -co (nz_optimum1, method_p0==5) natively via NzOptimumLzDecoder
 // (src/nz_optimum_lz.cpp, a byte-exact transcription of the real linux32/nz
-// binary's FUN_0809e600 -- see include/nz_optimum_lz.h and
+// binary's FUN_0809e600) or -cO (nz_optimum2, method_p0==6) via
+// NzOptimum2LzDecoder (src/nz_optimum2_lz.cpp, a byte-exact transcription of
+// FUN_080a5d90) -- see include/nz_optimum_lz.h, include/nz_optimum2_lz.h, and
 // work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md for the full RE
-// provenance). This function's outer block-header framing (payload_size u32,
+// provenance. This function's outer block-header framing (payload_size u32,
 // decr_param, param6, size18, staged, params, tt, dece -- the same flat
 // framing -cc uses) was already confirmed correct in an earlier session (the
 // field walk lands exactly on stream_end/EOF for every fixture tried); what
 // changed is the decr_param==1 payload decoder itself: it used to call
 // NzLzhdDecode() (a port of the community reference's DecLZ), which live GDB
-// tracing proved is never reached by the real binary for -co content. The
-// real per-block LZ/CM core is FUN_0809e600, now ported and validated
-// byte-exact against 4 isolated golden vectors (matchfix_co/bigdist_co/
-// smalldist_co/hientropy_co -- see tests/test_optimum_lz.cpp) covering
-// literal runs, small/large-distance matches (slots 0-18), rep-offset reuse,
-// and a high-entropy literal stress segment.
+// tracing proved is never reached by the real binary for -co/-cO content.
+// -co's real per-block LZ/CM core is FUN_0809e600, validated byte-exact
+// against 4 isolated golden vectors (matchfix_co/bigdist_co/smalldist_co/
+// hientropy_co -- see tests/test_optimum_lz.cpp) covering literal runs,
+// small/large-distance matches (slots 0-18), rep-offset reuse, and a
+// high-entropy literal stress segment. -cO's real per-block core is
+// FUN_080a5d90 (a materially richer 8-input literal-mixer plus a rolling
+// LZP-style secondary predictor -- the backbone is a byte-identical-formula
+// scale-up of -co's own), validated byte-exact against 2 isolated golden
+// vectors (aaa200_cO/hientropy_cO -- see tests/test_optimum2_lz.cpp)
+// covering the same shapes as -co's own vectors plus all three of -cO's
+// distance-tier footer-bit schedules (including tier3, only reachable with
+// slot>6 / distance>=129).
 //
-// Scope: SINGLE-CONTAINER only (archive header flag 0x05) -- one
-// NzOptimumLzDecoder instance is constructed per call (i.e. per container
+// Scope: SINGLE-CONTAINER only (archive header flag 0x05 for -co, 0x06 for
+// -cO) -- one decoder instance is constructed per call (i.e. per container
 // stream) and threaded across every decr_param==1 block in this stream's
 // sequence, matching the real binary's per-stream-persistent ring/adaptive-
-// table state. method_p0==6u (-cO / nz_optimum2, FUN_080a5d90) is a distinct,
-// not-yet-ported engine and is declined here so it keeps routing to the
-// bridge. decr_param==0 (BWT) blocks are also not yet ported and decline.
+// table state. Parallel-container -cO (flag 0x0f) remains out of scope and
+// is declined here so it keeps routing to the bridge (parallel-container
+// -co IS handled, but by a separate code path in TryParseLegacyCnArchive, not
+// this function -- see its own comments). decr_param==0 (BWT) blocks are also
+// not yet ported (either engine) and decline.
 //
 // Safety: every candidate is checksum-gated below (mirroring -cd/-cD/-cc's
 // own self-verify pattern) before being trusted by the caller; any mismatch,
@@ -4713,12 +4733,19 @@ static bool TryDecodeLegacyCm(
 // must be threaded across every call belonging to the same stream: its
 // ring and every adaptive probability table persist across block
 // boundaries (only the range coder and 4 rep-offsets reset per block).
+// Templated on the per-engine decoder type so the exact same block-record
+// framing/post-filter loop serves both -co (NzOptimumLzDecoder) and -cO
+// (NzOptimum2LzDecoder) -- both expose the identical
+// `bool DecodeBlock(in, in_len, out, out_size)` signature (see
+// nz_optimum_lz.h / nz_optimum2_lz.h), differing only in which real-binary
+// function ports the actual per-block LZ/CM engine.
+template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
     const unsigned char* raw,
     std::size_t blocks_begin,
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
-    nzr::optimum::NzOptimumLzDecoder& dec,
+    OptimumDecoder& dec,
     std::vector<unsigned char>* out_data) {
     std::size_t pos = blocks_begin;
     const std::size_t stream_end = blocks_end;
@@ -4951,7 +4978,8 @@ static bool TryDecodeLegacyOptimum(
     if (out_data == nullptr) return false;
     out_data->clear();
 
-    if (legacy.legacy_method != 0x3bu || legacy.legacy_method_p0 != 5u)
+    if (legacy.legacy_method != 0x3bu ||
+        (legacy.legacy_method_p0 != 5u && legacy.legacy_method_p0 != 6u))
         return false;
     if (legacy.data.empty()) return false;
 
@@ -4988,11 +5016,21 @@ static bool TryDecodeLegacyOptimum(
                 legacy.legacy_method_p1, window_capacity,
                 (unsigned long long)legacy.total_data_size);
     }
-    nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
-
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
-    const bool ok = DecodeOptimumBlockSequence(
-        raw, pos, stream_end, legacy.total_data_size, dec, out_data);
+    // method_p0==5 -> -co (nz_optimum1, NzOptimumLzDecoder / FUN_0809e600);
+    // method_p0==6 -> -cO (nz_optimum2, NzOptimum2LzDecoder / FUN_080a5d90).
+    // Both share the exact same block-record framing/post-filter loop
+    // (DecodeOptimumBlockSequence, templated on the decoder type) and the
+    // same window-size-from-method_p1 formula -- only the per-block LZ/CM
+    // engine construction differs.
+    bool ok;
+    if (legacy.legacy_method_p0 == 5u) {
+        nzr::optimum::NzOptimumLzDecoder dec(window_capacity);
+        ok = DecodeOptimumBlockSequence(raw, pos, stream_end, legacy.total_data_size, dec, out_data);
+    } else {
+        nzr::optimum2::NzOptimum2LzDecoder dec(window_capacity);
+        ok = DecodeOptimumBlockSequence(raw, pos, stream_end, legacy.total_data_size, dec, out_data);
+    }
 
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
         out_data->clear();
@@ -5072,10 +5110,12 @@ int RunLegacyCnExtractOrTest(
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
         // Native -co (nz_optimum1, method_p0==5, single-container flag 0x05)
-        // via TryDecodeLegacyOptimum, now backed by NzOptimumLzDecoder (a
-        // byte-exact port of the real binary's FUN_0809e600, validated against
-        // 4 isolated golden vectors -- see tests/test_optimum_lz.cpp and
-        // work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md). This
+        // AND -cO (nz_optimum2, method_p0==6, single-container flag 0x06) via
+        // TryDecodeLegacyOptimum, backed by NzOptimumLzDecoder (a byte-exact
+        // port of the real binary's FUN_0809e600) or NzOptimum2LzDecoder (a
+        // byte-exact port of FUN_080a5d90) respectively -- see
+        // tests/test_optimum_lz.cpp / tests/test_optimum2_lz.cpp and
+        // work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md. This
         // supersedes the long-standing "wrong decoder" finding from an earlier
         // session (NzLzhdDecode/DecLZ is never reached by a real -co decode;
         // the real per-block core is FUN_0809e600, not FUN_080b5240).
@@ -5083,12 +5123,13 @@ int RunLegacyCnExtractOrTest(
         // (mirroring TryDecodeLegacyLzhd immediately above), so a mismatch or
         // any malformed-bitstream/out-of-window condition already declines
         // before reaching here -- no extra bridge cross-check needed.
-        // -cO (method_p0==6, FUN_080a5d90) remains unported and continues to
-        // route to the bridge below, as does the parallel-container (flag
-        // 0x0f) case for -co (TryDecodeLegacyOptimum only parses a single
-        // stream_tag's worth of blocks; parallel-container framing would fail
-        // that parse and decline harmlessly, or in the unlikely event it
-        // doesn't, the checksum gate still catches it).
+        // Parallel-container -cO (flag 0x0f) and decr_param==0 (BWT, either
+        // engine) remain unported and continue to route to the bridge below,
+        // as does the parallel-container case for -co (TryDecodeLegacyOptimum
+        // only parses a single stream_tag's worth of blocks; parallel-
+        // container framing would fail that parse and decline harmlessly, or
+        // in the unlikely event it doesn't, the checksum gate still catches
+        // it).
         std::string optimum_decode_error;
         std::vector<unsigned char> optimum_native_data;
         if (TryDecodeLegacyOptimum(legacy, &optimum_native_data, &optimum_decode_error)) {
@@ -5097,13 +5138,15 @@ int RunLegacyCnExtractOrTest(
             bridged.data_offset = 0u;
             bridged.data = std::move(optimum_native_data);
             if (options.verbose) {
-                os << "[native] decoded -co payload natively ("
+                os << "[native] decoded " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
+                   << " payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         } else if (options.verbose && !optimum_decode_error.empty()) {
-            os << "[native] -co native decode declined: " << optimum_decode_error << '\n';
+            os << "[native] " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
+               << " native decode declined: " << optimum_decode_error << '\n';
         }
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
