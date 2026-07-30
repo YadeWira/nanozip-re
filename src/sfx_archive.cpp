@@ -3645,31 +3645,37 @@ bool TryParseLegacyCnArchive(
                     }
                 }
 
-                // `-co` (nz_optimum1, method_p0==5 only -- NOT -cO/method_p0==6,
-                // which is out of scope here) parallel multi-stream container
-                // (same header flag 0x0f / same generic chunk-record scheme as
-                // the -cf/-cF and -cd/-cD parallel branches above; shared
-                // infrastructure, not codec-specific). Empirically confirmed
-                // (real 8-15MB -co archives, GDB-free -- just byte inspection +
-                // the checksum gate as arbiter): each stream's type-0 chunk(s)
-                // contain the SAME "sequence of block records" body that
-                // TryDecodeLegacyOptimum's single-container path decodes after
-                // its own leading stream_tag varint -- i.e. a chunk begins
-                // directly with a block's payload_size (u32 LE), NOT with
-                // another stream_tag, and (unlike -cd/-cD, where a chunk is
-                // exactly one block) a single chunk here can itself contain
-                // several back-to-back block records. Each parallel stream
-                // gets its own FRESH NzOptimumLzDecoder (mirrors -cd/-cD's
-                // "each encoder thread owned its own subengine instance"
-                // finding), but all streams share the archive-wide window
-                // capacity derived from method_p1 -- there is only one such
-                // byte in the whole container header, so every stream almost
-                // certainly used the same ring size; a wrong guess here would
-                // simply make DecodeOptimumBlockSequence fail or the
-                // per-slice checksum mismatch, so it's safe to try.
+                // `-co`/`-cO` (nz_optimum1/nz_optimum2, method_p0==5 or 6)
+                // parallel multi-stream container (same header flag 0x0f /
+                // same generic chunk-record scheme as the -cf/-cF and -cd/-cD
+                // parallel branches above; shared infrastructure, not
+                // codec-specific). Empirically confirmed for -co (real
+                // 8-15MB archives, GDB-free -- just byte inspection + the
+                // checksum gate as arbiter; -cO's parallel envelope is
+                // identical, only the per-stream engine differs): each
+                // stream's type-0 chunk(s) contain the SAME "sequence of
+                // block records" body that TryDecodeLegacyOptimum's
+                // single-container path decodes after its own leading
+                // stream_tag varint -- i.e. a chunk begins directly with a
+                // block's payload_size (u32 LE), NOT with another stream_tag,
+                // and (unlike -cd/-cD, where a chunk is exactly one block) a
+                // single chunk here can itself contain several back-to-back
+                // block records. Each parallel stream gets its own FRESH
+                // decoder instance (mirrors -cd/-cD's "each encoder thread
+                // owned its own subengine instance" finding), but all
+                // streams share the archive-wide window capacity derived
+                // from method_p1 -- there is only one such byte in the whole
+                // container header, so every stream almost certainly used
+                // the same ring size; a wrong guess here would simply make
+                // DecodeOptimumBlockSequence fail or the per-slice checksum
+                // mismatch, so it's safe to try. The decoder TYPE (-co's
+                // NzOptimumLzDecoder vs -cO's NzOptimum2LzDecoder) is fixed
+                // for the whole archive (method_p0 doesn't vary per stream),
+                // so it's selected once via a type-erased closure rather
+                // than duplicating this whole loop per type.
                 if (!native_literal_payload &&
                     method == 0x3bu &&
-                    method_p0 == 5u) {
+                    (method_p0 == 5u || method_p0 == 6u)) {
                     std::size_t magic = bytes.size();
                     for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
                         if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
@@ -3742,6 +3748,27 @@ bool TryParseLegacyCnArchive(
                         }
                         const std::uint32_t popt_window_capacity =
                             nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
+                        // Type-erased "decode one block-record range" closure: the
+                        // decoder TYPE is fixed for the whole archive (method_p0
+                        // doesn't vary per stream), so pick it once here rather
+                        // than duplicating the per-stream loop body per type.
+                        std::function<bool(const unsigned char*, std::size_t, std::size_t,
+                                            std::uint64_t, std::vector<unsigned char>*)> decode_seq;
+                        if (method_p0 == 5u) {
+                            decode_seq = [popt_window_capacity](
+                                const unsigned char* raw, std::size_t b, std::size_t e,
+                                std::uint64_t hint, std::vector<unsigned char>* out) {
+                                nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, out);
+                            };
+                        } else {
+                            decode_seq = [popt_window_capacity](
+                                const unsigned char* raw, std::size_t b, std::size_t e,
+                                std::uint64_t hint, std::vector<unsigned char>* out) {
+                                nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, out);
+                            };
+                        }
                         std::vector<unsigned char> assembled(
                             static_cast<std::size_t>(total_data_size), 0);
                         bool all_ok = parse_ok && !ps.empty() && popt_window_capacity != 0u;
@@ -3753,19 +3780,18 @@ bool TryParseLegacyCnArchive(
                             if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
 
-                            nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
                             std::vector<unsigned char> slice;
                             slice.reserve(static_cast<std::size_t>(s.osz));
                             bool sok = true;
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
-                                sok = DecodeOptimumBlockSequence(
+                                sok = decode_seq(
                                     bytes.data(), c.first, c.first + c.second,
-                                    s.osz, sdec, &slice);
+                                    s.osz, &slice);
                             } else {
                                 // Defensive path: not observed in practice
-                                // (every real -co parallel archive fixture so
-                                // far emits exactly one type-0 chunk per
+                                // (every real -co/-cO parallel archive fixture
+                                // so far emits exactly one type-0 chunk per
                                 // stream), but concatenate in order and decode
                                 // as one contiguous block-record range, same
                                 // shape as -cf/-cF's lzpf payload handling.
@@ -3777,8 +3803,7 @@ bool TryParseLegacyCnArchive(
                                     concat.insert(concat.end(),
                                                   bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
                                                   bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
-                                sok = DecodeOptimumBlockSequence(
-                                    concat.data(), 0u, concat.size(), s.osz, sdec, &slice);
+                                sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &slice);
                             }
                             if (!sok || slice.size() != s.osz) { all_ok = false; break; }
                             if (ComputeBufferChecksum(s.cmode, slice.data(), slice.size()) != s.cval) {
