@@ -4562,14 +4562,23 @@ static bool TryDecodeLegacyCm(
             static_cast<std::uint32_t>(legacy.total_data_size) -
             static_cast<std::uint32_t>(prev_size);
 
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDCC] pre-filters: decr_param=%u param6=%u param2_flag=%u param1_flag=%u "
+                            "tt_enabled=%u tt_flags=%u out_size=%u pos=%zu stream_end=%zu\n",
+                    decr_param, param6, param2_flag, param1_flag, tt_enabled, tt_flags, out_size, pos, stream_end);
+        }
         // param2: u32-wise RLE expansion driven by the param2 side stream.
         if (param2_flag) {
             std::vector<std::uint8_t> exp(remaining);
             std::uint32_t esz = remaining;
-            if (!NzBwtRleDecodeU32(param2_data.data(),
+            const bool p2ok = NzBwtRleDecodeU32(param2_data.data(),
                                    static_cast<std::uint32_t>(param2_data.size()),
-                                   work.data(), cur_size, exp.data(), &esz)
-                || esz == 0u) { ok = false; break; }
+                                   work.data(), cur_size, exp.data(), &esz);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] param2: data.size=%zu cur_size=%u -> ok=%d esz=%u\n",
+                        param2_data.size(), cur_size, p2ok ? 1 : 0, esz);
+            }
+            if (!p2ok || esz == 0u) { ok = false; break; }
             exp.resize(esz);
             work.swap(exp);
             cur_size = esz;
@@ -4578,9 +4587,14 @@ static bool TryDecodeLegacyCm(
         // param1: AddBytesFilter (delta filter, output size == input size).
         if (param1_flag) {
             std::vector<std::uint8_t> tbuf(cur_size);
-            if (!NzAddBytesFilter(param1_data.data(),
+            const bool p1ok = NzAddBytesFilter(param1_data.data(),
                                   static_cast<std::uint32_t>(param1_data.size()),
-                                  work.data(), cur_size, tbuf.data())) { ok = false; break; }
+                                  work.data(), cur_size, tbuf.data());
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] param1: data.size=%zu cur_size=%u -> ok=%d\n",
+                        param1_data.size(), cur_size, p1ok ? 1 : 0);
+            }
+            if (!p1ok) { ok = false; break; }
             work.swap(tbuf);
             // cur_size unchanged
         }
@@ -4648,6 +4662,11 @@ static bool TryDecodeLegacyCm(
 
     NzCmDestroy(cm);
 
+    if (getenv("NZOPT_TRACE_TDO")) {
+        fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%zu total_data_size=%llu\n",
+                ok ? 1 : 0, pos, raw_len, out_data->size(),
+                static_cast<unsigned long long>(legacy.total_data_size));
+    }
     if (!ok) {
         out_data->clear();
         if (out_error_message) *out_error_message = "cm: malformed block stream";
@@ -4830,14 +4849,17 @@ static bool DecodeOptimumBlockSequence(
         }
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t param1_flag = raw[pos++];
+        std::vector<std::uint8_t> param1_data;
         if (param1_flag) {
             if (pos + 4u > stream_end) { ok = false; break; }
             std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u + vlen;
-            if (pos > stream_end) { ok = false; break; }
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            param1_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
         }
         if (pos + 1u > stream_end) { ok = false; break; }
         pos++;  // param16
@@ -4922,7 +4944,23 @@ static bool DecodeOptimumBlockSequence(
                 || esz == 0u) { ok = false; break; }
             exp.resize(esz); work.swap(exp); cur_size = esz;
         }
-        if (param1_flag) { ok = false; break; }
+        // param1: AddBytesFilter (delta filter, output size == input size).
+        // Same NzAddBytesFilter already used by -cc's TryDecodeLegacyCm --
+        // shared post-filter, not codec-specific (the "not yet ported" gate
+        // here was just never wired for the optimum family until now).
+        if (param1_flag) {
+            std::vector<std::uint8_t> tbuf(cur_size);
+            const bool p1ok = NzAddBytesFilter(param1_data.data(),
+                                  static_cast<std::uint32_t>(param1_data.size()),
+                                  work.data(), cur_size, tbuf.data());
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] param1: data.size=%zu cur_size=%u -> %d\n",
+                        param1_data.size(), cur_size, p1ok ? 1 : 0);
+            }
+            if (!p1ok) { ok = false; break; }
+            work.swap(tbuf);
+            // cur_size unchanged
+        }
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
         // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
         // far; any other bit set (0x80/4/0x40/1) declines cleanly.

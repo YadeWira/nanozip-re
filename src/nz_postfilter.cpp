@@ -129,16 +129,54 @@ static uint32_t bitmask(uint32_t nb) { return nb >= 32u ? 0xffffffffu : ((1u << 
 
 struct BitReader {
     uint32_t bitcount_, bitbuff_;
-    const uint32_t *ptr_, *ptr_start_, *ptr_end_;
+    const uint8_t *ptr_, *ptr_end_;
     void Initialize(const uint8_t* data, size_t size) {
         bitcount_ = 0; bitbuff_ = 0;
-        ptr_ = (const uint32_t*)data; ptr_start_ = ptr_;
-        ptr_end_ = (const uint32_t*)(data + (size & ~size_t(3)));
+        ptr_ = data;
+        // Reference computes ptr_end_ = data + size EXACTLY (nz.h BitReader),
+        // i.e. it does NOT round down to a multiple of 4 -- the "should I fetch
+        // another word" test is a raw byte-address comparison, so whenever
+        // `size` isn't a multiple of 4 the reference still performs one more
+        // (partial) word fetch to reach the final 1-3 trailing bytes, which can
+        // carry real bits the decode still needs (a param1 side-stream is only
+        // as long as its last meaningful bit, not padded to a u32 boundary).
+        // A prior port rounded this down (`size & ~3`), silently dropping the
+        // final partial word whenever size % 4 != 0 -- this under-read starved
+        // GetY()/GetZ() of real trailing bits, corrupting copy_offset/
+        // start_offset/num_delta for the tail of the stream. See
+        // NzAddBytesFilter's real-corpus failures (e.g. psionmai.doc, 6-byte
+        // param1_data against a 10229-byte block) for the reproduction.
+        ptr_end_ = data + size;
+    }
+    // Fetch the next 32-bit big-endian-ordered word. Unlike the reference's
+    // raw `*ptr_++` (which can read up to 3 bytes past `data+size` into
+    // whatever memory happens to follow -- harmless there only because a
+    // trailing partial word's out-of-range bits are never actually consumed
+    // before Process() finishes), this only ever touches bytes inside
+    // [data, data+size): any bytes beyond the true end are zero-filled
+    // instead of read, which is bit-for-bit equivalent for every position
+    // whose value can matter (a real decode always finishes needing bits
+    // strictly before it would rely on those unread bytes) while never
+    // touching memory outside the caller-owned buffer.
+    uint32_t FetchWord() {
+        if (ptr_ >= ptr_end_) return 0u;
+        const size_t avail = (size_t)(ptr_end_ - ptr_);
+        uint32_t v;
+        if (avail >= 4u) {
+            std::memcpy(&v, ptr_, 4);
+            ptr_ += 4;
+        } else {
+            uint8_t buf[4] = {0, 0, 0, 0};
+            std::memcpy(buf, ptr_, avail);
+            std::memcpy(&v, buf, 4);
+            ptr_ += avail;
+        }
+        return bswap32(v);
     }
     uint32_t GetBits(uint32_t nb) {
         uint32_t bits = bitbuff_, bitcount = bitcount_;
         if (nb > bitcount) {
-            bitbuff_ = bswap32(ptr_ < ptr_end_ ? *ptr_++ : 0u);
+            bitbuff_ = FetchWord();
             uint32_t new_bitcount = 32u - (nb - bitcount);
             bits = (bitbuff_ >> new_bitcount) | (bits << (nb - bitcount));
             bitcount = new_bitcount;
