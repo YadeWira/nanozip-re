@@ -18,6 +18,7 @@ set(RECON_SOURCES
     src/nz_lzhds.cpp
     src/nz_text_transform.cpp
     src/nz_postfilter.cpp
+    src/nz_bwt.cpp
     src/nz_texttransform_num.cpp
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_tables.cpp

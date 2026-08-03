@@ -8,6 +8,7 @@
 #include "nz_optimum2_lz.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
+#include "nz_bwt.h"
 #include "nz_texttransform_num.h"
 
 #include <algorithm>
@@ -4847,11 +4848,51 @@ static bool DecodeOptimumBlockSequence(
                     payload_size, decr_param, param6, out_size, staged_count, pos, stream_end);
         }
 
-        // decr_param == 0 (BWT) path not yet ported.
-        if (decr_param == 0u) { ok = false; break; }
+        // BWT-only header fields. Per the reference Header::Parse, a non-CM
+        // block with decr_param == 0 carries param7 (only when param6 is set),
+        // the inverse-BWT start position, and params 14/15 -- all absent from
+        // the decr_param == 1 (LZ) layout, which goes straight to param2.
+        std::uint8_t bwt_param7 = 0;
+        std::uint32_t bwt_start_pos = 0;
+        std::uint8_t param14_flag = 0, param15_flag = 0;
+        std::vector<std::uint8_t> param14_data, param15_data;
+        auto read_u32vec = [&](std::vector<std::uint8_t>& dst) -> bool {
+            if (pos + 4u > stream_end) return false;
+            const std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (vlen > stream_end - pos) return false;
+            dst.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
+            return true;
+        };
+        if (decr_param == 0u) {
+            if (param6) {
+                if (pos >= stream_end) { ok = false; break; }
+                bwt_param7 = raw[pos++];
+            }
+            if (pos + 4u > stream_end) { ok = false; break; }
+            bwt_start_pos = static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos >= stream_end) { ok = false; break; }
+            param14_flag = raw[pos++];
+            if (param14_flag && !read_u32vec(param14_data)) { ok = false; break; }
+            if (pos >= stream_end) { ok = false; break; }
+            param15_flag = raw[pos++];
+            if (param15_flag && !read_u32vec(param15_data)) { ok = false; break; }
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] BWT hdr: param7=%u bwt_start_pos=%u param14=%u (%zu bytes) param15=%u (%zu bytes) pos=%zu\n",
+                        bwt_param7, bwt_start_pos, param14_flag, param14_data.size(),
+                        param15_flag, param15_data.size(), pos);
+            }
+        }
 
-        // params 14/15 (BWT-only) appear only for decr_param==0, so for the LZ
-        // path we go straight to param2/param1/param16/tt/dece.
+        if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t param2_flag = raw[pos++];
         std::vector<std::uint8_t> param2_data;
         if (param2_flag) {
@@ -4922,7 +4963,13 @@ static bool DecodeOptimumBlockSequence(
                     dece_param, pos, stream_end, param6, out_size);
         }
 
-        if (!param6 || out_size == 0u) continue;
+        // A decr_param == 0 (BWT) block with param6 == 0 stores its BWT output
+        // raw -- the encoder found it incompressible, so there is no entropy
+        // layer and no size18 field at all, and the block expands to exactly
+        // its own payload size. Every other block shape needs param6 plus a
+        // non-zero size18 to say how far it expands.
+        const bool bwt_raw = (decr_param == 0u && param6 == 0u);
+        if (!bwt_raw && (!param6 || out_size == 0u)) continue;
 
         if (const char* dpp = getenv("NZOPT_DUMP_PAYLOAD")) {
             FILE* f = fopen(dpp, "wb");
@@ -4932,21 +4979,40 @@ static bool DecodeOptimumBlockSequence(
                     payload_size, dpp, out_size);
         }
 
-        // Decode this block's LZ/CM payload via the persistent per-stream
-        // decoder. A false return means the bitstream produced a malformed
-        // dispatch bit, an out-of-window match, or any other detected
-        // inconsistency -- decline cleanly rather than trust a partially-
-        // written buffer (DecodeBlock never touches `work` before it is sure).
-        std::vector<std::uint8_t> work(out_size);
-        const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
-        if (getenv("NZOPT_TRACE_TDO")) {
-            fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
-                    payload_size, out_size, decode_block_ok ? 1 : 0);
+        std::vector<std::uint8_t> work;
+        std::uint32_t cur_size = 0;
+        if (decr_param == 0u) {
+            // params 14/15 are BWT-only follow-on transforms; not yet ported.
+            if (param14_flag || param15_flag) { ok = false; break; }
+            // param6 == 1 wraps the BWT output in a per-symbol-bucket MTF +
+            // arithmetic layer (reference BwtDecodeInput); not yet ported.
+            if (!bwt_raw) { ok = false; break; }
+            work.assign(payload, payload + payload_size);
+            cur_size = payload_size;
+            const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
+                        cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
+            }
+            if (!bwt_ok) { ok = false; break; }
+        } else {
+            // Decode this block's LZ/CM payload via the persistent per-stream
+            // decoder. A false return means the bitstream produced a malformed
+            // dispatch bit, an out-of-window match, or any other detected
+            // inconsistency -- decline cleanly rather than trust a partially-
+            // written buffer (DecodeBlock never touches `work` before it is
+            // sure).
+            work.resize(out_size);
+            const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
+                        payload_size, out_size, decode_block_ok ? 1 : 0);
+            }
+            if (!decode_block_ok) {
+                ok = false; break;
+            }
+            cur_size = out_size;
         }
-        if (!decode_block_ok) {
-            ok = false; break;
-        }
-        std::uint32_t cur_size = out_size;
 
         const std::size_t prev_size = out_data->size();
         const std::uint32_t remaining =
