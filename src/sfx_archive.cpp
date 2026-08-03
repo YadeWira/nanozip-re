@@ -4984,11 +4984,21 @@ static bool DecodeOptimumBlockSequence(
         if (decr_param == 0u) {
             // params 14/15 are BWT-only follow-on transforms; not yet ported.
             if (param14_flag || param15_flag) { ok = false; break; }
-            // param6 == 1 wraps the BWT output in a per-symbol-bucket MTF +
-            // arithmetic layer (reference BwtDecodeInput); not yet ported.
-            if (!bwt_raw) { ok = false; break; }
-            work.assign(payload, payload + payload_size);
-            cur_size = payload_size;
+            if (bwt_raw) {
+                work.assign(payload, payload + payload_size);
+                cur_size = payload_size;
+            } else {
+                // param6 == 1: the BWT output is entropy-coded (256
+                // per-leading-symbol MTF/arith buckets). size18 is its size.
+                work.resize(out_size);
+                const bool bdi_ok = NzBwtDecodeInput(payload, payload_size, out_size, work.data());
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] BWT DecodeInput(payload_size=%u out_size=%u) -> %d\n",
+                            payload_size, out_size, bdi_ok ? 1 : 0);
+                }
+                if (!bdi_ok) { ok = false; break; }
+                cur_size = out_size;
+            }
             const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
             if (getenv("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
