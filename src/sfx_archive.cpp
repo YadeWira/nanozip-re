@@ -9,6 +9,7 @@
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_bwt.h"
+#include "nz_audio.h"
 #include "nz_texttransform_num.h"
 
 #include <algorithm>
@@ -2611,6 +2612,7 @@ static bool DecodeOptimumBlockSequence(
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
+    nzr::audio::NzAudioPred& audio,
     std::vector<unsigned char>* out_data);
 
 bool TryParseLegacyCnArchive(
@@ -3760,14 +3762,16 @@ bool TryParseLegacyCnArchive(
                                 const unsigned char* raw, std::size_t b, std::size_t e,
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, out);
+                                nzr::audio::NzAudioPred saud;
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, out);
                             };
                         } else {
                             decode_seq = [popt_window_capacity](
                                 const unsigned char* raw, std::size_t b, std::size_t e,
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, out);
+                                nzr::audio::NzAudioPred saud;
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, out);
                             };
                         }
                         std::vector<unsigned char> assembled(
@@ -4380,6 +4384,9 @@ static bool TryDecodeLegacyCm(
 
     // Create the CM decoder once; its state persists across all data chunks.
     NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    // One audio predictor for the whole entry, matching the reference's single
+    // global. Reset rules are applied per block below.
+    nzr::audio::NzAudioPred aud;
     if (!cm) {
         if (out_error_message) *out_error_message = "cm: allocation failed";
         return false;
@@ -4440,6 +4447,70 @@ static bool TryDecodeLegacyCm(
 
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t decr_param = raw[pos++];
+
+        // decr_param 2 (audio) and 3 both use the TRUNCATED header that stops
+        // right after size18 -- no staged-checksum count and none of the
+        // param2/param1/param16/tt/dece fields (reference Header::Parse
+        // early-returns for both). Reading them with the ordinary layout takes
+        // mode2_type for param6 and then walks into the following record.
+        if (decr_param == 2u || decr_param == 3u) {
+            std::uint8_t mode2_type = 0;
+            if (decr_param == 2u) {
+                if (pos >= stream_end) { ok = false; break; }
+                mode2_type = raw[pos++];
+            }
+            if (pos + 4u > stream_end) { ok = false; break; }
+            const std::uint32_t alt_out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
+                        payload_size, decr_param, mode2_type, alt_out_size, pos, stream_end);
+            }
+            if (alt_out_size >
+                static_cast<std::uint32_t>(legacy.total_data_size) -
+                static_cast<std::uint32_t>(out_data->size())) { ok = false; break; }
+
+            if (decr_param == 2u) {
+                if (alt_out_size == 0u) continue;
+                // An audio block resets the predictor only when mode2_type is set.
+                if (const char* adp = getenv("NZOPT_DUMP_AUDIO")) {
+                    FILE* f = fopen(adp, "wb");
+                    if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
+                    fprintf(stderr, "[TDCC] dumped audio payload (%u bytes, out_size=%u) to %s\n",
+                            payload_size, alt_out_size, adp);
+                }
+                if (mode2_type) aud.Reset();
+                std::vector<std::uint8_t> abuf(alt_out_size);
+                const bool aok = aud.Decode(payload, payload_size, abuf.data(), alt_out_size);
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDCC] audio Decode(payload_size=%u out_size=%u) -> %d\n",
+                            payload_size, alt_out_size, aok ? 1 : 0);
+                }
+                if (!aok) { ok = false; break; }
+                // NOTE: the reference does not feed audio output through the CM
+                // model. Our stored-block path does feed it (an empirically
+                // established deviation -- see the long comment below), so if a
+                // decr_param==0 CM block ever turns up after an audio block and
+                // decodes wrong, this is the first place to look.
+                out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+                continue;
+            }
+
+            // decr_param == 3: an ordinary CM block that must NOT reset the
+            // model, carrying no post-filters at all.
+            aud.Reset();
+            if (alt_out_size == 0u) continue;
+            std::vector<std::uint8_t> work3(alt_out_size);
+            NzCmDecode(cm, payload, payload_size, work3.data(), alt_out_size);
+            out_data->insert(out_data->end(), work3.begin(), work3.end());
+            continue;
+        }
+        // Every non-audio block resets the audio predictor.
+        aud.Reset();
 
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t param6 = raw[pos++];
@@ -4698,6 +4769,12 @@ static bool TryDecodeLegacyCm(
     }
 
     // Checksum self-verify, mirroring the sibling TryDecodeLegacyLzhd and
+    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
+        fprintf(stderr, "[TDCC] dumped pre-checksum output (%zu bytes) to %s\n", out_data->size(), dp);
+    }
+
     // TryDecodeLegacyOptimum gates: a stored per-file checksum mismatch means
     // "decline and let the caller fall back to the bridge", never "emit it
     // anyway".
@@ -4809,6 +4886,7 @@ static bool DecodeOptimumBlockSequence(
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
+    nzr::audio::NzAudioPred& audio,
     std::vector<unsigned char>* out_data) {
     std::size_t pos = blocks_begin;
     const std::size_t stream_end = blocks_end;
@@ -4828,6 +4906,60 @@ static bool DecodeOptimumBlockSequence(
 
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t decr_param = raw[pos++];
+
+        // decr_param 2 (audio) and 3 use a TRUNCATED header that stops right
+        // after size18: no staged-checksum count, and none of the param2 /
+        // param1 / param16 / text-transform / dece fields an ordinary block
+        // carries (reference Header::Parse, which early-returns for both).
+        // Parsing them with the ordinary layout reads mode2_type as param6 and
+        // then walks off into the next record -- which is exactly why every
+        // audio-bearing archive used to die before its first block trace.
+        if (decr_param == 2u || decr_param == 3u) {
+            std::uint8_t mode2_type = 0;
+            if (decr_param == 2u) {
+                if (pos >= stream_end) { ok = false; break; }
+                mode2_type = raw[pos++];
+            }
+            if (pos + 4u > stream_end) { ok = false; break; }
+            const std::uint32_t audio_out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
+                        payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
+            }
+            // decr_param == 3 is a CM-only shape: the reference dispatches it
+            // to CM_Decode without a reset, and returns false for every
+            // non-CM codec -- which is what the optimum family is.
+            if (decr_param == 3u) { ok = false; break; }
+            if (audio_out_size == 0u) continue;
+            if (audio_out_size > total_size_hint - out_data->size()) { ok = false; break; }
+            // An audio block resets the predictor only when mode2_type is set.
+            if (const char* adp = getenv("NZOPT_DUMP_AUDIO")) {
+                FILE* f = fopen(adp, "wb");
+                if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
+                fprintf(stderr, "[TDO] dumped audio payload (%u bytes, out_size=%u, mode2=%u) to %s\n",
+                        payload_size, audio_out_size, mode2_type, adp);
+            }
+            if (mode2_type) audio.Reset();
+            std::vector<std::uint8_t> abuf(audio_out_size);
+            const bool aok = audio.Decode(payload, payload_size, abuf.data(), audio_out_size);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] audio Decode(payload_size=%u out_size=%u) -> %d\n",
+                        payload_size, audio_out_size, aok ? 1 : 0);
+            }
+            if (!aok) { ok = false; break; }
+            out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+            continue;
+        }
+        // Every non-audio block resets the audio predictor (reference
+        // DecodeFromStream calls audio_pred->Reset() on the way past the
+        // decr_param == 2 branch), so its state never carries across one.
+        audio.Reset();
+
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t param6 = raw[pos++];
         std::uint32_t out_size = 0;
@@ -5195,16 +5327,22 @@ static bool TryDecodeLegacyOptimum(
     // parallel-container branch's own pattern below) rather than
     // duplicating the chain loop per type.
     const std::uint64_t total_size_hint = legacy.total_data_size;
+    // One audio predictor per archive entry, shared across every chain
+    // segment: the reference keeps a single global for the whole decode, and
+    // its state is meant to survive from one segment's last block into the
+    // next segment's first (subject to the per-block reset rule inside
+    // DecodeOptimumBlockSequence).
+    auto aud = std::make_shared<nzr::audio::NzAudioPred>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [raw, dec, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, out);
+        decode_seq = [raw, dec, aud, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, out);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [raw, dec, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, out);
+        decode_seq = [raw, dec, aud, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, out);
         };
     }
 
@@ -5230,6 +5368,14 @@ static bool TryDecodeLegacyOptimum(
         out_data->clear();
         if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
+    }
+
+    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+        // Pre-checksum dump: lets a failing decode be diffed against the
+        // oracle even though the gate below is about to clear out_data.
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
+        fprintf(stderr, "[TDO] dumped pre-checksum output (%zu bytes) to %s\n", out_data->size(), dp);
     }
 
     // Checksum self-verify (mirrors TryDecodeLegacyLzhd's own gate above): a
