@@ -26,15 +26,17 @@ corpus (random, text, source, repeats, zeros, audio; 10 fixtures × 8 methods):
 | `-cn` (store)      | 10/10 | `-cd` (lzhd)        | 9/10 |
 | `-cf` (lzpf A)     | 10/10 | `-cD` (lzhd strong) | 9/10 |
 | `-cF` (lzpf B)     | 10/10 | `-co` (optimum1)    | 9/10 |
-| `-cc` (cm)         |  9/10 | `-cO` (optimum2)    | 9/10 |
+| `-cc` (cm)         |  9/10 | `-cO` (optimum2)    | 10/10 |
 
-**≈ 75/80 (~94%) byte-exact native, zero bridge.** `-cn`/`-cf`/`-cF`/`-cc` are native for typical real inputs.
+**≈ 76/80 (95%) byte-exact native, zero bridge.** `-cn`/`-cf`/`-cF`/`-cc` are native for typical real inputs.
 `-cd`/`-cD` are native for LZ, block-RLE, raw-store, pure-literal, exe, the text pipeline, multi-chunk text, large
 multi-stream files, and parallel containers — bridging only on rare shared CM/BWT sub-chunks. `-co`/`-cO` are
 native for single-container AND parallel-container LZ/CM content and for `decr_param==0` (BWT) blocks in both
 shapes — raw-stored BWT output and the 256-bucket MTF/arithmetic entropy layer — bridging on BWT `param14`/`param15`
-and the shared text-transform/exe-filter gaps. The remaining 5 are all one audio fixture. Counts vary ±1 because
-the corpus uses random fixtures.
+and the shared text-transform/exe-filter gaps. `decr_param==2` audio blocks decode natively too — `-cO` is
+byte-exact on stereo and mono at 8/16/24-bit and on multi-block files. The remaining 4 are all one audio fixture,
+on the codecs whose audio shape the reference decoder itself gets wrong. Counts vary ±1 because the corpus uses
+random fixtures.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
