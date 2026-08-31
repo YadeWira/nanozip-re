@@ -453,7 +453,14 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
         // zero h0..h3 of stages 0..local_58-1 }` -- zeroes HISTORY only, not
         // weights.
         if (order != 0u) {
-            stage = stage % order;
+            // The stage index advances by the MATCH LENGTH before the modulo:
+            // FUN_080982e0 does `local_5c = uVar13 + local_5c;` (uVar13 == the
+            // match length) and only then `local_5c %= local_58`. This port
+            // previously did the modulo alone, so every match left the stage
+            // index behind by mlen and the error ACCUMULATED across matches --
+            // which is why literal-only regions decoded byte-exact while files
+            // with matches diverged at a content-dependent offset.
+            stage = (stage + mlen) % order;
             if (order < 5u) {
                 for (std::uint32_t st = 0; st < order; ++st) {
                     std::int32_t* s = pred + st * 8;

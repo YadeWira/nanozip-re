@@ -29,6 +29,21 @@ inline std::uint32_t LoadBigEndianU32(const std::uint8_t* p) {
            ((le & 0x0000ff00u) << 8) | (le << 24);
 }
 
+// Same load, but never reads past `end`: the missing trailing bytes are treated
+// as zero. The caller's guard is only `cur < end`, so with 1-3 bytes left the
+// unbounded form reads up to 3 bytes past the buffer (ASAN heap-buffer-overflow,
+// reached as soon as -cD started decoding files it previously declined). Bytes
+// beyond the true end can never carry a bit a valid stream consumes, so this is
+// bit-identical wherever the result matters, and the cursor still advances a
+// full word so the reader's position semantics are unchanged.
+inline std::uint32_t LoadBigEndianU32Bounded(const std::uint8_t* p, const std::uint8_t* end) {
+    const std::size_t avail = (end > p) ? static_cast<std::size_t>(end - p) : 0u;
+    if (avail >= 4u) return LoadBigEndianU32(p);
+    std::uint8_t buf[4] = {0, 0, 0, 0};
+    if (avail) std::memcpy(buf, p, avail);
+    return LoadBigEndianU32(buf);
+}
+
 // Read n_bits from a SideBitState using the same MSB-first big-endian logic
 // as DecodeResidualsMono's inline bit reader (mirrors FUN_080b1fb0 applied to
 // the local_4c array in FUN_080a5330).
@@ -79,7 +94,7 @@ std::uint32_t ReadBits(BitReader& r, std::uint32_t req) {
         const std::uint32_t shifted_cache = r.cache << deficit;
         std::uint32_t fresh = new_n;  // legacy: junk-default if past end
         if (r.cur < r.end) {
-            fresh = LoadBigEndianU32(r.cur);
+            fresh = LoadBigEndianU32Bounded(r.cur, r.end);
         }
         r.cur += 4;
         result = shifted_cache | (fresh >> new_n);
