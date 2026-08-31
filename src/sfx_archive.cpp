@@ -5114,8 +5114,6 @@ static bool DecodeOptimumBlockSequence(
         std::vector<std::uint8_t> work;
         std::uint32_t cur_size = 0;
         if (decr_param == 0u) {
-            // params 14/15 are BWT-only follow-on transforms; not yet ported.
-            if (param14_flag || param15_flag) { ok = false; break; }
             if (bwt_raw) {
                 work.assign(payload, payload + payload_size);
                 cur_size = payload_size;
@@ -5137,6 +5135,64 @@ static bool DecodeOptimumBlockSequence(
                         cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
             }
             if (!bwt_ok) { ok = false; break; }
+
+            // params 14/15 run here: after the inverse BWT, before the shared
+            // param2/param1/text-transform/dece chain (reference
+            // DecodeFromStream lines 1009-1017).
+            if (param14_flag) {
+                // Output can grow: the transform expands LZ matches. Cap at
+                // whatever this entry still has left to produce.
+                const std::uint32_t cap =
+                    static_cast<std::uint32_t>(total_size_hint) -
+                    static_cast<std::uint32_t>(out_data->size());
+                std::vector<std::uint8_t> t14(cap);
+                std::uint32_t n14 = 0;
+                const bool p14ok = NzBwtParam14(param14_data.data(),
+                                       static_cast<std::uint32_t>(param14_data.size()),
+                                       work.data(), cur_size, t14.data(), cap, &n14);
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
+                            param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
+                }
+                if (!p14ok || n14 == 0u) { ok = false; break; }
+                t14.resize(n14); work.swap(t14); cur_size = n14;
+            }
+            if (param15_flag) {
+                // param15 matches are ABSOLUTE offsets into the whole
+                // accumulated output stream, so the window has to be
+                // "everything decoded so far, with this block's current bytes
+                // at the end". Splice this block onto out_data, run the
+                // transform against that, then roll out_data back -- the
+                // block's own result is appended by the shared tail below.
+                const std::size_t prev = out_data->size();
+                out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+                const std::uint32_t cap =
+                    static_cast<std::uint32_t>(total_size_hint) -
+                    static_cast<std::uint32_t>(prev);
+                std::vector<std::uint8_t> t15(cap);
+                std::uint32_t n15 = 0;
+                const bool p15ok = NzBwtParam15(param15_data.data(),
+                                       static_cast<std::uint32_t>(param15_data.size()),
+                                       out_data->data() + prev, cur_size,
+                                       out_data->data(), out_data->size(),
+                                       t15.data(), cap, &n15);
+                out_data->resize(prev);
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
+                            param15_data.size(), cur_size, p15ok ? 1 : 0, n15);
+                }
+                if (!p15ok || n15 == 0u) { ok = false; break; }
+                t15.resize(n15); work.swap(t15); cur_size = n15;
+            }
+
+            // The window is the shared accumulated-block buffer in the
+            // original, advanced by every block that writes into it -- a BWT
+            // block included (reference: mem->data += size, right after
+            // params 14/15 and before the post-filter chain). This port's ring
+            // is otherwise only written by DecodeBlock, so feed it here or a
+            // later LZ block whose match reaches back into this BWT output
+            // reads stale ring bytes and fails.
+            dec.FeedWindow(work.data(), cur_size);
         } else {
             // Decode this block's LZ/CM payload via the persistent per-stream
             // decoder. A false return means the bitstream produced a malformed

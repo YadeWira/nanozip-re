@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 // NanoZip decr_param == 0 ("BWT") block decoding, ported from the community
@@ -36,3 +37,31 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos);
 // caller still runs NzBwtUntransform over the result.
 bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
                       uint32_t out_size, uint8_t* out);
+
+// param14 / param15: BWT-only follow-on transforms that run after the inverse
+// BWT and before the shared param2/param1/text-transform/dece chain. Both are
+// LZ77 passes over the block's bytes, driven by their own arithmetic-coded side
+// stream (`model_data`), that locate matches by scanning for a two-byte escape
+// tag: 0xfe 0xf1 for param14, 0xfe 0xf0 for param15.
+//
+// param14 codes its match offset relative to the current output position, with
+// four repeat-offset slots. Ported from reference DecodeLZ_Param14
+// (NZ_LZ.cpp:543).
+//
+// WARNING: this is NOT the same transform as NzCdParam14 in nz_cd_tokens.h
+// (the -cd char-class space-insertion text transform). Same name in the
+// original, completely different algorithm.
+bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
+                  const uint8_t* in, uint32_t in_size,
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size);
+
+// param15 names its match source as an ABSOLUTE offset (4 raw big-endian
+// one's-complement bytes taken from the byte stream) into the whole accumulated
+// output stream, so a match can reach back into earlier blocks. The caller must
+// therefore pass the base and length of everything decoded so far, with this
+// block's own pre-param15 bytes sitting at its end, and `in` pointing at them.
+// Ported from reference DecodeParam15 (NZ.cpp:843).
+bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
+                  const uint8_t* in, uint32_t in_size,
+                  const uint8_t* window_base, size_t window_len,
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size);

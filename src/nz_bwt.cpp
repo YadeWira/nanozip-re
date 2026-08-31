@@ -707,3 +707,258 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
     }
     return (uint32_t)(dst - out) == out_size;
 }
+
+// ---------------------------------------------------------------------------
+// param14 (reference NZ_LZ.cpp:543, DecodeLZ_Param14) and param15 (reference
+// NZ.cpp:843, DecodeParam15): two BWT-only follow-on transforms that run after
+// the inverse BWT and before the shared param2/param1/text-transform/dece
+// chain.
+//
+// Both are LZ77 passes driven by their own arithmetic-coded side stream, and
+// both find their matches by scanning the *byte* stream for a two-byte escape
+// tag rather than by coding literal/match flags. They differ in how a match
+// names its source:
+//   param14  tag 0xfe 0xf1, then a selector byte: 1 = the tag was a literal
+//            (emit it, continue), 0 = a match. Offset is coded relative to the
+//            current output position, with 4 repeat-offset slots.
+//   param15  tag 0xfe 0xf0, then a selector byte: 0 = literal. Otherwise the
+//            match length is coded, and the source is a 4-byte BIG-ENDIAN
+//            one's-complement ABSOLUTE offset from the base of the whole
+//            accumulated output stream -- so a match can reach back into
+//            earlier blocks, not just this one.
+//
+// NOTE: param14 here is NOT the same transform as nz_cd_tokens.cpp's
+// NzCdParam14 (the -cd char-class space-insertion text transform). Same name,
+// different algorithm; do not conflate them.
+//
+// The reference bounds-checks neither the relative offset nor the absolute one,
+// so a corrupt stream walks off the front of its buffer. Both ports decline
+// instead, matching this project's safety invariant.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Shared length decoder: a unary bit-count in `model_hi`, then that many bits
+// through the binary tree in `model_lo`, then any remaining low bits raw.
+struct Param1415LenDecoder {
+    static uint32_t Decode(ArithDec* adec, uint16_t* model_hi, uint16_t* model_lo,
+                           uint32_t lo_accum_init) {
+        uint32_t lenbits = 0;
+        for (;; lenbits++) {
+            uint16_t* mp = &model_hi[lenbits];
+            const bool flag = adec->Read(*mp);
+            *mp = (uint16_t)(*mp + ((((uint32_t)flag << 16) + 8u - *mp) >> 4));
+            if (!flag) break;
+        }
+        uint32_t matchlen = (lenbits != 0u);
+        const uint32_t base = lenbits * 8u;
+        uint32_t n_len_lower;
+        if (lenbits >= 2u) {
+            n_len_lower = lenbits - 2u;
+            lenbits = 2u;
+        } else {
+            lenbits += (lenbits == 0u);
+            n_len_lower = 0u;
+        }
+        uint32_t accum = lo_accum_init;
+        do {
+            uint16_t* mp = &model_lo[base + accum];
+            const bool flag = adec->Read(*mp);
+            *mp = (uint16_t)(*mp + ((((uint32_t)flag << 16) + 8u - *mp) >> 4));
+            matchlen = matchlen * 2u + flag;
+            accum = accum * 2u + flag;
+        } while (--lenbits);
+        while (n_len_lower) {
+            matchlen = matchlen * 2u + adec->Read(0x8000u);
+            n_len_lower--;
+        }
+        return matchlen;
+    }
+};
+
+}  // namespace
+
+bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
+                  const uint8_t* in, uint32_t in_size,
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size) {
+    if (out_size == nullptr) return false;
+    *out_size = 0;
+
+    ArithDec adec;
+    adec.InitializeX(model_data, model_data + model_len);
+    adec.FillBuffer();
+
+    uint16_t model_a[4], model_b[64], model_c[256], model_d[32];
+    for (uint32_t i = 0; i != 4u; ++i) model_a[i] = 0x8000u;
+    for (uint32_t i = 0; i != 64u; ++i) model_b[i] = 0x8000u;
+    for (uint32_t i = 0; i != 256u; ++i) model_c[i] = 0x8000u;
+    for (uint32_t i = 0; i != 32u; ++i) model_d[i] = 0x8000u;
+
+    const uint8_t* in_end = in + in_size;
+    uint8_t* const out_org = out;
+    uint8_t* const out_end = out + out_cap;
+
+    uint32_t repmatch[4] = {1u, 1u, 1u, 1u};
+
+    for (;;) {
+        const size_t room_in = (size_t)(in_end - in);
+        const size_t room_out = (size_t)(out_end - out);
+        const uint8_t* scan_max = in + (room_in < room_out ? room_in : room_out);
+        uint32_t prev_byte = 0;
+        for (;;) {
+            if (in == scan_max) {
+                if (in != in_end) {
+                    BWT_FAIL("param14: ran out of output room with %ld input left\n",
+                             (long)(in_end - in));
+                    return false;
+                }
+                *out_size = (uint32_t)(out - out_org);
+                return true;
+            }
+            if (prev_byte == 0xfef1u && *in <= 1u) break;
+            prev_byte = (uint32_t)((uint8_t)prev_byte << 8) | *in++;
+            *out++ = (uint8_t)prev_byte;
+        }
+
+        // Selector byte: 1 means the tag itself was literal data.
+        if (*in++ != 0u) continue;
+
+        // A match: drop the two tag bytes that were already emitted.
+        if ((size_t)(out - out_org) < 2u) {
+            BWT_FAIL("param14: match tag with fewer than 2 bytes emitted\n");
+            return false;
+        }
+        out -= 2;
+
+        uint32_t repmatch_index = 0;
+        for (; repmatch_index != 4u; repmatch_index++) {
+            uint16_t* mp = &model_a[repmatch_index];
+            const bool flag_a = adec.Read(*mp);
+            *mp = (uint16_t)(*mp + ((((uint32_t)flag_a << 16) + 4u - *mp) >> 3));
+            if (flag_a) break;
+        }
+
+        uint32_t offset, matchlen;
+        if (repmatch_index == 0u) {
+            uint32_t offs_bits = 0;
+            for (; offs_bits != 31u; offs_bits++) {
+                uint16_t* mp = &model_d[offs_bits];
+                const bool flag = adec.Read(*mp);
+                *mp = (uint16_t)(*mp + ((((uint32_t)flag << 16) + 8u - *mp) >> 4));
+                if (!flag) break;
+            }
+            const uint32_t upper_bits = offs_bits ? (1u << offs_bits) : 0u;
+            uint32_t numbits = offs_bits + (offs_bits == 0u);
+            uint32_t lowbits = 0;
+            do {
+                lowbits = lowbits * 2u + adec.Read(0x8000u);
+            } while (--numbits);
+            offset = upper_bits + lowbits;
+            repmatch[3] = repmatch[2];
+            repmatch[2] = repmatch[1];
+            repmatch[1] = repmatch[0];
+            repmatch[0] = offset;
+            matchlen = Param1415LenDecoder::Decode(&adec, model_b, model_c, 1u) + 7u;
+        } else {
+            offset = repmatch[repmatch_index - 1u];
+            if (repmatch_index != 1u) {
+                for (; repmatch_index != 1u; repmatch_index--)
+                    repmatch[repmatch_index - 1u] = repmatch[repmatch_index - 2u];
+                repmatch[0] = offset;
+            }
+            matchlen = Param1415LenDecoder::Decode(&adec, model_b + 32, model_c, 3u) + 7u;
+        }
+
+        if (offset == 0u || offset > (uint32_t)(out - out_org)) {
+            BWT_FAIL("param14: offset %u out of range (emitted %ld)\n",
+                     offset, (long)(out - out_org));
+            return false;
+        }
+        if (matchlen > (uint32_t)(out_end - out)) {
+            BWT_FAIL("param14: matchlen %u exceeds output room %ld\n",
+                     matchlen, (long)(out_end - out));
+            return false;
+        }
+        const uint8_t* src = out - offset;
+        for (uint32_t i = 0; i != matchlen; i++) out[i] = src[i];
+        out += matchlen;
+    }
+}
+
+bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
+                  const uint8_t* in, uint32_t in_size,
+                  const uint8_t* window_base, size_t window_len,
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size) {
+    if (out_size == nullptr) return false;
+    *out_size = 0;
+
+    ArithDec adec;
+    adec.InitializeX(model_data, model_data + model_len);
+    adec.FillBuffer();
+
+    uint16_t model_a[64], model_b[256];
+    for (uint32_t i = 0; i != 64u; ++i) model_a[i] = 0x8000u;
+    for (uint32_t i = 0; i != 256u; ++i) model_b[i] = 0x8000u;
+
+    const uint8_t* in_end = in + in_size;
+    uint8_t* const out_org = out;
+    uint8_t* const out_end = out + out_cap;
+
+    for (;;) {
+        const size_t room_in = (size_t)(in_end - in);
+        const size_t room_out = (size_t)(out_end - out);
+        const uint8_t* scan_max = in + (room_in < room_out ? room_in : room_out);
+        uint32_t prev_byte = 0;
+        for (;;) {
+            if (in == scan_max) {
+                if (in != in_end) {
+                    BWT_FAIL("param15: ran out of output room with %ld input left\n",
+                             (long)(in_end - in));
+                    return false;
+                }
+                *out_size = (uint32_t)(out - out_org);
+                return true;
+            }
+            if (prev_byte == 0xfef0u) break;
+            prev_byte = (uint32_t)((uint8_t)prev_byte << 8) | *in++;
+            *out++ = (uint8_t)prev_byte;
+        }
+
+        if (in == in_end) { BWT_FAIL("param15: truncated selector\n"); return false; }
+        if (*in == 0u) { in++; continue; }
+
+        // Length first, then the absolute source offset as 4 raw big-endian
+        // bytes (one's complement) taken from the byte stream, not the coder.
+        const uint32_t matchlen =
+            Param1415LenDecoder::Decode(&adec, model_a + 32, model_b, 3u);
+
+        if ((size_t)(in_end - in) < 4u) {
+            BWT_FAIL("param15: truncated absolute offset\n");
+            return false;
+        }
+        const uint32_t offs_from_start = ~(((uint32_t)in[0] << 24) |
+                                           ((uint32_t)in[1] << 16) |
+                                           ((uint32_t)in[2] << 8) |
+                                            (uint32_t)in[3]);
+        const uint64_t need = (uint64_t)matchlen + 8u;
+        if ((uint64_t)offs_from_start + need > (uint64_t)window_len) {
+            BWT_FAIL("param15: window offset %u + %llu exceeds window %zu\n",
+                     offs_from_start, (unsigned long long)need, window_len);
+            return false;
+        }
+        if ((size_t)(out - out_org) < 2u) {
+            BWT_FAIL("param15: match tag with fewer than 2 bytes emitted\n");
+            return false;
+        }
+        out -= 2;
+        if (need > (uint64_t)(out_end - out)) {
+            BWT_FAIL("param15: matchlen+8 %llu exceeds output room %ld\n",
+                     (unsigned long long)need, (long)(out_end - out));
+            return false;
+        }
+        const uint8_t* src = window_base + offs_from_start;
+        for (uint32_t i = 0; i != (uint32_t)need; i++) out[i] = src[i];
+        out += (uint32_t)need;
+        in += 4;
+    }
+}

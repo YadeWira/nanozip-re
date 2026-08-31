@@ -930,5 +930,27 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
     return local_74 == out_size;
 }
 
+
+void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
+    // Caveat: when `len` exceeds the ring capacity this writes in
+    // capacity-sized chunks, leaving the cursor at the end of the last one.
+    // Only the final `capacity` bytes are reachable either way, but the exact
+    // cursor the original would land on in that case is NOT verified against
+    // the real binary -- no observed BWT block was larger than the window. If
+    // it ever is, a later match reads the wrong ring position and the block or
+    // the entry checksum fails, i.e. it declines rather than emitting wrong
+    // bytes.
+    const std::uint32_t cap = ring_.capacity;
+    if (cap == 0u || data == nullptr) return;
+    while (len != 0u) {
+        const std::uint32_t n = (len < cap) ? len : cap;
+        const std::uint32_t start = ring_.EnsureHeadroom(n);
+        std::memcpy(ring_.Base() + start, data, n);
+        ring_.cursor = start + n;
+        data += n;
+        len -= n;
+    }
+}
+
 }  // namespace optimum
 }  // namespace nzr

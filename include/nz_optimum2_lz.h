@@ -120,6 +120,22 @@ public:
     bool DecodeBlock(const std::uint8_t* in, std::uint32_t in_len,
                       std::uint8_t* out, std::uint32_t out_size);
 
+    // Feed already-known output bytes into the window WITHOUT decoding, so a
+    // later block's matches can reference them. Needed because in the original
+    // the window is the shared accumulated-block buffer, advanced by every
+    // block that writes into it (reference: `mem->data += size`), not just by
+    // LZ blocks -- a decr_param==0 (BWT) block's post-param14/15 output lands
+    // there too. This port's ring is otherwise only ever written by
+    // DecodeBlock, so without this a later LZ match that reaches back into a
+    // BWT block's output reads stale ring bytes and the block fails.
+    //
+    // Note the window carries each block's PRE-post-filter bytes: call this
+    // before param2/param1/text-transform/dece run. Audio (decr_param==2)
+    // blocks must NOT be fed -- the reference returns before touching the
+    // window for those.
+    void FeedWindow(const std::uint8_t* data, std::uint32_t len);
+
+
 private:
     struct Ring {
         std::uint32_t capacity = 0;
