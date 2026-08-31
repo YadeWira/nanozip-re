@@ -716,6 +716,17 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                     std::uint32_t b;
                     do {
                         int coff = lenOff + static_cast<int>(raw) * 2;
+                        // This unary length loop has NO upper bound in the
+                        // original: a corrupt bitstream that keeps returning a
+                        // set bit walks `coff` up 2 bytes at a time straight
+                        // past the model buffer, and DecodeAdaptiveKSB both
+                        // READS and WRITES the cell -- an out-of-bounds heap
+                        // write on malformed input. Found by fuzzing single-byte
+                        // corruptions of a real archive under ASAN. A valid
+                        // stream stays inside the length table, far below this
+                        // bound, so declining here cannot reject anything the
+                        // original would have decoded.
+                        if (coff < 0 || static_cast<std::size_t>(coff) + 2u > mem_.size()) return false;
                         b = DecodeAdaptiveKS(rc, mem, coff, 0x10u, 5u);
                         raw += 1;
                     } while (b != 0);

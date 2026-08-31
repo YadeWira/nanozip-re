@@ -10,6 +10,7 @@
 #include "nz_postfilter.h"
 #include "nz_bwt.h"
 #include "nz_audio.h"
+#include "nz_exefilter.h"
 #include "nz_texttransform_num.h"
 
 #include <algorithm>
@@ -4594,8 +4595,9 @@ static bool TryDecodeLegacyCm(
             if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
             if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
         }
-        // Read dece_param.
+        // Read dece_param + its side stream.
         if (pos >= stream_end) { ok = false; break; }
+        std::vector<std::uint8_t> dece_data;
         const std::uint8_t dece_param = raw[pos++];
         if (dece_param) {
             if (pos + 4u > stream_end) { ok = false; break; }
@@ -4606,6 +4608,7 @@ static bool TryDecodeLegacyCm(
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
             if (pos + vlen > stream_end) { ok = false; break; }
+            dece_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
 
@@ -4783,7 +4786,24 @@ static bool TryDecodeLegacyCm(
             cur_size = n;
         }
 
-        if (dece_param) { ok = false; break; }
+        if (dece_param) {
+            // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
+            // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
+            // text transforms -> dece). Output GROWS (4 bytes per restored
+            // displacement, 3 more per add-esp), and since dece is last its
+            // result IS the block final output, so `remaining` is the right cap.
+            std::vector<std::uint8_t> tbuf(remaining);
+            std::uint32_t n = 0;
+            const bool dok = NzExeFilter(dece_data.data(),
+                                 static_cast<std::uint32_t>(dece_data.size()),
+                                 work.data(), cur_size, tbuf.data(), remaining, &n);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] dece: param=%u data=%zu in=%u -> %d out=%u\n",
+                        dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
+            }
+            if (!dok || n == 0u) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         }
@@ -5119,6 +5139,7 @@ static bool DecodeOptimumBlockSequence(
                     param2_flag, param1_flag, tt_enabled, tt_flags, tt16_data.size(), pos, stream_end);
         }
         if (pos >= stream_end) { ok = false; break; }
+        std::vector<std::uint8_t> dece_data;
         const std::uint8_t dece_param = raw[pos++];
         if (dece_param) {
             if (pos + 4u > stream_end) { ok = false; break; }
@@ -5126,8 +5147,10 @@ static bool DecodeOptimumBlockSequence(
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
-            pos += 4u + vlen;
-            if (pos > stream_end) { ok = false; break; }
+            pos += 4u;
+            if (vlen > stream_end - pos) { ok = false; break; }
+            dece_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
         }
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] dece_param=%u pos=%zu stream_end=%zu param6=%u out_size=%u\n",
@@ -5360,7 +5383,24 @@ static bool DecodeOptimumBlockSequence(
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
-        if (dece_param) { ok = false; break; }
+        if (dece_param) {
+            // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
+            // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
+            // text transforms -> dece). Output GROWS (4 bytes per restored
+            // displacement, 3 more per add-esp), and since dece is last its
+            // result IS the block final output, so `remaining` is the right cap.
+            std::vector<std::uint8_t> tbuf(remaining);
+            std::uint32_t n = 0;
+            const bool dok = NzExeFilter(dece_data.data(),
+                                 static_cast<std::uint32_t>(dece_data.size()),
+                                 work.data(), cur_size, tbuf.data(), remaining, &n);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] dece: param=%u data=%zu in=%u -> %d out=%u\n",
+                        dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
+            }
+            if (!dok || n == 0u) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         if (getenv("NZOPT_TRACE_TDO")) {
