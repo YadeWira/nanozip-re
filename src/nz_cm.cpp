@@ -23,6 +23,20 @@ static void* nz_aligned_malloc(size_t size, size_t align) {
 #endif
 }
 
+// The window is walked at arbitrary byte offsets, so these comparisons load
+// through unaligned addresses. Reading them via a uint16_t*/uint32_t* cast is
+// UB (UBSan flags it); memcpy compiles to the same single instruction on x86
+// while staying defined.
+static inline uint16_t nz_load16(const uint8_t* p) {
+    uint16_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+static inline uint32_t nz_load32(const uint8_t* p) {
+    uint32_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+static inline uint64_t nz_load64(const uint8_t* p) {
+    uint64_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+
 #define _rotr(v, n) (((v) >> (n)) | ((v) << (32 - (n))))
 #define BSR(x) (31u - static_cast<unsigned>(__builtin_clz(static_cast<unsigned>(x))))
 
@@ -504,7 +518,7 @@ static void CM_B_NewByte(CM_B* t) {
         if (!((t->write_pos - 2 - pos > 0xFF) ||
               ((histhash2_cur ^ (t->last_bytes << 16)) & t->inverse_mask) ||
               (t->last_bytes >> 8 == (uint8_t)t->last_bytes))) {
-            if (*(uint16_t*)&t->window[pos - (size_t)2] == *(uint16_t*)&t->window[t->write_pos - (size_t)2]) {
+            if (nz_load16(&t->window[pos - (size_t)2]) == nz_load16(&t->window[t->write_pos - (size_t)2])) {
                 t->hash2pos  = pos;
                 t->hash2attr = (int16_t)(((t->write_pos - pos <= 0x5F) + (t->write_pos - pos <= 0xF)) << 10);
             }
@@ -528,7 +542,7 @@ static void CM_B_NewByte(CM_B* t) {
     } else {
         if (!((t->histhash8 ^ histhash8_cur) & t->inverse_mask)) {
             uint32_t pos = (histhash8_cur & t->mask);
-            if (*(uint64_t*)&t->window[pos - (size_t)8] == *(uint64_t*)&t->window[t->write_pos - (size_t)8]) {
+            if (nz_load64(&t->window[pos - (size_t)8]) == nz_load64(&t->window[t->write_pos - (size_t)8])) {
                 if (t->hash4pos == pos) {
                     t->hash4len  = 0;
                     t->hash4attr = -1;
@@ -545,7 +559,7 @@ static void CM_B_NewByte(CM_B* t) {
         t->hash4attr = (int16_t)((t->hash4attr & ~(15 << 5)) | (int16_t)(32 * std::min<uint32_t>(t->hash4len - 4, 14)));
     } else {
         if (!((t->histhash4 ^ histhash4_cur) & t->inverse_mask) &&
-            (*(uint32_t*)&t->window[(histhash4_cur & t->mask) - (size_t)4] == *(uint32_t*)&t->window[t->write_pos - (size_t)4])) {
+            (nz_load32(&t->window[(histhash4_cur & t->mask) - (size_t)4]) == nz_load32(&t->window[t->write_pos - (size_t)4]))) {
             t->hash4len  = 4;
             t->hash4pos  = (histhash4_cur & t->mask);
             t->hash4attr = (int16_t)(((t->write_pos - (histhash4_cur & t->mask)) < 0x1000u) << 9);

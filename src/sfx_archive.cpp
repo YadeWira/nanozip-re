@@ -4693,7 +4693,7 @@ static bool TryDecodeLegacyCm(
         // then 0x08 (dictionary), then 0x02 (insert-LF). Other bits
         // (0x80/0x04/0x20/0x40/0x01) not yet ported -> decline so the caller
         // can bridge.
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x02u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformNumber(
@@ -4730,6 +4730,16 @@ static bool TryDecodeLegacyCm(
             work.swap(tbuf);
             cur_size = expanded;
         }
+        if (tt_enabled && (tt_flags & 0x04u)) {
+            // HTML closing-tag restoration (NzTextTransformHtml). Reference
+            // order puts 0x04 after the 0x08 dictionary and before 0x02.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
         if (tt_enabled && (tt_flags & 0x02u)) {
             // Insert-LF transform (NzTextTransformInsertLf, ported from
             // TransformText_3_InsertLF). Byte-count-preserving pure byte
@@ -4738,6 +4748,35 @@ static bool TryDecodeLegacyCm(
             const std::uint32_t n = NzTextTransformInsertLf(
                 tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
                 work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+
+        if (tt_enabled && (tt_flags & 0x20u)) {
+            // Escape+run-length repeat transform, the same codec-agnostic
+            // function the optimum path already uses and has verified against
+            // real archives. NOT verified for -cc specifically: no -cc archive
+            // in a 60-file real corpus sets this bit, so there is no repro to
+            // check. Wiring it can only help -- the reference applies 0x20
+            // identically regardless of codec (no reorder_ascii_ dependency),
+            // and a wrong result is caught by the entry checksum and declines
+            // exactly as it does today.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x01u)) {
+            // CR/CRLF restoration -- LAST in the reference's chain (after 0x20
+            // and 0x40). One byte of slack: the reference's output budget is
+            // out_cap + 1 and it writes that extra byte before noticing the
+            // overrun (see NzTextTransformCrToCrLf's header comment).
+            std::vector<std::uint8_t> tbuf(static_cast<std::size_t>(remaining) + 1u);
+            const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -5246,7 +5285,7 @@ static bool DecodeOptimumBlockSequence(
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
         // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
         // far; any other bit set (0x80/4/0x40/1) declines cleanly.
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x02u | 0x20u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
@@ -5279,6 +5318,14 @@ static bool DecodeOptimumBlockSequence(
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
+        if (tt_enabled && (tt_flags & 0x04u)) {
+            // HTML closing-tag restoration (NzTextTransformHtml). Reference
+            // order puts 0x04 after the 0x08 dictionary and before 0x02.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
         if (tt_enabled && (tt_flags & 0x02u)) {
             // Insert-LF transform (NzTextTransformInsertLf, ported from
             // TransformText_3_InsertLF -- see include/nz_text_transform.h).
@@ -5300,6 +5347,16 @@ static bool DecodeOptimumBlockSequence(
             // literal payload didn't warrant the word dictionary).
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x01u)) {
+            // CR/CRLF restoration -- LAST in the reference's chain (after 0x20
+            // and 0x40). One byte of slack: the reference's output budget is
+            // out_cap + 1 and it writes that extra byte before noticing the
+            // overrun (see NzTextTransformCrToCrLf's header comment).
+            std::vector<std::uint8_t> tbuf(static_cast<std::size_t>(remaining) + 1u);
+            const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }

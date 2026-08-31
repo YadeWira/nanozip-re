@@ -633,3 +633,236 @@ uint32_t NzTextTransformInsertLf(const uint8_t* side, uint32_t side_len,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// tt bit 0x01 -- TransformText_CR_to_CRLF (reference NZ_TextTransforms.cpp:402).
+// Faithful transcription, including the deliberate one-byte output slack the
+// reference's `out_size++` budget implies (see the header comment): the budget
+// counter starts at out_cap + 1 and the overrun is only detected after the
+// (out_cap + 1)-th byte has been written, so the caller allocates one spare.
+//
+// The state machine restores line endings that the encoder collapsed: state 1
+// re-expands a bare 10 into 13,10; state 2 rewrites a 10 back to a lone 13.
+// ---------------------------------------------------------------------------
+uint32_t NzTextTransformCrToCrLf(const uint8_t* in, uint32_t in_size,
+                                 uint8_t* out, uint32_t out_cap) {
+    uint8_t* const out_org = out;
+    if (!(in_size && out_cap)) return 0;
+
+    uint32_t out_size = out_cap + 1u;
+    int state = 0;
+    uint8_t c = 0, prev = 0;
+
+    for (;;) {
+        const uint32_t nn = (in_size < out_size) ? in_size : out_size;
+        uint32_t n = nn;
+        do {
+            prev = c;
+            c = *in++;
+            *out++ = c;
+        } while (--n && (c > 0x13u || (c != 13u && c != 10u)));
+
+        out_size -= (nn - n);
+        if (out_size == 0u) return 0;
+        in_size -= (nn - n);
+        if (in_size == 0u) return (uint32_t)(out - out_org);
+
+        if (state == 1) {
+            // A bare 10 becomes 13,10.
+            if (c == 10u) {
+                out[-1] = 13u;
+                *out++ = 10u;
+                if (--out_size == 0u) return 0;
+            } else {
+                out[-1] = *in++;
+                if (--in_size == 0u) return (uint32_t)(out - out_org);
+                state = 0;
+            }
+            c = 0;
+        } else if (state == 2) {
+            // A 10 standing in for a lone 13.
+            if (c == 10u) {
+                out[-1] = 13u;
+            } else {
+                out[-1] = 10u;
+                state = 0;
+            }
+            c = 0;
+        } else {
+            if (c == 10u) {
+                if (prev == 13u) state = 1;
+            } else if (c == 13u && *in > 13u) {
+                // Safe: in_size was just confirmed non-zero above, so this
+                // lookahead byte is inside the caller's buffer.
+                state = 2;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tt bit 0x04 -- HtmlTransformer (reference NZ_TextTransforms.cpp:781-899).
+//
+// The encoder replaces an HTML closing tag with the bare sequence "</", and the
+// decoder reconstructs the tag name from a stack of the tags it has seen opened.
+// A literal "</" in the source is escaped as "<//".
+//
+// The stack is deliberately lossy in the same way the original is: only 128
+// entries deep (pushes past that overwrite the top slot), names truncated to 16
+// bytes, and a small 4-entry "recent tag" ring plus a fixed set of predefined
+// tags that are never stacked at all because they never need closing.
+// ---------------------------------------------------------------------------
+namespace {
+
+static const uint8_t kCharTraitHtml[256] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,
+    0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,
+    0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+};
+
+// Folds case so <DIV> and <div> hash to the same short tag.
+static inline uint32_t NormalizeTagChar(uint8_t b) {
+    return (uint32_t)b | (uint32_t)((kCharacterTraits_0[b] & 0x40u) >> 1);
+}
+
+// Packs a 1..4 byte tag name into a comparable integer.
+static inline uint32_t GetTagShort(const uint8_t* tag, uint32_t taglen) {
+    uint32_t rv = NormalizeTagChar(tag[0]);
+    if (taglen != 1u) {
+        rv = rv * 256u + NormalizeTagChar(tag[1]);
+        if (taglen != 2u) {
+            rv = rv * 256u + NormalizeTagChar(tag[2]);
+            if (taglen != 3u) rv = rv * 256u + NormalizeTagChar(tag[3]);
+        }
+    }
+    return rv;
+}
+
+struct HtmlTransformer {
+    uint32_t rtag_[4];
+    uint8_t rtag_pos_;
+    size_t stack_count_;
+    uint8_t tagnames_[129][16];
+    uint8_t taglens_[129];
+
+    HtmlTransformer() {
+        std::memset(rtag_, 0, sizeof(rtag_));
+        rtag_pos_ = 0;
+        stack_count_ = 0;
+        taglens_[0] = 0;
+        // The reference leaves tagnames_/taglens_[1..] uninitialised; a decode
+        // only ever reads a slot it pushed first, but zero them so a malformed
+        // stream cannot read indeterminate stack memory.
+        std::memset(tagnames_, 0, sizeof(tagnames_));
+        std::memset(taglens_, 0, sizeof(taglens_));
+    }
+
+    // Tags that never need a closing partner, so they are never stacked.
+    static bool IsPredefinedTag(uint32_t t) {
+        return t == 0x6272u || t == 0x696E74u || t == 0x766172u ||
+               t == 0x696D67u || t == 0x6D657461u;
+    }
+    bool IsRecentTag(uint32_t t) const {
+        return t == rtag_[0] || t == rtag_[1] || t == rtag_[2] || t == rtag_[3];
+    }
+
+    uint32_t TagLen(const uint8_t* tag, const uint8_t* in_end) const {
+        const uint32_t cap = (uint32_t)std::min<size_t>((size_t)(in_end - tag), 16u);
+        uint32_t n = 0;
+        while (n < cap && kCharTraitHtml[tag[n]]) n++;
+        return n;
+    }
+
+    void AddTag(const uint8_t* tag, const uint8_t* in_end) {
+        uint32_t taglen = TagLen(tag, in_end);
+        if (taglen == 0u) return;
+        if (taglen > 2u) {
+            // A self-closing "<foo ... />" needs no stack entry.
+            uint32_t i = taglen;
+            const uint32_t cap = (uint32_t)std::min<size_t>((size_t)(in_end - tag), 33u);
+            while (i < cap && tag[i] != '>') i++;
+            if (i == 0u) return;
+            if (tag[i - 1u] == '/') return;
+        }
+        if (taglen < 4u) {
+            const uint32_t t = GetTagShort(tag, taglen);
+            if (IsRecentTag(t) || IsPredefinedTag(t)) return;
+        }
+        stack_count_ += (stack_count_ <= 127u);
+        taglens_[stack_count_] = (uint8_t)taglen;
+        std::memcpy(tagnames_[stack_count_], tag, taglen);
+    }
+
+    void EraseTag(const uint8_t* tag, const uint8_t* in_end) {
+        const uint32_t taglen = TagLen(tag, in_end);
+        if (taglen == 0u) return;
+        if (taglen < 4u) {
+            const uint32_t t = GetTagShort(tag, taglen);
+            if (IsRecentTag(t) || IsPredefinedTag(t)) return;
+        }
+        while (stack_count_ != 0u) {
+            const uint32_t curlen = taglens_[stack_count_];
+            if (taglen == curlen &&
+                std::memcmp(tagnames_[stack_count_], tag, taglen) == 0) break;
+            if (curlen != 0u && curlen <= 4u) {
+                const uint32_t t = GetTagShort(tagnames_[stack_count_], curlen);
+                if (!IsRecentTag(t)) rtag_[rtag_pos_++ & 0x3u] = t;
+            }
+            stack_count_--;
+        }
+    }
+
+    uint32_t Decode(const uint8_t* in, uint32_t in_size, uint8_t* out, uint32_t allocated) {
+        uint8_t* const out_org = out;
+        uint8_t* const out_end = out + allocated;
+        const uint8_t* const in_end = in + in_size;
+
+        for (;;) {
+            uint8_t* out_cur_end =
+                out + std::min<size_t>((size_t)(out_end - out), (size_t)(in_end - in));
+            while (out != out_cur_end && (*out++ = *in++) != '<') {
+                // copy through
+            }
+            if (out == out_cur_end) return (in == in_end) ? (uint32_t)(out - out_org) : 0u;
+
+            const uint8_t b = *out++ = *in++;
+            if (b != '/') {              // "<x" -- an opening tag
+                AddTag(in - 1, in_end);
+                continue;
+            }
+            if (in != in_end && in[0] == '/') {   // "<//" -- an escaped literal "</"
+                EraseTag(++in, in_end);
+                continue;
+            }
+            // "</" -- expand to the tag on top of the stack.
+            const size_t taglen = taglens_[stack_count_];
+            if (taglen >= (size_t)(out_end - out)) return 0u;
+            std::memcpy(out, tagnames_[stack_count_], taglen);
+            out += taglen;
+            *out++ = '>';
+            stack_count_ -= (stack_count_ != 0u);
+        }
+    }
+};
+
+}  // namespace
+
+uint32_t NzTextTransformHtml(const uint8_t* in, uint32_t in_size,
+                             uint8_t* out, uint32_t out_cap) {
+    if (in_size == 0u || out_cap == 0u) return 0;
+    HtmlTransformer t;
+    return t.Decode(in, in_size, out, out_cap);
+}

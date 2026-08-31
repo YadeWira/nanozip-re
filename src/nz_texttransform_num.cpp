@@ -271,7 +271,11 @@ struct TextTransformNumber {
             *b_ptr = (u16)(*b_ptr + ((is_predicted * 0x10006 - *b_ptr) >> 3));
             *c_ptr = (u16)(*c_ptr + ((is_predicted * 0x10000 - *c_ptr + 32) >> 6));
             one_.model_d_[d_idx >> 1] = (u8)(one_.model_d_[d_idx >> 1]
-                - (i32)(-(i32)(((u32)0x10 * is_predicted - d_value) >> 1) << (4 * (d_idx & 1))));
+                // Shift performed on the unsigned bit pattern: shifting a
+                // negative int is UB, and the optimiser is entitled to act on
+                // it (the same class of UB that let gcc delete a loop bound in
+                // the BWT port). Bit-identical on two's complement.
+                - (i32)((u32)(-(i32)(((u32)0x10 * is_predicted - d_value) >> 1)) << (4 * (d_idx & 1))));
         }
         if (!is_predicted) {
             if (num_zeros >= 4) {
@@ -317,7 +321,8 @@ struct TextTransformNumber {
                         *model_ptr = (u16)(*model_ptr + ((0x10000u * latest_bit - *model_ptr + 32u) >> 6));
                         u32 model_j_idx = model_j_upper + number_low;
                         one_.model_j_[model_j_idx >> 1] = (u8)(one_.model_j_[model_j_idx >> 1]
-                            - (i32)(-(i32)((22u * latest_bit - model_j_value) >> 3) << (4 * (model_j_idx & 1))));
+                            // Unsigned shift, see the matching note above.
+                            - (i32)((u32)(-(i32)((22u * latest_bit - model_j_value) >> 3)) << (4 * (model_j_idx & 1))));
                         number_low = number_low * 2 + latest_bit;
                     }
                     if (!latest_bit) lower = number; else upper = number;

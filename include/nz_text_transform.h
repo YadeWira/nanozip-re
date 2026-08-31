@@ -62,3 +62,22 @@ uint32_t NzTextTransformRle(const uint8_t* in, uint32_t in_size,
 uint32_t NzTextTransformInsertLf(const uint8_t* side, uint32_t side_len,
                                  const uint8_t* in, uint32_t in_size,
                                  uint8_t* out, uint32_t allocated);
+
+// tt bit 0x01: CR/CRLF line-ending restoration (reference
+// TransformText_CR_to_CRLF, NZ_TextTransforms.cpp:402). Applied LAST in the
+// text-transform chain, after 0x20 and 0x40.
+//
+// IMPORTANT: `out` must have room for out_cap + 1 bytes. The reference starts
+// its output budget at out_cap + 1 and only notices the overrun after writing
+// that extra byte, so a faithful port needs one byte of caller slack. The
+// returned size never exceeds out_cap; a stream that would need more makes the
+// function return 0 (decline), exactly as the reference does.
+uint32_t NzTextTransformCrToCrLf(const uint8_t* in, uint32_t in_size,
+                                 uint8_t* out, uint32_t out_cap);
+
+// tt bit 0x04: HTML closing-tag restoration (reference HtmlTransformer,
+// NZ_TextTransforms.cpp:781). The encoder shortens "</div>" to "</" and the
+// decoder rebuilds the name from a stack of opened tags; a literal "</" in the
+// source is escaped as "<//". Returns 0 on any inconsistency.
+uint32_t NzTextTransformHtml(const uint8_t* in, uint32_t in_size,
+                             uint8_t* out, uint32_t out_cap);
