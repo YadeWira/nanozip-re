@@ -33,7 +33,7 @@ corpus (random, text, source, repeats, zeros, audio; 10 fixtures × 8 methods):
 multi-stream files, and parallel containers — bridging only on rare shared CM/BWT sub-chunks. `-co`/`-cO` are
 native for single-container AND parallel-container LZ/CM content and for `decr_param==0` (BWT) blocks in both
 shapes — raw-stored BWT output and the 256-bucket MTF/arithmetic entropy layer — bridging on BWT `param14`/`param15`
-plus the BWT-only `param14`/`param15` follow-on transforms, bridging on the shared text-transform/exe-filter gaps. `decr_param==2` audio blocks decode natively too — `-cO` is
+plus the BWT-only `param14`/`param15` follow-on transforms. **The whole post-filter chain is now native** -- param2, param1, all six text-transform bits, and the `dece` x86 exe-filter -- so no unported post-filter remains. `decr_param==2` audio blocks decode natively too — `-cO` is
 byte-exact on stereo and mono at 8/16/24-bit and on multi-block files. The remaining 4 are all one audio fixture,
 on the codecs whose audio shape the reference decoder itself gets wrong. Counts vary ±1 because the corpus uses
 random fixtures.
