@@ -697,6 +697,10 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
         out_size = v2 + size; pure_literal = (v2 == 0u);
     }
+    if (CdTrace()) {
+        std::fprintf(stderr, "[CD] hdr: chunk=0x%x flags=0x%x out_size=%u pure_lit=%d is_lzhds=%d\n",
+                     chunk, flags, out_size, (int)pure_literal, (int)is_lzhds);
+    }
     if (out_size == 0) return 0;     // out_size <= 0x8001 always fits the 64 KB ring
     // The ring write base RESETS to 0 when this chunk would not fit before the ring
     // end (verified vs the binary's obj+0x980: f18 chunk2 53707+26661 > 65536 -> base
@@ -932,7 +936,15 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                       out + written, out_cap - written,
                                       out_pos_base + written, &adv,
                                       is_lzhds, lzhds_ctx_table, lzhds_ctx_index);
-        if (n == 0 || pos <= prev) break;   // malformed / no progress
+        if (CdTrace()) {
+            std::fprintf(stderr, "[CD] chunk: inpos %zu->%zu (of %zu) produced=%u written=%u/%u adv=%u\n",
+                         prev, pos, block_len, n, written + n, out_cap, adv);
+        }
+        if (n == 0 || pos <= prev) {
+            CD_FAIL("stream stop: n=%u pos=%zu prev=%zu block_len=%zu written=%u/%u\n",
+                    n, pos, prev, block_len, written, out_cap);
+            break;   // malformed / no progress
+        }
         written += n;
         *ring_pos = adv;                    // adv is the new absolute ring position
     }

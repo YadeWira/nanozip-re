@@ -4351,21 +4351,19 @@ static bool TryDecodeLegacyLzhd(
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
         return false;
     }
+    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+        // Dump before BOTH the size check and the checksum gate, so a short
+        // decode is diffable too (its prefix is still meaningful) -- not just a
+        // full-size wrong-bytes one.
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(window_base, 1, written, f); fclose(f); }
+        fprintf(stderr, "[LZHD] dumped %zu of %zu bytes to %s\n", written, (size_t)total_out, dp);
+    }
     if (written != total_out) {
         if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: output size mismatch";
         return false;
     }
-    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
-        // Pre-checksum dump: lets a wrong-bytes decode be diffed against the
-        // oracle even though the gate below is about to reject it. The -cd/-cD
-        // path had no such hook, which is why its wrong-bytes failures were
-        // indistinguishable from clean declines.
-        FILE* f = fopen(dp, "wb");
-        if (f) { fwrite(window_base, 1, total_out, f); fclose(f); }
-        fprintf(stderr, "[LZHD] dumped pre-checksum output (%zu bytes) to %s\n", (size_t)total_out, dp);
-    }
-
     // Verify the decoded output against the archive's stored per-file checksum(s).
     // The native -cd ring model is byte-exact for the common case but has a residual
     // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
