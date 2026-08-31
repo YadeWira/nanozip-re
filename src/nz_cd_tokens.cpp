@@ -1,5 +1,7 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
+#include <cstdio>
+#include <cstdlib>
 #include "nz_cd_tokens.h"
 #include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
 #include "nz_cd_texttransform_dict.h"   // &8 bit 0x8 word-dictionary transform
@@ -10,6 +12,17 @@
 
 namespace nzr {
 namespace cd {
+// NZOPT_TRACE_CD-gated diagnostics, following this project's existing
+// NZOPT_TRACE_* convention (zero cost when unset). This file had NO
+// instrumentation at all, which made every -cd/-cD decline indistinguishable
+// from every other -- the reason -cD sat at 34/60 on the real corpus without
+// anyone being able to say why.
+static bool CdTrace() {
+    static const bool on = (std::getenv("NZOPT_TRACE_CD") != nullptr);
+    return on;
+}
+#define CD_FAIL(...) do { if (CdTrace()) std::fprintf(stderr, "[CD] " __VA_ARGS__); } while (0)
+
 
 std::uint32_t NzCdReconstruct(const std::uint32_t* tokens, std::uint32_t num_tokens,
                               const std::uint8_t* literals,
@@ -553,7 +566,7 @@ std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
     const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x1u;
-    if (param & ~kSupported) return 0;
+    if (param & ~kSupported) do { CD_FAIL("text pipeline: unsupported bits 0x%x (param=0x%x)\n", param & ~kSupported, param); return 0; } while (0);
     std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
     const std::uint8_t* cur = src;
@@ -712,7 +725,21 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         // The window IS the literal stream (out_size bytes); no cols/tokens/recon.
         decode_literals(slice.data(), out_size);
         if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
-        if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
+        if (flags & 8u) {
+        const std::uint8_t* tp_at = r.cur;
+        text_param = (r.cur < r.end) ? *r.cur++ : 0;
+        if (CdTrace()) {
+            std::fprintf(stderr, "[CD] text_param=0x%x at blockoff=%ld (is_lzhds=%d flags=0x%x out_size=%u) ctx=",
+                         text_param, (long)(tp_at - (block + 0)), (int)is_lzhds, flags, out_size);
+            for (int k = -8; k <= 8; ++k) {
+                const std::uint8_t* q = tp_at + k;
+                if (q >= block && q < block + block_len)
+                    std::fprintf(stderr, "%s%02x", k == 0 ? "[" : " ", *q);
+                if (k == 0) std::fprintf(stderr, "]");
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
         RingWrite(ring, ring_size, base, slice.data(), out_size);  // window keeps the compact recon
     } else {
 
@@ -802,7 +829,21 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // Block-RLE (&2) run bits then text (&8) param trail the literals (same order
     // the dispatcher consumes them); both must be read so the next chunk parses.
     if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
-    if (flags & 8u) text_param = (r.cur < r.end) ? *r.cur++ : 0;
+    if (flags & 8u) {
+        const std::uint8_t* tp_at = r.cur;
+        text_param = (r.cur < r.end) ? *r.cur++ : 0;
+        if (CdTrace()) {
+            std::fprintf(stderr, "[CD] text_param=0x%x at blockoff=%ld (is_lzhds=%d flags=0x%x out_size=%u) ctx=",
+                         text_param, (long)(tp_at - (block + 0)), (int)is_lzhds, flags, out_size);
+            for (int k = -8; k <= 8; ++k) {
+                const std::uint8_t* q = tp_at + k;
+                if (q >= block && q < block + block_len)
+                    std::fprintf(stderr, "%s%02x", k == 0 ? "[" : " ", *q);
+                if (k == 0) std::fprintf(stderr, "]");
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
 
     // Reconstruct into the 64 KB ring at this chunk's base (matches reach prior
     // chunks via the wrap), then linearise the chunk's compact recon into `slice`.

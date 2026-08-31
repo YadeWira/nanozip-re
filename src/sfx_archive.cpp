@@ -4241,10 +4241,20 @@ static bool TryDecodeLegacyLzhd(
     if (out_data == nullptr) return false;
     out_data->clear();
 
+    if (getenv("NZOPT_TRACE_CD")) {
+        fprintf(stderr, "[LZHD] enter: method=0x%x p0=%u p1=%u total=%llu data=%zu\n",
+                legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1,
+                (unsigned long long)legacy.total_data_size, legacy.data.size());
+    }
     if (legacy.legacy_method != 0x2bu ||
-        (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u))
+        (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u)) {
+        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
         return false;
-    if (legacy.data.empty()) return false;
+    }
+    if (legacy.data.empty()) {
+        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
+        return false;
+    }
 
     const auto* raw = legacy.data.data();
     const std::size_t raw_len = legacy.data.size();
@@ -4328,18 +4338,34 @@ static bool TryDecodeLegacyLzhd(
             block_in, block_in_size, window_base + written, block_cap,
             ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
             is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index);
+        if (getenv("NZOPT_TRACE_CD")) {
+            fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
+                    block_in_size, block_cap, produced, written + produced, (size_t)total_out);
+        }
         if (produced == 0u) { ok = false; break; }
         written += produced;
     }
 
     if (!ok) {
+        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
         return false;
     }
     if (written != total_out) {
+        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: output size mismatch";
         return false;
     }
+    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+        // Pre-checksum dump: lets a wrong-bytes decode be diffed against the
+        // oracle even though the gate below is about to reject it. The -cd/-cD
+        // path had no such hook, which is why its wrong-bytes failures were
+        // indistinguishable from clean declines.
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(window_base, 1, total_out, f); fclose(f); }
+        fprintf(stderr, "[LZHD] dumped pre-checksum output (%zu bytes) to %s\n", (size_t)total_out, dp);
+    }
+
     // Verify the decoded output against the archive's stored per-file checksum(s).
     // The native -cd ring model is byte-exact for the common case but has a residual
     // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
