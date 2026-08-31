@@ -2614,6 +2614,7 @@ static bool DecodeOptimumBlockSequence(
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
+    NzExeFilter& exe,
     std::vector<unsigned char>* out_data);
 
 bool TryParseLegacyCnArchive(
@@ -3764,7 +3765,8 @@ bool TryParseLegacyCnArchive(
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, out);
+                                NzExeFilter sexe;
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, sexe, out);
                             };
                         } else {
                             decode_seq = [popt_window_capacity](
@@ -3772,7 +3774,8 @@ bool TryParseLegacyCnArchive(
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, out);
+                                NzExeFilter sexe;
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, sexe, out);
                             };
                         }
                         std::vector<unsigned char> assembled(
@@ -4388,6 +4391,11 @@ static bool TryDecodeLegacyCm(
     // One audio predictor for the whole entry, matching the reference's single
     // global. Reset rules are applied per block below.
     nzr::audio::NzAudioPred aud;
+    // One exe filter for the whole entry. Its recent-target caches and base
+    // persist across a RUN of consecutive dece blocks and reset as soon as a
+    // block without dece intervenes -- see nz_exefilter.h. The reference's
+    // per-block temporary is wrong on 22 of 88 real dece archives.
+    NzExeFilter exe;
     if (!cm) {
         if (out_error_message) *out_error_message = "cm: allocation failed";
         return false;
@@ -4794,7 +4802,7 @@ static bool TryDecodeLegacyCm(
             // result IS the block final output, so `remaining` is the right cap.
             std::vector<std::uint8_t> tbuf(remaining);
             std::uint32_t n = 0;
-            const bool dok = NzExeFilter(dece_data.data(),
+            const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
                                  work.data(), cur_size, tbuf.data(), remaining, &n);
             if (getenv("NZOPT_TRACE_TDO")) {
@@ -4803,6 +4811,9 @@ static bool TryDecodeLegacyCm(
             }
             if (!dok || n == 0u) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        } else {
+            // No dece on this block: it breaks any run in progress.
+            exe.Reset();
         }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
@@ -4946,6 +4957,7 @@ static bool DecodeOptimumBlockSequence(
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
+    NzExeFilter& exe,
     std::vector<unsigned char>* out_data) {
     std::size_t pos = blocks_begin;
     const std::size_t stream_end = blocks_end;
@@ -5391,7 +5403,7 @@ static bool DecodeOptimumBlockSequence(
             // result IS the block final output, so `remaining` is the right cap.
             std::vector<std::uint8_t> tbuf(remaining);
             std::uint32_t n = 0;
-            const bool dok = NzExeFilter(dece_data.data(),
+            const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
                                  work.data(), cur_size, tbuf.data(), remaining, &n);
             if (getenv("NZOPT_TRACE_TDO")) {
@@ -5400,6 +5412,9 @@ static bool DecodeOptimumBlockSequence(
             }
             if (!dok || n == 0u) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        } else {
+            // No dece on this block: it breaks any run in progress.
+            exe.Reset();
         }
 
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
@@ -5486,16 +5501,18 @@ static bool TryDecodeLegacyOptimum(
     // next segment's first (subject to the per-block reset rule inside
     // DecodeOptimumBlockSequence).
     auto aud = std::make_shared<nzr::audio::NzAudioPred>();
+    // One exe filter per entry, same run/reset semantics as -cc above.
+    auto exe = std::make_shared<NzExeFilter>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, out);
+        decode_seq = [raw, dec, aud, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *exe, out);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, out);
+        decode_seq = [raw, dec, aud, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *exe, out);
         };
     }
 

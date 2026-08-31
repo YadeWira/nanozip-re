@@ -223,181 +223,207 @@ static void StoreU32LE(uint8_t* p, uint32_t v) {
 
 }  // namespace
 
-bool NzExeFilter(const uint8_t* side, uint32_t side_len,
-                 const uint8_t* in, uint32_t in_size,
-                 uint8_t* out, uint32_t out_cap, uint32_t* out_size) {
-    if (out_size == nullptr) return false;
 
-    auto m = std::unique_ptr<ExeModels>(new ExeModels());
-
-    // Per-block recent-target caches (the reference builds a fresh ExeFilter
-    // per block, so these never carry across blocks).
+// ---------------------------------------------------------------------------
+// Run state. Only the recent-target caches and the base persist across a run of
+// consecutive dece blocks; the probability models above are rebuilt per block,
+// exactly as the reference's Decode-locals are.
+// ---------------------------------------------------------------------------
+struct NzExeFilter::Impl {
     uint32_t recent_call[3];
     uint32_t recent_jump[256];
-    for (uint32_t i = 0; i != 3u; ++i) recent_call[i] = i;
-    for (uint32_t i = 0; i != 256u; ++i) recent_jump[i] = i;
+    uint32_t carry;   // the reference's exe_base_: output bytes this run has made
 
-    BackwardsByteStream backwards(side, side_len);
-    const uint32_t num_call_offs = backwards.ReadBackwardsVarint();
-    const uint32_t num_call = backwards.ReadBackwardsVarint() + num_call_offs;
+    Impl() { Reset(); }
 
-    const uint8_t* const in_true_end = in + in_size;
-    const uint8_t* in_end = in_true_end;
-    uint8_t* const out_org = out;
-    uint8_t* const out_end = out + out_cap;
-
-    // The tail of the input carries the raw side data: `num_call` add-esp
-    // immediates, then `num_call_offs` big-endian 32-bit call targets.
-    const uint64_t end_bytes = (uint64_t)num_call_offs * 4u + num_call;
-    if (end_bytes >= (uint64_t)(in_end - in)) {
-        EXE_FAIL("end_bytes %llu >= input %u\n", (unsigned long long)end_bytes, in_size);
-        return false;
+    void Reset() {
+        for (uint32_t i = 0; i != 3u; ++i) recent_call[i] = i;
+        for (uint32_t i = 0; i != 256u; ++i) recent_jump[i] = i;
+        carry = 0;
     }
-    in_end -= end_bytes;
 
-    const uint8_t* addesp_stream = in_end;
-    const uint8_t* const addesp_end = addesp_stream + num_call;
-    const uint8_t* offs_stream = addesp_end;
-    const uint8_t* const offs_end = offs_stream + (size_t)num_call_offs * 4u;
+    bool Decode(const uint8_t* side, uint32_t side_len,
+                const uint8_t* in, uint32_t in_size,
+                uint8_t* out, uint32_t out_cap, uint32_t* out_size) {
+        auto m = std::unique_ptr<ExeModels>(new ExeModels());
 
-    ArithDec adec;
-    adec.InitializeX(backwards.ptr_, backwards.ptr_end_);
-    adec.FillBuffer();
+        BackwardsByteStream backwards(side, side_len);
+        const uint32_t num_call_offs = backwards.ReadBackwardsVarint();
+        const uint32_t num_call = backwards.ReadBackwardsVarint() + num_call_offs;
 
-    // The reference works in truncated pointer values:
-    //     base   = (uint32)out_org - exe_base_
-    //     stored = offs + base - (uint32)out
-    //     offs   = model + (uint32)out - base       (the non-recent jump case)
-    // The absolute addresses cancel exactly, leaving nothing but the output
-    // OFFSET, and exe_base_ is only ever assigned 0 in the constructor (the
-    // reference builds a temporary ExeFilter per block, so it is dead state).
-    // Working in offsets is bit-identical and, unlike casting a 64-bit pointer
-    // down to uint32, actually well defined. Note the algebra collapses the
-    // non-recent jump case to `stored == model value`.
-    uint32_t jump_mode = 0, jump_type = 0, offs = 0;
+        const uint8_t* const in_true_end = in + in_size;
+        const uint8_t* in_end = in_true_end;
+        uint8_t* const out_org = out;
+        uint8_t* const out_end = out + out_cap;
 
-    for (;;) {
-        const uint8_t prev_byte = (out > out_org) ? out[-1] : 0u;
+        // The tail of the input carries the raw side data: `num_call` add-esp
+        // immediates, then `num_call_offs` big-endian 32-bit call targets.
+        // Computed in uint64 so a 32-bit size_t cannot wrap the guard.
+        const uint64_t end_bytes = (uint64_t)num_call_offs * 4u + num_call;
+        if (end_bytes >= (uint64_t)(in_end - in)) {
+            EXE_FAIL("end_bytes %llu >= input %u\n", (unsigned long long)end_bytes, in_size);
+            return false;
+        }
+        in_end -= end_bytes;
 
-        if (in >= in_end || out >= out_end) break;
+        const uint8_t* addesp_stream = in_end;
+        const uint8_t* const addesp_end = addesp_stream + num_call;
+        const uint8_t* offs_stream = addesp_end;
+        const uint8_t* const offs_end = offs_stream + (size_t)num_call_offs * 4u;
 
-        const uint8_t b = *in++;
-        *out++ = b;
+        ArithDec adec;
+        adec.InitializeX(backwards.ptr_, backwards.ptr_end_);
+        adec.FillBuffer();
 
-        bool handle_jump = false;
+        // The reference works in truncated pointer values:
+        //     base   = (uint32)out_org - exe_base_
+        //     stored = offs + base - (uint32)out
+        //     offs   = model + (uint32)out - base       (non-recent jump)
+        // The absolute addresses cancel exactly, leaving the RUN-RELATIVE
+        // output position P = carry + (out - out_org). Working in offsets is
+        // bit-identical and, unlike casting a 64-bit pointer down to uint32,
+        // well defined. The algebra also collapses the non-recent jump case to
+        // "stored == the model value".
+        uint32_t jump_mode = 0, jump_type = 0, offs = 0;
 
-        if (b == 0xe8u) {
-            const uint32_t call_mode = m->call_mode.Get(&adec, prev_byte);
-            if (call_mode >= 1u) {
-                uint32_t coffs;
-                if (call_mode == 1u) {
-                    uint32_t recent = m->call_recent.Get(&adec, prev_byte);  // 0..2
-                    coffs = recent_call[recent];
-                    if (recent) {
-                        do {
-                            recent_call[recent] = recent_call[recent - 1u];
-                        } while (--recent);
+        for (;;) {
+            const uint8_t prev_byte = (out > out_org) ? out[-1] : 0u;
+
+            if (in >= in_end || out >= out_end) break;
+
+            const uint8_t b = *in++;
+            *out++ = b;
+
+            bool handle_jump = false;
+
+            if (b == 0xe8u) {
+                const uint32_t call_mode = m->call_mode.Get(&adec, prev_byte);
+                if (call_mode >= 1u) {
+                    uint32_t coffs;
+                    if (call_mode == 1u) {
+                        uint32_t recent = m->call_recent.Get(&adec, prev_byte);  // 0..2
+                        coffs = recent_call[recent];
+                        if (recent) {
+                            do {
+                                recent_call[recent] = recent_call[recent - 1u];
+                            } while (--recent);
+                            recent_call[0] = coffs;
+                        }
+                    } else {
+                        if ((size_t)(offs_end - offs_stream) < 4u) {
+                            EXE_FAIL("call target stream exhausted\n");
+                            return false;
+                        }
+                        coffs = (uint32_t)offs_stream[3] |
+                                ((uint32_t)offs_stream[2] << 8) |
+                                ((uint32_t)offs_stream[1] << 16) |
+                                ((uint32_t)offs_stream[0] << 24);
+                        offs_stream += 4;
+                        recent_call[2] = recent_call[1];
+                        recent_call[1] = recent_call[0];
                         recent_call[0] = coffs;
                     }
+                    // The reference writes these 4 bytes (and the 3 add-esp
+                    // bytes) with no room check at all -- the loop only tests
+                    // out >= out_end at the top, so it can run up to 7 bytes
+                    // past the buffer.
+                    if ((size_t)(out_end - out) < 4u) {
+                        EXE_FAIL("no room for call displacement\n");
+                        return false;
+                    }
+                    StoreU32LE(out, coffs - (carry + (uint32_t)(out - out_org)));
+                    out += 4;
+
+                    if (addesp_stream >= addesp_end) {
+                        EXE_FAIL("add-esp stream exhausted\n");
+                        return false;
+                    }
+                    const uint8_t sp_val = *addesp_stream++;
+                    if (sp_val) {
+                        if ((size_t)(out_end - out) < 3u) {
+                            EXE_FAIL("no room for add-esp\n");
+                            return false;
+                        }
+                        out[0] = 0x83u; out[1] = 0xc4u; out[2] = sp_val;
+                        out += 3;
+                    }
+                }
+            } else if (b == 0xe9u) {
+                jump_mode = m->jump_mode.Get(&adec, prev_byte);
+                jump_type = 0;
+                handle_jump = true;
+            } else if (b == 0x0fu) {
+                // The reference peeks past its own reduced in_end into the
+                // side-stream tail, which is still inside the caller's buffer,
+                // so bound the peek by the TRUE input end: faithful and
+                // in-bounds both.
+                if (in < in_true_end) {
+                    const uint8_t b2 = *in;
+                    if ((b2 & 0xF0u) == 0x80u && !(b2 >= 0x8Au && b2 <= 0x8Bu)) {
+                        if (out >= out_end) break;
+                        *out++ = b2;
+                        in++;
+                        jump_type = (uint32_t)(b2 & 0xFu) + 1u;
+                        jump_mode = m->jcc_mode[b2 & 0xFu].Get(&adec, 0x80u | (uint32_t)(prev_byte >> 4));
+                        handle_jump = true;
+                    }
+                }
+            }
+
+            if (handle_jump && jump_mode >= 1u) {
+                if (jump_mode == 1u) {
+                    uint32_t recent = m->jump_recent.Get(&adec);  // 0..255
+                    offs = recent_jump[recent];
+                    if (recent) {
+                        do {
+                            recent_jump[recent] = recent_jump[recent - 1u];
+                        } while (--recent);
+                        recent_jump[0] = offs;
+                    }
                 } else {
-                    if ((size_t)(offs_end - offs_stream) < 4u) {
-                        EXE_FAIL("call target stream exhausted\n");
-                        return false;
-                    }
-                    coffs = (uint32_t)offs_stream[3] |
-                            ((uint32_t)offs_stream[2] << 8) |
-                            ((uint32_t)offs_stream[1] << 16) |
-                            ((uint32_t)offs_stream[0] << 24);
-                    offs_stream += 4;
-                    recent_call[2] = recent_call[1];
-                    recent_call[1] = recent_call[0];
-                    recent_call[0] = coffs;
-                }
-                // The reference writes these 4 bytes (and the 3 add-esp bytes)
-                // with no room check at all -- the loop only tests out >= out_end
-                // at the top, so it can run up to 7 bytes past the buffer.
-                if ((size_t)(out_end - out) < 4u) {
-                    EXE_FAIL("no room for call displacement\n");
-                    return false;
-                }
-                StoreU32LE(out, coffs - (uint32_t)(out - out_org));
-                out += 4;
-
-                if (addesp_stream >= addesp_end) {
-                    EXE_FAIL("add-esp stream exhausted\n");
-                    return false;
-                }
-                const uint8_t sp_val = *addesp_stream++;
-                if (sp_val) {
-                    if ((size_t)(out_end - out) < 3u) {
-                        EXE_FAIL("no room for add-esp\n");
-                        return false;
-                    }
-                    out[0] = 0x83u; out[1] = 0xc4u; out[2] = sp_val;
-                    out += 3;
-                }
-            }
-        } else if (b == 0xe9u) {
-            jump_mode = m->jump_mode.Get(&adec, prev_byte);
-            jump_type = 0;
-            handle_jump = true;
-        } else if (b == 0x0fu) {
-            // Peek the next byte. The reference peeks past its own reduced
-            // in_end into the side-stream tail, which is still inside the
-            // caller's buffer -- so bound the peek by the TRUE input end to
-            // stay both faithful and in-bounds.
-            if (in < in_true_end) {
-                const uint8_t b2 = *in;
-                if ((b2 & 0xF0u) == 0x80u && !(b2 >= 0x8Au && b2 <= 0x8Bu)) {
-                    if (out >= out_end) break;
-                    *out++ = b2;
-                    in++;
-                    jump_type = (uint32_t)(b2 & 0xFu) + 1u;
-                    jump_mode = m->jcc_mode[b2 & 0xFu].Get(&adec, 0x80u | (uint32_t)(prev_byte >> 4));
-                    handle_jump = true;
-                }
-            }
-        }
-
-        if (handle_jump && jump_mode >= 1u) {
-            if (jump_mode == 1u) {
-                uint32_t recent = m->jump_recent.Get(&adec);  // 0..255
-                offs = recent_jump[recent];
-                if (recent) {
-                    do {
-                        recent_jump[recent] = recent_jump[recent - 1u];
-                    } while (--recent);
+                    uint32_t model_value = 0;
+                    if (!m->jump_offset.Get(&adec, jump_type, &model_value)) return false;
+                    offs = model_value + carry + (uint32_t)(out - out_org);
+                    for (size_t i = 255; i != 0; i--) recent_jump[i] = recent_jump[i - 1];
                     recent_jump[0] = offs;
                 }
-            } else {
-                uint32_t model_value = 0;
-                if (!m->jump_offset.Get(&adec, jump_type, &model_value)) return false;
-                offs = model_value + (uint32_t)(out - out_org);
-                for (size_t i = 255; i != 0; i--) recent_jump[i] = recent_jump[i - 1];
-                recent_jump[0] = offs;
+                if ((size_t)(out_end - out) < 4u) {
+                    EXE_FAIL("no room for jump displacement\n");
+                    return false;
+                }
+                StoreU32LE(out, offs - (carry + (uint32_t)(out - out_org)));
+                out += 4;
             }
-            if ((size_t)(out_end - out) < 4u) {
-                EXE_FAIL("no room for jump displacement\n");
-                return false;
-            }
-            StoreU32LE(out, offs - (uint32_t)(out - out_org));
-            out += 4;
         }
-    }
 
-    // Both raw side streams must end up EXACTLY consumed. On every real
-    // archive they do, so a leftover means the instruction stream and the side
-    // data disagree -- i.e. we decoded garbage that happened not to trip any
-    // other check. Turning that into a decline converts a silent-wrong-output
-    // path into a clean failure (the arithmetic stream has no equivalent gate:
-    // once exhausted its reader just returns zero bytes forever, and only the
-    // entry checksum catches that).
-    if (addesp_stream != addesp_end || offs_stream != offs_end) {
-        EXE_FAIL("side streams not fully consumed: addesp %ld left, offs %ld left\n",
-                 (long)(addesp_end - addesp_stream), (long)(offs_end - offs_stream));
-        return false;
-    }
+        // Both raw side streams must end up EXACTLY consumed. On every real
+        // archive they do, so a leftover means the instruction stream and the
+        // side data disagree -- i.e. we decoded garbage that happened not to
+        // trip any other check. Turning that into a decline converts a
+        // silent-wrong-output path into a clean failure (the arithmetic stream
+        // has no equivalent gate: once exhausted its reader just returns zero
+        // bytes forever, and only the entry checksum catches that).
+        if (addesp_stream != addesp_end || offs_stream != offs_end) {
+            EXE_FAIL("side streams not fully consumed: addesp %ld left, offs %ld left\n",
+                     (long)(addesp_end - addesp_stream), (long)(offs_end - offs_stream));
+            return false;
+        }
 
-    *out_size = (uint32_t)(out - out_org);
-    return true;
+        const uint32_t produced = (uint32_t)(out - out_org);
+        carry += produced;   // this run's output position advances
+        *out_size = produced;
+        return true;
+    }
+};
+
+NzExeFilter::NzExeFilter() : impl_(new Impl()) {}
+NzExeFilter::~NzExeFilter() = default;
+void NzExeFilter::Reset() { impl_->Reset(); }
+
+bool NzExeFilter::Decode(const std::uint8_t* side, std::uint32_t side_len,
+                         const std::uint8_t* in, std::uint32_t in_size,
+                         std::uint8_t* out, std::uint32_t out_cap,
+                         std::uint32_t* out_size) {
+    if (out_size == nullptr) return false;
+    return impl_->Decode(side, side_len, in, in_size, out, out_cap, out_size);
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 
 // dece post-filter: x86 CALL/JMP address un-relativiser, ported from the
 // community reference decoder (nzdec_v0 NZ_x86.cpp, ExeFilter).
@@ -11,19 +12,51 @@
 // displacement bytes plus an optional "add esp, imm8" tail into side streams;
 // this puts them back.
 //
-// Three input streams are involved:
-//   `side`        the dece_data vector: two backwards varints at its tail give
-//                 the counts, and the rest is an arithmetic-coded model stream.
-//   the tail of `in`  raw bytes: `num_call` add-esp immediates followed by
-//                 `num_call_offs` big-endian 32-bit call targets.
-//   the front of `in`  the instruction bytes themselves.
+// STATE LIFETIME -- the reference gets this wrong. It writes
+//     size = ExeFilter().Decode(...)
+// i.e. a TEMPORARY, so the recent-target caches reset on every block and its
+// exe_base_ is stuck at 0. That is only correct while no two dece blocks are
+// adjacent. Measured against real archives, the reference model produces wrong
+// bytes on 22 of 88 dece archives; the model that is exact everywhere is:
+//
+//   * the recent-call/recent-jump caches and the base persist across a RUN of
+//     consecutive dece blocks;
+//   * the base counts the output bytes produced so far BY THAT RUN;
+//   * everything resets as soon as a block without dece intervenes.
+//
+// The per-block probability models are NOT part of that state: they are locals
+// of the reference's Decode and stay fresh on every call in every model.
+//
+// So the caller keeps one instance per stream, calls Decode() for each dece
+// block, and Reset() on any block that has no dece field. Parallel-container
+// streams each need their own instance -- the base counts stream-local output,
+// not the file-absolute offset. Member/file boundaries inside one stream do
+// NOT break a run.
 //
 // Output GROWS relative to input (each restored displacement adds 4 bytes, and
 // an add-esp adds 3 more), so `out_cap` must be the room actually available.
 //
-// Returns false on any malformed or inconsistent input, leaving *out_size
-// unset; the caller declines rather than emitting partial output. `in` and
-// `out` must not overlap.
-bool NzExeFilter(const uint8_t* side, uint32_t side_len,
-                 const uint8_t* in, uint32_t in_size,
-                 uint8_t* out, uint32_t out_cap, uint32_t* out_size);
+// Decode returns false on any malformed or inconsistent input, leaving
+// *out_size unset; the caller declines rather than emitting partial output.
+// `in` and `out` must not overlap.
+class NzExeFilter {
+ public:
+    NzExeFilter();
+    ~NzExeFilter();
+
+    NzExeFilter(const NzExeFilter&) = delete;
+    NzExeFilter& operator=(const NzExeFilter&) = delete;
+
+    // Ends the current run: restores the identity recent-target caches and
+    // zeroes the base. Call this for every block that carries no dece field.
+    void Reset();
+
+    // Decodes one dece block and advances the run's base by the bytes produced.
+    bool Decode(const std::uint8_t* side, std::uint32_t side_len,
+                const std::uint8_t* in, std::uint32_t in_size,
+                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t* out_size);
+
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
