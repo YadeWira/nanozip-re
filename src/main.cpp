@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
 
     NzCmInitAll();
 
-    nz::recon::PrintBanner(std::cout);
+    nz::recon::PrintBanner(std::cerr);
     std::cout << std::flush;
 
     CliOptions options = nz::recon::ParseCli(argc, argv);

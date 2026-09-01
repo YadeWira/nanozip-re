@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ostream>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,33 @@ struct CliOptions {
 
 CliOptions ParseCli(int argc, char** argv);
 void PrintBanner(std::ostream& os);
+
+// ---- console formatting, matched to the original nz's own output ----
+//
+// The original writes its status lines over one another with a 79-space clear,
+// and formats every byte count with a SPACE as the thousands separator. Both are
+// reproduced here so `nz_recon`'s output can be diffed against `nz`'s directly.
+
+// "9 000", "2 546 000" -- space-separated groups of three, as the original prints
+// every byte count.
+std::string FormatGrouped(std::uint64_t value);
+
+// The size column of `l`: `%6llu %-2s`, with the unit stepping up as soon as the
+// value exceeds NINE of the current unit (measured against the original: 9216 B
+// prints as bytes, 9300 as "9 KB"; 9437184 -- exactly 9 MB -- prints as
+// "9216 KB", 9500000 as "9 MB"), and the number itself ROUNDED, not truncated:
+// (bytes + unit/2) / unit.
+std::string FormatSizeColumn(std::uint64_t bytes);
+
+// `\r` + 79 spaces + `\r`: the original's line-clear before each status line.
+void ClearStatusLine(std::ostream& os);
+
+// The banner's second line: "<cpu model>|<MHz> MHz|#<n>[+HT]|<avail>/<total> MB".
+std::string HostSummaryLine();
+
+// The thread count the original reports (and the `#N` in the host line): the number
+// of logical CPUs, capped at 32 the way a 32-bit process's affinity mask caps it.
+unsigned HostThreadCount();
 void PrintUsage(const char* program_name, std::ostream& os);
 void PrintAdvancedHelp(std::ostream& os);
 

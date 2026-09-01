@@ -758,6 +758,25 @@ std::string FormatMtime(std::int64_t unix_seconds) {
     return buf;
 }
 
+// The archive stores a file's mtime as its epoch MINUS the writer's local UTC
+// offset -- the writer converts local->UTC a second time. Measured: a file whose
+// mtime is 1788282000 (12:00:00 local, -0500) is stored as 1788300000, and the
+// original lists it back as "12:00:00". Adding the offset recovers the true epoch,
+// after which plain localtime reproduces the original's output.
+std::string FormatMtimeStored(std::int64_t stored) {
+    if (stored <= 0) return FormatMtime(stored);
+    const std::time_t t = static_cast<std::time_t>(stored);
+    std::tm tmv{};
+#if defined(_WIN32)
+    localtime_s(&tmv, &t);
+    const long off = -_timezone;
+#else
+    localtime_r(&t, &tmv);
+    const long off = tmv.tm_gmtoff;
+#endif
+    return FormatMtime(stored + static_cast<std::int64_t>(off));
+}
+
 std::string HumanBytes(std::uint64_t bytes) {
     static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
     double x = static_cast<double>(bytes);
@@ -2226,6 +2245,10 @@ bool BuildLegacyChecksumBytes(
     return true;
 }
 
+// The bare compressor name the original prints in its banner. LegacyCompressorLabel
+// below appends a diagnostic "[legacy m=..,p0=..,p1=..]" suffix that the original has
+// no equivalent of, so the banner uses this instead.
+
 std::string LegacyCompressorLabel(std::uint8_t method, std::uint8_t method_p0, std::uint8_t method_p1) {
     std::string base = "unknown";
     if (method == 0x2bu || method == 0x3bu || method == 0x4bu) {
@@ -2266,6 +2289,13 @@ std::string LegacyCompressorLabel(std::uint8_t method, std::uint8_t method_p0, s
         << ",p1=" << static_cast<unsigned>(method_p1) << "]";
     return oss.str();
 }
+
+std::string LegacyCompressorName(std::uint8_t method, std::uint8_t method_p0) {
+    const std::string full = LegacyCompressorLabel(method, method_p0, 0u);
+    const std::size_t br = full.find(" [");
+    return (br == std::string::npos) ? full : full.substr(0, br);
+}
+
 
 const char* LegacyPayloadModeLabel(LegacyPayloadMode mode) {
     switch (mode) {
@@ -4268,11 +4298,9 @@ bool TryParseLegacyCnArchive(
 
 int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, std::ostream& os) {
     const bool has_checksum = legacy.checksum_mode != ChecksumMode::kNone;
+    // Layout matched to the original: archive name, column header, one row per
+    // entry, total. It prints no compressor or payload line here.
     os << "Archive: " << legacy.archive_path << '\n';
-    os << "Compressor: "
-       << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
-       << '\n';
-    os << "Payload: " << LegacyPayloadModeLabel(legacy.payload_mode) << '\n';
     if (has_checksum) {
         os << "checksum ";
     }
@@ -4290,15 +4318,15 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
             os << std::setw(8) << std::left << FormatChecksum(legacy.checksum_mode, shown) << ' ';
         }
         os << std::setw(4) << std::right << FormatMode(e.has_permissions ? e.permissions : 0u) << ' '
-           << FormatMtime(e.has_mtime ? e.mtime_unix : 0) << " "
-           << std::setw(8) << std::right << HumanBytes(e.size) << "   "
+           << FormatMtimeStored(e.has_mtime ? e.mtime_unix : 0)
+           << FormatSizeColumn(e.size) << "  "
            << e.path << '\n';
 
         total_size += e.size;
         ++total_files;
     }
 
-    os << "Total of " << total_files << " files, " << total_size << " bytes.\n";
+    os << "Total of " << total_files << " files, " << FormatGrouped(total_size) << " bytes.\n";
     return 0;
 }
 
@@ -5807,11 +5835,122 @@ static bool TryDecodeLegacyOptimum(
     return true;
 }
 
+// The original's decode banner and summary. It writes each status line over the
+// previous one with a 79-space clear, reports the thread count it would use, names
+// the compressor with its working-set size, and closes with a throughput line plus
+// an IO line. Reproduced here so `nz_recon`'s console output diffs against `nz`'s.
+// The working-set figure the original prints beside the compressor name. Ours is
+// this port's own allocation for that engine -- the original's number comes from its
+// own budgeting (it reports 13 MB where this engine allocates 0.3 MB), so this is
+// the one field in the decode banner that is deliberately OUR value and not a clone.
+std::uint64_t LegacyEngineWorkingSet(std::uint32_t method, std::uint32_t p0, std::uint32_t p1) {
+    (void)p1;
+    if (p0 == 0u) return 0u;   // store: the original reports [0 MB]
+    if (method == 0x3bu) return (p0 == 6u) ? 0x1083080ull : 0x3f780ull;   // -cO / -co
+    if (method == 0x4bu) return 0x2000000ull;                            // -cc
+    if (method == 0x2bu) return 0x400000ull;                             // lzpf / lzhd family
+    return 0x10000ull;
+}
+
+// Throughput unit, chosen the way the original does: it prints "6000 B/s" for a
+// 6-byte decode and "55 KB/s" alongside it, i.e. the unit steps up past nine of the
+// current one, matching the size column's rule.
+std::string FormatRate(double bytes_per_second) {
+    static const char* kU[] = {"B/s", "KB/s", "MB/s", "GB/s"};
+    double v = bytes_per_second;
+    int i = 0;
+    while (i < 3 && v > 9.0 * 1024.0) { v /= 1024.0; ++i; }
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.0f %s", v, kU[i]);
+    return std::string(b);
+}
+
+double ElapsedSince(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The original's compression banner and summary. Shapes matched exactly; the
+// memory/IO-buffer figures are this port's own (it does not implement the original's
+// buffer budgeting), and `bpb` is out*8/(in+1) -- fitted to five measured samples,
+// two of which rule out the obvious out*8/in (6 -> 55 prints 62.857 = 55*8/7, and
+// 100 -> 154 prints 12.198 = 154*8/101).
+void PrintEncodeHeader(std::ostream& os, const std::string& archive_path,
+                       const std::string& compressor_name, std::uint64_t engine_bytes,
+                       unsigned memory_mb, unsigned read_mb, unsigned write_mb, bool verbose) {
+    os << "Archive: " << archive_path << '\n';
+    os << "Threads: " << HostThreadCount() << ", memory: " << memory_mb
+       << " MB, IO-buffers: " << read_mb << '+' << write_mb << " MB\n";
+    if (verbose) os << "Setting up IO write buffer: " << write_mb << " MB\n";
+    ClearStatusLine(os);
+    os << "Compressor #0: " << compressor_name << " ["
+       << ((engine_bytes + 512u * 1024u) / (1024u * 1024u)) << " MB]";
+    if (verbose) os << " IO-buffer: " << read_mb << " MB.";
+    os << '\n';
+}
+
+void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t out_bytes,
+                       double seconds, bool verbose) {
+    const double bps = (seconds > 0.0) ? (double)in_bytes / seconds : 0.0;
+    char buf[224];
+    ClearStatusLine(os);
+    // Note: no trailing period on this line in the original; the IO line has one.
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %.2fs, %s",
+                  FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
+                  seconds, FormatRate(bps).c_str());
+    os << buf;
+    if (verbose) {
+        std::snprintf(buf, sizeof(buf), " (%.3f bpb)",
+                      (double)out_bytes * 8.0 / (double)(in_bytes + 1u));
+        os << buf;
+    }
+    os << '\n';
+    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", seconds, FormatRate(bps).c_str());
+    os << buf << '\n';
+}
+
+void PrintDecodeHeader(std::ostream& os, const std::string& archive_path,
+                       const std::string& compressor_label, std::uint64_t engine_bytes) {
+    os << "Archive: " << archive_path << '\n';
+    os << "Threads: " << HostThreadCount() << '\n';
+    ClearStatusLine(os);
+    os << "Compressor #0: " << compressor_label << " ["
+       << ((engine_bytes + 512u * 1024u) / (1024u * 1024u)) << " MB]\n";
+}
+
+// `<name>` then five spaces, then the running figure rewritten in place: back four,
+// four characters, four spaces -- and eight backspaces once the file is done. This
+// is the original's exact cursor dance.
+// The four-character field the original rewrites in place: megabytes done.
+std::string FormatSizeColumnCompact(std::uint64_t bytes) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%llu MB", (unsigned long long)(bytes / (1024u * 1024u)));
+    return std::string(b);
+}
+
+void PrintFileProgress(std::ostream& os, const std::string& name, const std::string& field4) {
+    ClearStatusLine(os);
+    os << name << "     " << "\b\b\b\b" << field4 << "    " << "\b\b\b\b\b\b\b\b";
+    os.flush();
+}
+
+void PrintDecodeFooter(std::ostream& os, std::uint64_t bytes, double seconds) {
+    const double bps = (seconds > 0.0) ? (double)bytes / seconds : 0.0;
+    char buf[192];
+    ClearStatusLine(os);
+    std::snprintf(buf, sizeof(buf), "Decompressed %s bytes in %.2fs, %s.",
+                  FormatGrouped(bytes).c_str(), seconds, FormatRate(bps).c_str());
+    os << buf << '\n';
+    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", seconds, FormatRate(bps).c_str());
+    os << buf << '\n';
+}
+
 int RunLegacyCnExtractOrTest(
     const CliOptions& options,
     const LegacyCnContext& legacy,
     bool test_mode,
     std::ostream& os) {
+    const auto run_start = std::chrono::steady_clock::now();
+    bool header_printed = false;
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
@@ -5964,6 +6103,13 @@ int RunLegacyCnExtractOrTest(
     std::uint64_t bytes_ok = 0;
     std::size_t cursor = 0;
 
+    if (!header_printed) {
+        header_printed = true;
+        PrintDecodeHeader(os, legacy.archive_path,
+                          LegacyCompressorName(legacy.legacy_method, legacy.legacy_method_p0),
+                          LegacyEngineWorkingSet(legacy.legacy_method, legacy.legacy_method_p0,
+                                                 legacy.legacy_method_p1));
+    }
     for (const LegacyCnEntry& e : legacy.entries) {
         if (cursor > legacy.data.size() || e.size > legacy.data.size() - cursor) {
             os << "Data corrupted while reading file payload: " << e.path << '\n';
@@ -6031,22 +6177,23 @@ int RunLegacyCnExtractOrTest(
             }
         }
 
+        PrintFileProgress(os, e.path, FormatSizeColumnCompact(e.size));
+
         ++processed;
         bytes_ok += e.size;
         if (options.verbose) {
+            ClearStatusLine(os);
             os << (test_mode ? "tested " : "extract ") << e.path << '\n';
         }
     }
 
-    if (test_mode) {
-        os << "Tested " << processed << " files, " << bytes_ok << " bytes.";
-    } else {
-        os << "Extracted " << processed << " files, " << bytes_ok << " bytes.";
-    }
     if (failed > 0) {
-        os << " Failures: " << failed << '.';
+        ClearStatusLine(os);
+        os << (test_mode ? "Tested " : "Extracted ") << processed << " files, "
+           << FormatGrouped(bytes_ok) << " bytes. Failures: " << failed << ".\n";
+    } else {
+        PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
     }
-    os << '\n';
 
     return failed == 0 ? 0 : 2;
 }
@@ -6510,6 +6657,7 @@ bool BuildNativeLegacyStreamPayload(
 }
 
 int RunAddNativeLegacyStream(const CliOptions& options, const std::vector<SourceFile>& sources, std::ostream& os) {
+    const auto add_start = std::chrono::steady_clock::now();
     LegacyNativeSpec spec;
     if (!ResolveLegacyNativeSpec(options.compressor, &spec)) {
         os << "Error: native legacy writer is not available for compressor "
@@ -6643,10 +6791,23 @@ int RunAddNativeLegacyStream(const CliOptions& options, const std::vector<Source
     if (checksum_mode_remapped) {
         os << "Note: -hf was mapped to legacy Fletcher32 checksum variant for this stream.\n";
     }
-    os << "Archive: " << out_path.string() << '\n';
-    os << "Compressor: " << CompressorToString(options.compressor)
-       << " (" << LegacyNativeWrapperLabel(spec.wrapper) << ")\n";
-    os << "Total of " << sources.size() << " files, " << total_bytes << " bytes.\n";
+    PrintEncodeHeader(os, out_path.string(), CompressorToString(options.compressor),
+                      /*engine_bytes=*/0u, /*memory_mb=*/512u, /*read_mb=*/20u,
+                      /*write_mb=*/4u, options.verbose);
+    if (options.verbose) {
+        ClearStatusLine(os);
+        os << "wrapper: " << LegacyNativeWrapperLabel(spec.wrapper) << '\n';
+    }
+    for (const auto& src : sources) {
+        PrintFileProgress(os, src.archive_name, "100%");
+    }
+    {
+        // Take the produced size from the stream itself and flush first: reading the
+        // path before the ofstream is closed reports 0.
+        const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+        out.flush();
+        PrintEncodeFooter(os, total_bytes, produced, ElapsedSince(add_start), options.verbose);
+    }
     return 0;
 }
 
@@ -6757,6 +6918,7 @@ bool TryRunLegacyCompressionBridge(const CliOptions& options, std::ostream& os, 
 }
 
 int RunAdd(const CliOptions& options, std::ostream& os) {
+    const auto add_start = std::chrono::steady_clock::now();
     const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
     if (!native_legacy_stream && IsInternalLegacyCompressionBridgeCompressor(options.compressor)) {
         int bridge_exit = 0;
@@ -6889,15 +7051,21 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
             }
             total_bytes += static_cast<std::uint64_t>(got);
         }
-
-        if (options.verbose) {
-            os << "added  " << src.archive_name << " (" << src.size << " bytes)\n";
-        }
     }
 
-    os << "Archive: " << out_path.string() << '\n';
-    os << "Compressor: " << CompressorToString(options.compressor) << " (stored)\n";
-    os << "Total of " << sources.size() << " files, " << total_bytes << " bytes.\n";
+    PrintEncodeHeader(os, out_path.string(), CompressorToString(options.compressor),
+                      /*engine_bytes=*/0u, /*memory_mb=*/512u, /*read_mb=*/20u,
+                      /*write_mb=*/4u, options.verbose);
+    for (const auto& src : sources) {
+        PrintFileProgress(os, src.archive_name, "100%");
+    }
+    {
+        // Take the produced size from the stream itself and flush first: reading the
+        // path before the ofstream is closed reports 0.
+        const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+        out.flush();
+        PrintEncodeFooter(os, total_bytes, produced, ElapsedSince(add_start), options.verbose);
+    }
     return 0;
 }
 
@@ -7018,19 +7186,20 @@ int RunList(const CliOptions& options, std::ostream& os) {
         }
 
         os << std::setw(4) << std::right << FormatMode(e.permissions) << ' '
-           << FormatMtime(e.mtime_unix) << " "
-           << std::setw(8) << std::right << HumanBytes(e.original_size) << "   "
+           << FormatMtimeStored(e.mtime_unix)
+           << FormatSizeColumn(e.original_size) << "  "
            << e.path << '\n';
 
         total_size += e.original_size;
         ++total_files;
     }
 
-    os << "Total of " << total_files << " files, " << total_size << " bytes.\n";
+    os << "Total of " << total_files << " files, " << FormatGrouped(total_size) << " bytes.\n";
     return 0;
 }
 
 int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os) {
+    const auto run_start = std::chrono::steady_clock::now();
     ArchiveContext context;
     std::string error;
     const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);
@@ -7166,15 +7335,13 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
         }
     }
 
-    if (test_mode) {
-        os << "Tested " << processed << " files, " << bytes_ok << " bytes.";
-    } else {
-        os << "Extracted " << processed << " files, " << bytes_ok << " bytes.";
-    }
     if (failed > 0) {
-        os << " Failures: " << failed << '.';
+        ClearStatusLine(os);
+        os << (test_mode ? "Tested " : "Extracted ") << processed << " files, "
+           << FormatGrouped(bytes_ok) << " bytes. Failures: " << failed << ".\n";
+    } else {
+        PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
     }
-    os << '\n';
 
     return failed == 0 ? 0 : 2;
 }
@@ -7184,19 +7351,49 @@ int RunInfo(std::ostream& os) {
     const std::string mem_total = ParseProcValue("/proc/meminfo", "MemTotal:");
     const std::string mem_avail = ParseProcValue("/proc/meminfo", "MemAvailable:");
 
-    os << "Host information\n";
-    if (!cpu.empty()) {
-        os << "CPU: " << cpu << '\n';
+    (void)cpu; (void)mem_total; (void)mem_avail;
+    // `info` in the original prints the banner's host summary line again, then the
+    // CPU identification and its feature list. The identification reads
+    //   CPU "<vendor>" family <f> [ext 0x<extended family>], model <m & 0xf>, stepping <s>
+    // -- measured: this host is family 6, model 79, stepping 1 and the original
+    // prints "family 6 [ext 0x00], model 15, stepping 1", i.e. the model is masked
+    // to its low nibble and the bracketed value is the EXTENDED FAMILY (0 for
+    // family 6), not the extended model.
+    // (the host summary line is already on screen: PrintBanner emits it)
+    const std::string vendor   = ParseProcValue("/proc/cpuinfo", "vendor_id\t:");
+    const std::string family_s = ParseProcValue("/proc/cpuinfo", "cpu family\t:");
+    const std::string model_s  = ParseProcValue("/proc/cpuinfo", "model\t\t:");
+    const std::string step_s   = ParseProcValue("/proc/cpuinfo", "stepping\t:");
+    const std::string flags    = ParseProcValue("/proc/cpuinfo", "flags\t\t:");
+
+    const unsigned family = family_s.empty() ? 0u : (unsigned)strtoul(family_s.c_str(), nullptr, 10);
+    const unsigned model  = model_s.empty()  ? 0u : (unsigned)strtoul(model_s.c_str(), nullptr, 10);
+    const unsigned step   = step_s.empty()   ? 0u : (unsigned)strtoul(step_s.c_str(), nullptr, 10);
+    const unsigned ext_family = (family >= 15u) ? (family - 15u) : 0u;
+
+    char idbuf[256];
+    snprintf(idbuf, sizeof(idbuf),
+             "CPU \"%s\" family %u [ext 0x%02x], model %u, stepping %u",
+             vendor.empty() ? "unknown" : vendor.c_str(),
+             family, ext_family, model & 0x0fu, step);
+    os << idbuf << '\n';
+
+    // Feature list, in the original's own order and spelling.
+    static const struct { const char* flag; const char* shown; } kFeat[] = {
+        {"mmx", "MMX"}, {"sse", "SSE1"}, {"sse2", "SSE2"}, {"pni", "SSE3"},
+        {"ssse3", "SSSE3"}, {"sse4_1", "SSE41"}, {"sse4_2", "SSE42"},
+        {"ht", "Hyper-Threading"},
+    };
+    std::string feat;
+    for (const auto& f : kFeat) {
+        const std::string needle = std::string(" ") + f.flag + " ";
+        const std::string hay = std::string(" ") + flags + " ";
+        if (hay.find(needle) != std::string::npos) {
+            if (!feat.empty()) feat += ' ';
+            feat += f.shown;
+        }
     }
-    if (!mem_total.empty()) {
-        os << "MemTotal: " << mem_total << '\n';
-    }
-    if (!mem_avail.empty()) {
-        os << "MemAvailable: " << mem_avail << '\n';
-    }
-    if (cpu.empty() && mem_total.empty() && mem_avail.empty()) {
-        os << "(basic host info unavailable on this platform)\n";
-    }
+    os << "CPU-features: " << feat << '\n';
     return 0;
 }
 
