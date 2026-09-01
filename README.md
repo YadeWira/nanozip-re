@@ -19,26 +19,28 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 The honest metric is how much decodes **byte-exact with no original binary at runtime**.
 `tests/native_only_v2.sh` runs extraction under `NZ_NO_BRIDGE=1` (which disables the
 legacy `nz` fallback entirely) and diffs against the legacy oracle. On a mixed
-corpus (random, text, source, repeats, zeros, audio; 10 fixtures × 8 methods):
+corpus (random, text, source, repeats, zeros, audio, and a mixed audio/text/high-entropy
+file; 11 fixtures × 8 methods):
 
 | method | native byte-exact | method | native byte-exact |
 |--------|-------------------|--------|-------------------|
-| `-cn` (store)      | 10/10 | `-cd` (lzhd)        | 10/10 |
-| `-cf` (lzpf A)     | 10/10 | `-cD` (lzhd strong) | 10/10 |
-| `-cF` (lzpf B)     | 10/10 | `-co` (optimum1)    |  9/10 |
-| `-cc` (cm)         |  9/10 | `-cO` (optimum2)    | 10/10 |
+| `-cn` (store)      | 11/11 | `-cd` (lzhd)        | 11/11 |
+| `-cf` (lzpf A)     | 11/11 | `-cD` (lzhd strong) | 11/11 |
+| `-cF` (lzpf B)     | 11/11 | `-co` (optimum1)    |  9/11 |
+| `-cc` (cm)         |  9/11 | `-cO` (optimum2)    | 11/11 |
 
-**≈ 78/80 (98%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
+**≈ 84/88 (95%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
 six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
 output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. The
-2 remaining synthetic failures are one audio fixture on `-co` and `-cc`, where the community reference decoder
-itself produces the wrong bytes (this port is bit-identical to it). Counts vary ±1 because the corpus uses random
-fixtures.
+4 remaining synthetic failures are a single open gap: the two audio-bearing fixtures on `-co` and `-cc`, where the
+community reference decoder itself produces the wrong bytes (this port is bit-identical to it). Counts vary ±1
+because the corpus uses random fixtures.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cO` 59 · `-cd` 58 · `-co` 57 · `-cc` 56 · `-cD` 52.
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-co` 57 · `-cc` 56 — **472/480 overall**.
+All four `0x2b`-family codecs are now clean on it; the 8 remaining failures are confined to `-co`/`-cO`/`-cc`.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
