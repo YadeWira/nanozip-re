@@ -176,7 +176,30 @@ inline std::uint16_t Rd16(const std::uint8_t* mem, int off) {
     std::memcpy(&v, mem + off, 2);
     return v;
 }
+// Cell-write watch: NZO2_WATCH=<hex offset> logs every write to that model cell.
+// Pair it with a GDB hardware watchpoint on (real_obj + same offset) to compare the
+// two write sequences -- the first differing write is the decode event that
+// introduced a LATENT model divergence.
+inline int& O2WatchOff() { static int v = -2; return v; }
+inline long& O2WatchSeq() { static long n = 0; return n; }
+
+inline void O2Watch(const std::uint8_t* mem, int off, int width, const void* newv) {
+    if (O2WatchOff() == -2) {
+        const char* e = std::getenv("NZO2_WATCH");
+        O2WatchOff() = e ? (int)strtol(e, nullptr, 16) : -1;
+    }
+    const int w = O2WatchOff();
+    if (w < 0 || w < off || w >= off + width) return;
+    std::uint16_t oldv, nv;
+    std::memcpy(&oldv, mem + w, 2);
+    std::memcpy(&nv, (const std::uint8_t*)newv + (w - off), 2);
+    if (oldv != nv)
+        std::fprintf(stderr, "[O2W] #%ld off=0x%x w=%d %u -> %u\n",
+                     O2WatchSeq()++, off, width, oldv, nv);
+}
+
 inline void Wr16(std::uint8_t* mem, int off, std::uint16_t v) {
+    O2Watch(mem, off, 2, &v);
     std::memcpy(mem + off, &v, 2);
 }
 inline std::int32_t Rd32(const std::uint8_t* mem, int off) {
@@ -185,6 +208,7 @@ inline std::int32_t Rd32(const std::uint8_t* mem, int off) {
     return v;
 }
 inline void Wr32(std::uint8_t* mem, int off, std::int32_t v) {
+    O2Watch(mem, off, 4, &v);
     std::memcpy(mem + off, &v, 4);
 }
 
@@ -270,6 +294,14 @@ NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
     // like every other adaptive length/distance table in this engine (and
     // the sibling -co port's own external align table) -- see
     // kTier2AlignOff's comment above.
+    //
+    // Do NOT "correct" this against a GDB dump of the real object: kTier2AlignOff
+    // is kMemSize, i.e. this table is APPENDED past the real object's model area
+    // because the real one lives somewhere inside it that this port never located.
+    // The real memory therefore reads 0 at this offset, and seeding it to match
+    // that drops -cO from 11/11 to 7/11 and its golden vectors from 2/2 to 1/2.
+    // Measured 2026-09-01; the 0 in the binary at this offset is an artefact of a
+    // port-invented address, not evidence about the table.
     for (std::size_t i = 0; i < kTier2AlignSize; i += 2) {
         mem_[static_cast<std::size_t>(kTier2AlignOff) + i] = 0x00;
         mem_[static_cast<std::size_t>(kTier2AlignOff) + i + 1] = 0x80;
@@ -301,6 +333,21 @@ std::uint32_t NzOptimum2LzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
 bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_len,
                                        std::uint8_t* out, std::uint32_t out_size) {
     if (out_size == 0) return true;
+
+    if (const char* dp = getenv("NZO2_DUMP_MEM")) {
+        // Model memory at block entry. mem_ mirrors the real decoder object's own
+        // layout (every cell offset in this file is an absolute offset into it), so
+        // a GDB dump of the real object at the same point diffs directly against
+        // this -- which is how to find a LATENT model divergence that has not yet
+        // changed any decoded bit.
+        static int seq = 0;
+        char nm[512];
+        std::snprintf(nm, sizeof(nm), "%s.%d", dp, seq++);
+        FILE* f = std::fopen(nm, "wb");
+        if (f) { std::fwrite(mem_.data(), 1, mem_.size(), f); std::fclose(f); }
+        std::fprintf(stderr, "[O2] dumped %zu bytes of model memory at block entry -> %s\n",
+                     mem_.size(), nm);
+    }
 
     RangeDecoder rc;
     rc.Init(in, in_len);
