@@ -39,6 +39,25 @@ cp "${RECON_ROOT}/src/sfx_archive.cpp" "${WORK}/in/source.cpp"; FIXTURES+=("sour
 [[ -f "${RECON_ROOT}/tests/fixtures/cm/abcd3.txt" ]] && { cp "${RECON_ROOT}/tests/fixtures/cm/abcd3.txt" "${WORK}/in/"; FIXTURES+=("abcd3.txt"); }
 [[ -f "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav" ]] && { cp "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav" "${WORK}/in/"; FIXTURES+=("stereo_lms.wav"); }
 
+# Audio + text + high-entropy + audio + text, in one file. Every fixture above is a
+# SINGLE kind of data, and that is exactly what they cannot cover: the -cd/-cD chunk
+# pipeline carries state across chunk boundaries, and the shapes that carry it -- a
+# 0xc prefilter sub-chunk, and a FULL stored chunk (header size field == 0) -- only
+# ever appear directly before a MODELLED chunk when the input changes character
+# mid-file. Two such cross-chunk state bugs were live while this suite reported -cd
+# and -cD at a clean 10/10; this fixture fails on either of them.
+# openssl supplies the high-entropy block because it is DETERMINISTIC -- with
+# /dev/urandom the chunk layout, and so the coverage, would vary run to run.
+if [[ -f "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav" ]] && command -v openssl >/dev/null 2>&1; then
+  { cat "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav"
+    for i in $(seq 1 600); do echo "Lorem ipsum dolor sit amet, consectetur adipiscing elit."; done
+    head -c 40960 /dev/zero | openssl enc -aes-256-ctr -pass pass:nzre-mixed -nosalt 2>/dev/null
+    cat "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav"
+    for i in $(seq 1 600); do echo "the quick brown fox jumps over the lazy dog"; done
+  } > "${WORK}/in/mixed_audio_text_229k.bin"
+  FIXTURES+=("mixed_audio_text_229k.bin")
+fi
+
 METHODS=(cn cf cF cd cD co cO cc)
 
 declare -A M_PASS M_FAIL M_SKIP

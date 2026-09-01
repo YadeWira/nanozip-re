@@ -698,8 +698,9 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     //   otherwise        -> the LZ token path, where the bits DO mean
     //                       &1 = LZ, &2 = block-RLE, &4 = exe, &8 = param14
     const bool is_pf_chunk = (flags != 0xfu) && ((flags & 0xcu) == 0xcu);
+    bool full_literal_chunk = false;   // the size_field==0 flavour of pure-literal
     if (size == 0) {
-        out_size = 0x8000u; pure_literal = true;
+        out_size = 0x8000u; pure_literal = true; full_literal_chunk = true;
     } else if (is_pf_chunk) {
         // The generator FUN_08098cf0 RETURNS EARLY for a 0xc-class chunk, before
         // it would emit the second varint (asm 0x08098d7f and 0x08098f30), and
@@ -748,7 +749,12 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         const std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
         std::memcpy(out, pf_out.data(), n);
         *block_pos = static_cast<std::size_t>((r.cur - block) + used);
-        *recon_advance = out_size;
+        // `*recon_advance` is the NEW ABSOLUTE ring position, not a delta (see the
+        // token path's `base + out_size` below). Returning the bare out_size here
+        // left the ring cursor wherever the PREVIOUS chunk had put it, so the next
+        // LZ chunk got a stale write base: it overwrote this sub-chunk's own output
+        // and resolved every match offset from the wrong origin.
+        *recon_advance = base + out_size;
         return n;
     }
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
@@ -790,6 +796,28 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         }
     }
         RingWrite(ring, ring_size, base, slice.data(), out_size);  // window keeps the compact recon
+        // `-cD` (nz_lzhds) ONLY: a pure-literal chunk RE-INITIALISES the literal
+        // model's persistent per-context MTF state, and resets its order-1 context
+        // index to 0. Measured, not inferred: at the first literal of the chunk
+        // following a pure-literal one the real decoder resolves every rank code the
+        // way a freshly initialised table does (rank code r < 0x20 yields symbol r,
+        // r >= 0x20 inserts as new), while our carried-over table resolved the same
+        // codes to different symbols -- e.g. `ctx=3a rank=1d` gave 0x3a here where
+        // the binary produced 0x1d.
+        // The scope of the rule is load-bearing in BOTH directions:
+        //   - resetting on EVERY chunk destroys adjacent token chunks (the state
+        //     genuinely persists across those -- everything breaks from chunk 1 on),
+        //   - resetting on a PREFILTER sub-chunk too breaks Moly, which is byte-exact
+        //     when only pure-literal chunks reset,
+        //   - and only the size_field==0 flavour (a FULL 0x8000-byte literal window)
+        //     resets: the `v2 == 0` flavour, whose window is the shorter compact
+        //     recon, does not (tombofchrist10.adf carries two 17-byte ones and needs
+        //     the state kept across them).
+        if (is_lzhds && full_literal_chunk &&
+            lzhds_ctx_table != nullptr && lzhds_ctx_index != nullptr) {
+            NzLzhdsInitCtxTable(lzhds_ctx_table);
+            *lzhds_ctx_index = 0u;
+        }
     } else {
 
     std::uint32_t N = CdReadVar(r, out_size - 1);

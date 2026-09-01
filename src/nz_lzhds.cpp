@@ -8,6 +8,8 @@
 // code). Validated byte-exact against 3 real GDB-captured chunks (see the
 // session's research artifacts) before this C++ transcription.
 #include "nz_lzhds.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include <cstring>
 
@@ -233,6 +235,23 @@ std::uint32_t EmitPredictorSymbol(std::uint8_t* ctx_table, std::uint32_t ctx, st
 
 }  // namespace
 
+// Per-byte decode trace, zero cost unless NZOPT_TRACE_LZHDS is set. The value is
+// the index of the NzLzhdsReconstruct call to trace (chunks that bypass this model
+// -- pure-literal and prefilter sub-chunks -- do not consume an index), or "all".
+// This path shipped with no instrumentation at all, which is what made its
+// cross-chunk state bugs expensive to find.
+namespace {
+int g_call_index = -1;
+long g_trace_want = -2;
+bool TraceOn() {
+    if (g_trace_want == -2) {
+        const char* e = std::getenv("NZOPT_TRACE_LZHDS");
+        g_trace_want = (e == nullptr) ? -1 : ((*e == 'a') ? -3 : std::atol(e));
+    }
+    return g_trace_want == -3 || (g_trace_want >= 0 && g_call_index == (int)g_trace_want);
+}
+}  // namespace
+
 void NzLzhdsInitCtxTable(std::uint8_t* ctx_table) {
     for (std::uint32_t c = 0; c < kLzhdsCtxCount; ++c) {
         std::uint8_t* rank = CtxRank(ctx_table, c);
@@ -269,6 +288,11 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
 
     std::uint32_t run_ctr = LzhdsExpGolomb(rb) + 1;
 
+    ++g_call_index;
+    if (TraceOn())
+        std::fprintf(stderr, "[LH] call=%d enter: out_size=%u ntok=%u base=%u ring_size=%u ctx=%u litlen=%zu ratebits=%zu\n",
+                     g_call_index, out_size, num_tokens, base, ring_size, *ctx_index,
+                     litstream_len, ratebits_len);
     std::uint32_t ctx = *ctx_index;
     std::size_t lp = 0;
     std::uint32_t pos = 0;
@@ -427,13 +451,21 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
                 // Raw mode processing (mode==0, run_ctr didn't hit zero this byte).
                 std::uint32_t b = (lp < litstream_len) ? litstream[lp] : 0u;
                 sym = RawDecodeAndUpdate(ctx_table, ctx, b);
+                if (TraceOn())
+                    std::fprintf(stderr, "[LH]   raw: ctx=%02x rank=%02x -> sym=%02x\n",
+                                 ctx, b, sym);
                 ctx = sym;
                 mode = 0u;
                 ++pos; ++lp;
             }
+            if (TraceOn())
+                std::fprintf(stderr, "[LH] lit pos=%u sym=%02x mode=%u order=%u stage=%u runctr=%u lp=%zu\n",
+                             pos - 1u, sym, mode, order, stage, run_ctr, lp);
             ring_at(pos - 1u) = static_cast<std::uint8_t>(sym);
         }
         if (pos >= out_size) break;
+
+        if (TraceOn()) std::fprintf(stderr, "[LH] match pos=%u off=%u mlen=%u sel=%u\n", pos, offset, mlen, sel);
 
         // Match copy (identical semantics to nz_cd_tokens.cpp's ReconstructRing;
         // only the match-length class thresholds differ from -cd, per
