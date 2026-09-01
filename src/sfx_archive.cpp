@@ -2458,6 +2458,31 @@ bool DecodeLzpfMember(
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 std::memcpy(decoded.data() + total_written, window + block_start_in_window,
                             static_cast<std::size_t>(block_out_size));
+                // Backfill hash_table for the prefilter block's window bytes.
+                // The real dispatcher FUN_08097570 calls FUN_080b6d90 at the end
+                // of the prefilter branch too, not just after literal blocks --
+                // and a prefilter block DOES publish window content that a later
+                // LZ77 block can match into. Without this, those matches read the
+                // table's untouched init value and the LZ block decodes wrong
+                // (summer.php: blocks 0-2 byte-exact, first divergence 951 bytes
+                // into block 3, the first lz-side block after a prefilter block).
+                // A prefilter block has (uvar9 & 7) == 4, so uvar9 & 1 == 0 --
+                // the SPARSE variant (every 101 bytes, stopping 100 short of the
+                // block end), matching the literal path's own uvar9&1 == 0 case.
+                {
+                    const std::size_t bstart = block_start_in_window;
+                    const std::size_t bend = block_start_in_window + static_cast<std::size_t>(block_out_size);
+                    const std::size_t hstop = (bend > 100u) ? (bend - 100u) : bstart;
+                    for (std::size_t hp = bstart; hp < hstop; hp += 101u) {
+                        std::uint32_t hw;
+                        std::memcpy(&hw, window + hp - (is_variant_b ? 3u : 2u), 4);
+                        const std::uint32_t h = is_variant_b ? (hw & 0xffffffu) : (hw & 0x1fffu);
+                        hash_table[h] = static_cast<std::int32_t>(hp);
+                    }
+                    if (is_variant_b) {
+                        std::memset(byte_buffer_b.data(), 0, byte_buffer_b.size());
+                    }
+                }
                 total_written += static_cast<std::size_t>(block_out_size);
                 continue;
             }
@@ -3933,7 +3958,21 @@ bool TryParseLegacyCnArchive(
                             if (e.has_checksum) { entries_have_checksum = true; break; }
                     }
                     auto member_verify = [&](const std::vector<unsigned char>& dec) -> bool {
-                        if (!validate_decoded_candidate(dec)) return false;
+                        const bool vdc = validate_decoded_candidate(dec);
+                        if (getenv("NZOPT_TRACE_LZPF")) {
+                            fprintf(stderr, "[lzpf] member_verify: size=%zu vdc=%d entries=%zu have_cksum=%d mode=%d\n",
+                                    dec.size(), (int)vdc, entries.size(), (int)entries_have_checksum, (int)checksum_mode);
+                            std::size_t cur = 0;
+                            for (const LegacyCnEntry& e : entries) {
+                                if (e.size > (std::uint64_t)(dec.size() - cur)) break;
+                                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, dec.data() + cur, (std::size_t)e.size);
+                                fprintf(stderr, "[lzpf]   entry sz=%llu has_cksum=%d stored=%08x got=%08x %s\n",
+                                        (unsigned long long)e.size, (int)e.has_checksum, e.checksum, got,
+                                        (e.has_checksum && got != e.checksum) ? "MISMATCH" : "");
+                                cur += (std::size_t)e.size;
+                            }
+                        }
+                        if (!vdc) return false;
                         if (entries_have_checksum) return true;
                         std::uint8_t tag = 0; std::size_t cw = 0;
                         switch (checksum_mode) {
