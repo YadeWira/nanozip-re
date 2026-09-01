@@ -39,9 +39,9 @@ bit-count decoder is a different class from the one the other codecs use and is 
 vary ±1 because the corpus uses random fixtures.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-cc` 59 · `-co` 58 — **476/480 overall**.
-Six of the eight codecs are perfect on it; the 4 remaining failures are three independent defects, the
-largest being `-co`'s unported per-channel bit-count decoder class (2 files).
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cc` 60 · `-cO` 59 · `-co` 58 — **477/480 overall**.
+Seven of the eight codecs are perfect on it; the 3 remaining failures are two independent defects, the
+larger being `-co`'s unported per-channel bit-count decoder class (2 files).
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
