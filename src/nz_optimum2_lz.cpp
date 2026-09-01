@@ -579,6 +579,18 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
             // just above.
             std::memset(mem + 0x1042bc0, 0, 0x40000u);
         }
+        if (const char* dp = getenv("NZO2_DUMP_CHUNK")) {
+            // Model memory at the start of each 0x8000 chunk, so a divergence that
+            // appears WITHIN a block can be bracketed. Pair with a GDB hardware
+            // watchpoint on the real output buffer at the same byte offset, which
+            // fires exactly once when that chunk's first byte is written.
+            static int cseq = 0;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dp, cseq++);
+            FILE* f = std::fopen(nm, "wb");
+            if (f) { std::fwrite(mem_.data(), 1, mem_.size(), f); std::fclose(f); }
+            std::fprintf(stderr, "[O2] chunk dump: produced=%u -> %s\n", local_74, nm);
+        }
         std::uint8_t* base = ring_.Base();
         std::uint32_t chunk_start = ring_.cursor;
         std::uint32_t local_50 = chunk_start + chunk_size;
