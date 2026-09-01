@@ -313,8 +313,37 @@ struct AudioStereoDecoder {
 // re-routing the payload straight into DecodePrefilterStream (best of 64 offsets
 // x orders x nstages x mono/stereo left 63725 of 64044 bytes wrong).
 //
-// Dump this port's residuals with NZOPT_DUMP_AUDRESID=<path> to diff against a
-// fresh capture.
+// fresh capture. NZOPT_DUMP_AUDCOUNTS dumps the per-sample bit-count array where
+// FUN_0809bbf0 receives it, NZOPT_DUMP_AUDPOST the residuals where it returns, and
+// NZOPT_DUMP_AUDPLANE=<prefix> one file per FUN_08095d90 call. Those three split the
+// pipeline at exactly the points the GDB captures in ~/.cache/nzre_tools/audio_gdb/
+// were taken, so each half can be checked independently.
+//
+// SECOND ROUND OF GROUND TRUTH (2026-09-01). The two remaining codecs fail for two
+// DIFFERENT reasons, and both are now localised:
+//
+// -co: its BIT-COUNT DECODER IS A DIFFERENT CLASS, and it is unported. The two
+//   per-channel decoders are reached through a vtable at obj+0x38700/+0x38704, and
+//   the vtable pointer differs per codec:
+//        -cO, -cc :  vtable 0x0813c848, decode = FUN_0809c070
+//        -co      :  vtable 0x0813c860, decode = FUN_0809bdc0
+//   The AudioBitcountDecoder below is a transcription of FUN_0809c070 -- which is why
+//   -cO's and -cc's bit-count arrays come out BYTE-EXACT and -co's is garbage from
+//   element 0 (near-constant ~26 where the real values range 0..45). Per
+//   work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md, vtable 0x0813c860 is
+//   a Fenwick-tree/frequency-count coder whose slot0 (FUN_080bd760) is its
+//   build/rebalance routine; FUN_0809bdc0 has never been read line by line and there
+//   is no decompile for it. Porting it is what -co needs.
+//
+// -cc: bit-counts byte-exact AND the post-residual-decode array byte-exact, so its
+//   defect is in the PREDICTOR stages. The real per-plane call order for it is
+//   5, 2, 3, 0, 1 on channels ch2, ch1, ch2, ch1, ch2 -- which this file's loop
+//   already reproduces exactly. Stage 0 (linpred[5], shift 8) is byte-exact; stage 1
+//   (linpred[2], shift 13) first diverges at element 2, where the real predictor
+//   contributes 0 and this one contributes -1. So the SUM differs, not the rounding.
+//   Re-confirmed with per-stage evidence (not just end-to-end, as before): switching
+//   RunSmall to UpdateBig's magnitude-shift-then-re-sign convention breaks stage 0,
+//   which was exact. The arithmetic shift is right; do not retry that.
 // ---------------------------------------------------------------------------
 
 // LinearPredictor: sign-LMS over a 512-stride dual history (samples in the low
@@ -832,13 +861,51 @@ struct NzAudioPred::Impl {
                 (int)use_stereo_dec,
                 use_lp[0][0], use_lp[0][1], use_lp[1][0], use_lp[1][1], use_lp[2][0], use_lp[2][1]);
         }
+        if (const char* dp = getenv("NZOPT_DUMP_AUDCOUNTS")) {
+            // Dump the per-sample bit-count array exactly where the real decoder
+            // passes it to FUN_0809bbf0 (its 3rd argument), so a GDB capture of
+            // that call splits "our bit-count decode is wrong" from "our residual
+            // decode is wrong".
+            static int seq = 0;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dp, seq++);
+            FILE* f = std::fopen(nm, "wb");
+            if (f) { std::fwrite(bitcount, 1, nsamples, f); std::fclose(f); }
+            std::fprintf(stderr, "[AUD] dumped %u bit-counts to %s\n", nsamples, nm);
+        }
         if (!DecodeInt32Array(samples, nsamples, bitcount, &bit_reader)) return 0;
+
+        if (const char* dp = getenv("NZOPT_DUMP_AUDPOST")) {
+            // Dump the residual array immediately after the residual decode, i.e.
+            // exactly where FUN_0809bbf0 returns in the real decoder -- the
+            // remaining split point between "residual decode wrong" and
+            // "predictor / inter-channel stage wrong".
+            static int seq = 0;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dp, seq++);
+            FILE* f = std::fopen(nm, "wb");
+            if (f) { std::fwrite(samples, 4, nsamples, f); std::fclose(f); }
+            std::fprintf(stderr, "[AUD] dumped %u post-residual int32 to %s\n", nsamples, nm);
+        }
 
         in += bit_reader.BytesRead();
 
+        const char* pdump = getenv("NZOPT_DUMP_AUDPLANE");
+        int pseq = 0;
         for (int i = 2; i >= 0; i--) {
             for (int j = 0; j < (fmt.channels ? 2 : 1); j++) {
-                if (use_lp[i][j]) linpred_[i * 2 + j].Run(samples + j * nframes, nframes);
+                if (use_lp[i][j]) {
+                    linpred_[i * 2 + j].Run(samples + j * nframes, nframes);
+                    if (pdump) {
+                        char nm[512];
+                        std::snprintf(nm, sizeof(nm), "%s_%d.bin", pdump, pseq);
+                        FILE* f = std::fopen(nm, "wb");
+                        if (f) { std::fwrite(samples, 4, nsamples, f); std::fclose(f); }
+                        std::fprintf(stderr, "[AUD] plane call #%d = linpred[%d] ch%d -> %s\n",
+                                     pseq, i * 2 + j, j, nm);
+                        ++pseq;
+                    }
+                }
             }
         }
 
