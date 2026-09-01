@@ -27,22 +27,21 @@ file; 11 fixtures × 8 methods):
 | `-cn` (store)      | 11/11 | `-cd` (lzhd)        | 11/11 |
 | `-cf` (lzpf A)     | 11/11 | `-cD` (lzhd strong) | 11/11 |
 | `-cF` (lzpf B)     | 11/11 | `-co` (optimum1)    |  9/11 |
-| `-cc` (cm)         |  9/11 | `-cO` (optimum2)    | 11/11 |
+| `-cc` (cm)         | 11/11 | `-cO` (optimum2)    | 11/11 |
 
-**≈ 84/88 (95%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
+**≈ 86/88 (98%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
 six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
 output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. The
-4 remaining synthetic failures are a single open gap: the two audio-bearing fixtures on `-co` and `-cc`, where the
-community reference decoder itself produces the wrong bytes (this port is bit-identical to it). Counts vary ±1
-because the corpus uses random fixtures.
+2 remaining synthetic failures are a single open gap: the two audio-bearing fixtures on `-co`, whose per-channel
+bit-count decoder is a different class from the one the other codecs use and is the last unported piece. Counts
+vary ±1 because the corpus uses random fixtures.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-co` 58 · `-cc` 56 — **473/480 overall**.
-All four `0x2b`-family codecs are now clean on it, and the 7 remaining failures are confined to
-`-co`/`-cO`/`-cc`. Five of those seven are the same single open defect (`decr_param == 2` audio blocks,
-where the community reference decoder is itself wrong and this port is bit-identical to it).
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-cc` 59 · `-co` 58 — **476/480 overall**.
+Six of the eight codecs are perfect on it; the 4 remaining failures are three independent defects, the
+largest being `-co`'s unported per-channel bit-count decoder class (2 files).
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
