@@ -3161,6 +3161,15 @@ bool TryParseLegacyCnArchive(
         }  // if (!store_multiblock)
     }
 
+    // Dumps the front metadata run, which is where the entry tags (mtime 0x42,
+    // permissions 0x24, checksum 0x45/0x47/0x26) are expected to sit contiguously.
+    if (getenv("NZOPT_TRACE_META")) {
+        fprintf(stderr, "[META] entries=%zu metadata=[%zu,%zu) cksum_mode=%d bytes=",
+                entries.size(), metadata_begin, metadata_end, (int)checksum_mode);
+        for (std::size_t k = metadata_begin; k < metadata_end && k < metadata_begin + 32u; ++k)
+            fprintf(stderr, "%02x ", bytes[k]);
+        fprintf(stderr, "\n");
+    }
     // Best-effort metadata extraction (single-file path is the most reliable).
     if (entries.size() == 1u && metadata_end > metadata_begin) {
         std::size_t mp = metadata_begin;
@@ -4516,6 +4525,11 @@ static bool TryDecodeLegacyCm(
     bool ok = true;
     std::size_t pos = 0;
 
+    // Set when a type-5/6/7 checksum record turns up mid-stream rather than in the
+    // front metadata run (see the chunk_type != 0 branch below).
+    std::uint32_t inline_checksum = 0;
+    bool inline_checksum_seen = false;
+
     // Outer loop over consecutive type-0 data chunks. Large -cc archives split the
     // payload into multiple chunks; the CM state carries across them (a block with
     // decr_param != 1 does not reset). Each chunk header is a biased varint
@@ -4548,7 +4562,33 @@ static bool TryDecodeLegacyCm(
             if ((r >> 4) == 0u) chunk_type += 15u;
         }
         if (chunk_size > raw_len - pos) { ok = false; break; }
-        if (chunk_type != 0u) {  // metadata chunk between data chunks: skip
+        if (chunk_type != 0u) {
+            // Metadata chunk between data chunks. One of these can be the entry's
+            // CHECKSUM: it is a type-5 record, and it does NOT have to sit in the
+            // contiguous metadata run at the front of the archive. A large -cc
+            // archive emits an EMPTY type-5 placeholder up front and the real
+            // 4-byte one after its first data chunk, which the front-of-archive
+            // tag scan in TryParseLegacyCnArchive cannot see -- so the entry came
+            // out with has_checksum == false and the gate below declined a decode
+            // that was in fact byte-exact. Pick it up here instead.
+            if ((chunk_type == 5u || chunk_type == 6u || chunk_type == 7u) &&
+                !inline_checksum_seen) {
+                if (chunk_size == 4u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 2]) << 16u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 3]) << 24u);
+                    inline_checksum_seen = true;
+                } else if (chunk_size == 2u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u);
+                    inline_checksum_seen = true;
+                }
+                if (inline_checksum_seen && getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDCC] inline type-%u checksum record: 0x%08x\n",
+                            chunk_type, inline_checksum);
+                }
+            }
             pos += static_cast<std::size_t>(chunk_size);
             continue;
         }
@@ -4979,17 +5019,36 @@ static bool TryDecodeLegacyCm(
         legacy.checksum_mode != ChecksumMode::kNone &&
         !legacy.entries.empty()) {
         std::size_t cursor = 0;
+        if (getenv("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDCC] checksum gate: mode=%d entries=%zu outsize=%zu\n",
+                    (int)legacy.checksum_mode, legacy.entries.size(), out_data->size());
+        }
         for (const LegacyCnEntry& e : legacy.entries) {
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (cursor + n > out_data->size()) break;
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC]   entry: size=%zu has_cksum=%d cursor=%zu outsize=%zu\n",
+                        n, (int)e.has_checksum, cursor, out_data->size());
+            }
+            std::uint32_t expected = e.checksum;
             if (!e.has_checksum) {
-                out_data->clear();
-                if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
-                return false;
+                // Fall back to a checksum record found mid-stream. Only for the
+                // single-entry case: with several entries there is no way to tell
+                // from here which entry a mid-stream record belongs to.
+                if (!inline_checksum_seen || legacy.entries.size() != 1u) {
+                    out_data->clear();
+                    if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
+                    return false;
+                }
+                expected = inline_checksum;
             }
             const std::uint32_t got =
                 ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
-            if (got != e.checksum) {
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC]   entry n=%zu expected=0x%08x computed=0x%08x %s\n",
+                        n, expected, got, got == expected ? "OK" : "MISMATCH");
+            }
+            if (got != expected) {
                 out_data->clear();
                 if (out_error_message) *out_error_message = "cm: checksum mismatch";
                 return false;
