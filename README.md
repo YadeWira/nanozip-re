@@ -39,8 +39,10 @@ community reference decoder itself produces the wrong bytes (this port is bit-id
 because the corpus uses random fixtures.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-co` 57 · `-cc` 56 — **472/480 overall**.
-All four `0x2b`-family codecs are now clean on it; the 8 remaining failures are confined to `-co`/`-cO`/`-cc`.
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cO` 59 · `-co` 58 · `-cc` 56 — **473/480 overall**.
+All four `0x2b`-family codecs are now clean on it, and the 7 remaining failures are confined to
+`-co`/`-cO`/`-cc`. Five of those seven are the same single open defect (`decr_param == 2` audio blocks,
+where the community reference decoder is itself wrong and this port is bit-identical to it).
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
