@@ -2492,6 +2492,30 @@ bool DecodeLzpfMember(
             if (block_out_size == 0u) block_out_size = 0x8000u;
             if (block_out_size > 0x8001u) { decode_ok = false; break; }
             if (total_written + block_out_size > total) { decode_ok = false; break; }
+            // Exe un-transform (uvar9 bit 2). The real dispatcher
+            // FUN_08097570 does, for every NON-prefilter block:
+            //     if ((uVar9 & 4) != 0)
+            //         FUN_080c0540(param_3, *param_4, param_3, param_1[0x4018], -1);
+            //     param_1[0x4018] += *param_4;
+            // i.e. the same x86 E8/E9 call/jmp address filter the -cd path
+            // already runs for its own chunk flag &4 (NzCdExeUnfilter), driven
+            // by a running output-position counter seeded at 4. This path never
+            // applied it at all, so every E8/E9 displacement in an executable
+            // was left in the encoder's absolute form -- e.g. batnball.exe kept
+            // 0x00000410 where the file has 0x0000000b.
+            //
+            // Critically it filters the OUTPUT COPY ONLY: the window keeps the
+            // unfiltered bytes, because later matches reference the unfiltered
+            // window (the real code copies window -> param_3 first and filters
+            // param_3 in place). Filtering the window would corrupt them.
+            // The prefilter branch (uvar9 & 7) == 4 is NOT covered: it has its
+            // own position-counter update in the original and never reaches
+            // this branch.
+            auto apply_exe_filter = [&](std::size_t out_off, std::size_t n) {
+                if ((uvar9 & 4u) == 0u) return;
+                nzr::cd::NzCdExeUnfilter(decoded.data() + out_off, static_cast<std::uint32_t>(n),
+                                static_cast<std::uint32_t>(out_off + 4u));
+            };
             if (mode_literal) {
                 if (input_pos + block_out_size > stream_data_end) { decode_ok = false; break; }
                 const std::size_t block_start_in_window = window_cursor;
@@ -2515,9 +2539,13 @@ bool DecodeLzpfMember(
                     const std::size_t step = (uvar9 & 1u) ? 1u : 101u;
                     const std::size_t hstop = (uvar9 & 1u) ? bend : (bend > 100u ? bend - 100u : bstart);
                     for (std::size_t pos = bstart; pos < hstop; pos += step) {
-                        const std::uint32_t h = is_variant_b
-                            ? (*reinterpret_cast<const std::uint32_t*>(window + pos - 3) & 0xffffffu)
-                            : (*reinterpret_cast<const std::uint32_t*>(window + pos - 2) & 0x1fffu);
+                        // memcpy rather than a uint32_t* cast: `pos` walks the
+                        // window byte by byte, so these loads are unaligned and
+                        // the cast form is UB (UBSan flags it). Same instruction
+                        // on x86, defined everywhere.
+                        std::uint32_t hw;
+                        std::memcpy(&hw, window + pos - (is_variant_b ? 3u : 2u), 4);
+                        const std::uint32_t h = is_variant_b ? (hw & 0xffffffu) : (hw & 0x1fffu);
                         hash_table[h] = static_cast<std::int32_t>(pos);
                     }
                     // Variant B additionally resets the entire byte_buffer_8k
@@ -2528,6 +2556,7 @@ bool DecodeLzpfMember(
                         std::memset(byte_buffer_b.data(), 0, byte_buffer_b.size());
                     }
                 }
+                apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
                 input_pos += static_cast<std::size_t>(block_out_size);
                 total_written += static_cast<std::size_t>(block_out_size);
                 continue;
@@ -2575,6 +2604,7 @@ bool DecodeLzpfMember(
             if (window_cursor != block_start_in_window + block_out_size) { decode_ok = false; break; }
             std::memcpy(decoded.data() + total_written, window + block_start_in_window,
                         static_cast<std::size_t>(block_out_size));
+            apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
             total_written += static_cast<std::size_t>(block_out_size);
         }
         if (trace_lzpf) {
