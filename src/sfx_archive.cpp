@@ -5707,7 +5707,7 @@ static bool TryDecodeLegacyOptimum(
     // (the LMS) instead of FUN_08096160 -- and reads two 3-bit shifts biased
     // +7 rather than two 4-bit shifts biased +0x10.
     aud->SetContextFlags(legacy.legacy_method_p0 == 5u ? 0x13u : 0x03u);
-    if (legacy.legacy_method_p0 == 5u) { aud->SetPlaneOrders(64u, 8u, 8u); aud->SetStereoParam(4u); }   // -co
+    if (legacy.legacy_method_p0 == 5u) { aud->SetPlaneOrders(64u, 8u, 8u); aud->SetStereoParam(4u); aud->SetBitcountVariantB(true); }   // -co
     else                               { aud->SetPlaneOrders(96u, 8u, 8u); aud->SetStereoParam(8u); }   // -cO
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();

@@ -54,6 +54,11 @@ class NzAudioPred {
     // (GDB-read): -co 4, -cO 8, -cc 16. The old hardcoded 8 was -cO's.
     void SetStereoParam(std::uint32_t param);
 
+    // Selects the second bit-count decoder CLASS (vtable 0x0813c860, FUN_0809bdc0),
+    // which only -co uses. -cO and -cc use the default (vtable 0x0813c848,
+    // FUN_0809c070).
+    void SetBitcountVariantB(bool b);
+
     // Clears the bit-count models, the stereo decoder and all six linear
     // predictors, exactly as the reference AudioPred::Reset does.
     void Reset();

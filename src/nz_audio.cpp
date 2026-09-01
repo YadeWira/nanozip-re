@@ -283,6 +283,166 @@ struct AudioStereoDecoder {
 };
 
 // ---------------------------------------------------------------------------
+// Second bit-count decoder class (vtable 0x0813c860, slot 2 = FUN_0809bdc0).
+//
+// `-co` selects this instead of the 64-symbol bit-tree coder AudioBitcountDecoder
+// implements (vtable 0x0813c848, FUN_0809c070); `-cO` and `-cc` select that one.
+// Transcribed from the raw disassembly at 0x0809bdc0 (207 instructions, no calls) --
+// there is no decompile for it, and the architecture notes' description of it as a
+// "Fenwick-tree cumulative frequency" coder does not survive reading the code: the
+// cumulative search is a plain LINEAR scan in groups of four with a back-off, and
+// the adaptive model is an EXACT SLIDING WINDOW, not a decayed frequency table.
+//
+// Layout of the state object, all confirmed by the addressing in the asm:
+//   +0x0004                     "dirty" flag, set to 1 on entry
+//   +0x0010 + sel*0x900 + 4*i   freq[sel][i], i in 0..63   (u32)
+//   +0x0110 + sel*0x900         ring[sel][0..0x7f7]        (u8, 2040 recent symbols)
+//   +0x0908 + sel*0x900         ring write cursor          (u32)
+//   +0x12010                    the persistent context     (u32)
+// 32 contexts x 0x900 = 0x12000, which is exactly why the context field lands at
+// +0x12010 -- the strongest confirmation that the table count is 32.
+//
+// Model invariant: freq[sel][s] == 8 * (number of times s appears in ring[sel]).
+// Every decode does freq[new] += 8 and freq[evicted] -= 8, so the per-context total
+// is a constant 2040*8 = 16320 (0x3fc0), which is what keeps the 14-bit cumulative
+// target in range. A fresh object therefore starts with an all-zero ring and
+// freq[0] = 0x3fc0.
+class AudioBitcountDecoderB {
+ public:
+    AudioBitcountDecoderB() { Reset(); }
+
+    // Initial state, GDB-read from the real object and then reduced to its rule
+    // (the object is built by the class's slot-0 routine, FUN_080bd760, for which
+    // there is no decompile either -- so this was derived from the state it leaves).
+    // Per context `sel`, with `center = 2 * sel`:
+    //   * the ring's first entries are a symmetric ramp: for d = 4 down to 0, write
+    //     2^(4-d) copies of (center-d) and (center+d), interleaved left-then-right
+    //     and clipped to [0,63]; the write cursor ends where that ramp ends;
+    //   * every remaining slot k holds `k % 64`;
+    //   * freq[s] = 1 + 8 * (occurrences of s in the WHOLE ring).
+    // That last identity is what makes the totals come out at exactly
+    // 64 + 8*2040 = 16384 = 0x4000, matching the coder's 14-bit precision.
+    // Verified against the binary's own tables for sel = 0, 1 and 31: cursor lands
+    // on 31, 43 and 39 respectively, and every one of the 64 frequencies matches.
+    void Reset() {
+        std::memset(freq_, 0, sizeof(freq_));
+        for (uint32_t sel = 0; sel < kCtx; sel++) {
+            const int center = (int)(2u * sel);
+            uint32_t w = 0;
+            for (int d = 4; d >= 0; --d) {
+                const uint32_t reps = 1u << (4 - d);
+                for (uint32_t r = 0; r < reps; ++r) {
+                    const int a = center - d, b = center + d;
+                    if (a >= 0 && a < (int)kSym && w < kWindow) ring_[sel][w++] = (uint8_t)a;
+                    if (d != 0 && b >= 0 && b < (int)kSym && w < kWindow)
+                        ring_[sel][w++] = (uint8_t)b;
+                }
+            }
+            cursor_[sel] = w;
+            for (uint32_t k = w; k < kWindow; ++k) ring_[sel][k] = (uint8_t)(k % kSym);
+            for (uint32_t k = 0; k < kWindow; ++k) freq_[sel][ring_[sel][k]] += 8u;
+            for (uint32_t i = 0; i < kSym; ++i) freq_[sel][i] += 1u;
+        }
+        ctx_ = 0;
+    }
+
+    // Returns input bytes consumed (the u16 length header plus that many bytes), or
+    // 0 on malformed input. Mirrors FUN_0809bdc0's own return of `len + 2`.
+    uint32_t Decode(const uint8_t* in, const uint8_t* in_end, uint8_t* dst, uint32_t count) {
+        const size_t avail = (size_t)(in_end - in);
+        if (avail <= 1u || count == 0u) return 0u;
+        const uint32_t len = (uint32_t)in[0] | ((uint32_t)in[1] << 8);
+        if (len > avail - 2u) return 0u;
+        const uint8_t* cur = in + 2;
+        const uint8_t* end = cur + len;
+
+        auto next_byte = [&]() -> uint32_t {
+            // The original reads *cur unconditionally and masks the result when
+            // cur == end (`movzbl (%ebx),%ebx; sbb; and`). Bounded here; the masked
+            // value is zero either way.
+            if (cur < end) return *cur++;
+            return 0u;
+        };
+
+        uint32_t code = 0;
+        for (int k = 0; k < 4; k++) code = (code << 8) | next_byte();
+
+        uint32_t lo = 0;
+        uint32_t range = 0xffffffffu;
+        uint32_t scale = range >> 14;
+        uint32_t target = (uint32_t)(((uint64_t)(code - lo)) / scale) & 0x3fffu;
+
+        for (uint32_t i = 0;;) {
+            const uint32_t sel = ((ctx_ + 0x80u) >> 9) & (kCtx - 1u);
+            uint32_t* f = freq_[sel];
+
+            // Cumulative scan: four at a time until the running sum passes the
+            // target, then back off one entry at a time (up to four).
+            uint32_t acc = 0, idx = 0;
+            do {
+                acc += f[idx] + f[idx + 1] + f[idx + 2] + f[idx + 3];
+                idx += 4;
+            } while (acc <= target && idx + 4u <= kSym);
+            uint32_t sym_freq = 0;
+            for (int back = 0; back < 4; back++) {
+                sym_freq = f[idx - 1];
+                acc -= sym_freq;
+                idx -= 1;
+                if (acc <= target) break;
+            }
+            const uint32_t sym = idx;
+            const uint32_t cum_low = acc;
+
+            f[sym] += 8u;
+            const uint32_t pos = cursor_[sel];
+            const uint8_t evicted = ring_[sel][pos];
+            f[evicted] -= 8u;
+            ring_[sel][pos] = (uint8_t)sym;
+            cursor_[sel] = (pos < kWindow - 1u) ? pos + 1u : 0u;
+
+            dst[i] = (uint8_t)sym;
+
+            // ctx = (15*ctx + 256*sym + 8) >> 4  -- exponential decay toward 16*sym.
+            ctx_ = ((ctx_ * 16u + sym * 256u + 8u) - ctx_) >> 4;
+
+            lo += cum_low * scale;
+            range = scale * sym_freq;
+
+            // Carryless renormalize: shift a byte in while the top byte of lo and
+            // lo+range agree, with the classic underflow squeeze when range gets
+            // smaller than the 14-bit precision.
+            for (;;) {
+                if (((lo + range) ^ lo) > 0xffffffu) {
+                    if (range > 0x3fffu) break;
+                    range = (0u - lo) & 0x3fffu;
+                }
+                if (range == 0u) return 0u;
+                code = (code << 8) | next_byte();
+                lo <<= 8;
+                range <<= 8;
+            }
+
+            // Safety net the original does not need: with a mis-modelled table a
+            // zero symbol frequency makes range 0, and the renormalize loop above
+            // would then spin forever. Decline instead.
+            if (range == 0u) return 0u;
+            scale = range >> 14;
+            if (++i == count) break;
+            target = (uint32_t)(((uint64_t)(code - lo)) / scale) & 0x3fffu;
+        }
+        return len + 2u;
+    }
+
+ private:
+    static constexpr uint32_t kCtx = 32u;
+    static constexpr uint32_t kSym = 64u;
+    static constexpr uint32_t kWindow = 0x7f8u;   // 2040
+    uint32_t freq_[kCtx][kSym];
+    uint8_t  ring_[kCtx][kWindow];
+    uint32_t cursor_[kCtx];
+    uint32_t ctx_;
+};
+
 // ---------------------------------------------------------------------------
 // GDB GROUND TRUTH, 2026-09-01 -- what the real binary actually does for a
 // `decr_param == 2` block, and why this AudioPred transcription only agrees with
@@ -719,6 +879,8 @@ struct NzAudioPred::Impl {
     AudioStereoDecoder stereo_dec_;
     // The FUN_08096e20 alternative to stereo_dec_, selected by context bit 4.
     nzr::lzpf::LmsObject lms_[2];
+    AudioBitcountDecoderB bitcount_b_[2];
+    bool bitcount_variant_b_{false};
     uint8_t ctx_flags_{0x03};
     LinearPredictor linpred_[6];
     // The reference puts these on the stack (uint8[65536] + int32[65536],
@@ -744,6 +906,8 @@ struct NzAudioPred::Impl {
     // RunSmall.
     void SetStereoParam(uint32_t param) { stereo_dec_.Configure((int)param); }
 
+    void SetBitcountVariantB(bool b) { bitcount_variant_b_ = b; }
+
     void SetPlaneOrders(uint32_t pair0, uint32_t pair1, uint32_t pair2) {
         linpred_[0].Initialize(pair0);
         linpred_[1].Initialize(pair0);
@@ -756,6 +920,8 @@ struct NzAudioPred::Impl {
     void Reset() {
         bitcount_decoder_[0].Reset();
         bitcount_decoder_[1].Reset();
+        bitcount_b_[0].Reset();
+        bitcount_b_[1].Reset();
         stereo_dec_.Reset();
         lms_[0].Init();
         lms_[1].Init();
@@ -824,15 +990,24 @@ struct NzAudioPred::Impl {
         uint8_t* bitcount = bitcount_.data();
         int32_t* samples = samples_.data();
 
+        // Which bit-count decoder CLASS runs is per-codec: a virtual call through
+        // obj+0x38700/+0x38704 in the real decoder, vtable 0x0813c848
+        // (FUN_0809c070 = AudioBitcountDecoder) for -cO/-cc and 0x0813c860
+        // (FUN_0809bdc0 = AudioBitcountDecoderB) for -co.
+        auto decode_counts = [&](int which, uint8_t* out_counts, uint32_t n) -> uint32_t {
+            return bitcount_variant_b_
+                ? bitcount_b_[which].Decode(in, in_end, out_counts, n)
+                : bitcount_decoder_[which].Decode(in, in_end, out_counts, n);
+        };
         if (fmt.channels) {
-            const uint32_t u0 = bitcount_decoder_[0].Decode(in, in_end, bitcount, nframes);
+            const uint32_t u0 = decode_counts(0, bitcount, nframes);
             if (u0 == 0u) return 0;
             in += u0;
-            const uint32_t u1 = bitcount_decoder_[1].Decode(in, in_end, bitcount + nframes, nframes);
+            const uint32_t u1 = decode_counts(1, bitcount + nframes, nframes);
             if (u1 == 0u) return 0;
             in += u1;
         } else {
-            const uint32_t u0 = bitcount_decoder_[0].Decode(in, in_end, bitcount, nframes);
+            const uint32_t u0 = decode_counts(0, bitcount, nframes);
             if (u0 == 0u) return 0;
             in += u0;
         }
@@ -990,6 +1165,8 @@ void NzAudioPred::SetPlaneOrders(std::uint32_t pair0, std::uint32_t pair1, std::
 }
 
 void NzAudioPred::SetStereoParam(std::uint32_t param) { impl_->SetStereoParam(param); }
+
+void NzAudioPred::SetBitcountVariantB(bool b) { impl_->SetBitcountVariantB(b); }
 
 NzAudioPred::NzAudioPred() : impl_(new Impl()) {}
 NzAudioPred::~NzAudioPred() = default;
