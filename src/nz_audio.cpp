@@ -239,6 +239,18 @@ struct AudioStereoDecoder {
     Chan left_, right_;
 
     AudioStereoDecoder(int order, int param) : left_(order), right_(order) {
+        Configure(param);
+    }
+
+    // `param` is a per-CODEC constant, not a fixed 8. GDB-read from the real
+    // object's order fields (+0x1404 / +0x2814 relative to obj+0xa870):
+    //     -co : 4, 4   => param 4      (the `param > 4` refinement is skipped)
+    //     -cO : 8, 4   => param 8
+    //     -cc : 16, 12 => param 16
+    // The hardcoded 8 was -cO's value, which is why only -cO agreed with the
+    // binary here. SetOrder recomputes hist_order_, so re-running this is enough
+    // to reconfigure -- the constructor's `order` argument does not survive it.
+    void Configure(int param) {
         SetBits(23, 23);
         if (param) {
             left_.SetOrder(4, 4);
@@ -335,15 +347,18 @@ struct AudioStereoDecoder {
 //   build/rebalance routine; FUN_0809bdc0 has never been read line by line and there
 //   is no decompile for it. Porting it is what -co needs.
 //
-// -cc: bit-counts byte-exact AND the post-residual-decode array byte-exact, so its
-//   defect is in the PREDICTOR stages. The real per-plane call order for it is
-//   5, 2, 3, 0, 1 on channels ch2, ch1, ch2, ch1, ch2 -- which this file's loop
-//   already reproduces exactly. Stage 0 (linpred[5], shift 8) is byte-exact; stage 1
-//   (linpred[2], shift 13) first diverges at element 2, where the real predictor
-//   contributes 0 and this one contributes -1. So the SUM differs, not the rounding.
-//   Re-confirmed with per-stage evidence (not just end-to-end, as before): switching
-//   RunSmall to UpdateBig's magnitude-shift-then-re-sign convention breaks stage 0,
-//   which was exact. The arithmetic shift is right; do not retry that.
+// -cc: FIXED. Its bit-counts and post-residual-decode array were already byte-exact,
+//   so the defect was downstream, and it turned out to be TWO hardcoded per-codec
+//   parameters -- see SetPlaneOrders and AudioStereoDecoder::Configure below. Every
+//   configurable constant in this decoder is a per-CODEC value and this file had
+//   -cO's baked in throughout, which is the whole reason -cO was byte-exact and
+//   nothing else was.
+//   Refuted along the way, with per-stage evidence (the earlier attempt could only
+//   test end to end): switching RunSmall to UpdateBig's magnitude-shift-then-re-sign
+//   convention breaks a stage that was exact, and so does flipping its factor-update
+//   polarity. Both conventions in this file are correct as written -- the real
+//   assembly at 0x08095ca0 confirms `sar` on the signed sum and `delta > 0 ->
+//   psubw`. Do not retry either.
 // ---------------------------------------------------------------------------
 
 // LinearPredictor: sign-LMS over a 512-stride dual history (samples in the low
@@ -713,12 +728,29 @@ struct NzAudioPred::Impl {
     std::vector<int32_t> samples_;
 
     Impl() : stereo_dec_(4, 8), bitcount_(0x10000), samples_(0x10000) {
-        linpred_[0].Initialize(0x60);
-        linpred_[1].Initialize(0x60);
-        linpred_[2].Initialize(8);
-        linpred_[3].Initialize(8);
-        linpred_[4].Initialize(8);
-        linpred_[5].Initialize(8);
+        SetPlaneOrders(0x60u, 8u, 8u);   // -cO's profile; the historical hardcoding
+    }
+
+    // The six linear predictors' orders are NOT fixed -- they are a per-CODEC
+    // constant, read out of the real decoder's plane objects (field +0x1c08) with
+    // GDB. One order per PAIR:
+    //     -co :  64, 8,  8
+    //     -cO :  96, 8,  8
+    //     -cc : 384, 16, 8
+    // This file used to hardcode 0x60/8/8 for every codec, i.e. -cO's profile --
+    // which is exactly why -cO was byte-exact and the other two were not. With the
+    // wrong order a plane can even take the wrong code path: -cc's planes 2 and 3
+    // are order 16, so they belong in RunBig, and the port was running them through
+    // RunSmall.
+    void SetStereoParam(uint32_t param) { stereo_dec_.Configure((int)param); }
+
+    void SetPlaneOrders(uint32_t pair0, uint32_t pair1, uint32_t pair2) {
+        linpred_[0].Initialize(pair0);
+        linpred_[1].Initialize(pair0);
+        linpred_[2].Initialize(pair1);
+        linpred_[3].Initialize(pair1);
+        linpred_[4].Initialize(pair2);
+        linpred_[5].Initialize(pair2);
     }
 
     void Reset() {
@@ -952,6 +984,12 @@ struct NzAudioPred::Impl {
 };
 
 void NzAudioPred::SetContextFlags(std::uint8_t flags) { impl_->ctx_flags_ = flags; }
+
+void NzAudioPred::SetPlaneOrders(std::uint32_t pair0, std::uint32_t pair1, std::uint32_t pair2) {
+    impl_->SetPlaneOrders(pair0, pair1, pair2);
+}
+
+void NzAudioPred::SetStereoParam(std::uint32_t param) { impl_->SetStereoParam(param); }
 
 NzAudioPred::NzAudioPred() : impl_(new Impl()) {}
 NzAudioPred::~NzAudioPred() = default;

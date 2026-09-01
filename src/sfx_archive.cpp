@@ -4501,6 +4501,8 @@ static bool TryDecodeLegacyCm(
     // real binary (GDB-read at FUN_080a5330's entry): -cO 0x03, -cc 0x0f,
     // -co 0x13. Only bit 4 is consulted; see NzAudioPred::SetContextFlags.
     aud.SetContextFlags(0x0fu);      // -cc
+    aud.SetPlaneOrders(384u, 16u, 8u);
+    aud.SetStereoParam(16u);
     // One exe filter for the whole entry. Its recent-target caches and base
     // persist across a RUN of consecutive dece blocks and reset as soon as a
     // block without dece intervenes -- see nz_exefilter.h. The reference's
@@ -5646,6 +5648,8 @@ static bool TryDecodeLegacyOptimum(
     // (the LMS) instead of FUN_08096160 -- and reads two 3-bit shifts biased
     // +7 rather than two 4-bit shifts biased +0x10.
     aud->SetContextFlags(legacy.legacy_method_p0 == 5u ? 0x13u : 0x03u);
+    if (legacy.legacy_method_p0 == 5u) { aud->SetPlaneOrders(64u, 8u, 8u); aud->SetStereoParam(4u); }   // -co
+    else                               { aud->SetPlaneOrders(96u, 8u, 8u); aud->SetStereoParam(8u); }   // -cO
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;

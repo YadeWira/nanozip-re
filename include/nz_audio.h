@@ -43,6 +43,17 @@ class NzAudioPred {
     // everything after it, which is exactly how -co used to fail.
     void SetContextFlags(std::uint8_t flags);
 
+    // The six linear predictors' orders, one per PAIR (planes 0/1, 2/3, 4/5).
+    // A per-CODEC constant, GDB-read from the real decoder's plane objects:
+    //     -co :  64, 8,  8       -cO :  96, 8,  8       -cc : 384, 16, 8
+    // Not fixed, and not read from the stream. Getting it wrong can put a plane
+    // on the wrong code path entirely (order > 8 uses a different filter).
+    void SetPlaneOrders(std::uint32_t pair0, std::uint32_t pair1, std::uint32_t pair2);
+
+    // The inter-channel decoder's order parameter, also a per-CODEC constant
+    // (GDB-read): -co 4, -cO 8, -cc 16. The old hardcoded 8 was -cO's.
+    void SetStereoParam(std::uint32_t param);
+
     // Clears the bit-count models, the stereo decoder and all six linear
     // predictors, exactly as the reference AudioPred::Reset does.
     void Reset();
