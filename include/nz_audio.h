@@ -33,6 +33,16 @@ class NzAudioPred {
     NzAudioPred(const NzAudioPred&) = delete;
     NzAudioPred& operator=(const NzAudioPred&) = delete;
 
+    // Selects the inter-channel stage, from the decoder object's flag byte in
+    // the real binary (`*param_1` in FUN_080a5330). GDB-read per codec:
+    // -cO 0x03, -cc 0x0f, -co 0x13. Only bit 4 matters here: clear selects
+    // FUN_08096160 (two 4-bit shifts biased +0x10, the AudioStereoDecoder this
+    // file has always implemented), set selects FUN_08096e20 (two 3-bit shifts
+    // biased +7, i.e. the LMS already ported as nzr::lzpf::LmsObject).
+    // Reading the wrong one costs two bits of side-channel and desynchronises
+    // everything after it, which is exactly how -co used to fail.
+    void SetContextFlags(std::uint8_t flags);
+
     // Clears the bit-count models, the stereo decoder and all six linear
     // predictors, exactly as the reference AudioPred::Reset does.
     void Reset();

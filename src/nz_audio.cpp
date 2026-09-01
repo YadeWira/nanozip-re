@@ -2,6 +2,7 @@
 // the community reference decoder (nzdec_v0 NZ_Audio.cpp). Faithful
 // reimplementation.
 #include "nz_audio.h"
+#include "lzpf_arith.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -672,6 +673,9 @@ static bool DecodeInt32Array(int32_t* samples, uint32_t size, const uint8_t* bit
 struct NzAudioPred::Impl {
     AudioBitcountDecoder bitcount_decoder_[2];
     AudioStereoDecoder stereo_dec_;
+    // The FUN_08096e20 alternative to stereo_dec_, selected by context bit 4.
+    nzr::lzpf::LmsObject lms_[2];
+    uint8_t ctx_flags_{0x03};
     LinearPredictor linpred_[6];
     // The reference puts these on the stack (uint8[65536] + int32[65536],
     // 320 KB per call). They are members here so a deep call chain cannot blow
@@ -692,6 +696,8 @@ struct NzAudioPred::Impl {
         bitcount_decoder_[0].Reset();
         bitcount_decoder_[1].Reset();
         stereo_dec_.Reset();
+        lms_[0].Init();
+        lms_[1].Init();
         for (uint32_t i = 0; i != 6u; i++) linpred_[i].Reset();
     }
 
@@ -778,15 +784,32 @@ struct NzAudioPred::Impl {
         BitReader bit_reader;
         bit_reader.Initialize(in, (size_t)(in_end - in));
 
+        // FUN_080a5330 lines 195-210. The leading bit gates the inter-channel
+        // stage; when it is set, WHICH stage runs (and therefore how many side
+        // bits are consumed) depends on context bit 4 -- 4+4 bits biased +0x10
+        // for FUN_08096160, or 3+3 bits biased +7 for FUN_08096e20. When it is
+        // clear, BOTH objects are reset (FUN_080be670 + FUN_080beb60).
         bool use_stereo_dec = false;
+        bool use_lms = false;
+        const bool lms_variant = (ctx_flags_ & 0x10u) != 0u;
         if (fmt.channels) {
             if (bit_reader.GetBits(1)) {
-                const uint32_t c0 = bit_reader.GetBits(4);
-                const uint32_t c1 = bit_reader.GetBits(4);
-                stereo_dec_.SetBits(16u + c0, 16u + c1);
-                use_stereo_dec = true;
+                if (!lms_variant) {
+                    const uint32_t c0 = bit_reader.GetBits(4);
+                    const uint32_t c1 = bit_reader.GetBits(4);
+                    stereo_dec_.SetBits(16u + c0, 16u + c1);
+                    use_stereo_dec = true;
+                } else {
+                    const uint32_t s0 = bit_reader.GetBits(3);
+                    const uint32_t s1 = bit_reader.GetBits(3);
+                    lms_[0].shift = (uint8_t)(7u + s0);
+                    lms_[1].shift = (uint8_t)(7u + s1);
+                    use_lms = true;
+                }
             } else {
                 stereo_dec_.Reset();
+                lms_[0].Init();
+                lms_[1].Init();
             }
         }
 
@@ -820,6 +843,9 @@ struct NzAudioPred::Impl {
         }
 
         if (use_stereo_dec) stereo_dec_.Decode(samples, samples + nframes, nframes);
+        else if (use_lms)
+            nzr::lzpf::ApplyLmsInterChannel(samples, samples + nframes, nframes,
+                                            &lms_[0], &lms_[1]);
 
         if (const char* dp = getenv("NZOPT_DUMP_AUDRESID")) {
             // Dump the residual array exactly where the real decoder hands it to
@@ -857,6 +883,8 @@ struct NzAudioPred::Impl {
         return true;
     }
 };
+
+void NzAudioPred::SetContextFlags(std::uint8_t flags) { impl_->ctx_flags_ = flags; }
 
 NzAudioPred::NzAudioPred() : impl_(new Impl()) {}
 NzAudioPred::~NzAudioPred() = default;

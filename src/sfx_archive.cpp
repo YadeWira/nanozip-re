@@ -4497,6 +4497,10 @@ static bool TryDecodeLegacyCm(
     // One audio predictor for the whole entry, matching the reference's single
     // global. Reset rules are applied per block below.
     nzr::audio::NzAudioPred aud;
+    // Inter-channel stage selector, from the decoder object's flag byte in the
+    // real binary (GDB-read at FUN_080a5330's entry): -cO 0x03, -cc 0x0f,
+    // -co 0x13. Only bit 4 is consulted; see NzAudioPred::SetContextFlags.
+    aud.SetContextFlags(0x0fu);      // -cc
     // One exe filter for the whole entry. Its recent-target caches and base
     // persist across a RUN of consecutive dece blocks and reset as soon as a
     // block without dece intervenes -- see nz_exefilter.h. The reference's
@@ -5637,6 +5641,11 @@ static bool TryDecodeLegacyOptimum(
     // next segment's first (subject to the per-block reset rule inside
     // DecodeOptimumBlockSequence).
     auto aud = std::make_shared<nzr::audio::NzAudioPred>();
+    // Same flag byte as at the -cc site above: -co (p0 5) is the one codec of
+    // the three whose bit 4 is SET, so it is the one that runs FUN_08096e20
+    // (the LMS) instead of FUN_08096160 -- and reads two 3-bit shifts biased
+    // +7 rather than two 4-bit shifts biased +0x10.
+    aud->SetContextFlags(legacy.legacy_method_p0 == 5u ? 0x13u : 0x03u);
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
