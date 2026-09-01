@@ -23,20 +23,22 @@ corpus (random, text, source, repeats, zeros, audio; 10 fixtures × 8 methods):
 
 | method | native byte-exact | method | native byte-exact |
 |--------|-------------------|--------|-------------------|
-| `-cn` (store)      | 10/10 | `-cd` (lzhd)        | 9/10 |
-| `-cf` (lzpf A)     | 10/10 | `-cD` (lzhd strong) | 9/10 |
-| `-cF` (lzpf B)     | 10/10 | `-co` (optimum1)    | 9/10 |
+| `-cn` (store)      | 10/10 | `-cd` (lzhd)        | 10/10 |
+| `-cf` (lzpf A)     | 10/10 | `-cD` (lzhd strong) | 10/10 |
+| `-cF` (lzpf B)     | 10/10 | `-co` (optimum1)    |  9/10 |
 | `-cc` (cm)         |  9/10 | `-cO` (optimum2)    | 10/10 |
 
-**≈ 76/80 (95%) byte-exact native, zero bridge.** `-cn`/`-cf`/`-cF`/`-cc` are native for typical real inputs.
-`-cd`/`-cD` are native for LZ, block-RLE, raw-store, pure-literal, exe, the text pipeline, multi-chunk text, large
-multi-stream files, and parallel containers — bridging only on rare shared CM/BWT sub-chunks. `-co`/`-cO` are
-native for single-container AND parallel-container LZ/CM content and for `decr_param==0` (BWT) blocks in both
-shapes — raw-stored BWT output and the 256-bucket MTF/arithmetic entropy layer — bridging on BWT `param14`/`param15`
-plus the BWT-only `param14`/`param15` follow-on transforms. **The whole post-filter chain is now native** -- param2, param1, all six text-transform bits, and the `dece` x86 exe-filter -- so no unported post-filter remains. `decr_param==2` audio blocks decode natively too — `-cO` is
-byte-exact on stereo and mono at 8/16/24-bit and on multi-block files. The remaining 4 are all one audio fixture,
-on the codecs whose audio shape the reference decoder itself gets wrong. Counts vary ±1 because the corpus uses
-random fixtures.
+**≈ 78/80 (98%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
+six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
+codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
+single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
+output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. The
+2 remaining synthetic failures are one audio fixture on `-co` and `-cc`, where the community reference decoder
+itself produces the wrong bytes (this port is bit-identical to it). Counts vary ±1 because the corpus uses random
+fixtures.
+
+On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cO` 59 · `-cd` 58 · `-co` 57 · `-cc` 56 · `-cD` 52.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
