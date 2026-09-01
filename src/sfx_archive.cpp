@@ -5275,13 +5275,28 @@ static bool DecodeOptimumBlockSequence(
                     dece_param, pos, stream_end, param6, out_size);
         }
 
-        // A decr_param == 0 (BWT) block with param6 == 0 stores its BWT output
-        // raw -- the encoder found it incompressible, so there is no entropy
-        // layer and no size18 field at all, and the block expands to exactly
-        // its own payload size. Every other block shape needs param6 plus a
-        // non-zero size18 to say how far it expands.
+        // param6 == 0 means "this block has no compressed layer": the encoder
+        // found the data incompressible, so there is no size18 field at all and
+        // the block expands to exactly its own payload size. That holds for BOTH
+        // block kinds the optimum family emits, which is visible in the
+        // reference's own dispatch (NZ.cpp:997-1004): the decr_param == 0 branch
+        // does `size = payload_size; memcpy(...)` and only applies the entropy
+        // layer `if (header.param6)`. The decr_param == 1 branch reads
+        // `size = header.size18` unconditionally -- but size18 is only ever
+        // assigned under `if (param6)` and `Header` has no constructor, so with
+        // param6 == 0 the reference is reading an UNINITIALISED field. It is UB
+        // there, not a specification; the payload-size reading is what the real
+        // binary does, and it is what makes the sizes add up (PowerPacker.pp:
+        // 40492 total - 20091 from its two BWT blocks = 20401 = exactly this
+        // block's payload size).
+        //
+        // Treating only the BWT kind as storable made a stored LZ block hit the
+        // `continue` below: the block was skipped ENTIRELY while the sequence
+        // reported success, so the stream came up short and the whole file was
+        // declined with a misleading "decode failed".
+        const bool stored_block = ((decr_param == 0u || decr_param == 1u) && param6 == 0u);
         const bool bwt_raw = (decr_param == 0u && param6 == 0u);
-        if (!bwt_raw && (!param6 || out_size == 0u)) continue;
+        if (!stored_block && (!param6 || out_size == 0u)) continue;
 
         if (const char* dpp = getenv("NZOPT_DUMP_PAYLOAD")) {
             FILE* f = fopen(dpp, "wb");
@@ -5380,6 +5395,20 @@ static bool DecodeOptimumBlockSequence(
             // inconsistency -- decline cleanly rather than trust a partially-
             // written buffer (DecodeBlock never touches `work` before it is
             // sure).
+            if (stored_block) {
+                // Stored LZ block: the payload IS the block output. It still has
+                // to go through the window, exactly as the BWT branch above does
+                // -- the original advances its shared accumulated-block buffer
+                // for every block, so a later LZ block whose match reaches back
+                // into this one must find these bytes there.
+                work.assign(payload, payload + payload_size);
+                cur_size = payload_size;
+                dec.FeedWindow(work.data(), cur_size);
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] stored LZ block: payload_size=%u (param6=0, no size18)\n",
+                            payload_size);
+                }
+            } else {
             work.resize(out_size);
             const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
             if (getenv("NZOPT_TRACE_TDO")) {
@@ -5390,6 +5419,7 @@ static bool DecodeOptimumBlockSequence(
                 ok = false; break;
             }
             cur_size = out_size;
+            }
         }
 
         const std::size_t prev_size = out_data->size();
