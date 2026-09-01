@@ -2369,10 +2369,12 @@ bool DecodeLzpfMember(
         std::size_t input_pos = first_block_pos;
         bool decode_ok = true;
         std::size_t blk_idx = 0;
-        nzr::lzpf::LpcPredictor pf_pred{};
-        nzr::lzpf::LpcPredictor pf_pred2{};
-        pf_pred.taps  = is_variant_b ? 8u : 4u;
-        pf_pred2.taps = is_variant_b ? 8u : 4u;
+        // The prefilter state object (FUN_080b1600). -cf configures order01 = 4,
+        // -cF order01 = 8, both with nstages = 1 -- GDB-measured immediates at the
+        // two callers. -cd/-cD use nstages = 3 (and -cD order01 = 32), which is why
+        // this is now an explicit context rather than two loose predictors.
+        nzr::lzpf::PrefilterContext pf_ctx;
+        pf_ctx.Configure(is_variant_b ? 8u : 4u, 1u);
         nzr::lzpf::LmsObject pf_lms_ch1{};
         nzr::lzpf::LmsObject pf_lms_ch2{};
         pf_lms_ch1.Init();
@@ -2435,10 +2437,9 @@ bool DecodeLzpfMember(
                     bytes.data() + input_pos, avail_in,
                     window + block_start_in_window,
                     static_cast<std::size_t>(block_out_size),
-                    is_stereo_pf, &pf_pred,
+                    is_stereo_pf, &pf_ctx,
                     is_stereo_pf ? &pf_lms_ch1 : nullptr,
-                    is_stereo_pf ? &pf_lms_ch2 : nullptr,
-                    is_stereo_pf ? &pf_pred2 : nullptr);
+                    is_stereo_pf ? &pf_lms_ch2 : nullptr);
                 if (trace_lzpf) {
                     const std::uint32_t c1 = (pf_hdr >> 1u) / 3u;
                     const std::uint32_t wq = c1 / 5u;
@@ -2509,8 +2510,7 @@ bool DecodeLzpfMember(
             // on that same evidence (no fixture in this corpus ever has lms_enable=1 to
             // test it directly, but leaving LMS state stale while LPC resets would be an
             // odd asymmetry the real binary's bundled reset function does not exhibit).
-            pf_pred.ResetState();
-            pf_pred2.ResetState();
+            pf_ctx.ResetAll();
             pf_lms_ch1.Init();
             pf_lms_ch2.Init();
             std::uint64_t block_out_size = uvar9 >> 3u;
@@ -4361,6 +4361,18 @@ static bool TryDecodeLegacyLzhd(
     // The context table is per-archive persistent state (like `ring`): init
     // once here, then thread across every stream/chunk in this archive.
     const bool is_lzhds = (legacy.legacy_method_p0 == 4u);
+
+    // Prefilter sub-chunk state ((nibble & 0xc) == 0xc). ONE object for the whole
+    // archive, matching the real codec object's single instance at obj+0x40: state
+    // persists across adjacent prefilter chunks and every LZ chunk resets it
+    // (both rules measured; see nz_cd_tokens.cpp). -cd configures order01 = 8,
+    // -cD order01 = 32, both nstages = 3 (GDB-measured immediates).
+    nzr::lzpf::PrefilterContext cd_pf_ctx;
+    cd_pf_ctx.Configure(is_lzhds ? 32u : 8u, 3u);
+    nzr::lzpf::LmsObject cd_pf_lms1{}, cd_pf_lms2{};
+    cd_pf_lms1.Init();
+    cd_pf_lms2.Init();
+
     std::vector<std::uint8_t> lzhds_ctx;
     std::uint32_t lzhds_ctx_index = 0u;
     std::uint8_t* lzhds_ctx_ptr = nullptr;
@@ -4406,7 +4418,8 @@ static bool TryDecodeLegacyLzhd(
         std::uint32_t produced = nzr::cd::NzCdDecodeStream(
             block_in, block_in_size, window_base + written, block_cap,
             ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
-            is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index);
+            is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
+            &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2);
         if (getenv("NZOPT_TRACE_CD")) {
             fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);

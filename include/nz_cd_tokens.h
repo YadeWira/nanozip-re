@@ -15,6 +15,7 @@
 // `-cd` gaps that still bridge: tt08/reorder text bits, and CM/BWT sub-chunks. See
 // work/reports/decomp_lzhd/ARCHITECTURE_cd.md for the complete map.
 #pragma once
+#include "lzpf_arith.h"
 #include <cstdint>
 #include <cstddef>
 
@@ -150,7 +151,13 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint32_t* ring_pos, std::uint32_t out_pos_base,
                                bool is_lzhds = false,
                                std::uint8_t* lzhds_ctx_table = nullptr,
-                               std::uint32_t* lzhds_ctx_index = nullptr);
+                               std::uint32_t* lzhds_ctx_index = nullptr,
+                               // Prefilter sub-chunk state ((nibble & 0xc) == 0xc).
+                               // Caller-owned so it persists across the stream's
+                               // chunks; nullptr makes such a chunk decline.
+                               nzr::lzpf::PrefilterContext* pf_ctx = nullptr,
+                               nzr::lzpf::LmsObject* pf_lms1 = nullptr,
+                               nzr::lzpf::LmsObject* pf_lms2 = nullptr);
 
 }  // namespace cd
 }  // namespace nzr

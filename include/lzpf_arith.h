@@ -19,6 +19,70 @@ namespace nzr::lzpf {
 // (variant A, the <8 MMX path — two samples/iter, adapt only the first) and 8 for
 // nz_lzpf_large (variant B, the ==8 MMX path — one sample/iter, adapt every sample).
 // `shift` is obj+0x1c0a (8 in practice). Arrays sized for the max (8 taps).
+// Port of FUN_08095d90's order>=9 branch, per-sample core = FUN_080bddc0.
+// Scalar (DAT_081835b8==0) reference; proven output-identical to the MMX path.
+struct LpcBigPredictor {
+    std::uint32_t order = 32;
+    std::uint32_t shift = 13;
+    std::int32_t  pred  = 0;
+    std::int16_t  coeff[512]{};      // blk+0x000 .. (order words)
+    std::uint8_t  area[0x1800]{};    // blk+0x400 .. blk+0x1c00
+    std::int32_t  ring_off = 0x1000; // ring - (blk+0x400); init ring = blk+0x1400
+
+    void Reset() {                   // FUN_080bdac0
+        ring_off = 0x1000;
+        std::memset(area + 0x1000, 0, order * 2);   // blk+0x1400
+        std::memset(area + 0x1400, 0, order * 2);   // blk+0x1800
+        std::memset(coeff, 0, order * 2);
+        pred  = 0;
+        shift = 13;
+    }
+    static std::int16_t sat16(std::int32_t x) {
+        if (x > 32767) return 32767;
+        if (x < -32768) return -32768;
+        return (std::int16_t)x;
+    }
+    std::int16_t* H() { return (std::int16_t*)(area + ring_off); }
+    std::int16_t* S() { return (std::int16_t*)(area + ring_off + 0x400); }
+
+    void Run(std::int32_t* samples, std::uint32_t n) {
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::int32_t r = samples[i];
+            std::int32_t dec = (std::int32_t)((std::uint32_t)pred + (std::uint32_t)r);
+            samples[i] = dec;
+            if (r != 0) {
+                std::int16_t* s = S();
+                for (std::uint32_t k = 0; k < order; ++k)
+                    coeff[k] = sat16(r > 0 ? (std::int32_t)coeff[k] + s[k]
+                                           : (std::int32_t)coeff[k] - s[k]);
+            }
+            ring_off -= 2;
+            if (ring_off < 0) {
+                std::int32_t nr = 0x1400 - (std::int32_t)(order * 2);
+                std::memmove(area + nr + 2,     area + 0x000, (order - 1) * 2);
+                std::memmove(area + nr + 0x402, area + 0x400, (order - 1) * 2);
+                ring_off = nr;
+            }
+            std::int16_t sv = sat16(dec);
+            H()[0] = sv;
+            std::uint32_t mag = (std::uint32_t)(sv < 0 ? -(std::int32_t)sv : (std::int32_t)sv);
+            std::uint32_t b = 0;
+            if (mag != 0) { b = 31; while ((mag >> b) == 0) --b; }
+            std::int32_t sgn = (sv < 0) ? -1 : 0;
+            S()[0] = (std::int16_t)((((std::int32_t)b + 1) ^ sgn) - sgn);
+            std::uint32_t sum = 0;
+            const std::int16_t* h = H();
+            for (std::uint32_t k = 0; k < order; ++k)
+                sum += (std::uint32_t)((std::int32_t)coeff[k] * (std::int32_t)h[k]);
+            std::int32_t ssum = (std::int32_t)sum;
+            std::int32_t sg2 = ssum >> 31;
+            std::uint32_t m2 = ((std::uint32_t)ssum ^ (std::uint32_t)sg2) - (std::uint32_t)sg2;
+            m2 >>= shift;
+            pred = (std::int32_t)((m2 ^ (std::uint32_t)sg2) - (std::uint32_t)sg2);
+        }
+    }
+};
+
 struct LpcPredictor {
     std::int32_t  predicted_value{0};
     std::uint32_t shift{0};
@@ -372,6 +436,66 @@ std::size_t DecodePrefilterBlock(const std::uint8_t* input, std::size_t input_si
 // Loop wrapper that splits output into chunks of ≤ 65536 bytes and calls
 // DecodePrefilterBlock for each chunk. Mirrors FUN_080a5bb0.
 // Returns total input bytes consumed, or 0 on error.
+// One predictor plane. The real codec object holds SIX of these (FUN_080b1600
+// configures obj+0x10 + k*0x1c10 for k in 0..5) and dispatches per plane on the
+// configured order field obj+0x1c08 (FUN_08095d90): order < 9 takes the MMX-shaped
+// path this port implements as LpcPredictor, order >= 9 a different adaptive
+// predictor (LpcBigPredictor).
+struct PrefilterPlane {
+    std::uint32_t order{8};
+    LpcPredictor small{};
+    LpcBigPredictor big{};
+
+    void Configure(std::uint32_t o) {
+        order = o;
+        if (o >= 9u) { big.order = o; big.Reset(); }
+        else { small.taps = (o >= 8u) ? 8u : 4u; small.ResetState(); small.shift = 13u; }
+    }
+    void Reset() {
+        if (order >= 9u) big.Reset();
+        else { small.ResetState(); small.shift = 13u; }
+    }
+    void SetShift(std::uint32_t s) { if (order >= 9u) big.shift = s; else small.shift = s; }
+    void Run(std::int32_t* r, std::uint32_t n) { if (order >= 9u) big.Run(r, n); else small.Run(r, n); }
+};
+
+// The prefilter state object (FUN_080b1600's `obj`). Its configuration is what
+// distinguishes the four codecs that share this core -- the algorithm is identical:
+//   codec  order01  flags  nstages   resulting plane orders
+//   -cf      4      0x00     1       4,4,8,8,8,8
+//   -cF      8      0x00     1       8,8,8,8,8,8
+//   -cd      8      0x10     3       8,8,8,8,8,8
+//   -cD     32      0x10     3       32,32,8,8,8,8
+// (GDB-measured immediates at the four callers.) `nstages` is obj[1]: the number of
+// CASCADED stages, each owning planes 2*s and 2*s+1. A block's side-bit header
+// carries one activation bit (plus an optional 3-bit shift, biased +8) per plane
+// per stage, and the stages are APPLIED IN DESCENDING order.
+struct PrefilterContext {
+    std::uint32_t nstages{1};
+    PrefilterPlane plane[6];
+
+    // order01 sets planes 0 and 1; the rest are order 8 (FUN_080b1600, given that
+    // obj[0] & 4 is never set for these four codecs).
+    void Configure(std::uint32_t order01, std::uint32_t nst) {
+        nstages = nst;
+        plane[0].Configure(order01);
+        plane[1].Configure(order01);
+        for (int i = 2; i < 6; ++i) plane[i].Configure(8u);
+    }
+    // FUN_080b1950: every LZ chunk resets all six planes (and both LMS objects,
+    // which the caller owns).
+    void ResetAll() { for (int i = 0; i < 6; ++i) plane[i].Reset(); }
+};
+
+// Overload driven by an explicit, caller-owned PrefilterContext, so the state
+// persists across the chunks of one stream and the codec's configuration is
+// explicit rather than implied. Required for -cd/-cD (nstages == 3).
+std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
+                                   std::uint8_t* output, std::size_t output_size,
+                                   bool is_stereo_variant,
+                                   PrefilterContext* ctx,
+                                   LmsObject* lms_ch1, LmsObject* lms_ch2);
+
 std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_size,
                                    std::uint8_t* output, std::size_t output_size,
                                    bool is_stereo_variant);

@@ -675,7 +675,9 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
                           std::uint8_t* ring, std::uint32_t ring_pos, std::uint32_t ring_size,
                           std::uint8_t* out, std::uint32_t out_cap, std::uint32_t out_pos,
                           std::uint32_t* recon_advance,
-                          bool is_lzhds, std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index) {
+                          bool is_lzhds, std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index,
+                          nzr::lzpf::PrefilterContext* pf_ctx,
+                          nzr::lzpf::LmsObject* pf_lms1, nzr::lzpf::LmsObject* pf_lms2) {
     *recon_advance = 0;
     CdRd r{block + *block_pos, block + block_len};
     std::uint32_t chunk = CdReadVar(r, 0x80010u);
@@ -690,8 +692,21 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     std::uint32_t size = chunk >> 4;
     std::uint32_t out_size;
     bool pure_literal;
+    // The low nibble is a DISPATCH VALUE, not a bit mask (FUN_080994b0):
+    //   0xf              -> CM sub-chunk (FUN_080a9ca0 = NzCmDecode)
+    //   (nibble & 0xc)==0xc -> prefilter sub-chunk (FUN_080a5bb0)
+    //   otherwise        -> the LZ token path, where the bits DO mean
+    //                       &1 = LZ, &2 = block-RLE, &4 = exe, &8 = param14
+    const bool is_pf_chunk = (flags != 0xfu) && ((flags & 0xcu) == 0xcu);
     if (size == 0) {
         out_size = 0x8000u; pure_literal = true;
+    } else if (is_pf_chunk) {
+        // The generator FUN_08098cf0 RETURNS EARLY for a 0xc-class chunk, before
+        // it would emit the second varint (asm 0x08098d7f and 0x08098f30), and
+        // FUN_080994b0 takes the output size from gen+0x2c rather than gen+0x30.
+        // So there is no second varint in the stream and out_size is just
+        // size_field - 1. Reading a varint here would eat the first payload byte.
+        out_size = size - 1u; pure_literal = true;
     } else {
         size -= 1;
         std::uint32_t v2 = CdReadVar(r, 0x8001u - size);
@@ -706,6 +721,36 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // end (verified vs the binary's obj+0x980: f18 chunk2 53707+26661 > 65536 -> base
     // 0; all chunks that fit keep advancing). Cross-chunk matches still wrap (& mask).
     std::uint32_t base = (ring_pos + out_size > ring_size) ? 0u : ring_pos;
+    if (is_pf_chunk) {
+        // Prefilter sub-chunk: the SAME core -cf/-cF use (FUN_080a5bb0), driven by
+        // this codec's own state object -- -cd/-cD configure nstages = 3 (and -cD
+        // order01 = 32) where lzpf uses nstages = 1. No post-filters apply on this
+        // path (&8/&2/&4 are absent, and the generator emitted no mode byte or RLE
+        // count because it returned early), and the output still feeds the LZ ring.
+        //
+        // `flags & 2` additionally means "reset the state object first"
+        // (FUN_080b1950 at asm 0x0809980b). Only 0xc has been observed in a
+        // 71-file real corpus plus a 90-file sweep; 0xd/0xe are reachable but
+        // unobserved, so that reset is wired but untested.
+        if (pf_ctx == nullptr) return 0;
+        if (flags & 2u) { pf_ctx->ResetAll(); if (pf_lms1) pf_lms1->Init(); if (pf_lms2) pf_lms2->Init(); }
+        std::vector<std::uint8_t> pf_out(out_size);
+        const std::size_t used = nzr::lzpf::DecodePrefilterStream(
+            r.cur, static_cast<std::size_t>(r.end - r.cur),
+            pf_out.data(), static_cast<std::size_t>(out_size),
+            /*is_stereo_variant=*/true, pf_ctx, pf_lms1, pf_lms2);
+        if (CdTrace()) {
+            std::fprintf(stderr, "[CD] pf chunk: out_size=%u used=%zu avail=%ld\n",
+                         out_size, used, (long)(r.end - r.cur));
+        }
+        if (used == 0) return 0;
+        RingWrite(ring, ring_size, base, pf_out.data(), out_size);
+        const std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
+        std::memcpy(out, pf_out.data(), n);
+        *block_pos = static_cast<std::size_t>((r.cur - block) + used);
+        *recon_advance = out_size;
+        return n;
+    }
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
@@ -799,6 +844,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         ratebits_len = (r.cur < r.end) ? *r.cur++ : 0u;
         ratebits = r.cur;
         r.cur += ratebits_len;
+    }
+
+    // Every LZ chunk unconditionally resets the prefilter state object
+    // (FUN_080994b0 calls FUN_080b1950(obj+0x40) on the LZ path). Measured: the
+    // rule is load-bearing -- adjacent 0xc chunks must KEEP state, and 0xc chunks
+    // separated by LZ chunks must each start fresh.
+    if (pf_ctx != nullptr) {
+        pf_ctx->ResetAll();
+        if (pf_lms1) pf_lms1->Init();
+        if (pf_lms2) pf_lms2->Init();
     }
 
     NzCdField fl{g_kCdSlotLit, g_kCdModelLit, 8u};
@@ -904,10 +959,12 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
     if (ring_size == 0) ring_size = kCdRingSizeDefault;
     std::vector<std::uint8_t> ring(ring_size, 0);
     std::uint32_t adv = 0;
+    nzr::lzpf::PrefilterContext local_pf; local_pf.Configure(8u, 3u);
+    nzr::lzpf::LmsObject l1{}, l2{}; l1.Init(); l2.Init();
     return DecodeChunk(block, block_len, block_pos,
                        ring.data(), 0u, ring_size,
                        out, out_cap, 0u, &adv,
-                       false, nullptr, nullptr);
+                       false, nullptr, nullptr, &local_pf, &l1, &l2);
 }
 
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
@@ -915,7 +972,9 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* ring, std::uint32_t ring_size,
                                std::uint32_t* ring_pos, std::uint32_t out_pos_base,
                                bool is_lzhds,
-                               std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index) {
+                               std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index,
+                               nzr::lzpf::PrefilterContext* pf_ctx,
+                               nzr::lzpf::LmsObject* pf_lms1, nzr::lzpf::LmsObject* pf_lms2) {  // NOLINT
     // Decode one -cd/-cD stream into `out` using a CALLER-OWNED ring that PERSISTS across
     // streams (the binary keeps ONE window object for the whole archive; large files
     // split output into 1 MB streams that match into each other through this ring).
@@ -935,7 +994,8 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                       ring, *ring_pos, ring_size,
                                       out + written, out_cap - written,
                                       out_pos_base + written, &adv,
-                                      is_lzhds, lzhds_ctx_table, lzhds_ctx_index);
+                                      is_lzhds, lzhds_ctx_table, lzhds_ctx_index,
+                                      pf_ctx, pf_lms1, pf_lms2);
         if (CdTrace()) {
             std::fprintf(stderr, "[CD] chunk: inpos %zu->%zu (of %zu) produced=%u written=%u/%u adv=%u\n",
                          prev, pos, block_len, n, written + n, out_cap, adv);
@@ -967,9 +1027,13 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
         NzLzhdsInitCtxTable(lzhds_ctx.data());
         ctx_ptr = lzhds_ctx.data();
     }
+    nzr::lzpf::PrefilterContext pf_ctx;
+    pf_ctx.Configure(is_lzhds ? 32u : 8u, 3u);
+    nzr::lzpf::LmsObject pf_l1{}, pf_l2{}; pf_l1.Init(); pf_l2.Init();
     return NzCdDecodeStream(block, block_len, out, out_cap,
                             ring.data(), ring_size, &ring_pos, 0u,
-                            is_lzhds, ctx_ptr, &lzhds_ctx_index);
+                            is_lzhds, ctx_ptr, &lzhds_ctx_index,
+                            &pf_ctx, &pf_l1, &pf_l2);
 }
 
 }  // namespace cd
