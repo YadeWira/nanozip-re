@@ -270,6 +270,52 @@ struct AudioStereoDecoder {
 };
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GDB GROUND TRUTH, 2026-09-01 -- what the real binary actually does for a
+// `decr_param == 2` block, and why this AudioPred transcription only agrees with
+// it under `-cO`.
+//
+// Captured against `linux32/nz` on the three archives in ~/.cache/nzre_aud by
+// watchpointing the residual array the real decoder hands to its reconstruction
+// call (`FUN_080a50c0`, 3rd argument), then watching one element of it to get the
+// sequence of stages that write it:
+//
+//   -cO :  FUN_0809bbf0  ->  FUN_08095d90  ->  FUN_08096160
+//   -co :  FUN_0809bbf0  ->  FUN_080958d0  ->  FUN_08095d90  ->  FUN_08096e20
+//   (-cc takes the -co shape)
+//
+// So the audio path is NOT a separate algorithm family: it is assembled from the
+// SAME primitives as the lzpf prefilter, three of which this tree already has
+// byte-exact --
+//   FUN_0809bbf0 = nzr::lzpf::DecodeResidualsStereo  (in-tree, and its comment
+//                  calls it speculative/never-the-real-path -- true for lzpf,
+//                  FALSE for audio: this is its real caller)
+//   FUN_08095d90 = nzr::lzpf::LpcPredictor / PrefilterPlane
+//   FUN_08096e20 = nzr::lzpf::LmsObject (the LMS)
+// -- plus two that are NOT ported: FUN_080958d0 (an extra predictor stage that
+// only -co/-cc run) and FUN_08096160 (-cO's inter-channel stage, where -co/-cc
+// use the LMS instead).
+//
+// Measured consequences, so nobody re-derives them:
+//   * The residual array handed to the reconstruction is BYTE-IDENTICAL across
+//     -co, -cO and -cc (md5 7d4ca807c2b0fdcc6f57ac92291a82f9, 32000 int32).
+//   * This port reproduces it byte-exactly for -cO (0 diffs) and gets it wrong
+//     for -co (from element 0) and -cc (from element 2). The reconstruction
+//     stage is therefore fine; the defect is entirely in residual production.
+//   * The real decoder writes resid[0] exactly ONCE, so its predictor stages do
+//     not touch the first element.
+//
+// REFUTED here, do not retry: reading the small header the reconstruction call
+// receives (`01 01 02 02 2c 00 00 00 ...`, where [4..7] is header_bytes = 44 and
+// [2]/[3] drive FUN_080a50c0's branch) as the six predictor-enable flags -- no
+// bit offset in -120..+120 reproduces it and forcing it does not match; and
+// re-routing the payload straight into DecodePrefilterStream (best of 64 offsets
+// x orders x nstages x mono/stereo left 63725 of 64044 bytes wrong).
+//
+// Dump this port's residuals with NZOPT_DUMP_AUDRESID=<path> to diff against a
+// fresh capture.
+// ---------------------------------------------------------------------------
+
 // LinearPredictor: sign-LMS over a 512-stride dual history (samples in the low
 // half, log-magnitudes in the high half). hist_[3072] is exactly sized for the
 // wrap target &hist_[2560 - order] plus the +512 stride, for order <= 512.
@@ -724,6 +770,11 @@ struct NzAudioPred::Impl {
             in += u0;
         }
 
+        if (AudioTrace()) std::fprintf(stderr, "[AUD] bitcount consumed: cursor now at +%u\n",
+                                       (uint32_t)(in - in_start));
+        // GDB ground truth (2026-09-01) says this whole stage list is WRONG for
+        // -co/-cc: see the comment block at the top of NzAudioPred for the real
+        // per-codec stage sequence and which primitives it is actually built from.
         BitReader bit_reader;
         bit_reader.Initialize(in, (size_t)(in_end - in));
 
@@ -770,6 +821,17 @@ struct NzAudioPred::Impl {
 
         if (use_stereo_dec) stereo_dec_.Decode(samples, samples + nframes, nframes);
 
+        if (const char* dp = getenv("NZOPT_DUMP_AUDRESID")) {
+            // Dump the residual array exactly where the real decoder hands it to
+            // FUN_080a50c0 (its 3rd argument), so a GDB capture of that call can be
+            // diffed against this port stage by stage.
+            static int seq = 0;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dp, seq++);
+            FILE* f = std::fopen(nm, "wb");
+            if (f) { std::fwrite(samples, 4, nsamples, f); std::fclose(f); }
+            std::fprintf(stderr, "[AUD] dumped %u residual int32 to %s\n", nsamples, nm);
+        }
         CopyOutSamples(out, nframes, samples, fmt);
 
         // NOTE: `in` can legitimately end up a few bytes past in_end here.
