@@ -26,22 +26,21 @@ file; 11 fixtures × 8 methods):
 |--------|-------------------|--------|-------------------|
 | `-cn` (store)      | 11/11 | `-cd` (lzhd)        | 11/11 |
 | `-cf` (lzpf A)     | 11/11 | `-cD` (lzhd strong) | 11/11 |
-| `-cF` (lzpf B)     | 11/11 | `-co` (optimum1)    |  9/11 |
+| `-cF` (lzpf B)     | 11/11 | `-co` (optimum1)    | 11/11 |
 | `-cc` (cm)         | 11/11 | `-cO` (optimum2)    | 11/11 |
 
-**≈ 86/88 (98%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
+**88/88 (100%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
 six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
-output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. The
-2 remaining synthetic failures are a single open gap: the two audio-bearing fixtures on `-co`, whose per-channel
-bit-count decoder is a different class from the one the other codecs use and is the last unported piece. Counts
-vary ±1 because the corpus uses random fixtures.
+output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. No
+synthetic fixture needs the bridge for any method any more. Counts vary ±1 because the corpus uses random
+fixtures.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-cc` 60 · `-cO` 59 · `-co` 58 — **477/480 overall**.
-Seven of the eight codecs are perfect on it; the 3 remaining failures are two independent defects, the
-larger being `-co`'s unported per-channel bit-count decoder class (2 files).
+`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-co` 60 · `-cc` 60 · `-cO` 59 — **479/480 overall**.
+Seven of the eight codecs are perfect on it, and a single file remains: `-cO` on `doc/Fonts Poster-color.dp`,
+where one mis-decoded literal bit after 101226 correct bytes cascades.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
