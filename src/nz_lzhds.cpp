@@ -12,6 +12,7 @@
 #include <cstdlib>
 
 #include <cstring>
+#include <vector>
 
 namespace nzr {
 namespace cd {
@@ -289,6 +290,20 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
     std::uint32_t run_ctr = LzhdsExpGolomb(rb) + 1;
 
     ++g_call_index;
+    if (const char* dc = std::getenv("NZ_LH_DUMP_CTX")) {
+        // Per call: the 16 KB per-context MTF table + the ctx index, to diff against
+        // a GDB dump of the original's object (table at obj+0x20, index at obj+4).
+        char nm[512]; std::snprintf(nm, sizeof(nm), "%s.%d", dc, g_call_index);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(ctx_table, 1, kLzhdsCtxTableSize, f); std::fwrite(ctx_index, 4, 1, f); std::fclose(f); }
+    }
+    if (const char* dc = std::getenv("NZ_LH_DUMP_CTX")) {
+        char nm[512]; std::snprintf(nm, sizeof(nm), "%s.tok.%d", dc, g_call_index);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tokens, 4, static_cast<std::size_t>(num_tokens) * 3, f); std::fclose(f); }
+        std::snprintf(nm, sizeof(nm), "%s.lit.%d", dc, g_call_index);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(litstream, 1, litstream_len, f); std::fclose(f); }
+        std::snprintf(nm, sizeof(nm), "%s.rate.%d", dc, g_call_index);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(ratebits, 1, ratebits_len, f); std::fclose(f); }
+    }
     if (TraceOn())
         std::fprintf(stderr, "[LH] call=%d enter: out_size=%u ntok=%u base=%u ring_size=%u ctx=%u litlen=%zu ratebits=%zu\n",
                      g_call_index, out_size, num_tokens, base, ring_size, *ctx_index,
@@ -301,6 +316,15 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
 
     auto ring_at = [&](std::uint32_t rel) -> std::uint8_t& {
         return ring[LzhdsRingReduce(base + rel, ring_size)];
+    };
+    // Predictor history `k` bytes back, modulo the ring: after a wrap the
+    // original reads `out[pos - k]` below the buffer start, where FUN_080bd380
+    // has just copied the ring's last 256 bytes -- i.e. the previous lap's tail.
+    // On a true cold start the ring is all zeros, so this equals the old guard.
+    auto ring_back = [&](std::uint32_t p, std::uint32_t k) -> std::uint8_t {
+        if (k == 0u || k > ring_size) return 0u;
+        const std::uint32_t idx = LzhdsRingReduce(base + p, ring_size);
+        return ring[(idx >= k) ? (idx - k) : (idx + ring_size - k)];
     };
 
     while (pos < out_size) {
@@ -348,7 +372,7 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
                     mode = neworder;
                     std::memset(pred, 0, sizeof(pred));
                     order = neworder;
-                    std::uint8_t predicted = (base + pos >= neworder) ? ring_at(pos - neworder) : 0u;
+                    std::uint8_t predicted = ring_back(pos, neworder);
                     std::uint32_t residual_byte = (lp < litstream_len) ? litstream[lp] : 0u;
                     std::uint32_t use_stage, next_stage;
                     if (stage < neworder) { use_stage = stage; next_stage = stage + 1u; }
@@ -394,7 +418,7 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
                         mode = neworder;
                         std::memset(pred, 0, sizeof(pred));
                         order = neworder;
-                        std::uint8_t predicted = (base + pos >= neworder) ? ring_at(pos - neworder) : 0u;
+                        std::uint8_t predicted = ring_back(pos, neworder);
                         std::uint32_t residual_byte = (lp < litstream_len) ? litstream[lp] : 0u;
                         std::uint32_t use_stage, next_stage;
                         if (stage < neworder) { use_stage = stage; next_stage = stage + 1u; }
@@ -421,7 +445,7 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
                     }
                 } else {
                     // Mid-run predictor byte.
-                    std::uint8_t predicted = (base + pos >= mode) ? ring_at(pos - mode) : 0u;
+                    std::uint8_t predicted = ring_back(pos, mode);
                     std::uint32_t residual_byte = (lp < litstream_len) ? litstream[lp] : 0u;
                     std::uint32_t use_stage, next_stage;
                     if (order <= stage) { use_stage = 0u; next_stage = 1u; }
@@ -473,10 +497,27 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
         // (0x3fff<uVar10)+(0x3ff<uVar10)+(0x7fffff<uVar10)`).
         if (offset == 0u || offset > ring_size) return 0u;
         std::uint32_t mcopy = (mlen < out_size - pos) ? mlen : (out_size - pos);
-        for (std::uint32_t k = 0; k < mcopy; ++k) {
-            std::uint32_t wi = LzhdsRingReduce(base + pos + k, ring_size);
-            std::uint32_t ri = (offset <= wi) ? (wi - offset) : (wi + ring_size - offset);
-            ring[wi] = ring[ri];
+        // The source pointer is resolved ONCE, at the match start -- wrapped by
+        // the capacity only if pos - offset is negative -- and the copy then
+        // runs LINEARLY from there (FUN_080982e0: `src = base + ((pos-off) >>
+        // 31 & cap) + (pos-off)`, then `rep movsb` / word copies). When a match
+        // starts just before the ring end and extends past it, the original keeps
+        // reading past `base + cap` into the slack the first wrap zeroed
+        // (FUN_080bd380's memset covers cap - pos + 0x100 bytes; later overshoots
+        // into it are undone by the guard word saved at out + size), so those
+        // source bytes are ZERO -- not the bytes just written at the ring start,
+        // which is what a per-byte modular copy reads. Seen on a 256-byte last
+        // chunk that began exactly at a lap boundary: `match pos=1 off=3 len=4`
+        // copied ring[65534], ring[65535], then 00 00 where the modular copy
+        // produced out[0], out[1]. Byte-exact for the first 65540 bytes and wrong
+        // from the fifth of that chunk.
+        {
+            const std::uint32_t wstart = LzhdsRingReduce(base + pos, ring_size);
+            std::uint32_t si = (offset <= wstart) ? (wstart - offset) : (wstart + ring_size - offset);
+            for (std::uint32_t k = 0; k < mcopy; ++k, ++si) {
+                const std::uint32_t wi = LzhdsRingReduce(base + pos + k, ring_size);
+                ring[wi] = (si < ring_size) ? ring[si] : 0u;
+            }
         }
         pos += mcopy;
 

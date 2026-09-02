@@ -668,10 +668,24 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::
             if (pos >= out_size) break;
         }
         if (pos + mlen > out_size) mlen = out_size - pos;
-        for (std::uint32_t i = 0; i < mlen; ++i) {   // overlap-safe, modular-ring-wrapped
-            std::uint32_t wi = RingReduce(base + pos + i, ring_size);
-            std::uint32_t ri = (offset <= wi) ? (wi - offset) : (wi + ring_size - offset);
-            ring[wi] = ring[ri];
+        // Source resolved ONCE at the match start (wrapped by the capacity only
+        // when pos - offset is negative), then copied LINEARLY -- FUN_08099050's
+        // `src = base + ((pos-off) >> 31 & cap) + (pos-off)` followed by word/
+        // byte copies, the same shape as the -cD reconstruct. A match that
+        // starts just before the ring end and runs past it therefore reads the
+        // slack past `base + cap`, which the first wrap zeroed
+        // (FUN_080bd380: memset(base+pos, 0, cap-pos+0x100)), NOT the bytes
+        // just written at the ring start. The previous per-byte modular copy
+        // read those instead; it never showed here only because no -cd sample
+        // happened to place such a match, while -cD had two real files fail on
+        // exactly this (see nz_lzhds.cpp).
+        {
+            const std::uint32_t wstart = RingReduce(base + pos, ring_size);
+            std::uint32_t si = (offset <= wstart) ? (wstart - offset) : (wstart + ring_size - offset);
+            for (std::uint32_t i = 0; i < mlen; ++i, ++si) {
+                const std::uint32_t wi = RingReduce(base + pos + i, ring_size);
+                ring[wi] = (si < ring_size) ? ring[si] : 0u;
+            }
         }
         pos += mlen;
     }
