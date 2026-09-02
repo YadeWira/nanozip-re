@@ -2692,6 +2692,7 @@ bool DecodeLzpfMember(
     std::uint64_t total,
     bool is_variant_b,
     unsigned method_p1,
+    bool derived_cap_only,
     Verify&& verify,
     std::vector<unsigned char>* out) {
     if (first_block_pos + first_stream_len > bytes.size()) return false;
@@ -2718,31 +2719,50 @@ bool DecodeLzpfMember(
     };
 
     const std::size_t window_left_pad = 4u;
-    // The dict capacity is always a multiple of 64 KiB, but the multiplier the
-    // encoder chose is not recoverable from the header. GDB across many archives
-    // shows it is one of: ceil/floor(total / 64 KiB)·64 KiB (parallel slices),
-    // ceil/floor(total / 128 KiB)·128 KiB (large single-stream members), or
-    // (p1+1)·64 KiB (small single-stream members). We try each and keep the
-    // first whose decode passes verify(); a wrong capacity only matters once a
-    // window wrap occurs, which the checksum rejects.
+    // The dict capacity is DERIVED from the codec record's p1 byte, which is a
+    // mantissa/exponent "byte float" -- the same encoding the -cc window size
+    // uses: m = (p1+1) & 0xf, s = (p1+1) >> 4, and if s then m = (m+16) << (s-1);
+    // capacity = m << 16. It is linear in p1 for small values and exponential
+    // above, which is why a plain "(p1+1) * 64 KiB" fits every small archive and
+    // breaks on a large one (p1=38 means 46 * 64 KiB, not 39).
+    //
+    // This used to be a SEARCH over five guesses -- ceil/floor of total over
+    // 64 KiB and over 128 KiB, plus (p1+1)*64 KiB -- kept honest by checking each
+    // decode against the stored checksum. That worked only because a wrong
+    // capacity is harmless until the window wraps, and it could not work at all
+    // for an archive written with -hn or -nm, which stores no checksum to
+    // adjudicate with: those declined outright. The derived value was verified
+    // as the ONLY candidate against the 60-file real corpus, the synthetic suite
+    // and the multi-file suite, all unchanged.
     std::vector<std::size_t> cap_candidates;
     {
-        const std::size_t t = static_cast<std::size_t>(total);
-        const std::size_t u64 = t / 0x10000u;
-        const std::size_t u128 = t / 0x20000u;
-        const std::size_t cands[] = {
-            ((t + 0xffffu) / 0x10000u) * 0x10000u,  // ceil 64 KiB
-            u64 * 0x10000u,                          // floor 64 KiB
-            (u128 + 1u) * 0x20000u,                  // ceil 128 KiB
-            u128 * 0x20000u,                         // floor 128 KiB
-            (static_cast<std::size_t>(method_p1) + 1u) * 0x10000u,
-        };
-        for (std::size_t c : cands) {
-            if (c == 0u) continue;
-            bool dup = false;
-            for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
-            if (!dup) cap_candidates.push_back(c);
+        const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
+        unsigned mant = xp1 & 0x0fu;
+        const unsigned exp_bits = xp1 >> 4u;
+        if (exp_bits) mant = (mant + 16u) << (exp_bits - 1u);
+        const std::size_t derived = static_cast<std::size_t>(mant) << 16u;
+        if (derived != 0u) cap_candidates.push_back(derived);
+        // The old guesses stay as a fallback for a shape the derived value might
+        // not cover -- but only where a checksum can adjudicate between them,
+        // which is exactly where they were safe before.
+        if (!derived_cap_only) {
+            const std::size_t t = static_cast<std::size_t>(total);
+            const std::size_t u64 = t / 0x10000u;
+            const std::size_t u128 = t / 0x20000u;
+            const std::size_t cands[] = {
+                ((t + 0xffffu) / 0x10000u) * 0x10000u,
+                u64 * 0x10000u,
+                (u128 + 1u) * 0x20000u,
+                u128 * 0x20000u,
+            };
+            for (std::size_t c : cands) {
+                if (c == 0u) continue;
+                bool dup = false;
+                for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
+                if (!dup) cap_candidates.push_back(c);
+            }
         }
+        if (cap_candidates.empty()) cap_candidates.push_back(0x10000u);
     }
     const std::size_t window_wrap_threshold = 0x8000u;  // 32 KiB
     const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
@@ -4077,7 +4097,7 @@ bool TryParseLegacyCnArchive(
                             };
                             std::vector<unsigned char> slice;
                             if (!DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
-                                                  is_variant_b, method_p1, slice_verify, &slice)) {
+                                                  is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &slice)) {
                                 all_ok = false; break;
                             }
                             std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
@@ -4629,7 +4649,12 @@ bool TryParseLegacyCnArchive(
                             case ChecksumMode::kFletcher16: tag = 0x45u; cw = 2u; break;
                             case ChecksumMode::kCrc32:      tag = 0x47u; cw = 4u; break;
                             case ChecksumMode::kCrc16:      tag = 0x26u; cw = 2u; break;
-                            case ChecksumMode::kNone:       return false;
+                            // No checksum exists anywhere in the archive, so
+                            // there is nothing to compare against; the caller
+                            // restricts this path to the single DERIVED
+                            // capacity, and vdc has already checked that the
+                            // output length and every entry length line up.
+                            case ChecksumMode::kNone:       return true;
                         }
                         const std::uint32_t c = ComputeBufferChecksum(checksum_mode, dec.data(), dec.size());
                         std::array<std::uint8_t, 5> pat{};
@@ -4648,8 +4673,13 @@ bool TryParseLegacyCnArchive(
                     const std::vector<unsigned char>& chain_src =
                         use_splice ? spliced_data : bytes;
                     const std::size_t chain_sp = use_splice ? (sp - payload_start) : sp;
+                    // With no checksum stored (-hn / -nm) there is nothing to
+                    // adjudicate between capacity candidates, so use only the
+                    // derived one -- and accept it, which is what member_verify
+                    // does for ChecksumMode::kNone.
                     if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
                                          total_data_size, is_variant_b, method_p1,
+                                         /*derived_cap_only=*/checksum_mode == ChecksumMode::kNone,
                                          member_verify, &member_out)) {
                         native_literal_payload = true;
                         literal_data_offset = 0u;

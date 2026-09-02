@@ -152,6 +152,11 @@ OPTSETS=("" "-nt" "-np" "-nt -np" "-hn" "-hc" "-hC" "-nm")
 # Signature of an extracted tree: path, octal mode, size and mtime of every
 # file, plus its content hash. Comparing only contents would miss a permission
 # or timestamp that the metadata run restores wrongly.
+# Contents only -- paths and hashes, no mode or mtime.
+tree_content_sig() {
+  ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 md5sum 2>/dev/null )
+}
+
 tree_sig() {
   ( cd "$1" && find . -type f -printf '%p %m %s %T@\n' | sort ) 2>/dev/null
   ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 md5sum 2>/dev/null )
@@ -187,6 +192,37 @@ for shape in "${SHAPES[@]}"; do
   done
 done
 
+# ------------------------------------ phase 1b: extract under the switches ----
+# Phase 1 builds every archive with default options, so an option that changes
+# what the DECODER has to work with was never exercised on the extract path.
+# -hn/-nm are the ones that matter: with no stored checksum there is nothing to
+# adjudicate between dictionary-capacity candidates, and -cf/-cF used to decline
+# outright until the capacity was derived from the codec record instead.
+spass=0; sfail=0
+for opts in "-hn" "-nm" "-nt -np"; do
+  for m in "${METHODS[@]}"; do
+    arc="${WORK}/sw_$(echo "$opts" | tr -d ' -')_${m}.nz"; rm -f "$arc"
+    if ! ( cd "$WORK" && "$LEGACY" a -y -"$m" ${opts} "$arc" ${SHAPE_FILES[small3]} ) >/dev/null 2>&1; then
+      continue
+    fi
+    od="${WORK}/so_$$_${m}"; nd="${WORK}/sn_$$_${m}"
+    rm -rf "$od" "$nd"; mkdir -p "$od" "$nd"
+    ( cd "$od" && "$LEGACY" x -y -fo "$arc" ) >/dev/null 2>&1
+    ( cd "$nd" && NZ_NO_BRIDGE=1 "$NATIVE" x -y -fo "$arc" ) >/dev/null 2>&1
+    if [[ -z "$(find "$od" -type f | head -1)" ]]; then continue; fi
+    # Contents only here: -nt stores no timestamp, so both sides fall back to
+    # their own creation time and a full tree_sig would always differ. Mode and
+    # mtime are what phase 1 compares.
+    if [[ "$(tree_content_sig "$od")" == "$(tree_content_sig "$nd")" ]]; then
+      spass=$((spass+1))
+    else
+      sfail=$((sfail+1))
+      fail_log="${fail_log}FAIL switch-extract: '${opts}' / -${m}\n"
+    fi
+    rm -rf "$od" "$nd"
+  done
+done
+
 # ---------------------------------------------------- phase 2: `l` output ----
 # The listing is where the metadata run is visible directly: a wrong checksum, a
 # wrong mode, a shifted timestamp or a column that should not be there all show
@@ -213,9 +249,10 @@ printf "%-6s %6s %6s\n" "method" "pass" "fail"
 for m in "${METHODS[@]}"; do printf "%-6s %6d %6d\n" "-$m" "${M_PASS[$m]}" "${M_FAIL[$m]}"; done
 echo "----------------------------------"
 printf "%-14s %6d %6d  (skip %d)\n" "EXTRACT TOTAL" "$pass" "$fail" "$skip"
+printf "%-14s %6d %6d\n" "SWITCH EXTRACT" "$spass" "$sfail"
 printf "%-14s %6d %6d\n" "LIST TOTAL" "$lpass" "$lfail"
 if [[ -n "$fail_log" ]]; then echo; printf "%b" "$fail_log" | head -60; fi
-if [[ $fail -eq 0 && $lfail -eq 0 ]]; then
-  echo; echo "ok: $pass multi-file trees + $lpass listings byte-exact, zero bridge"; exit 0
+if [[ $fail -eq 0 && $lfail -eq 0 && $sfail -eq 0 ]]; then
+  echo; echo "ok: $((pass+spass)) multi-file trees + $lpass listings byte-exact, zero bridge"; exit 0
 fi
-echo; echo "INFO: $((fail+lfail)) multi-file combinations not yet native"; exit 1
+echo; echo "INFO: $((fail+lfail+sfail)) multi-file combinations not yet native"; exit 1
