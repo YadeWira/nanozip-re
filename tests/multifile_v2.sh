@@ -233,6 +233,38 @@ for opts in "-hn" "-nm" "-nt -np"; do
   done
 done
 
+# ------------------------------- phase 1c: as a USER runs it (no env at all) ----
+# Every other phase sets NZ_NO_BRIDGE=1, which is the honest way to measure
+# native decode -- but it is NOT how anyone who downloads a binary runs it. With
+# the bridge merely ENABLED and no legacy binary reachable, the CM path treated
+# "cross-check could not run" as "unverified" and declined, so `-cc` archives
+# failed by default for every user while this suite reported them green. Run a
+# copy of the binary from a directory with no legacy `nz` anywhere near it, under
+# `env -i`, and compare against the oracle.
+upass=0; ufail=0
+UDIR="${WORK}/userenv"
+mkdir -p "$UDIR"
+cp "$NATIVE" "$UDIR/nz_recon"
+for m in "${METHODS[@]}"; do
+  arc="${WORK}/ue_${m}.nz"; rm -f "$arc"
+  if ! ( cd "$WORK" && "$LEGACY" a -y -"$m" "$arc" ${SHAPE_FILES[small3]} ) >/dev/null 2>&1; then
+    continue
+  fi
+  od="${WORK}/ueo_${m}"; nd="${WORK}/uen_${m}"
+  rm -rf "$od" "$nd"; mkdir -p "$od" "$nd"
+  ( cd "$od" && "$LEGACY" x -y -fo "$arc" ) >/dev/null 2>&1
+  ( cd "$nd" && env -i PATH=/usr/bin:/bin HOME="$UDIR" "$UDIR/nz_recon" x -y "$arc" ) >/dev/null 2>&1
+  if [[ -z "$(find "$od" -type f | head -1)" ]]; then continue; fi
+  if [[ "$(tree_content_sig "$od")" == "$(tree_content_sig "$nd")" ]]; then
+    upass=$((upass+1))
+  else
+    ufail=$((ufail+1))
+    nf=$(find "$nd" -type f | wc -l)
+    fail_log="${fail_log}FAIL user-env: -${m} ($([[ $nf -eq 0 ]] && echo 'declined with no env vars set' || echo 'wrong bytes'))\n"
+  fi
+  rm -rf "$od" "$nd"
+done
+
 # ---------------------------------------------------- phase 2: `l` output ----
 # The listing is where the metadata run is visible directly: a wrong checksum, a
 # wrong mode, a shifted timestamp or a column that should not be there all show
@@ -260,9 +292,10 @@ for m in "${METHODS[@]}"; do printf "%-6s %6d %6d\n" "-$m" "${M_PASS[$m]}" "${M_
 echo "----------------------------------"
 printf "%-14s %6d %6d  (skip %d)\n" "EXTRACT TOTAL" "$pass" "$fail" "$skip"
 printf "%-14s %6d %6d\n" "SWITCH EXTRACT" "$spass" "$sfail"
+printf "%-14s %6d %6d\n" "USER ENV" "$upass" "$ufail"
 printf "%-14s %6d %6d\n" "LIST TOTAL" "$lpass" "$lfail"
 if [[ -n "$fail_log" ]]; then echo; printf "%b" "$fail_log" | head -60; fi
-if [[ $fail -eq 0 && $lfail -eq 0 && $sfail -eq 0 ]]; then
+if [[ $fail -eq 0 && $lfail -eq 0 && $sfail -eq 0 && $ufail -eq 0 ]]; then
   echo; echo "ok: $((pass+spass)) multi-file trees + $lpass listings byte-exact, zero bridge"; exit 0
 fi
-echo; echo "INFO: $((fail+lfail+sfail)) multi-file combinations not yet native"; exit 1
+echo; echo "INFO: $((fail+lfail+sfail+ufail)) multi-file combinations not yet native"; exit 1

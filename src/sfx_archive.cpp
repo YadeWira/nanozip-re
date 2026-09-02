@@ -7065,6 +7065,18 @@ int RunLegacyCnExtractOrTest(
                     os << "[native] CM native output differs from legacy; "
                           "falling back to extract bridge.\n";
                 }
+            } else {
+                // The cross-check COULD NOT RUN -- there is no legacy binary
+                // reachable. That is the normal case for anyone who just
+                // downloaded this decoder, and it must not turn a good native
+                // decode into a refusal: "bridge enabled by configuration" and
+                // "bridge actually available" are different things, and
+                // conflating them made every `-cc` archive decline unless the
+                // user happened to set NZ_NO_BRIDGE. The native result is
+                // already gated on the stored per-file checksum inside
+                // TryDecodeLegacyCm; this comparison is a bonus, not a
+                // requirement.
+                cm_verified = true;
             }
         } else if (cm_native_ok) {
             cm_verified = true;
