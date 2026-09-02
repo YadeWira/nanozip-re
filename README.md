@@ -86,34 +86,30 @@ chunks.
 A 61-file corpus at 488/488 proves nothing by itself; an earlier release quoted one at 479/480 while
 `-cO` was in fact failing about **7.5% of real files**, because that corpus happened to contain exactly
 one of them. The figure below therefore comes from a **fresh 155-file real-world corpus** (63 MB across
-eight format categories), swept with all eight codecs: **1231/1240 byte-exact, zero bridge**.
+eight format categories), swept with all eight codecs: **1233/1240 byte-exact, zero bridge**.
 
 | method | pass | fail | | method | pass | fail |
 |--------|------|------|---|--------|------|------|
 | `-cn`  | 155  | 0    | | `-cd`  | 154  | 1    |
-| `-cf`  | 154  | 1    | | `-cD`  | 152  | 3    |
+| `-cf`  | 154  | 1    | | `-cD`  | 154  | 1    |
 | `-cF`  | 154  | 1    | | `-co`  | 154  | 1    |
 | `-cc`  | 154  | 1    | | `-cO`  | 154  | 1    |
 
-The 9 failures are **two causes**, and neither writes wrong bytes — both decline, the second caught by
-the archive's own per-file checksum:
+The 7 failures are **one file and one cause**, and it does not write wrong bytes — it declines:
 
-- **An image model for uncompressed BMPs is not ported** (7 of the 19). One 24-bit BMP fails every
-  codec except `-cn`. Destroy its `BM` magic and every codec passes; strip its 54-byte header and every
-  codec passes; the file extension is irrelevant, and the archive is 3.4% smaller with the magic intact.
+- **An image model for uncompressed BMPs is not ported.** One 24-bit BMP fails every codec except
+  `-cn`. Destroy its `BM` magic and every codec passes; strip its 54-byte header and every codec
+  passes; the file extension is irrelevant, and the archive is 3.4% smaller with the magic intact.
   So NanoZip detects the bitmap and routes it through a model none of these ports implement. The
   detector itself is fully mapped (24-bit RGB, or 8-bit with an identity grayscale palette, either way
   needing width and height above 127).
-- **A `-cD` literal-model edge on a short last chunk** (2 of the 9). Two files fail `-cD` only, in
-  their last chunk, from its first bytes; `-cd` decodes both. The original runs its `-cD` literal model
-  as a second pass over a compact buffer, and this port's interleaved equivalent agrees with it on
-  every other file in the corpus. Declines, never writes.
 
-The `-cd`/`-cD` cluster that stood here a few hours earlier (12 failures) turned out to be three
-causes, two of them now closed: the prefilter state was not being reset after a pure-literal LZ chunk
-(the original resets on every LZ chunk), and the LZ ring was sized `round(total / 64 KB)` where the
-real rule is `bytefloat(p1 + 1)` — the same mantissa/exponent byte the `-cc` window and the lzpf
-dictionary already use, fitting every earlier sample and failing the first file where the two differ.
+The `-cd`/`-cD` cluster that stood here earlier the same day (12 failures) was three causes, all now
+closed: the prefilter state was not reset after a pure-literal LZ chunk (the original resets on every
+LZ chunk); the LZ ring was sized `round(total / 64 KB)` where the real rule is `bytefloat(p1 + 1)` —
+the same mantissa/exponent byte the `-cc` window and the lzpf dictionary use — for single-container
+and per-stream parallel rings alike; and a match reaching back across the ring end is copied
+*linearly* into the zeroed slack past the ring, not modulo the ring.
 
 `-cO`'s own literal model — the long-standing failure this project quoted for months — is **closed**. It
 was two ring-lifetime bugs: the wrap's LZP-table sweep started 64 bytes too low, leaving its last 16
