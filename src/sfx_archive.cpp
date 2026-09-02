@@ -2978,6 +2978,13 @@ bool TryParseLegacyCnArchive(
     // metadata run (the offset the single-file path uses as payload_start).
     std::size_t first_data_record = 0u;
     bool found_first_data = false;
+    // Every main-stream data record, as [record_begin, record_end). In a
+    // multi-block archive the next block's table/mtime/perm/checksum records sit
+    // BETWEEN two data records, so the payload is not one contiguous run.
+    std::vector<std::pair<std::size_t, std::size_t>> data_records;
+    // Any record belonging to a non-zero stream => parallel (-pN) container,
+    // which has its own framing and must not be spliced.
+    bool has_parallel_streams = false;
     // Accumulated file sizes across all per-stream type-1 tables.
     std::map<std::string, std::uint64_t> size_accum;
     // Which streams' tables mention each path; more than one means the file is
@@ -3022,10 +3029,16 @@ bool TryParseLegacyCnArchive(
             if (csize > 0u && (ctype == 2u || ctype == 4u || ctype == 5u ||
                                ctype == 6u || ctype == 7u)) {
                 attr_records.push_back({static_cast<std::size_t>(ctype), pos, pos + csize});
-            } else if (ctype == 0u && !found_first_data) {
-                first_data_record = record_begin;
-                found_first_data = true;
+            } else if (ctype == 0u) {
+                if (!found_first_data) {
+                    first_data_record = record_begin;
+                    found_first_data = true;
+                }
+                data_records.push_back({record_begin, pos + csize});
             }
+        }
+        if (!is_main) {
+            has_parallel_streams = true;
         }
 
         // Codec params: type 11, main stream.  Payload: [p0] [p1] [extras...].
@@ -3469,7 +3482,7 @@ bool TryParseLegacyCnArchive(
         // end of the metadata records; run_metadata_end is that same offset
         // (the type-0 record header), just located by parsing instead of by
         // tag sniffing.
-        if (!native_store_payload && entries.size() == 1u && found_first_data) {
+        if (!native_store_payload && found_first_data) {
             payload_start = run_metadata_end;
         }
     } else if (entries.size() == 1u && metadata_end > metadata_begin) {
@@ -4562,8 +4575,29 @@ bool TryParseLegacyCnArchive(
         //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
         //    parallel-container -cO (flag 0x0f) and decr_param==0 (BWT) still
         //    bridge (see nz_optimum2_lz.h for scope).
-        ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
-                        bytes.end());
+        // A multi-block archive interleaves the next block's metadata records
+        // between its data records, so the raw tail is not a valid stream chain.
+        // Splice the data records back together; when they are already adjacent
+        // (the single-block and contiguous-chain cases) this is a no-op and the
+        // raw tail is kept, trailing bytes included.
+        bool data_contiguous = true;
+        for (std::size_t i = 1; i < data_records.size(); ++i) {
+            if (data_records[i].first != data_records[i - 1u].second) {
+                data_contiguous = false;
+                break;
+            }
+        }
+        if (!data_contiguous && !has_parallel_streams) {
+            ctx.data.clear();
+            for (const auto& dr : data_records) {
+                ctx.data.insert(ctx.data.end(),
+                                bytes.begin() + static_cast<std::ptrdiff_t>(dr.first),
+                                bytes.begin() + static_cast<std::ptrdiff_t>(dr.second));
+            }
+        } else {
+            ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
+                            bytes.end());
+        }
     }
 
     *out_context = std::move(ctx);
