@@ -930,7 +930,24 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         acc = (hi_bits << 4) | (hiPart << n3) | low4;
                     }
 
-                    if (ring_.capacity <= acc) { if (getenv("NZOPT2_TRACE")) fprintf(stderr, "FAIL@distance pos=%u acc=%u capacity=%u\n", local_54, acc, ring_.capacity); failed = true; break; }
+                    if (ring_.capacity <= acc) {
+                        if (getenv("NZOPT2_TRACE")) fprintf(stderr, "FAIL@distance pos=%u acc=%u capacity=%u\n", local_54, acc, ring_.capacity);
+                        // Copy out whatever this chunk decoded before giving up:
+                        // the boundary between right and wrong bytes is the only
+                        // thing that localises a model divergence, and a chunk
+                        // that copies nothing hides it entirely.
+                        if (const char* cp = getenv("NZO2_DUMP_PARTIAL")) {
+                            FILE* pf = fopen(cp, "wb");
+                            if (pf) {
+                                fwrite(base + chunk_start, 1,
+                                       (local_54 >= chunk_start) ? (local_54 - chunk_start) : 0u, pf);
+                                fclose(pf);
+                            }
+                            fprintf(stderr, "[O2] partial chunk: chunk_start=%u pos=%u (%u bytes) -> %s\n",
+                                    chunk_start, local_54, (local_54 >= chunk_start) ? (local_54 - chunk_start) : 0u, cp);
+                        }
+                        failed = true; break;
+                    }
                     rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = acc;
                 } else {
                     std::uint32_t chosen = rep[local_a8_rep];

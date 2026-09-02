@@ -6531,6 +6531,18 @@ static bool DecodeOptimumBlockSequence(
             } else {
             work.resize(out_size);
             const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
+            if (!decode_block_ok) {
+                // A failing block's PARTIAL output is where the interesting
+                // boundary is: its correct prefix ends exactly at the first
+                // wrong decision. Without this the pre-checksum dump only ever
+                // showed the blocks that already succeeded.
+                if (const char* bp = getenv("NZOPT_DUMP_FAILBLOCK")) {
+                    FILE* bf = fopen(bp, "wb");
+                    if (bf) { fwrite(work.data(), 1, out_size, bf); fclose(bf); }
+                    fprintf(stderr, "[TDO] dumped failing block (%u bytes, out_data so far %zu) to %s\n",
+                            out_size, out_data->size(), bp);
+                }
+            }
             if (getenv("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
                         payload_size, out_size, decode_block_ok ? 1 : 0);
@@ -6797,18 +6809,21 @@ static bool TryDecodeLegacyOptimum(
         seg_pos = stream_end;
     }
 
+    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+        // Dump BEFORE the size gate as well as the checksum gate, so a decode
+        // that gave up part-way is diffable too -- its correct prefix is where
+        // the interesting boundary is. Sitting after the size check made this
+        // useless for exactly the failure it was added to investigate.
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
+        fprintf(stderr, "[TDO] dumped %zu of %llu bytes to %s\n", out_data->size(),
+                (unsigned long long)legacy.total_data_size, dp);
+    }
+
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
         out_data->clear();
         if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
-    }
-
-    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
-        // Pre-checksum dump: lets a failing decode be diffed against the
-        // oracle even though the gate below is about to clear out_data.
-        FILE* f = fopen(dp, "wb");
-        if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
-        fprintf(stderr, "[TDO] dumped pre-checksum output (%zu bytes) to %s\n", out_data->size(), dp);
     }
 
     // Checksum self-verify (mirrors TryDecodeLegacyLzhd's own gate above): a
