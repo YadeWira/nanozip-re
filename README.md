@@ -19,41 +19,41 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 The honest metric is how much decodes **byte-exact with no original binary at runtime**.
 `tests/native_only_v2.sh` runs extraction under `NZ_NO_BRIDGE=1` (which disables the
 legacy `nz` fallback entirely) and diffs against the legacy oracle. On a mixed
-corpus (random, text, source, repeats, zeros, audio, and a mixed audio/text/high-entropy
-file; 11 fixtures × 8 methods):
+corpus (random, text, source, repeats, zeros, audio, a mixed audio/text/high-entropy
+file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
 
 | method | native byte-exact | method | native byte-exact |
 |--------|-------------------|--------|-------------------|
-| `-cn` (store)      | 11/11 | `-cd` (lzhd)        | 11/11 |
-| `-cf` (lzpf A)     | 11/11 | `-cD` (lzhd strong) | 11/11 |
-| `-cF` (lzpf B)     | 11/11 | `-co` (optimum1)    | 11/11 |
-| `-cc` (cm)         | 11/11 | `-cO` (optimum2)    | 11/11 |
+| `-cn` (store)      | 12/12 | `-cd` (lzhd)        | 12/12 |
+| `-cf` (lzpf A)     | 12/12 | `-cD` (lzhd strong) | 12/12 |
+| `-cF` (lzpf B)     | 12/12 | `-co` (optimum1)    | 12/12 |
+| `-cc` (cm)         | 12/12 | `-cO` (optimum2)    | 12/12 |
 
-**88/88 (100%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
+**96/96 (100%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
 six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
-output and the 256-bucket MTF/arithmetic entropy layer) with the BWT-only `param14`/`param15` follow-ons. No
-synthetic fixture needs the bridge for any method any more. Counts vary ±1 because the corpus uses random
-fixtures.
+output, the 256-bucket MTF/arithmetic entropy layer, and buckets the encoder stored verbatim) with the BWT-only
+`param14`/`param15` follow-ons.
 
 On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
 `-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-co` 60 · `-cc` 60 · `-cO` 59 — **479/480 overall**.
-Seven of the eight codecs are perfect on it, and a single file remains: `-cO` on `doc/Fonts Poster-color.dp`,
-where one mis-decoded literal bit after 101226 correct bytes cascades.
 
-Both of those suites build **one-file** archives and compare **one** extracted file, so they say nothing about
-multi-file ones. `tests/multifile_v2.sh` covers that separately: 8 archive shapes × 8 methods compared as whole
-extracted **trees** — contents, mode *and* mtime — plus 56 listings across the metadata switches
-(`-nt`/`-np`/`-hn`/`-hc`/`-hC`). Each shape forces a different branch of the per-file metadata records:
-distinct versus repeated permissions, 70 equal modes, setuid/sticky, an all-0600 input (whose permission record
-the encoder omits entirely), a multi-block mix, a `-r` recursive tree, and a `-p4` parallel container.
-**64/64 extract, 56/56 list.** Writing it first was the point — it failed on every gap it later guarded,
-including one where `-co`/`-cO` wrote wrong bytes for a multi-file archive without declining while the two
-suites above reported 88/88 and 479/480.
+`tests/multifile_v2.sh` covers what neither of those can: they build **one-file** archives and compare **one**
+extracted file. It runs **all twelve** compressor selectors the binary's own usage lists — `-cdp`/`-cdP`/`-cDp`/`-cDP`
+are encoder-parallelism variants of `-cd`/`-cD`, and testing only eight of them hid a real bug — across nine
+archive shapes, comparing whole extracted **trees** (contents, permissions *and* timestamps), plus extraction under
+the metadata switches and 72 listings. Each shape forces a different branch: distinct versus repeated permissions,
+70 equal modes, setuid/sticky, an all-0600 input (whose permission record the encoder omits entirely), a
+multi-block mix, a `-r` recursive tree, a `-p4` single-file container and a `-p4` **multi-file** one.
+**108/108 extract · 36/36 switches · 72/72 listings.**
 
-The remaining known gap is a **parallel (`-pN`) archive holding several files**: it declines rather than
-decoding (never wrong output). Parallel single-file archives are native for all eight methods.
+### The one known decode failure
+
+`-cO` on one `.dp` document in the real corpus: a single mis-decoded literal at output offset 122018 (after
+101226 correct bytes) cascades. `-co` decodes the same file, so it is specific to optimum2's own literal model.
+Window size, `EnsureHeadroom` and inherited block state are all ruled out. **More instances of this would help
+localise it** — if an archive of yours fails only under `-cO`, that is the interesting report.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
