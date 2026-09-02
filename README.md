@@ -46,7 +46,16 @@ archive shapes, comparing whole extracted **trees** (contents, permissions *and*
 the metadata switches and 72 listings. Each shape forces a different branch: distinct versus repeated permissions,
 70 equal modes, setuid/sticky, an all-0600 input (whose permission record the encoder omits entirely), a
 multi-block mix, a `-r` recursive tree, a `-p4` single-file container and a `-p4` **multi-file** one.
-**108/108 extract · 36/36 switches · 72/72 listings.**
+**108/108 extract · 36/36 switches · 12/12 in a bare user environment · 72/72 listings.**
+
+### Measured the way a user runs it
+
+Every suite sets `NZ_NO_BRIDGE=1`. That is the honest way to measure *native* decode, but it is not
+how anyone who downloads a binary runs it — and the difference mattered: with the bridge merely
+*enabled* and no legacy binary reachable, the CM path treated "the cross-check could not run" as
+"unverified" and declined, so **`-cc` archives failed by default for every user** while the suites
+reported them green. `tests/multifile_v2.sh` now also runs a copy of the binary under `env -i`,
+with no variables set and no legacy `nz` anywhere near it, and compares against the oracle.
 
 ### Robustness against input that is not a valid archive
 
