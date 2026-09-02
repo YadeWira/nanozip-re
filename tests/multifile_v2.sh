@@ -60,7 +60,12 @@ mk shapes/mixed5/t.txt
 head -c 40960 /dev/zero | openssl enc -aes-256-ctr -pass pass:nzre-mf -nosalt 2>/dev/null > "${WORK}/shapes/mixed5/e.bin" \
   || head -c 40960 /dev/urandom > "${WORK}/shapes/mixed5/e.bin"
 head -c 20000 /dev/zero > "${WORK}/shapes/mixed5/z.bin"
-cp "${RECON_ROOT}/src/sfx_archive.cpp" "${WORK}/shapes/mixed5/src.cpp"
+# A ~330 KB compressible blob. Deliberately NOT a copy of a repo source file:
+# whether this shape crosses the encoder's block boundary depends on its exact
+# size, so a fixture that grows with the repo makes the pass count drift.
+{ for i in $(seq 1 4200); do
+    printf 'static int helper_%d(int a, int b) { return a * %d + b; }  /* padding padding */\n' "$i" "$i"
+  done; } > "${WORK}/shapes/mixed5/src.cpp"
 { yes "the quick brown fox jumps over the lazy dog " || true; } | head -c 30000 > "${WORK}/shapes/mixed5/r.txt"
 SHAPE_FILES[mixed5]="shapes/mixed5/t.txt shapes/mixed5/e.bin shapes/mixed5/z.bin shapes/mixed5/src.cpp shapes/mixed5/r.txt"
 SHAPES+=(mixed5)
