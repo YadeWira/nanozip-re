@@ -86,23 +86,30 @@ chunks.
 A 61-file corpus at 488/488 proves nothing by itself; an earlier release quoted one at 479/480 while
 `-cO` was in fact failing about **7.5% of real files**, because that corpus happened to contain exactly
 one of them. The figure below therefore comes from a **fresh 155-file real-world corpus** (63 MB across
-eight format categories), swept with all eight codecs: **1233/1240 byte-exact, zero bridge**.
+eight format categories), swept with all eight codecs: **1240/1240 byte-exact, zero bridge**.
 
 | method | pass | fail | | method | pass | fail |
 |--------|------|------|---|--------|------|------|
-| `-cn`  | 155  | 0    | | `-cd`  | 154  | 1    |
-| `-cf`  | 154  | 1    | | `-cD`  | 154  | 1    |
-| `-cF`  | 154  | 1    | | `-co`  | 154  | 1    |
-| `-cc`  | 154  | 1    | | `-cO`  | 154  | 1    |
+| `-cn`  | 155  | 0    | | `-cd`  | 155  | 0    |
+| `-cf`  | 155  | 0    | | `-cD`  | 155  | 0    |
+| `-cF`  | 155  | 0    | | `-co`  | 155  | 0    |
+| `-cc`  | 155  | 0    | | `-cO`  | 155  | 0    |
 
-The 7 failures are **one file and one cause**, and it does not write wrong bytes — it declines:
+The last cause standing on this corpus, **the image model, is ported** (`NzImageModel`, `nz_audio.cpp`).
+NanoZip's encoder runs four image detectors (BMP, and the same model is reached by PGM/PPM/TGA and
+uncompressed TIFF) and puts a recognised block on `decr_param = 3`; every codec then decodes it with
+the same function — the CM family's mode 3, `-cd/-cD`'s `0xf` sub-chunk, `-cf/-cF`'s prefilter-slot
+block with bit 3 set. The community reference treats that value as ordinary CM without reset, which
+is why every uncompressed bitmap failed its checksum in every codec. The model is the audio
+decoder's two-dimensional sibling: per-channel LMS planes and the same residual coder, a four-stage
+sign-sign cascade fed by the four rows above, and an eight-mode pixel predictor over the left,
+above, above-left and above-right neighbours. It decodes byte-exact in all seven codecs on 37 real
+BMPs, on 8/16/24/32-bit and PGM/PPM/TGA/TIFF images, and in mixed archives with audio and text.
 
-- **An image model for uncompressed BMPs is not ported.** One 24-bit BMP fails every codec except
-  `-cn`. Destroy its `BM` magic and every codec passes; strip its 54-byte header and every codec
-  passes; the file extension is irrelevant, and the archive is 3.4% smaller with the magic intact.
-  So NanoZip detects the bitmap and routes it through a model none of these ports implement. The
-  detector itself is fully mapped (24-bit RGB, or 8-bit with an identity grayscale palette, either way
-  needing width and height above 127).
+Two `-co/-cO` failures remain outside this corpus, found by that BMP sweep and unrelated to images
+(the image model is never entered): a 16-bit BMP whose fourth block, an LZ block after two BWT blocks,
+is declined; and a 1.4 MB BMP the encoder sent through the BWT path (likely the large-bucket case
+below). Both decline cleanly; repros are kept with the project tooling.
 
 The `-cd`/`-cD` cluster that stood here earlier the same day (12 failures) was three causes, all now
 closed: the prefilter state was not reset after a pure-literal LZ chunk (the original resets on every

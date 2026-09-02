@@ -1177,5 +1177,431 @@ bool NzAudioPred::Decode(const std::uint8_t* in, std::uint32_t in_size,
     return impl_->Decode(in, in_size, out, out_size);
 }
 
+// ===========================================================================
+// NzImageModel -- decr_param == 3 (FUN_080a9ca0 / FUN_080a90c0 and callees).
+// Ported from the Ghidra decompile + asm of work/linux32/nz; offsets in the
+// comments are the real object's, for cross-reference with GDB.
+// ===========================================================================
+namespace {
+
+inline bool ImgTrace() {
+    static const bool t = (std::getenv("NZ_IMG_TRACE") != nullptr);
+    return t;
+}
+#define IMG_TRACE(...) do { if (ImgTrace()) std::fprintf(stderr, "[IMG] " __VA_ARGS__); } while (0)
+
+// One 4-tap sign-sign stage of the cascade (obj+0x8c60 + stage*0x80 + ch*0x20):
+// [0..3] = coefficients, [4..7] = the neighbour values FUN_080b6820 loads.
+struct ImgCascade {
+    int32_t coef[4]{};
+    int32_t hist[4]{};
+};
+
+// FUN_080b5ed0 (regparm: eax=left, edx=above, ecx=above_left): the neighbour
+// closest to the gradient left+above-above_left, ties left, then above.
+inline uint32_t ImgGradientPick(uint32_t a, uint32_t b, uint32_t c) {
+    auto uabs = [](uint32_t x) { const uint32_t s = (uint32_t)((int32_t)x >> 31); return (x ^ s) - s; };
+    const uint32_t g = a + b - c;
+    const uint32_t da = uabs(g - a), db = uabs(g - b), dc = uabs(g - c);
+    if (da <= dc && da <= db) return a;
+    return (db <= dc) ? b : c;
+}
+
+}  // namespace
+
+struct NzImageModel::Impl {
+    uint8_t flags_{0};                       // obj+0x52940
+    bool variant_b_{false};
+    nzr::lzpf::LpcBigPredictor plane_[5];    // obj+0x10 + k*0x1c10 (FUN_080bddc0 core)
+    ImgCascade casc_[4][4];                  // [stage][channel]
+    std::vector<int16_t> ring0_;             // *obj      : 4 shorts per sample, index & 0xfffff
+    std::vector<int16_t> ring1_;             // *(obj+4)  : 1 short per sample, index & 0x7fff
+    uint32_t r0_{0}, r1_{0};                 // obj+0x52910 / +0x52914
+    uint16_t width_{1};                      // obj+0x5291a
+    uint16_t row_{0};                        // obj+0x5291e
+    uint16_t col_{0};                        // obj+0x52918
+    uint8_t align_{0}, nch_{1}, grp_{1}, endian_{0};   // +0x52921 / 22 / 23 / 25
+    uint8_t casc_shift_[16];                 // obj+0x52926 (16 bytes)
+    uint8_t plane_shift_[5];                 // obj+0x52936 (u16 stride, low bytes)
+    AudioBitcountDecoder bc_a_[4];           // obj+0x50f00 + k*0x680  (vtable 0x0813c848)
+    AudioBitcountDecoderB bc_b_[4];          // obj+0x8e60  + k*0x12020 (vtable 0x0813c860)
+    std::vector<uint8_t> bitcount_;          // auStack_100e0
+    std::vector<int32_t> resid_;             // auStack_500fc
+
+    Impl() : ring0_(0x100000u + 16u, 0), ring1_(0x8000u + 4u, 0),
+             bitcount_(0x10000u), resid_(0x10000u + 8u) {
+        std::memset(casc_shift_, 0x0c, sizeof(casc_shift_));
+        for (auto& s : plane_shift_) s = 0x0f;
+        Configure(0x0fu, 32u, 48u, false);
+    }
+
+    void Configure(uint8_t flags, uint32_t order03, uint32_t order4, bool vb) {
+        flags_ = flags; variant_b_ = vb;
+        for (int k = 0; k < 4; ++k) { plane_[k].order = order03; plane_[k].Reset(); }
+        plane_[4].order = order4; plane_[4].Reset();
+    }
+
+    // FUN_080bdb20: clear a plane's sample/sign windows and its prediction; the
+    // coefficients and the shift survive.
+    static void PlaneResetWindow(nzr::lzpf::LpcBigPredictor& p) {
+        p.ring_off = 0x1000;
+        std::memset(p.area + 0x1000, 0, p.order * 2u);
+        std::memset(p.area + 0x1400, 0, p.order * 2u);
+        p.pred = 0;
+    }
+    // FUN_080bddc0(plane, value, residual) with value == plane.pred + residual.
+    static void PlaneStep(nzr::lzpf::LpcBigPredictor& p, int32_t residual) {
+        int32_t r = residual;
+        p.Run(&r, 1u);
+    }
+
+    void ZeroSampleGroup() {
+        for (uint32_t k = 0; k < nch_; ++k) {
+            for (uint32_t j = 0; j < 4; ++j) ring0_[r0_ + k * 4u + j] = 0;
+            ring1_[r1_ + k] = 0;
+        }
+    }
+
+    // FUN_080b6340: a chunk below 0x180 bytes is stored verbatim; the model only
+    // advances its rings/counters as if `n` zero bytes had been decoded.
+    void SmallAdvance(uint32_t n) {
+        if (n == 0u) return;
+        uint8_t a = align_;
+        if (a != 0u) {
+            const uint8_t g = grp_;
+            for (;;) {
+                ++a; --n;
+                if (a == g) { align_ = 0; if (n == 0u) return; break; }
+                if (n == 0u) { align_ = a; return; }
+            }
+        }
+        const uint32_t g = grp_;
+        align_ = (uint8_t)(n % g);
+        uint32_t cnt = (g - 1u + n) / g;
+        do {
+            ZeroSampleGroup();
+            r0_ = (r0_ + nch_ * 4u) & 0xfffffu;
+            r1_ = (r1_ + nch_) & 0x7fffu;
+            const uint16_t c = (uint16_t)(col_ + 1u);
+            col_ = c;
+            if (c == width_) { col_ = 0; ++row_; }
+        } while (--cnt);
+    }
+
+    // FUN_080b64d0: after a chunk that ended mid-pixel, account for the split
+    // pixel with one zero sample group.
+    void EndChunk() {
+        if (align_ == 0u) return;
+        ZeroSampleGroup();
+        r1_ = (r1_ + nch_) & 0x7fffu;
+        r0_ = (r0_ + nch_ * 4u) & 0xfffffu;
+        const uint16_t c = (uint16_t)(col_ + 1u);
+        col_ = (width_ == c) ? (uint16_t)0 : c;
+    }
+
+    // FUN_080b6820: load the four cascade stages' neighbour values from ring0.
+    // Stage 0 tracks the pixel above-and-three-to-the-right (value level 0) as a
+    // shift register; stages 1..3 take the four rows above at level 1 (straight
+    // up), level 2 (up-right diagonal) and level 3 (up-left diagonal).
+    void CascadeLoad(uint32_t stride, uint32_t nch) {
+        const uint32_t idx0 = (r0_ - 4u * (stride - 3u * nch)) & 0xfffffu;
+        for (uint32_t c = 0; c < 4; ++c) {
+            ImgCascade& st = casc_[0][c];
+            st.hist[3] = st.hist[2]; st.hist[2] = st.hist[1]; st.hist[1] = st.hist[0];
+            st.hist[0] = ring0_[idx0 + c * 4u];
+        }
+        uint32_t idx = r0_ + 1u;
+        for (uint32_t i = 0; i < 4; ++i) {
+            idx = (idx - 4u * stride) & 0xfffffu;
+            for (uint32_t c = 0; c < 4; ++c) casc_[1][c].hist[i] = ring0_[idx + c * 4u];
+        }
+        idx = r0_ + 2u;
+        for (uint32_t i = 0; i < 4; ++i) {
+            idx = (idx - 4u * (stride - nch)) & 0xfffffu;
+            for (uint32_t c = 0; c < 4; ++c) casc_[2][c].hist[i] = ring0_[idx + c * 4u];
+        }
+        idx = r0_ + 3u;
+        for (uint32_t i = 0; i < 4; ++i) {
+            idx = (idx - 4u * (stride + nch)) & 0xfffffu;
+            for (uint32_t c = 0; c < 4; ++c) casc_[3][c].hist[i] = ring0_[idx + c * 4u];
+        }
+    }
+
+    // FUN_080b65b0: turn `pr` (entering as the previous pixel's values) into the
+    // 2D prediction. Always operates on 4 lanes; lanes >= nch are harmless.
+    void Predict2D(uint32_t* pr, uint32_t stride, uint32_t mode, uint32_t nch) {
+        if (mode == 0u) return;
+        const int16_t* above = &ring1_[(r1_ - stride) & 0x7fffu];
+        const int16_t* aleft = &ring1_[(r1_ - stride - nch) & 0x7fffu];
+        if (mode <= 4u) {
+            for (int c = 0; c < 4; ++c) pr[c] += 1u + (uint16_t)above[c];
+            if (mode >= 3u) for (int c = 0; c < 4; ++c) pr[c] += (uint16_t)aleft[c];
+        } else if (mode == 5u) {
+            for (int c = 0; c < 4; ++c) pr[c] += (uint16_t)aleft[c];
+        }
+        switch (mode) {
+        case 1: for (int c = 0; c < 4; ++c) pr[c] = (uint16_t)above[c]; break;
+        case 2: case 5: for (int c = 0; c < 4; ++c) pr[c] = (uint32_t)((int32_t)pr[c] >> 1); break;
+        case 3: for (int c = 0; c < 4; ++c) pr[c] = (uint32_t)((int32_t)pr[c] / 3); break;
+        case 4: {
+            const int16_t* aright = &ring1_[(r1_ - stride + nch) & 0x7fffu];
+            for (int c = 0; c < 4; ++c) pr[c] = (uint32_t)((int32_t)(pr[c] + 1u + (uint16_t)aright[c]) >> 2);
+            break;
+        }
+        case 6: for (int c = 0; c < 4; ++c) pr[c] = ImgGradientPick(pr[c], (uint16_t)above[c], (uint16_t)aleft[c]); break;
+        default: break;   // 7: keep the left pixel
+        }
+    }
+
+    // FUN_080a90c0. Returns 0 on success, 1 on truncated input, 2 on a zero width.
+    int DecodeChunk(const uint8_t* in, size_t* consumed, size_t* remaining,
+                    uint8_t* out, uint32_t chunk) {
+        if (chunk < 0x180u) {
+            if (chunk <= *remaining) {
+                SmallAdvance(chunk);
+                std::memcpy(out, in, chunk);
+                *consumed += chunk; *remaining -= chunk;
+                IMG_TRACE("small chunk=%u (verbatim)\n", chunk);
+                return 0;
+            }
+            return 1;
+        }
+        if (*remaining < 2u) return 1;
+        const uint8_t h = in[0];
+        *consumed += 1; *remaining -= 1;
+        if (*remaining == 0u) return 1;
+        const uint8_t* p = in + 1;
+        uint32_t prefix = h >> 5;
+        if (prefix > 5u) {
+            if (prefix == 7u) {
+                if (*remaining < 3u) return 1;
+                prefix = (uint32_t)(p[0] | (p[1] << 8)) + 0xfau;
+                p += 2; *consumed += 2; *remaining -= 2;
+            } else {
+                const uint8_t b = p[0];
+                *consumed += 1; *remaining -= 1;
+                if (*remaining == 0u) return 1;
+                prefix = (uint32_t)b + 6u;
+                p += 1;
+            }
+        }
+        uint32_t W;
+        if ((h & 1u) == 0u) {
+            if (*remaining < 3u) return 1;
+            W = (uint32_t)(p[0] | (p[1] << 8)) + 1u;
+            p += 2; *consumed += 2; *remaining -= 2;
+        } else {
+            W = width_;
+            if (W == 0u) return 2;
+        }
+        // Raw prefix (the BMP header on the first chunk), byte by byte.
+        if (prefix != 0u) {
+            if (prefix > chunk) return 1;   // (the original would overrun; be safe)
+            for (uint32_t i = 0; i < prefix; ++i) {
+                out[i] = p[i];
+                *consumed += 1; *remaining -= 1;
+                if (*remaining == 0u) return 1;
+            }
+            p += prefix;
+        }
+        uint8_t* outp = out + prefix;
+        const uint32_t nch = ((h >> 3) & 3u) + 1u;
+        const uint32_t bps = ((h >> 2) & 1u) + 1u;
+        const uint32_t rem_mod = (chunk - prefix) % (bps * nch);
+        const uint32_t aligned = (chunk - prefix) - rem_mod;
+        // Misaligned tail bytes: raw, stored at the END of the chunk.
+        if (rem_mod != 0u) {
+            uint8_t* dst = outp + aligned;
+            for (uint32_t i = 0; i < rem_mod; ++i) {
+                dst[i] = p[i];
+                *consumed += 1; *remaining -= 1;
+                if (*remaining == 0u) return 1;
+            }
+            p += rem_mod;
+        }
+        // LAB_080a92cb: commit the chunk's format into the object.
+        align_ = (uint8_t)rem_mod;
+        grp_ = (uint8_t)(bps * nch);
+        nch_ = (uint8_t)nch;
+        endian_ = (h >> 1) & 1u;
+        width_ = (uint16_t)W;
+        const uint32_t per_ch = (aligned / nch) / bps;
+        if (per_ch * nch > bitcount_.size()) return 1;
+        // Per-channel bit-count streams (planar).
+        uint8_t* bc = bitcount_.data();
+        for (uint32_t c = 0; c < nch; ++c) {
+            size_t n;
+            if ((flags_ & 1u) == 0u) {
+                n = nzr::lzpf::DecodeArithBuffer(p, *remaining, bc, per_ch, 12u);
+            } else if (variant_b_) {
+                n = bc_b_[c].Decode(p, p + *remaining, bc, per_ch);
+            } else {
+                n = bc_a_[c].Decode(p, p + *remaining, bc, per_ch);
+            }
+            if (n == 0u || n > *remaining) { IMG_TRACE("bitcount ch%u failed (n=%zu)\n", c, n); return 1; }
+            p += n; *consumed += n; *remaining -= n;
+            bc += per_ch;
+        }
+        // Side-bit header (FUN_080b1fb0 reads) then the residual stream.
+        nzr::lzpf::BitReader br;
+        nzr::lzpf::Init(br, p, *remaining);
+        const uint32_t mode = nzr::lzpf::ReadBits(br, 3u);
+        if (nzr::lzpf::ReadBits(br, 1u)) {
+            for (int k = 0; k < 5; ++k) plane_shift_[k] = (uint8_t)(nzr::lzpf::ReadBits(br, 4u) + 0x0bu);
+        }
+        for (int k = 0; k < 5; ++k) plane_[k].shift = plane_shift_[k];
+        uint8_t casc[16];
+        if (nzr::lzpf::ReadBits(br, 1u) == 0u) {
+            std::memcpy(casc, casc_shift_, 16);
+        } else {
+            std::memcpy(casc, casc_shift_, 16);
+            for (int s = 0; s < 4; ++s)
+                for (uint32_t c = 0; c < nch; ++c)
+                    casc[s * 4 + c] = (uint8_t)(nzr::lzpf::ReadBits(br, 4u) + 0x0cu);
+            std::memcpy(casc_shift_, casc, 16);
+        }
+        const uint32_t count = aligned / bps;
+        if (count > resid_.size()) return 1;
+        {
+            nzr::lzpf::SideBitState sb;
+            sb.ignored = br.start; sb.end = br.end; sb.cur = br.cur; sb.cache = br.cache; sb.n_valid = br.n_valid;
+            if ((flags_ & 1u) == 0u) nzr::lzpf::DecodeResidualsMono(resid_.data(), count, bitcount_.data(), &sb);
+            else                     nzr::lzpf::DecodeResidualsStereo(resid_.data(), count, bitcount_.data(), &sb);
+            br.cur = sb.cur; br.cache = sb.cache; br.n_valid = sb.n_valid;
+        }
+        {
+            const uint32_t used_bytes = (uint32_t)(((7u - br.n_valid) + (uint32_t)(br.cur - br.start) * 8u) >> 3);
+            const size_t n = (used_bytes < *remaining) ? used_bytes : *remaining;
+            *consumed += n; *remaining -= n;
+        }
+        IMG_TRACE("chunk=%u h=%02x prefix=%u W=%u nch=%u bps=%u tail=%u per_ch=%u mode=%u pshift=%u,%u,%u,%u,%u r0=%u r1=%u col=%u row=%u\n",
+                  chunk, h, prefix, W, nch, bps, rem_mod, per_ch, mode,
+                  plane_shift_[0], plane_shift_[1], plane_shift_[2], plane_shift_[3], plane_shift_[4],
+                  r0_, r1_, col_, row_);
+        // Pixel loop.
+        const int32_t* rp[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (uint32_t c = 0; c < nch; ++c) rp[c] = resid_.data() + c * per_ch;
+        const uint32_t stride = W * nch;
+        uint32_t left[4] = {0, 0, 0, 0};
+        uint32_t pr[4] = {0, 0, 0, 0};
+        uint32_t done = 0;
+        while (done < per_ch) {
+            uint32_t run = per_ch - done; if (run > W) run = W;
+            const uint16_t colc = col_;
+            if (colc == 0u) {
+                ++row_;
+                col_ = (W == run) ? (uint16_t)0 : (uint16_t)run;
+                if (flags_ & 2u) for (int k = 0; k < 5; ++k) PlaneResetWindow(plane_[k]);
+            } else {
+                col_ = 0;
+                const uint32_t left_in_row = W - colc;
+                if (run > left_in_row) run = left_in_row;
+            }
+            {
+                const uint32_t ai = (r1_ - stride) & 0x7fffu;
+                for (int c = 0; c < 4; ++c) left[c] = (uint16_t)ring1_[ai + c];
+            }
+            done += run;
+            for (; run != 0u; --run) {
+                int32_t d[4] = {0, 0, 0, 0};          // aiStack_d0: what gets added to the prediction
+                int32_t lvl[4][4] = {};              // cascade levels 0..3 (aiStack_c0/b0/a0/90)
+                if ((flags_ & 2u) == 0u) {
+                    for (uint32_t c = 0; c < nch; ++c) d[c] = *rp[c]++;
+                } else {
+                    int32_t lms4[4] = {0, 0, 0, 0};  // aiStack_80: plane-4 output per channel
+                    for (uint32_t c = 0; c < nch; ++c) {
+                        const int32_t r = *rp[c]++;
+                        lms4[c] = plane_[4].pred + r;
+                        PlaneStep(plane_[4], r);
+                    }
+                    if (flags_ & 4u) {
+                        CascadeLoad(stride, nch);
+                        int32_t nxt[4];
+                        for (uint32_t c = 0; c < nch; ++c) nxt[c] = lms4[c];
+                        for (int s = 3; s >= 0; --s) {
+                            for (uint32_t c = 0; c < nch; ++c) {
+                                ImgCascade& st = casc_[s][c];
+                                const int64_t dot = (int64_t)st.coef[0] * st.hist[0] + (int64_t)st.coef[1] * st.hist[1]
+                                                  + (int64_t)st.coef[2] * st.hist[2] + (int64_t)st.coef[3] * st.hist[3];
+                                const int64_t sg = dot >> 63;
+                                const uint64_t mag = (uint64_t)((dot ^ sg) - sg);
+                                const uint32_t q = (uint32_t)(mag >> (casc[s * 4 + c] & 0x1fu));
+                                const int32_t pred = (int32_t)((q ^ (uint32_t)sg) - (uint32_t)sg);
+                                const int32_t in_v = nxt[c];
+                                lvl[s][c] = pred + in_v;
+                                if (in_v != 0) {
+                                    const int32_t sgn = in_v >> 31;
+                                    for (int k = 0; k < 4; ++k) st.coef[k] += (st.hist[k] ^ sgn) - sgn;
+                                }
+                            }
+                            for (uint32_t c = 0; c < nch; ++c) nxt[c] = lvl[s][c];
+                        }
+                    } else {
+                        for (uint32_t c = 0; c < nch; ++c) lvl[0][c] = lms4[c];
+                    }
+                    for (uint32_t c = 0; c < nch; ++c) {
+                        d[c] = plane_[c].pred + lvl[0][c];
+                        PlaneStep(plane_[c], lvl[0][c]);
+                    }
+                }
+                for (uint32_t c = 0; c < nch; ++c) pr[c] = left[c];
+                Predict2D(pr, stride, mode, nch);
+                for (uint32_t c = 0; c < nch; ++c) {
+                    const uint32_t v = pr[c] + (uint32_t)d[c];
+                    left[c] = v;
+                    if (bps == 1u) {
+                        *outp++ = (uint8_t)v;
+                    } else {
+                        if (endian_ == 0u) { outp[1] = (uint8_t)v; outp[0] = (uint8_t)(v >> 8); }
+                        else               { outp[0] = (uint8_t)v; outp[1] = (uint8_t)(v >> 8); }
+                        outp += 2;
+                    }
+                }
+                if ((flags_ & 2u) == 0u) {
+                    for (uint32_t c = 0; c < nch; ++c) ring1_[r1_ + c] = (int16_t)left[c];
+                    r1_ = (r1_ + nch) & 0x7fffu;
+                } else {
+                    for (uint32_t c = 0; c < nch; ++c) {
+                        ring1_[r1_ + c] = (int16_t)left[c];
+                        ring0_[r0_ + c * 4u + 0u] = (int16_t)lvl[0][c];
+                        ring0_[r0_ + c * 4u + 1u] = (int16_t)lvl[1][c];
+                        ring0_[r0_ + c * 4u + 2u] = (int16_t)lvl[2][c];
+                        ring0_[r0_ + c * 4u + 3u] = (int16_t)lvl[3][c];
+                    }
+                    r0_ = (r0_ + nch * 4u) & 0xfffffu;
+                    r1_ = (r1_ + nch) & 0x7fffu;
+                }
+            }
+        }
+        EndChunk();
+        return 0;
+    }
+
+    // FUN_080a9ca0.
+    size_t Decode(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size) {
+        if (out_size == 0u || in_size == 0u) return 0;
+        size_t consumed = 0, remaining = in_size;
+        for (;;) {
+            const uint32_t chunk = (out_size < 0x10000u) ? (uint32_t)out_size : 0x10000u;
+            const int rc = DecodeChunk(in + consumed, &consumed, &remaining, out, chunk);
+            if (rc != 0) { IMG_TRACE("chunk failed rc=%d consumed=%zu remaining=%zu\n", rc, consumed, remaining); return 0; }
+            out_size -= chunk;
+            if (out_size == 0u) return consumed;
+            if (remaining == 0u) return 0;
+            out += chunk;
+        }
+    }
+};
+
+NzImageModel::NzImageModel() : impl_(new Impl()) {}
+NzImageModel::~NzImageModel() = default;
+void NzImageModel::Configure(std::uint8_t flags, std::uint32_t order03, std::uint32_t order4, bool vb) {
+    impl_->Configure(flags, order03, order4, vb);
+}
+std::size_t NzImageModel::Decode(const std::uint8_t* in, std::size_t in_size,
+                                 std::uint8_t* out, std::size_t out_size) {
+    return impl_->Decode(in, in_size, out, out_size);
+}
+
 }  // namespace audio
 }  // namespace nzr

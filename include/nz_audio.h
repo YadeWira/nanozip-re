@@ -75,5 +75,62 @@ class NzAudioPred {
     std::unique_ptr<Impl> impl_;
 };
 
+// NanoZip decr_param == 3 ("image") block decoding, ported from the binary
+// (FUN_080a9ca0 = 64 KB-chunk wrapper, FUN_080a90c0 = per-chunk decoder).
+//
+// The encoder puts a block on decr_param 3 when its detector chain recognises
+// an image (BMP so far). The block's payload is a sequence of chunks of up to
+// 65536 output bytes, each headed by one byte:
+//     bit 0     width comes from the object (1) or from a u16 in the stream (0)
+//     bit 1     16-bit sample byte order (0 = big-endian, 1 = little-endian)
+//     bit 2     bytes per sample - 1
+//     bits 3-4  channels - 1 (1..4; a 24-bit BMP is 3)
+//     bits 5-7  raw prefix length (6 = next byte + 6, 7 = next u16 + 0xfa)
+// followed by the raw prefix, the misaligned tail bytes (raw, stored at the
+// END of the chunk), per-channel bit-count streams, a side-bit header (3-bit
+// prediction mode, optional per-plane shifts, optional cascade shifts) and the
+// residual stream. Each pixel is rebuilt as
+//     out = Predict2D(left, above, above-left, above-right; mode) + residual
+// where, depending on the codec's flag byte, the residual first goes through
+// a per-channel LMS (planes 0..3 and a shared plane 4) and a 4-stage 4-tap
+// sign-sign cascade fed by the four neighbouring rows' intermediate values.
+// The same core serves every codec: -cc/-co/-cO via the CM dispatcher's
+// mode 3, -cd/-cD as the 0xf sub-chunk, -cf/-cF as the (uVar9&7)==4 variant
+// with bit 3 set. Only the flag byte and the plane orders differ per codec.
+//
+// The state (history rings, LMS planes, cascade coefficients, row/column
+// counters) persists across chunks and across blocks of one stream; nothing
+// in the decoder ever resets it (row starts clear only the LMS windows when
+// flag bit 1 is set).
+class NzImageModel {
+ public:
+    NzImageModel();
+    ~NzImageModel();
+    NzImageModel(const NzImageModel&) = delete;
+    NzImageModel& operator=(const NzImageModel&) = delete;
+
+    // Per-codec profile, GDB-read at FUN_080a90c0's entry (obj+0x52940, the
+    // planes' +0x1c08 order fields, and the bit-count objects' vtables):
+    //     codec  flags  planes0-3  plane4  bitcount class
+    //     -cc    0x0f      32        48    A (0x0813c848)
+    //     -cO    0x0f      32        48    A
+    //     -co    0x07      32        48    B (0x0813c860)
+    //     -cd    0x02      16        16    (unused: flag bit 0 clear)
+    //     -cf    0x00      16        16    (unused)
+    // flag bit 0 = per-channel bit-count objects + FUN_0809bbf0 residuals (else
+    // FUN_080a4ea0 + FUN_0809baa0); bit 1 = LMS planes; bit 2 = 4-stage cascade.
+    void Configure(std::uint8_t flags, std::uint32_t order_planes0_3,
+                   std::uint32_t order_plane4, bool bitcount_variant_b);
+
+    // Decodes one block of `out_size` bytes (FUN_080a9ca0). Returns the number
+    // of input bytes consumed, or 0 on malformed input (output is garbage then).
+    std::size_t Decode(const std::uint8_t* in, std::size_t in_size,
+                       std::uint8_t* out, std::size_t out_size);
+
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace audio
 }  // namespace nzr

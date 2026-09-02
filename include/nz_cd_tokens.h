@@ -16,6 +16,7 @@
 // work/reports/decomp_lzhd/ARCHITECTURE_cd.md for the complete map.
 #pragma once
 #include "lzpf_arith.h"
+#include "nz_audio.h"
 #include <cstdint>
 #include <cstddef>
 
@@ -157,7 +158,11 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                // chunks; nullptr makes such a chunk decline.
                                nzr::lzpf::PrefilterContext* pf_ctx = nullptr,
                                nzr::lzpf::LmsObject* pf_lms1 = nullptr,
-                               nzr::lzpf::LmsObject* pf_lms2 = nullptr);
+                               nzr::lzpf::LmsObject* pf_lms2 = nullptr,
+                               // Image model for the 0xf sub-chunk (FUN_080a9ca0).
+                               // Caller-owned, persists across the stream's chunks;
+                               // nullptr makes such a chunk decline.
+                               nzr::audio::NzImageModel* img = nullptr);
 
 }  // namespace cd
 }  // namespace nzr

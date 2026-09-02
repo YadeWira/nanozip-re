@@ -2992,6 +2992,12 @@ bool DecodeLzpfMember(
         nzr::lzpf::LmsObject pf_lms_ch2{};
         pf_lms_ch1.Init();
         pf_lms_ch2.Init();
+        // The image model: the (uVar9 & 7) == 4 block with bit 3 set runs
+        // FUN_080a9ca0 on the dispatcher's image object (param_1 + 0x121f0) instead
+        // of the prefilter core. One per stream, never reset. -cf and -cF share
+        // the profile (GDB: flags 0x00, all five planes order 16).
+        nzr::audio::NzImageModel lzpf_img;
+        lzpf_img.Configure(0x00u, 16u, 16u, true);
         while (total_written < total) {
             if (input_pos >= stream_data_end) {
                 if (input_pos != stream_data_end) { decode_ok = false; break; }
@@ -3035,8 +3041,7 @@ bool DecodeLzpfMember(
                 window_cursor = 0;
             }
             if (mode_prefilter) {
-                const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;
-                if (uvar18 != 0u) { decode_ok = false; break; }
+                const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;   // 1 = image block
                 std::uint64_t block_out_size = uvar9 >> 4u;
                 if (block_out_size == 0u) block_out_size = 0x8000u;
                 if (block_out_size > 0x8001u) { decode_ok = false; break; }
@@ -3046,13 +3051,17 @@ bool DecodeLzpfMember(
                 const std::uint8_t pf_hdr = bytes[input_pos];
                 const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
                 const bool is_stereo_pf = (pf_channels != 0u);
-                const std::size_t pf_consumed = nzr::lzpf::DecodePrefilterStream(
-                    bytes.data() + input_pos, avail_in,
-                    window + block_start_in_window,
-                    static_cast<std::size_t>(block_out_size),
-                    is_stereo_pf, &pf_ctx,
-                    is_stereo_pf ? &pf_lms_ch1 : nullptr,
-                    is_stereo_pf ? &pf_lms_ch2 : nullptr);
+                const std::size_t pf_consumed = (uvar18 != 0u)
+                    ? lzpf_img.Decode(bytes.data() + input_pos, avail_in,
+                                      window + block_start_in_window,
+                                      static_cast<std::size_t>(block_out_size))
+                    : nzr::lzpf::DecodePrefilterStream(
+                          bytes.data() + input_pos, avail_in,
+                          window + block_start_in_window,
+                          static_cast<std::size_t>(block_out_size),
+                          is_stereo_pf, &pf_ctx,
+                          is_stereo_pf ? &pf_lms_ch1 : nullptr,
+                          is_stereo_pf ? &pf_lms_ch2 : nullptr);
                 if (trace_lzpf) {
                     const std::uint32_t c1 = (pf_hdr >> 1u) / 3u;
                     const std::uint32_t wq = c1 / 5u;
@@ -3282,8 +3291,29 @@ static bool DecodeOptimumBlockSequence(
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
+    nzr::audio::NzImageModel& image,
     NzExeFilter& exe,
     std::vector<unsigned char>* out_data);
+
+// Per-codec profiles of the two side models the optimum family carries.
+// Audio (GDB-read at FUN_080a5330's entry): the decoder object's flag byte is
+// -co 0x13 / -cO 0x03 -- -co is the one whose bit 4 is SET, so it runs
+// FUN_08096e20 (the LMS) instead of FUN_08096160 and reads two 3-bit shifts
+// biased +7 rather than two 4-bit shifts biased +0x10; plane orders -co
+// 64/8/8, -cO 96/8/8; stereo param -co 4, -cO 8; -co uses the bit-count
+// decoder class B. Image (GDB-read at FUN_080a90c0's entry): -co flags 0x07,
+// -cO 0x0f, both planes 32/48; -co bit-count class B. `p0` is the method's
+// first parameter byte (5 = -co, 6 = -cO).
+static void ConfigureOptimumModels(std::uint32_t p0, nzr::audio::NzAudioPred& aud,
+                                   nzr::audio::NzImageModel& img) {
+    if (p0 == 5u) {
+        aud.SetContextFlags(0x13u); aud.SetPlaneOrders(64u, 8u, 8u); aud.SetStereoParam(4u); aud.SetBitcountVariantB(true);
+        img.Configure(0x07u, 32u, 48u, true);
+    } else {
+        aud.SetContextFlags(0x03u); aud.SetPlaneOrders(96u, 8u, 8u); aud.SetStereoParam(8u);
+        img.Configure(0x0fu, 32u, 48u, false);
+    }
+}
 
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
@@ -4561,6 +4591,10 @@ bool TryParseLegacyCnArchive(
                             // loop in the single-container case.
                             std::size_t pwritten = 0u;
                             bool sok = true;
+                            // Per-stream image model for 0xf sub-chunks (fresh per
+                            // stream, like the ring; -cd/-cD profile).
+                            nzr::audio::NzImageModel s_img;
+                            s_img.Configure(0x02u, 16u, 16u, true);
                             for (const auto& c : s.chunks) {
                                 if (pwritten >= slice_total) break;
                                 const std::uint8_t* blk_in = bytes.data() + c.first;
@@ -4570,7 +4604,8 @@ bool TryParseLegacyCnArchive(
                                     blk_in, blk_in_size, slice_window + pwritten, blk_cap,
                                     sring.data(), sring_size, &sring_pos,
                                     static_cast<std::uint32_t>(pwritten),
-                                    s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index);
+                                    s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index,
+                                    nullptr, nullptr, nullptr, &s_img);
                                 if (produced == 0u) { sok = false; break; }
                                 pwritten += produced;
                             }
@@ -4697,6 +4732,8 @@ bool TryParseLegacyCnArchive(
                                     }
                                     dst->assign(static_cast<std::size_t>(out_size), 0u);
                                     std::size_t written = 0u;
+                                    nzr::audio::NzImageModel s_img;
+                                    s_img.Configure(0x02u, 16u, 16u, true);
                                     for (const auto& c : chunks) {
                                         if (written >= out_size) break;
                                         const std::uint32_t produced = nzr::cd::NzCdDecodeStream(
@@ -4706,7 +4743,8 @@ bool TryParseLegacyCnArchive(
                                             static_cast<std::uint32_t>(out_size - written),
                                             ring.data(), ring_size, &ring_pos,
                                             static_cast<std::uint32_t>(written),
-                                            s_is_lzhds, ctx_ptr, &ctx_index);
+                                            s_is_lzhds, ctx_ptr, &ctx_index,
+                                            nullptr, nullptr, nullptr, &s_img);
                                         if (produced == 0u) return false;
                                         written += produced;
                                     }
@@ -4726,15 +4764,17 @@ bool TryParseLegacyCnArchive(
                                         ConcatParallelChunks(bytes, chunks);
                                     if (in.empty()) return false;
                                     nzr::audio::NzAudioPred aud;
+                                    nzr::audio::NzImageModel img;
+                                    ConfigureOptimumModels(method_p0, aud, img);
                                     NzExeFilter exe;
                                     if (method_p0 == 5u) {
                                         nzr::optimum::NzOptimumLzDecoder dec(wcap);
                                         return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                          out_size, dec, aud, exe, dst);
+                                                                          out_size, dec, aud, img, exe, dst);
                                     }
                                     nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
                                     return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                      out_size, dec, aud, exe, dst);
+                                                                      out_size, dec, aud, img, exe, dst);
                                 },
                                 &assembled);
                         } else if (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) {
@@ -4915,8 +4955,10 @@ bool TryParseLegacyCnArchive(
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
+                                nzr::audio::NzImageModel simg;
+                                ConfigureOptimumModels(5u, saud, simg);
                                 NzExeFilter sexe;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, sexe, out);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         } else {
                             decode_seq = [popt_window_capacity](
@@ -4924,8 +4966,10 @@ bool TryParseLegacyCnArchive(
                                 std::uint64_t hint, std::vector<unsigned char>* out) {
                                 nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
+                                nzr::audio::NzImageModel simg;
+                                ConfigureOptimumModels(6u, saud, simg);
                                 NzExeFilter sexe;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, sexe, out);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         }
                         std::vector<unsigned char> assembled(
@@ -5521,6 +5565,11 @@ static bool TryDecodeLegacyLzhd(
     nzr::lzpf::LmsObject cd_pf_lms1{}, cd_pf_lms2{};
     cd_pf_lms1.Init();
     cd_pf_lms2.Init();
+    // Image model for the 0xf sub-chunk (FUN_080a9ca0 on obj+0xe1f0): one per
+    // archive, never reset. -cd and -cD share the profile (GDB: flags 0x02,
+    // all five planes order 16).
+    nzr::audio::NzImageModel cd_img;
+    cd_img.Configure(0x02u, 16u, 16u, true);
 
     std::vector<std::uint8_t> lzhds_ctx;
     std::uint32_t lzhds_ctx_index = 0u;
@@ -5568,7 +5617,7 @@ static bool TryDecodeLegacyLzhd(
             block_in, block_in_size, window_base + written, block_cap,
             ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
             is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
-            &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2);
+            &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img);
         if (getenv("NZOPT_TRACE_CD")) {
             fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);
@@ -5652,6 +5701,10 @@ static bool TryDecodeLegacyCm(
     aud.SetContextFlags(0x0fu);      // -cc
     aud.SetPlaneOrders(384u, 16u, 8u);
     aud.SetStereoParam(16u);
+    // The image model (decr_param 3), one per entry; its state is never reset.
+    // Profile GDB-read at FUN_080a90c0's entry for -cc (see nz_audio.h).
+    nzr::audio::NzImageModel img;
+    img.Configure(0x0fu, 32u, 48u, false);
     // One exe filter for the whole entry. Its recent-target caches and base
     // persist across a RUN of consecutive dece blocks and reset as soon as a
     // block without dece intervenes -- see nz_exefilter.h. The reference's
@@ -5806,12 +5859,19 @@ static bool TryDecodeLegacyCm(
                 continue;
             }
 
-            // decr_param == 3: an ordinary CM block that must NOT reset the
-            // model, carrying no post-filters at all.
+            // decr_param == 3: an IMAGE block. The real dispatcher's mode-3 branch
+            // runs FUN_080a9ca0 on its own image object -- not the CM model (the
+            // community reference decodes it as CM-without-reset, which is why every
+            // BMP failed its checksum). Nothing feeds the CM model here.
             aud.Reset();
             if (alt_out_size == 0u) continue;
             std::vector<std::uint8_t> work3(alt_out_size);
-            NzCmDecode(cm, payload, payload_size, work3.data(), alt_out_size);
+            const std::size_t iused = img.Decode(payload, payload_size, work3.data(), alt_out_size);
+            if (getenv("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
+                        payload_size, alt_out_size, iused);
+            }
+            if (iused == 0u) { ok = false; break; }
             out_data->insert(out_data->end(), work3.begin(), work3.end());
             continue;
         }
@@ -6296,6 +6356,7 @@ static bool DecodeOptimumBlockSequence(
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
+    nzr::audio::NzImageModel& image,
     NzExeFilter& exe,
     std::vector<unsigned char>* out_data) {
     std::size_t pos = blocks_begin;
@@ -6341,12 +6402,24 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
                         payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
             }
-            // decr_param == 3 is a CM-only shape: the reference dispatches it
-            // to CM_Decode without a reset, and returns false for every
-            // non-CM codec -- which is what the optimum family is.
-            if (decr_param == 3u) { ok = false; break; }
             if (audio_out_size == 0u) continue;
             if (audio_out_size > total_size_hint - out_data->size()) { ok = false; break; }
+            if (decr_param == 3u) {
+                // Image block (FUN_080a9ca0 on the codec's image object; the
+                // community reference wrongly treats this shape as CM-only and
+                // returns false for the optimum family). Every non-audio block
+                // resets the audio predictor; the image object is never reset.
+                audio.Reset();
+                std::vector<std::uint8_t> ibuf(audio_out_size);
+                const std::size_t iused = image.Decode(payload, payload_size, ibuf.data(), audio_out_size);
+                if (getenv("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
+                            payload_size, audio_out_size, iused);
+                }
+                if (iused == 0u) { ok = false; break; }
+                out_data->insert(out_data->end(), ibuf.begin(), ibuf.end());
+                continue;
+            }
             // An audio block resets the predictor only when mode2_type is set.
             if (const char* adp = getenv("NZOPT_DUMP_AUDIO")) {
                 FILE* f = fopen(adp, "wb");
@@ -6905,25 +6978,21 @@ static bool TryDecodeLegacyOptimum(
     // next segment's first (subject to the per-block reset rule inside
     // DecodeOptimumBlockSequence).
     auto aud = std::make_shared<nzr::audio::NzAudioPred>();
-    // Same flag byte as at the -cc site above: -co (p0 5) is the one codec of
-    // the three whose bit 4 is SET, so it is the one that runs FUN_08096e20
-    // (the LMS) instead of FUN_08096160 -- and reads two 3-bit shifts biased
-    // +7 rather than two 4-bit shifts biased +0x10.
-    aud->SetContextFlags(legacy.legacy_method_p0 == 5u ? 0x13u : 0x03u);
-    if (legacy.legacy_method_p0 == 5u) { aud->SetPlaneOrders(64u, 8u, 8u); aud->SetStereoParam(4u); aud->SetBitcountVariantB(true); }   // -co
-    else                               { aud->SetPlaneOrders(96u, 8u, 8u); aud->SetStereoParam(8u); }   // -cO
+    // One image model per entry as well (decr_param 3); never reset.
+    auto img = std::make_shared<nzr::audio::NzImageModel>();
+    ConfigureOptimumModels(legacy.legacy_method_p0, *aud, *img);
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *exe, out);
+        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *exe, out);
+        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     }
 
