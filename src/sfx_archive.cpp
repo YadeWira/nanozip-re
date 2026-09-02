@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -40,6 +41,8 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <utime.h>
 #endif
 
 namespace nz {
@@ -507,6 +510,32 @@ fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
     return ch::time_point_cast<fs::file_time_type::duration>(sys_tp - now_sys + now_ft);
 }
 
+// Create an extracted file exactly the way the original does: a single
+// open(O_WRONLY|O_CREAT|O_TRUNC) whose mode argument is the mode stored in the
+// archive, and no chmod afterwards.  That distinction is observable -- the
+// kernel applies the umask and drops S_ISUID/S_ISGID at creation, so an archived
+// 04755 lands as 0755, while a post-hoc chmod would restore the setuid bit the
+// original does not.  An archive with no permission record (which is also what
+// -np and an all-0600 input produce) uses the original's own default of 0600.
+bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
+                        std::uint32_t mode) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                          static_cast<mode_t>(mode & 07777u));
+    if (fd < 0) {
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < n) {
+        const ssize_t w = ::write(fd, data + written, n - written);
+        if (w <= 0) {
+            ::close(fd);
+            return false;
+        }
+        written += static_cast<std::size_t>(w);
+    }
+    return ::close(fd) == 0;
+}
+
 bool ApplyExtractedMetadata(
     const fs::path& path,
     bool has_permissions,
@@ -719,8 +748,10 @@ bool BuildSourceList(
 std::string FormatChecksum(ChecksumMode mode, std::uint32_t checksum) {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
+    // The original always prints 8 hex digits, narrow modes included
+    // (a crc16 of 0x3935 lists as "00003935").
     if (mode == ChecksumMode::kCrc16 || mode == ChecksumMode::kFletcher16) {
-        oss << std::setw(4) << (checksum & 0xffffu);
+        oss << std::setw(8) << (checksum & 0xffffu);
     } else if (mode == ChecksumMode::kNone) {
         oss << "----";
     } else {
@@ -763,8 +794,13 @@ std::string FormatMtime(std::int64_t unix_seconds) {
 // mtime is 1788282000 (12:00:00 local, -0500) is stored as 1788300000, and the
 // original lists it back as "12:00:00". Adding the offset recovers the true epoch,
 // after which plain localtime reproduces the original's output.
-std::string FormatMtimeStored(std::int64_t stored) {
-    if (stored <= 0) return FormatMtime(stored);
+// A legacy archive stores a file's mtime as its LOCAL wall clock reinterpreted
+// as UTC, so the value has to be shifted back by the zone offset both to print
+// it and to restore it.  Getting this wrong is invisible in a listing that is
+// only compared against itself: it shows up as a whole-hours skew against the
+// original.
+std::int64_t LegacyStoredMtimeToUnix(std::int64_t stored) {
+    if (stored <= 0) return stored;
     const std::time_t t = static_cast<std::time_t>(stored);
     std::tm tmv{};
 #if defined(_WIN32)
@@ -774,7 +810,24 @@ std::string FormatMtimeStored(std::int64_t stored) {
     localtime_r(&t, &tmv);
     const long off = tmv.tm_gmtoff;
 #endif
-    return FormatMtime(stored + static_cast<std::int64_t>(off));
+    return stored + static_cast<std::int64_t>(off);
+}
+
+std::string FormatMtimeStored(std::int64_t stored) {
+    if (stored <= 0) return FormatMtime(stored);
+    return FormatMtime(LegacyStoredMtimeToUnix(stored));
+}
+
+// The original restores a timestamp with utime(), which takes whole seconds and
+// leaves the access time at "now".  Going through std::filesystem instead lands
+// a fractional nanosecond part that a byte-exact tree comparison catches.
+bool SetExtractedMtime(const fs::path& path, std::int64_t stored) {
+    const std::int64_t real = LegacyStoredMtimeToUnix(stored);
+    if (real <= 0) return true;
+    struct utimbuf tb;
+    tb.actime = std::time(nullptr);
+    tb.modtime = static_cast<std::time_t>(real);
+    return ::utime(path.c_str(), &tb) == 0;
 }
 
 std::string HumanBytes(std::uint64_t bytes) {
@@ -1219,6 +1272,12 @@ struct LegacyCnEntry {
     std::uint64_t size = 0;
     std::uint32_t checksum = 0;
     bool has_checksum = false;
+    // Set when the archive stores checksums but this file has none of its own:
+    // a parallel (-pN) container splits a big file across streams and each
+    // stream checksums only its slice, so no whole-file value exists. The
+    // original lists such a file as "n/a"; verifying the file against a slice
+    // checksum would fail every time.
+    bool checksum_na = false;
     std::uint32_t permissions = 0;
     bool has_permissions = false;
     std::int64_t mtime_unix = 0;
@@ -1567,6 +1626,145 @@ void WriteLegacyVarint(std::uint64_t value, std::vector<unsigned char>* out_byte
             out_bytes->push_back(chunk);
         }
     }
+}
+
+std::uint32_t ReadU32LE(const unsigned char* p);
+// Per-file attributes carried by the container's metadata records.  A legacy
+// archive is a flat sequence of [varint (size<<4)|type][payload] records, and
+// the files are handed to the compressor in BLOCKS: each block contributes a
+// type-1 filename table followed by the type-2/type-4 records for exactly that
+// table's files, while the type-5/6/7 checksum records form one running list
+// across the whole archive (a block emits the checksums of the files its data
+// record completes, which is why a block's checksum count need not match its
+// own table).  Validated against the original linux32 binary on 40+ synthesised
+// archives (1..200 files, single- and multi-block, every checksum mode,
+// -nt/-np, setuid/sticky modes).
+//
+//   type 2  timestamps  [u32le mtime of the record's first file] then a zigzag
+//                       bounded-varint delta per further file, until the record
+//                       ends.  Absent with -nt.
+//   type 4  permissions a sequence of u16le values V, each covering a run of
+//                       consecutive files:
+//                         V <  0x1000  ->  one file, mode = V
+//                         V >= 0x1000  ->  run of ((V >> 9) - 6) files,
+//                                          mode = V & 0x1ff
+//                       The ranges are disjoint because the encoder only
+//                       collapses a run when mode < 0x200, which is also why a
+//                       repeated setuid/sticky mode is written once per file.
+//                       Max run is 121, so 200 equal modes encode as 121 + 79.
+//                       The record is absent with -np and also when every mode
+//                       is 0600 -- such an archive is byte-identical to the -np
+//                       one, so absence means "no permissions stored", not
+//                       "default permissions", and the original then drops the
+//                       perm column from `l` and creates files with mode 0600.
+//   type 5/7 checksums  u32le per file  (5 = fletcher, 7 = crc32)
+//   type 6  checksums   u16le per file  (crc16).  Absent with -hn.
+//
+// Returns true only when every record parsed AND each attribute that appears at
+// all covers exactly one value per entry.  It never guesses: on false nothing
+// is written, so callers fall back to the older per-shape heuristics and, more
+// importantly, no half-parsed checksum can be mistaken for a real one.
+bool ApplyLegacyAttributeRecords(
+    const std::vector<unsigned char>& bytes,
+    const std::vector<std::array<std::size_t, 3>>& records,  // {type, begin, end}
+    const std::set<std::string>& split_paths,
+    std::vector<LegacyCnEntry>* entries) {
+    if (entries == nullptr || entries->empty()) {
+        return false;
+    }
+    const std::size_t n = entries->size();
+    std::vector<std::int64_t> mtimes;
+    std::vector<std::uint32_t> perms;
+    std::vector<std::uint32_t> checksums;
+
+    for (const auto& rec : records) {
+        const unsigned rtype = static_cast<unsigned>(rec[0]);
+        const std::size_t rbegin = rec[1];
+        const std::size_t rend = rec[2];
+        if (rbegin > rend || rend > bytes.size()) return false;
+        const std::size_t rsize = rend - rbegin;
+
+        switch (rtype) {
+            case 2u: {
+                if (rsize < 4u) return false;
+                std::size_t p = rbegin;
+                std::int64_t cur = static_cast<std::int64_t>(ReadU32LE(bytes.data() + p));
+                p += 4u;
+                if (mtimes.size() >= n) return false;
+                mtimes.push_back(cur);
+                while (p < rend) {
+                    std::uint64_t z = 0u;
+                    if (!ReadLegacyVarint(bytes, &p, rend, &z)) return false;
+                    cur += static_cast<std::int64_t>(z >> 1u) ^ -static_cast<std::int64_t>(z & 1u);
+                    if (mtimes.size() >= n) return false;
+                    mtimes.push_back(cur);
+                }
+                if (p != rend) return false;
+                break;
+            }
+            case 4u: {
+                if ((rsize % 2u) != 0u) return false;
+                for (std::size_t p = rbegin; p + 1u < rend; p += 2u) {
+                    const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
+                                            (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                    std::uint32_t mode = v;
+                    std::size_t run = 1u;
+                    if (v >= 0x1000u) {
+                        const std::uint32_t coded = v >> 9u;
+                        if (coded < 8u) return false;
+                        run = static_cast<std::size_t>(coded - 6u);
+                        mode = v & 0x1ffu;
+                    }
+                    if (run > n - perms.size()) return false;
+                    perms.insert(perms.end(), run, mode);
+                }
+                break;
+            }
+            case 5u:
+            case 6u:
+            case 7u: {
+                const std::size_t width = (rtype == 6u) ? 2u : 4u;
+                if (rsize == 0u || (rsize % width) != 0u) return false;
+                if (checksums.size() + rsize / width > n) return false;
+                for (std::size_t p = rbegin; p < rend; p += width) {
+                    checksums.push_back(
+                        (width == 2u)
+                            ? (static_cast<std::uint32_t>(bytes[p]) |
+                               (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
+                            : ReadU32LE(bytes.data() + p));
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // Partial coverage means the layout was not the one described above; treat
+    // it as not understood rather than filling some entries and not others.
+    if ((!mtimes.empty() && mtimes.size() != n) ||
+        (!perms.empty() && perms.size() != n) ||
+        (!checksums.empty() && checksums.size() != n)) {
+        return false;
+    }
+    if (mtimes.empty() && perms.empty() && checksums.empty()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        LegacyCnEntry& e = (*entries)[i];
+        if (!mtimes.empty()) { e.mtime_unix = mtimes[i]; e.has_mtime = true; }
+        if (!perms.empty()) { e.permissions = perms[i]; e.has_permissions = true; }
+        if (!checksums.empty()) {
+            if (split_paths.count(e.path) != 0u) {
+                e.checksum_na = true;  // slice checksum, not this file's
+            } else {
+                e.checksum = checksums[i];
+                e.has_checksum = true;
+            }
+        }
+    }
+    return true;
 }
 
 // Walk a multi-block "stored" (-cn, method_p0==0) payload. NanoZip splits a
@@ -2770,10 +2968,24 @@ bool TryParseLegacyCnArchive(
     std::uint32_t cm_window_size = 1024u * 1024u;
     std::size_t table_start = 0u, table_end = 0u;
     bool found_codec = false, found_table = false;
+    // Every main-stream filename table, in order. A multi-file archive hands
+    // its files to the compressor in blocks and emits one table per block, so
+    // reading only the first one loses every file after the first block.
+    std::vector<std::pair<std::size_t, std::size_t>> main_tables;
+    // Main-stream per-file attribute records ({type, begin, end}), in order.
+    std::vector<std::array<std::size_t, 3>> attr_records;
+    // Start of the first main-stream type-0 record == end of the leading
+    // metadata run (the offset the single-file path uses as payload_start).
+    std::size_t first_data_record = 0u;
+    bool found_first_data = false;
     // Accumulated file sizes across all per-stream type-1 tables.
     std::map<std::string, std::uint64_t> size_accum;
+    // Which streams' tables mention each path; more than one means the file is
+    // split across parallel streams and has no whole-file checksum.
+    std::map<std::string, std::set<unsigned>> path_streams;
 
     for (int guard = 0; guard < 1024 && pos < bytes.size(); ++guard) {
+        const std::size_t record_begin = pos;
         std::uint64_t r64 = 0u;
         if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) break;
         auto r = static_cast<std::uint32_t>(r64);
@@ -2803,6 +3015,17 @@ bool TryParseLegacyCnArchive(
             if      (ctype == 5u || ctype == 20u) checksum_mode = ChecksumMode::kFletcher32;
             else if (ctype == 6u || ctype == 21u) checksum_mode = ChecksumMode::kCrc16;
             else if (ctype == 7u || ctype == 22u) checksum_mode = ChecksumMode::kCrc32;
+        }
+
+        // Per-file attribute records, and the first data record after them.
+        if (is_main && found_codec) {
+            if (csize > 0u && (ctype == 2u || ctype == 4u || ctype == 5u ||
+                               ctype == 6u || ctype == 7u)) {
+                attr_records.push_back({static_cast<std::size_t>(ctype), pos, pos + csize});
+            } else if (ctype == 0u && !found_first_data) {
+                first_data_record = record_begin;
+                found_first_data = true;
+            }
         }
 
         // Codec params: type 11, main stream.  Payload: [p0] [p1] [extras...].
@@ -2842,14 +3065,19 @@ bool TryParseLegacyCnArchive(
                 std::string fname(
                     bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it);
                 size_accum[fname] += fsize;
+                path_streams[fname].insert(cstream);
                 tp = static_cast<std::size_t>(
                     std::distance(bytes.begin(), nul_it)) + 1u;
             }
-            // Record the first main-stream type-1 chunk as the canonical table.
-            if (found_codec && is_main && !found_table) {
-                table_start = pos;
-                table_end   = pos + csize;
-                found_table = true;
+            // Record the first main-stream type-1 chunk as the canonical table,
+            // and keep every one of them for the multi-block entry build.
+            if (found_codec && is_main) {
+                if (!found_table) {
+                    table_start = pos;
+                    table_end   = pos + csize;
+                    found_table = true;
+                }
+                main_tables.push_back({pos, pos + csize});
             }
             pos += csize;
         }
@@ -2883,8 +3111,16 @@ bool TryParseLegacyCnArchive(
     }
 
     std::vector<LegacyCnEntry> entries;
-    std::size_t p = table_start;
     std::uint64_t total_data_size = 0;
+    // Walk every main-stream filename table, in order. A single-block archive
+    // has exactly one; a multi-block one has a table per block and its later
+    // files live only in the later tables. A parallel (-pN) container repeats a
+    // filename across streams, so a path already seen is skipped rather than
+    // duplicated -- its true size is restored from size_accum below.
+    std::set<std::string> seen_paths;
+    for (const auto& table_span : main_tables) {
+    std::size_t p = table_span.first;
+    const std::size_t table_end = table_span.second;
     while (p < table_end) {
         std::uint64_t file_size = 0;
         if (!ReadLegacyVarint(bytes, &p, table_end, &file_size)) {
@@ -2916,6 +3152,9 @@ bool TryParseLegacyCnArchive(
             }
             return false;
         }
+        if (!seen_paths.insert(e.path).second) {
+            continue;  // same file, another stream's slice
+        }
         total_data_size += file_size;
         if (native_store_payload && total_data_size > bytes.size()) {
             if (out_error_message != nullptr) {
@@ -2926,7 +3165,15 @@ bool TryParseLegacyCnArchive(
         entries.push_back(std::move(e));
     }
 
-    if (p != table_end || entries.empty()) {
+    if (p != table_end) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+    }  // for each main-stream table
+
+    if (entries.empty()) {
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
         }
@@ -3089,6 +3336,20 @@ bool TryParseLegacyCnArchive(
     std::size_t metadata_end = bytes.size();
     std::size_t payload_start = bytes.size();
 
+    // Preferred path: walk the metadata run as the record sequence it actually
+    // is (see ParseLegacyMetadataRun). This is the only path that reads
+    // per-entry checksums for MULTI-file archives -- without them the per-entry
+    // verification in RunLegacyCnExtractOrTest is skipped, which used to let a
+    // wrong decode be written out silently. When the walk does not fully
+    // understand the run we fall through to the older per-shape heuristics.
+    std::set<std::string> split_paths;
+    for (const auto& kv : path_streams) {
+        if (kv.second.size() > 1u) split_paths.insert(kv.first);
+    }
+    const bool metadata_run_parsed =
+        ApplyLegacyAttributeRecords(bytes, attr_records, split_paths, &entries);
+    const std::size_t run_metadata_end = first_data_record;
+
     // For stored payloads (-cn) that split across several blocks, the raw file
     // bytes are not a contiguous tail of the archive, so we assemble them here.
     bool store_multiblock = false;
@@ -3152,8 +3413,9 @@ bool TryParseLegacyCnArchive(
         }
         if (!store_multiblock) {
 
-        // Parse checksums from the end of metadata.
-        const std::size_t checksum_bytes_per_file =
+        // Parse checksums from the end of metadata.  Only needed when the
+        // record walk above did not already provide them.
+        const std::size_t checksum_bytes_per_file = metadata_run_parsed ? 0u :
             (checksum_mode == ChecksumMode::kCrc16) ? 2u :
             (checksum_mode == ChecksumMode::kNone) ? 0u : 4u;
 
@@ -3201,7 +3463,16 @@ bool TryParseLegacyCnArchive(
         fprintf(stderr, "\n");
     }
     // Best-effort metadata extraction (single-file path is the most reliable).
-    if (entries.size() == 1u && metadata_end > metadata_begin) {
+    if (metadata_run_parsed) {
+        // Attributes already filled from the record run. For single-file
+        // compressed families the old path also derived payload_start from the
+        // end of the metadata records; run_metadata_end is that same offset
+        // (the type-0 record header), just located by parsing instead of by
+        // tag sniffing.
+        if (!native_store_payload && entries.size() == 1u && found_first_data) {
+            payload_start = run_metadata_end;
+        }
+    } else if (entries.size() == 1u && metadata_end > metadata_begin) {
         std::size_t mp = metadata_begin;
         if (metadata_end >= mp + 5u && bytes[mp] == 0x42u) {
             entries[0].mtime_unix = static_cast<std::int64_t>(ReadU32LE(bytes.data() + mp + 1u));
@@ -3306,7 +3577,13 @@ bool TryParseLegacyCnArchive(
     // reads neighboring metadata or compressed bytes as if they were
     // checksums and rejects correctly extracted data on mismatch. Better
     // to show 00000000 than to falsely fail extraction.
-    if (multiblock_scanner_added_entries || entries.size() > 1u) {
+    //
+    // ParseLegacyMetadataRun does not guess: it only reports success when the
+    // whole record run parsed and the checksum record covered exactly one
+    // value per entry. When it did, the values are the real ones and the
+    // per-entry verification must run — that verification is what stops a
+    // wrong multi-file decode from being written out silently.
+    if (!metadata_run_parsed && (multiblock_scanner_added_entries || entries.size() > 1u)) {
         checksum_verification_supported = false;
     }
     // Skip this fallback for single-file archives — the tagged scan above
@@ -4298,13 +4575,30 @@ bool TryParseLegacyCnArchive(
 
 int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, std::ostream& os) {
     const bool has_checksum = legacy.checksum_mode != ChecksumMode::kNone;
+    // The original drops a whole column when the archive carries no such
+    // record: -hn removes the checksum, -nt the timestamp, -np the permission
+    // column -- and so does a permission record that the encoder omitted
+    // because every entry was mode 0600 (such an archive is byte-identical to
+    // the -np one).
+    bool has_perm = false;
+    bool has_date = false;
+    for (const LegacyCnEntry& e : legacy.entries) {
+        if (e.has_permissions) has_perm = true;
+        if (e.has_mtime) has_date = true;
+    }
     // Layout matched to the original: archive name, column header, one row per
     // entry, total. It prints no compressor or payload line here.
     os << "Archive: " << legacy.archive_path << '\n';
     if (has_checksum) {
         os << "checksum ";
     }
-    os << "perm yyyy-mmm-dd hh:mm:ss     size  file\n";
+    if (has_perm) {
+        os << "perm ";
+    }
+    if (has_date) {
+        os << "yyyy-mmm-dd hh:mm:ss";
+    }
+    os << "     size  file\n";
 
     std::uint64_t total_size = 0;
     std::size_t total_files = 0;
@@ -4314,13 +4608,21 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
         }
 
         if (has_checksum) {
-            const std::uint32_t shown = e.has_checksum ? e.checksum : 0;
-            os << std::setw(8) << std::left << FormatChecksum(legacy.checksum_mode, shown) << ' ';
+            if (e.checksum_na) {
+                os << "     n/a ";
+            } else {
+                const std::uint32_t shown = e.has_checksum ? e.checksum : 0;
+                os << std::setw(8) << std::left
+                   << FormatChecksum(legacy.checksum_mode, shown) << ' ';
+            }
         }
-        os << std::setw(4) << std::right << FormatMode(e.has_permissions ? e.permissions : 0u) << ' '
-           << FormatMtimeStored(e.has_mtime ? e.mtime_unix : 0)
-           << FormatSizeColumn(e.size) << "  "
-           << e.path << '\n';
+        if (has_perm) {
+            os << std::setw(4) << std::right << FormatMode(e.permissions) << ' ';
+        }
+        if (has_date) {
+            os << FormatMtimeStored(e.mtime_unix);
+        }
+        os << FormatSizeColumn(e.size) << "  " << e.path << '\n';
 
         total_size += e.size;
         ++total_files;
@@ -6150,30 +6452,16 @@ int RunLegacyCnExtractOrTest(
             if (out_path.has_parent_path()) {
                 fs::create_directories(out_path.parent_path(), ec);
             }
-            std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
-            if (!out) {
+            if (!WriteExtractedFile(out_path, ptr, n,
+                                    e.has_permissions ? e.permissions : 0600u)) {
                 os << "Cannot write output file: " << out_path.string() << '\n';
                 ++failed;
                 continue;
             }
-            out.write(reinterpret_cast<const char*>(ptr), static_cast<std::streamsize>(n));
-            if (!out) {
-                os << "Cannot write output file: " << out_path.string() << '\n';
-                ++failed;
-                continue;
-            }
-            out.close();
 
-            std::string metadata_warning;
-            const bool metadata_ok = ApplyExtractedMetadata(
-                out_path,
-                e.has_permissions,
-                e.permissions,
-                e.has_mtime,
-                e.mtime_unix,
-                &metadata_warning);
-            if (!metadata_ok && options.verbose && !metadata_warning.empty()) {
-                os << "Warning: " << metadata_warning << '\n';
+            if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) &&
+                options.verbose) {
+                os << "Warning: cannot apply mtime to " << out_path.string() << '\n';
             }
         }
 
