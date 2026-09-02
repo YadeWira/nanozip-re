@@ -1940,7 +1940,17 @@ bool ParseLegacyParallelStreams(
         } else if (ct == 0u && csz > 0u) {
             st.chunks.emplace_back(p, csz);
         }
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] rec sid=%u ct=%u csz=%zu at %zu\n", sid, ct, csz, p);
         p += csz;
+    }
+    if (std::getenv("NZ_TRACE_PARSTREAM")) {
+        for (const auto& kv : *out_streams) {
+            std::fprintf(stderr, "[PAR] stream %u: osz=%llu(%d) ooff=%llu(%d) cmode=%d chunks=%zu slices=%zu\n",
+                         kv.first, (unsigned long long)kv.second.osz, (int)kv.second.hassz,
+                         (unsigned long long)kv.second.ooff, (int)kv.second.hasoff,
+                         (int)kv.second.cmode, kv.second.chunks.size(), kv.second.slices.size());
+        }
     }
     return !out_streams->empty();
 }
@@ -2068,7 +2078,11 @@ bool TryAssembleParallelStore(
     for (const auto& kv : streams) {
         const LegacyParallelStream& st = kv.second;
         if (st.chunks.empty()) continue;
-        if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone) return false;
+        if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone) {
+            if (std::getenv("NZ_TRACE_PARSTREAM"))
+                std::fprintf(stderr, "[PAR] store: stream %u missing off/sz/cksum\n", kv.first);
+            return false;
+        }
         if (st.ooff > total_size || st.osz > total_size - st.ooff) return false;
 
         std::vector<unsigned char> slice;
@@ -2084,7 +2098,12 @@ bool TryAssembleParallelStore(
                     slice.data(), slice.size());
         covered += st.osz;
     }
-    if (covered != total_size) return false;
+    if (covered != total_size) {
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] store: covered=%llu != total=%llu\n",
+                         (unsigned long long)covered, (unsigned long long)total_size);
+        return false;
+    }
     *out = std::move(assembled);
     return true;
 }
@@ -3358,6 +3377,9 @@ bool TryParseLegacyCnArchive(
 
         if (pos + csize > bytes.size()) break;
         const bool is_main = (cstream == 0u);
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] @%zu ctype=%u cstream=%u csize=%zu codec=%d table=%d\n",
+                         pos, ctype, cstream, (size_t)csize, (int)found_codec, (int)found_table);
 
         // Checksum indicator: zero-payload main-stream chunk.
         // Direct (single-stream): type 5/6/7.
@@ -3427,10 +3449,26 @@ bool TryParseLegacyCnArchive(
                 tp = static_cast<std::size_t>(
                     std::distance(bytes.begin(), nul_it)) + 1u;
             }
-            // Record the first main-stream type-1 chunk as the canonical table,
-            // and keep every one of them for the entry build.
+            // Record the FIRST type-1 chunk as the canonical table, whatever
+            // stream it belongs to, and keep every one of them for the entry
+            // build. This only fixes the metadata/payload BOUNDARY: the entry
+            // list itself is built by walking all_tables with dedup below, so
+            // it stays complete either way.
+            //
+            // Requiring the main stream here was wrong. In a parallel (-pN)
+            // container every worker emits its own self-describing record run
+            // (type 5/11/1/10/2/4/5 then its type-0 data), and the ORDER of
+            // those runs follows thread scheduling, not the stream id. Most of
+            // the time stream 0 goes first; occasionally (about 1 run in 20 for
+            // -cn -p4 on a 1 MB file) all four stream ids are declared up front
+            // and the runs come out 3, 0, 2, 1. Skipping stream 3's table then
+            // adopted stream 0's, which sits AFTER stream 3's 250 KB data
+            // record -- so table_end landed inside the payload and the archive
+            // was rejected with "Data corrupted while reading headers!". The
+            // tables are per-stream copies, and the boundary we want is simply
+            // where the first metadata run ends.
             if (found_codec) {
-                if (is_main && !found_table) {
+                if (!found_table) {
                     table_start = pos;
                     table_end   = pos + csize;
                     found_table = true;
@@ -3462,6 +3500,8 @@ bool TryParseLegacyCnArchive(
     const bool native_store_payload = (method_p0 == 0u);
 
     if (table_end > bytes.size()) {
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] BAIL table_end=%zu > size=%zu\n", (size_t)table_end, bytes.size());
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
         }
@@ -3528,6 +3568,9 @@ bool TryParseLegacyCnArchive(
         path_index.emplace(e.path, entries.size());
         stream_named[table_stream].push_back(entries.size());
         total_data_size += file_size;
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] store size check: total_data_size=%llu size=%zu\n",
+                         (unsigned long long)total_data_size, bytes.size());
         if (native_store_payload && total_data_size > bytes.size()) {
             if (out_error_message != nullptr) {
                 *out_error_message = "Data corrupted while reading headers!";
@@ -3802,6 +3845,10 @@ bool TryParseLegacyCnArchive(
                 break;
             }
         }
+        if (std::getenv("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%zu table_end=%zu prefix_found=%d entries=%zu\n",
+                         (unsigned long long)total_data_size, data_offset, (size_t)table_end,
+                         (int)prefix_found, entries.size());
         if (!prefix_found && entries.size() > 1u) {
             // Parallel store holding several files: the slices are raw, so
             // "decoding" a stream is copying its concatenated chunks.
