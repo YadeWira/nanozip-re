@@ -41,8 +41,10 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/wait.h>
 #include <unistd.h>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <utime.h>
+#endif
 #endif
 
 namespace nz {
@@ -519,6 +521,15 @@ fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
 // -np and an all-0600 input produce) uses the original's own default of 0600.
 bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
                         std::uint32_t mode) {
+#if defined(_WIN32)
+    // Windows has no POSIX mode bits to hand to the open call, and the
+    // original's Windows build does not restore them either.
+    (void)mode;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    if (n != 0u) out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    return static_cast<bool>(out);
+#else
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
                           static_cast<mode_t>(mode & 07777u));
     if (fd < 0) {
@@ -534,6 +545,7 @@ bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::si
         written += static_cast<std::size_t>(w);
     }
     return ::close(fd) == 0;
+#endif
 }
 
 bool ApplyExtractedMetadata(
@@ -824,10 +836,18 @@ std::string FormatMtimeStored(std::int64_t stored) {
 bool SetExtractedMtime(const fs::path& path, std::int64_t stored) {
     const std::int64_t real = LegacyStoredMtimeToUnix(stored);
     if (real <= 0) return true;
+#if defined(_WIN32)
+    // mingw hides the utime() family under -std=c++17 (__STRICT_ANSI__), and
+    // Windows has no whole-second-only stat to be exact against anyway.
+    std::error_code ec;
+    fs::last_write_time(path, UnixToFileTime(real), ec);
+    return !ec;
+#else
     struct utimbuf tb;
     tb.actime = std::time(nullptr);
     tb.modtime = static_cast<std::time_t>(real);
     return ::utime(path.c_str(), &tb) == 0;
+#endif
 }
 
 std::string HumanBytes(std::uint64_t bytes) {

@@ -1,9 +1,17 @@
 #include "nz_sfx/sfx_cli.hpp"
+#include <vector>
+#include <string>
 #include <cstdlib>
 #include <cstdio>
+#include <thread>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <x86intrin.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <cpuid.h>
+#endif
 #include <ctime>
 
 #include <algorithm>
@@ -336,25 +344,83 @@ std::string ProcField(const char* path, const char* key) {
 
 unsigned MeasuredMhz(const std::string& cpuinfo_mhz) {
 #if defined(__i386__) || defined(__x86_64__)
-    struct timespec t0, t1;
-    if (clock_gettime(CLOCK_MONOTONIC, &t0) == 0) {
-        const unsigned long long c0 = __rdtsc();
-        struct timespec req{0, 2000000};   // 2 ms
-        nanosleep(&req, nullptr);
-        const unsigned long long c1 = __rdtsc();
-        if (clock_gettime(CLOCK_MONOTONIC, &t1) == 0) {
-            const double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 +
-                              (double)(t1.tv_nsec - t0.tv_nsec);
-            if (ns > 0.0) return (unsigned)((double)(c1 - c0) * 1000.0 / ns);
-        }
-    }
+    // std::chrono + sleep_for rather than clock_gettime/nanosleep: the latter
+    // pair does not exist on mingw, and this measures the same thing.
+    const auto t0 = std::chrono::steady_clock::now();
+    const unsigned long long c0 = __rdtsc();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const unsigned long long c1 = __rdtsc();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ns = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    if (ns > 0.0) return static_cast<unsigned>(static_cast<double>(c1 - c0) * 1000.0 / ns);
 #endif
     return cpuinfo_mhz.empty() ? 0u : (unsigned)std::strtod(cpuinfo_mhz.c_str(), nullptr);
 }
 
+#if defined(_WIN32)
+// /proc does not exist here, so the same three facts come from CPUID and the
+// Win32 API. Without this the banner every command prints reads
+// "unknown CPU|... MHz|#0|0/0 MB", which looks like a broken build.
+std::string WinCpuBrand() {
+    unsigned regs[4] = {0, 0, 0, 0};
+    if (!__get_cpuid(0x80000000u, &regs[0], &regs[1], &regs[2], &regs[3]) ||
+        regs[0] < 0x80000004u) {
+        return std::string();
+    }
+    char brand[49];
+    brand[48] = '\0';
+    for (unsigned leaf = 0; leaf < 3u; ++leaf) {
+        if (!__get_cpuid(0x80000002u + leaf, &regs[0], &regs[1], &regs[2], &regs[3])) {
+            return std::string();
+        }
+        std::memcpy(brand + leaf * 16u, regs, 16u);
+    }
+    std::string out(brand);
+    // CPUID pads the brand string with leading blanks on many parts.
+    const std::size_t first = out.find_first_not_of(' ');
+    if (first == std::string::npos) return std::string();
+    return out.substr(first, out.find_last_not_of(' ') - first + 1u);
+}
+
+// Physical cores and logical processors, so the "+HT" suffix means the same
+// thing it does on the Linux build.
+void WinCoreCounts(unsigned* physical, unsigned* logical) {
+    *physical = 0u;
+    *logical = 0u;
+    DWORD len = 0;
+    GetLogicalProcessorInformation(nullptr, &len);
+    if (len != 0u) {
+        std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(
+            len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+        if (GetLogicalProcessorInformation(info.data(), &len)) {
+            for (const auto& e : info) {
+                if (e.Relationship != RelationProcessorCore) continue;
+                ++(*physical);
+                ULONG_PTR mask = e.ProcessorMask;
+                while (mask) { *logical += static_cast<unsigned>(mask & 1u); mask >>= 1; }
+            }
+        }
+    }
+    if (*logical == 0u) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        *logical = static_cast<unsigned>(si.dwNumberOfProcessors);
+    }
+    if (*physical == 0u) *physical = *logical;
+    if (*logical == 0u) { *logical = 1u; *physical = 1u; }
+}
+#endif  // _WIN32
+
 }  // namespace
 
 unsigned HostThreadCount() {
+#if defined(_WIN32)
+    unsigned physical = 0, logical = 0;
+    WinCoreCounts(&physical, &logical);
+    if (physical > 32u) physical = 32u;
+    return physical;
+#else
     unsigned logical = 0;
     std::ifstream in("/proc/cpuinfo");
     std::string line;
@@ -368,11 +434,32 @@ unsigned HostThreadCount() {
     const std::string cores    = ProcField("/proc/cpuinfo", "cpu cores");
     if (!siblings.empty() && !cores.empty() && siblings != cores && logical > 1u) logical /= 2u;
     return logical;
+#endif
 }
 
 std::string HostSummaryLine() {
     // "<model>|<MHz> MHz|#<logical>[+HT]|<available>/<total> MB", the second line
     // the original prints under its banner and the only line `info` shares with it.
+#if defined(_WIN32)
+    unsigned physical = 0, logical_w = 0;
+    WinCoreCounts(&physical, &logical_w);
+    if (logical_w > 32u) logical_w = 32u;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    unsigned long long avail_mb = 0, total_mb = 0;
+    if (GlobalMemoryStatusEx(&ms)) {
+        avail_mb = ms.ullAvailPhys / (1024ull * 1024ull);
+        total_mb = ms.ullTotalPhys / (1024ull * 1024ull);
+    }
+    const std::string brand = WinCpuBrand();
+    char wbuf[512];
+    std::snprintf(wbuf, sizeof(wbuf), "%s|%u MHz|#%u%s|%llu/%llu MB",
+                  brand.empty() ? "unknown CPU" : brand.c_str(),
+                  MeasuredMhz(std::string()),
+                  logical_w, (logical_w > physical) ? "+HT" : "",
+                  avail_mb, total_mb);
+    return std::string(wbuf);
+#else
     const std::string model = ProcField("/proc/cpuinfo", "model name");
     const std::string mhz = ProcField("/proc/cpuinfo", "cpu MHz");
     const std::string siblings = ProcField("/proc/cpuinfo", "siblings");
@@ -421,6 +508,7 @@ std::string HostSummaryLine() {
                   static_cast<unsigned long long>((avail_kb + 512u) / 1024u),
                   static_cast<unsigned long long>((total_kb + 512u) / 1024u));
     return std::string(buf);
+#endif
 }
 
 void PrintBanner(std::ostream& os) {
