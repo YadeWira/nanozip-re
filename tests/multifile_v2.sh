@@ -135,9 +135,19 @@ SHAPE_FILES[par1]="shapes/par1/p.bin"
 SHAPE_OPTS[par1]="-p4"
 SHAPES+=(par1)
 
-# NOTE: a parallel container holding SEVERAL files still declines on extract
-# (its per-stream slice framing is not reconstructed); it is deliberately not a
-# shape here, so a green run means green.
+# parN: a parallel container holding SEVERAL files. This is the shape a stream is
+# a worker rather than a file: one stream can carry slices of two different
+# files, one file's slices are spread over several streams, and the type-10
+# offset is relative to the FILE, not the output -- so both files have a slice at
+# offset 0. It is also the shape `nz a -r <folder>` produces for anything over
+# ~8 MB, i.e. an ordinary one.
+mkdir -p "${WORK}/shapes/parN"
+head -c 1200000 /dev/zero | openssl enc -aes-256-ctr -pass pass:nzre-pn -nosalt 2>/dev/null > "${WORK}/shapes/parN/a.bin" \
+  || head -c 1200000 /dev/urandom > "${WORK}/shapes/parN/a.bin"
+{ for i in $(seq 1 20000); do echo "parallel multifile line $i, compressible"; done; } > "${WORK}/shapes/parN/b.txt"
+SHAPE_FILES[parN]="shapes/parN/a.bin shapes/parN/b.txt"
+SHAPE_OPTS[parN]="-p4"
+SHAPES+=(parN)
 
 # All TWELVE compressor selectors the binary's own usage lists, not the eight
 # this project had been measuring: dp/dP/Dp/DP are encoder-parallelism variants

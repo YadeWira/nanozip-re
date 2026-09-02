@@ -1815,6 +1815,20 @@ static bool TryDecodeLegacyCm(const LegacyCnContext& legacy,
                               std::vector<unsigned char>* out_data,
                               std::string* out_error_message);
 
+// One slice of one file inside a parallel (-pN) container. Each stream's record
+// set names its slices as (type-1 table with a single filename+length, type-10
+// offset WITHIN that file) pairs, in the order the stream's data decodes to, and
+// its type-5/6/7 record carries one checksum per slice in that same order.
+struct LegacyParallelSlice {
+    std::string path;
+    std::uint64_t osz = 0;   // this slice's decoded length
+    std::uint64_t ooff = 0;  // where it sits inside its own file
+    ChecksumMode cmode = ChecksumMode::kNone;
+    std::uint32_t cval = 0;
+    bool hasoff = false;
+    bool has_cksum = false;
+};
+
 // One stream of a parallel (-pN) container.
 struct LegacyParallelStream {
     // Block-record payload ranges for this stream, in order. Usually one, but
@@ -1824,6 +1838,10 @@ struct LegacyParallelStream {
     ChecksumMode cmode = ChecksumMode::kNone;
     std::uint32_t cval = 0;               // checksum OF THE SLICE, not the file
     bool hasoff = false, hassz = false;
+    // Every slice this stream carries, in order. A single-file archive has one
+    // and the fields above describe it; a multi-file one can have several, of
+    // different files (a stream is a worker, not a file).
+    std::vector<LegacyParallelSlice> slices;
 };
 
 // Detect and parse a parallel container. The encoder splits the input into one
@@ -1872,24 +1890,162 @@ bool ParseLegacyParallelStreams(
         if (ct == 1u && csz >= 2u) {
             std::size_t tp = p;
             std::uint64_t v = 0;
-            if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { st.osz = v; st.hassz = true; }
+            if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) {
+                st.osz = v; st.hassz = true;
+                const auto nul_it = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(tp),
+                                              bytes.begin() + static_cast<std::ptrdiff_t>(p + csz),
+                                              static_cast<unsigned char>(0));
+                if (nul_it != bytes.begin() + static_cast<std::ptrdiff_t>(p + csz)) {
+                    LegacyParallelSlice sl;
+                    sl.path.assign(reinterpret_cast<const char*>(bytes.data() + tp),
+                                   static_cast<std::size_t>(
+                                       std::distance(bytes.begin() + static_cast<std::ptrdiff_t>(tp),
+                                                     nul_it)));
+                    sl.osz = v;
+                    st.slices.push_back(std::move(sl));
+                }
+            }
         } else if (ct == 10u && csz >= 4u) {
             st.ooff = ReadU32LE(bytes.data() + p);
             st.hasoff = true;
-        } else if (ct == 5u && csz == 4u) {
-            st.cmode = ChecksumMode::kFletcher32; st.cval = ReadU32LE(bytes.data() + p);
-        } else if (ct == 7u && csz == 4u) {
-            st.cmode = ChecksumMode::kCrc32; st.cval = ReadU32LE(bytes.data() + p);
-        } else if (ct == 6u && csz == 2u) {
-            st.cmode = ChecksumMode::kCrc16;
-            st.cval = static_cast<std::uint32_t>(bytes[p]) |
-                      (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+            // The offset belongs to the slice its table just introduced.
+            for (auto it = st.slices.rbegin(); it != st.slices.rend(); ++it) {
+                if (!it->hasoff) { it->ooff = st.ooff; it->hasoff = true; break; }
+            }
+        } else if ((ct == 5u || ct == 6u || ct == 7u) && csz > 0u) {
+            const ChecksumMode m = (ct == 5u) ? ChecksumMode::kFletcher32
+                                 : (ct == 6u) ? ChecksumMode::kCrc16
+                                              : ChecksumMode::kCrc32;
+            const std::size_t width = (ct == 6u) ? 2u : 4u;
+            if ((csz % width) == 0u) {
+                std::size_t q = p;
+                for (auto& sl : st.slices) {
+                    if (sl.has_cksum || q + width > p + csz) continue;
+                    sl.cmode = m;
+                    sl.cval = (width == 2u)
+                        ? (static_cast<std::uint32_t>(bytes[q]) |
+                           (static_cast<std::uint32_t>(bytes[q + 1u]) << 8u))
+                        : ReadU32LE(bytes.data() + q);
+                    sl.has_cksum = true;
+                    q += width;
+                }
+            }
+            if (csz == width) {  // the single-file fields the older paths read
+                st.cmode = m;
+                st.cval = (width == 2u)
+                    ? (static_cast<std::uint32_t>(bytes[p]) |
+                       (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
+                    : ReadU32LE(bytes.data() + p);
+            }
         } else if (ct == 0u && csz > 0u) {
             st.chunks.emplace_back(p, csz);
         }
         p += csz;
     }
     return !out_streams->empty();
+}
+
+// Assemble a parallel (-pN) container that holds SEVERAL files.
+//
+// A stream is a worker, not a file: it can carry slices of two different files,
+// and one file's slices can be spread over several streams. Each stream decodes
+// as ONE unit -- its data records form a single chain whose output is the
+// concatenation of its slices in table order -- and every slice then lands at
+// (its file's base in the output) + (its own offset WITHIN that file). The
+// type-10 offset being file-relative rather than output-relative is what makes
+// the single-file tiling paths wrong here: in a two-file archive both files have
+// a slice at offset 0.
+//
+// `decode_stream` turns one stream's concatenated chunk bytes into its declared
+// output length; it is the only codec-specific part. Every slice is checked
+// against its own checksum, so a wrong layout produces nothing rather than
+// wrong bytes.
+template <class DecodeStreamFn>
+bool AssembleParallelMultiFile(
+    const std::vector<unsigned char>& bytes,
+    const std::map<unsigned, LegacyParallelStream>& streams,
+    const std::vector<LegacyCnEntry>& entries,
+    std::uint64_t total,
+    DecodeStreamFn&& decode_stream,
+    std::vector<unsigned char>* out) {
+    if (out == nullptr || entries.size() < 2u || total == 0u ||
+        total > (static_cast<std::uint64_t>(1) << 40)) {
+        return false;
+    }
+    // Files are laid out in the order `entries` holds them, which is also how
+    // the caller splits the assembled buffer back into files.
+    std::map<std::string, std::uint64_t> base;
+    std::uint64_t acc = 0;
+    for (const LegacyCnEntry& e : entries) {
+        if (!base.emplace(e.path, acc).second) return false;  // duplicate path
+        acc += e.size;
+    }
+    if (acc != total) return false;
+
+    std::vector<unsigned char> assembled(static_cast<std::size_t>(total), 0);
+    std::uint64_t covered = 0;
+    for (const auto& kv : streams) {
+        const LegacyParallelStream& st = kv.second;
+        if (st.chunks.empty() || st.slices.empty()) continue;
+
+        std::uint64_t stream_out = 0;
+        for (const LegacyParallelSlice& sl : st.slices) {
+            // A slice with no type-10 record sits at offset 0 -- the encoder
+            // omits it for a slice that is the whole file (observed on a stream
+            // carrying one file's 750 KB head plus another file entire).
+            if (!sl.has_cksum || sl.osz == 0u) return false;
+            if (base.find(sl.path) == base.end()) return false;
+            stream_out += sl.osz;
+        }
+        if (stream_out == 0u || stream_out > total) return false;
+
+        // Every slice must match its own checksum before anything is written,
+        // so a codec that searches candidate parameters has a real gate here.
+        const auto accept = [&](const std::vector<unsigned char>& dec) -> bool {
+            if (dec.size() != stream_out) return false;
+            std::uint64_t cur = 0;
+            for (const LegacyParallelSlice& sl : st.slices) {
+                if (ComputeBufferChecksum(sl.cmode, dec.data() + cur,
+                                          static_cast<std::size_t>(sl.osz)) != sl.cval) {
+                    return false;
+                }
+                cur += sl.osz;
+            }
+            return true;
+        };
+
+        std::vector<unsigned char> decoded;
+        if (!decode_stream(st.chunks, stream_out, accept, &decoded)) return false;
+        if (!accept(decoded)) return false;
+
+        std::uint64_t cursor = 0;
+        for (const LegacyParallelSlice& sl : st.slices) {
+            const std::uint64_t file_base = base.find(sl.path)->second;
+            if (file_base + sl.ooff + sl.osz > total) return false;
+            std::memcpy(assembled.data() + static_cast<std::size_t>(file_base + sl.ooff),
+                        decoded.data() + static_cast<std::size_t>(cursor),
+                        static_cast<std::size_t>(sl.osz));
+            cursor += sl.osz;
+            covered += sl.osz;
+        }
+    }
+    if (covered != total) return false;
+    *out = std::move(assembled);
+    return true;
+}
+
+// Concatenate a stream's data-record payloads into one buffer.
+inline std::vector<unsigned char> ConcatParallelChunks(
+    const std::vector<unsigned char>& bytes,
+    const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
+    std::vector<unsigned char> in;
+    for (const auto& c : chunks) {
+        if (c.first + c.second > bytes.size()) return std::vector<unsigned char>();
+        in.insert(in.end(),
+                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+    }
+    return in;
 }
 
 // Assemble a parallel STORE (-cn) payload: each stream's data record holds its
@@ -3562,6 +3718,44 @@ bool TryParseLegacyCnArchive(
     // verification in RunLegacyCnExtractOrTest is skipped, which used to let a
     // wrong decode be written out silently. When the walk does not fully
     // understand the run we fall through to the older per-shape heuristics.
+    // In a parallel container the file ORDER is not record order: a stream is a
+    // worker, and the first table in the file belongs to whichever worker
+    // started first. The order the original lists (and lays out) is the order of
+    // the stream whose tables name the most distinct files -- the worker that
+    // saw the whole job. Files that stream never names keep their record order
+    // after it. Verified against the original on every parallel multi-file
+    // archive here; a sequential container has one stream and is unaffected.
+    if (has_parallel_streams && entries.size() > 1u) {
+        const std::vector<std::size_t>* best = nullptr;
+        std::size_t best_distinct = 0;
+        for (const auto& kv : stream_named) {
+            std::set<std::size_t> distinct(kv.second.begin(), kv.second.end());
+            if (distinct.size() > best_distinct) { best_distinct = distinct.size(); best = &kv.second; }
+        }
+        if (best != nullptr && best_distinct > 1u) {
+            std::vector<std::size_t> order;
+            std::vector<bool> placed(entries.size(), false);
+            for (std::size_t idx : *best) {
+                if (idx < entries.size() && !placed[idx]) { placed[idx] = true; order.push_back(idx); }
+            }
+            for (std::size_t i = 0; i < entries.size(); ++i)
+                if (!placed[i]) order.push_back(i);
+            if (order.size() == entries.size()) {
+                std::vector<LegacyCnEntry> reordered;
+                reordered.reserve(order.size());
+                std::vector<std::size_t> remap(entries.size(), 0);
+                for (std::size_t k = 0; k < order.size(); ++k) {
+                    remap[order[k]] = k;
+                    reordered.push_back(entries[order[k]]);
+                }
+                entries.swap(reordered);
+                for (auto& kv : stream_named)
+                    for (std::size_t& idx : kv.second)
+                        if (idx < remap.size()) idx = remap[idx];
+            }
+        }
+    }
+
     std::set<std::string> split_paths;
     for (const auto& kv : path_streams) {
         if (kv.second.size() > 1u) split_paths.insert(kv.first);
@@ -3606,6 +3800,27 @@ bool TryParseLegacyCnArchive(
                 prefix_start = s;
                 prefix_found = true;
                 break;
+            }
+        }
+        if (!prefix_found && entries.size() > 1u) {
+            // Parallel store holding several files: the slices are raw, so
+            // "decoding" a stream is copying its concatenated chunks.
+            std::map<unsigned, LegacyParallelStream> pstreams;
+            if (ParseLegacyParallelStreams(bytes, &pstreams) &&
+                AssembleParallelMultiFile(
+                    bytes, pstreams, entries, total_data_size,
+                    [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                        std::uint64_t out_size,
+                        const std::function<bool(const std::vector<unsigned char>&)>&,
+                        std::vector<unsigned char>* dst) {
+                        *dst = ConcatParallelChunks(bytes, chunks);
+                        return dst->size() == out_size;
+                    },
+                    &store_blocks_buffer)) {
+                store_multiblock = true;
+                metadata_end = table_end;
+                payload_start = table_end;
+                prefix_found = true;
             }
         }
         if (!prefix_found && entries.size() == 1u &&  // see the offset note below
@@ -4338,6 +4553,138 @@ bool TryParseLegacyCnArchive(
                 // record chain, decode it with a fresh context, and tile by the
                 // type-10 offsets. Every slice is checked against its own
                 // checksum, so a wrong layout cannot produce output.
+                // Parallel container holding SEVERAL files: one generic path
+                // for every codec, differing only in how a stream's chunk chain
+                // is turned into that stream's output. See
+                // AssembleParallelMultiFile for why the single-file tiling paths
+                // below cannot be reused.
+                if (!native_literal_payload && has_parallel_streams && entries.size() > 1u) {
+                    std::map<unsigned, LegacyParallelStream> pstreams;
+                    if (ParseLegacyParallelStreams(bytes, &pstreams) && pstreams.size() > 1u) {
+                        std::vector<unsigned char> assembled;
+                        bool got = false;
+                        if (method == 0x4bu && method_p0 == 7u) {
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    LegacyCnContext sub;
+                                    sub.legacy_method = method;
+                                    sub.legacy_method_p0 = method_p0;
+                                    sub.legacy_method_p1 = method_p1;
+                                    sub.cm_a_bits = cm_a_bits;
+                                    sub.cm_b_bits = cm_b_bits;
+                                    sub.cm_window_size = cm_window_size;
+                                    sub.total_data_size = out_size;
+                                    for (const auto& c : chunks) {
+                                        WriteLegacyVarint(
+                                            static_cast<std::uint64_t>(c.second) << 4u, &sub.data);
+                                        sub.data.insert(
+                                            sub.data.end(),
+                                            bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                            bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                    }
+                                    std::string err;
+                                    return TryDecodeLegacyCm(sub, dst, &err);
+                                },
+                                &assembled);
+                        } else if (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) {
+                            // Each type-0 chunk IS one delimited nz_cd block, so
+                            // they are decoded one at a time threading a ring
+                            // that is fresh PER STREAM (each worker owned its
+                            // own instance), sized from that stream's output.
+                            const bool s_is_lzhds = (method_p0 == 4u);
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    std::uint32_t units = static_cast<std::uint32_t>(
+                                        (out_size + 0x8000u) / 0x10000u);
+                                    if (units == 0u) units = 1u;
+                                    const std::uint32_t ring_size = units * 0x10000u;
+                                    std::vector<std::uint8_t> ring(ring_size, 0u);
+                                    std::uint32_t ring_pos = 0u;
+                                    std::vector<std::uint8_t> ctx;
+                                    std::uint32_t ctx_index = 0u;
+                                    std::uint8_t* ctx_ptr = nullptr;
+                                    if (s_is_lzhds) {
+                                        ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+                                        nzr::cd::NzLzhdsInitCtxTable(ctx.data());
+                                        ctx_ptr = ctx.data();
+                                    }
+                                    dst->assign(static_cast<std::size_t>(out_size), 0u);
+                                    std::size_t written = 0u;
+                                    for (const auto& c : chunks) {
+                                        if (written >= out_size) break;
+                                        const std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+                                            bytes.data() + c.first,
+                                            static_cast<std::uint32_t>(c.second),
+                                            dst->data() + written,
+                                            static_cast<std::uint32_t>(out_size - written),
+                                            ring.data(), ring_size, &ring_pos,
+                                            static_cast<std::uint32_t>(written),
+                                            s_is_lzhds, ctx_ptr, &ctx_index);
+                                        if (produced == 0u) return false;
+                                        written += produced;
+                                    }
+                                    return written == out_size;
+                                },
+                                &assembled);
+                        } else if (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u)) {
+                            const std::uint32_t wcap =
+                                nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
+                            got = (wcap != 0u) && AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    const std::vector<unsigned char> in =
+                                        ConcatParallelChunks(bytes, chunks);
+                                    if (in.empty()) return false;
+                                    nzr::audio::NzAudioPred aud;
+                                    NzExeFilter exe;
+                                    if (method_p0 == 5u) {
+                                        nzr::optimum::NzOptimumLzDecoder dec(wcap);
+                                        return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
+                                                                          out_size, dec, aud, exe, dst);
+                                    }
+                                    nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
+                                    return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
+                                                                      out_size, dec, aud, exe, dst);
+                                },
+                                &assembled);
+                        } else if (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) {
+                            const bool vb = (method_p0 == 2u);
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>& accept,
+                                    std::vector<unsigned char>* dst) {
+                                    const std::vector<unsigned char> in =
+                                        ConcatParallelChunks(bytes, chunks);
+                                    if (in.empty()) return false;
+                                    return DecodeLzpfMember(in, 0u, in.size(), out_size, vb,
+                                                            method_p1, /*derived_cap_only=*/false,
+                                                            accept, dst);
+                                },
+                                &assembled);
+                        }
+                        if (got && validate_decoded_candidate(assembled)) {
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
                 if (!native_literal_payload && method == 0x4bu && method_p0 == 7u &&
                     entries.size() == 1u) {  // see the offset note above
                     std::map<unsigned, LegacyParallelStream> pstreams;
