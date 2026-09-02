@@ -29,17 +29,19 @@ file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
 | `-cF` (lzpf B)     | 12/12 | `-co` (optimum1)    | 12/12 |
 | `-cc` (cm)         | 12/12 | `-cO` (optimum2)    | 12/12 |
 
-**96/96 (100%) byte-exact native, zero bridge** on this fixture set — see the correction below for what a
-wider real-world sample says about `-cO`. The whole post-filter chain is native — param2, param1, all
-six text-transform bits that were known to be emitted (bit `0x40` is a seventh, and is NOT ported — see
-below), and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
+**96/96 (100%) byte-exact native, zero bridge** on this fixture set — see the wide real-world sweep
+below for the numbers that actually characterise the decode. The whole post-filter chain is native —
+param2, param1, **all seven** text-transform bits the encoder emits (including `0x40`, the PGN/chess
+transform, which the community reference never implemented either),
+and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
 output, the 256-bucket MTF/arithmetic entropy layer, and buckets the encoder stored verbatim) with the BWT-only
 `param14`/`param15` follow-ons.
 
-On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-`-cn` 60 · `-cf` 60 · `-cF` 60 · `-cd` 60 · `-cD` 60 · `-co` 60 · `-cc` 60 · `-cO` 59 — **479/480 overall**.
+On a 61-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
+**488/488**, every codec 61/61. That corpus is now saturated, so it cannot detect anything on its own —
+the honest figure comes from the wider sweep below.
 
 `tests/multifile_v2.sh` covers what neither of those can: they build **one-file** archives and compare **one**
 extracted file. It runs **all twelve** compressor selectors the binary's own usage lists — `-cdp`/`-cdP`/`-cDp`/`-cDP`
@@ -49,6 +51,12 @@ the metadata switches and 72 listings. Each shape forces a different branch: dis
 70 equal modes, setuid/sticky, an all-0600 input (whose permission record the encoder omits entirely), a
 multi-block mix, a `-r` recursive tree, a `-p4` single-file container and a `-p4` **multi-file** one.
 **108/108 extract · 36/36 switches · 12/12 in a bare user environment · 72/72 listings.**
+
+That suite is also where a *flaky* case turned out to be a real defect. NanoZip is multi-threaded by
+default, and each worker writes its own self-describing record run into the container — in
+**thread-scheduling order**, not stream order. About one archive in twenty came out with the runs
+reordered, which this decoder rejected outright as a corrupt header. A flaky test is a defect report:
+re-running until green would have buried a layout that a user hits 5% of the time.
 
 ### Measured the way a user runs it
 
@@ -73,23 +81,40 @@ entry, not per call** — a valid decode needs exactly 8 bit decodes per output 
 the chunks are cut, and a per-call bound still lets a corrupt header multiply the work by inventing
 chunks.
 
-### Known decode failures — and an honest correction
+### Known decode failures, on a corpus large enough to measure them
 
-The 60-file corpus above says `-cO` 59/60. **That number was unrepresentative.** Sweeping 200 fresh real
-files (document/text/image, 80 KB–900 KB) found **15 failures under `-cO`, about 7.5%** — the small corpus
-happened to contain exactly one, which made a common bug look like a curiosity. The original round-trips all
-of them losslessly, so they are ours. Two distinct bugs are behind them:
+A 61-file corpus at 488/488 proves nothing by itself; an earlier release quoted one at 479/480 while
+`-cO` was in fact failing about **7.5% of real files**, because that corpus happened to contain exactly
+one of them. The figure below therefore comes from a **fresh 155-file real-world corpus** (63 MB across
+eight format categories), swept with all eight codecs: **1221/1240 byte-exact, zero bridge**.
 
-- **optimum2's literal model** (13 of the 15 fail under `-cO` only; one also under `-co`). The first wrong
-  byte is a literal whose *first decoded bit* is wrong, with tens of thousands of byte-exact bytes on either
-  side — the signature of a probability that is very slightly off. Refuted with evidence: the ring wrap and
-  eviction (disabling the wrap entirely still fails), the history-prefix source, resolving underflowing
-  matches modulo the high-water mark, the wrap's `rep[]`/LZP resets, and the mixer's rare clamp branches.
-- **Text-transform bit `0x40` is not ported.** One file (chess notation) fails under `-cd`, `-cD`, `-co`,
-  `-cO` *and* `-cc` while passing `-cn`/`-cf`/`-cF` — the signature of a shared path. It is
-  `TransformText_6` in the reference dispatcher, whose body there is `assert(0)`, so the community decoder
-  never implemented it either. Any claim elsewhere that all the text-transform bits are native should be
-  read as "the six that were known"; this is a seventh, and it is reachable on ordinary text.
+| method | pass | fail | | method | pass | fail |
+|--------|------|------|---|--------|------|------|
+| `-cn`  | 155  | 0    | | `-cd`  | 149  | 6    |
+| `-cf`  | 154  | 1    | | `-cD`  | 147  | 8    |
+| `-cF`  | 154  | 1    | | `-co`  | 154  | 1    |
+| `-cc`  | 154  | 1    | | `-cO`  | 154  | 1    |
+
+The 19 failures are **two causes**, and neither writes wrong bytes — both decline, and the second is
+caught by the archive's own per-file checksum:
+
+- **An image model for uncompressed BMPs is not ported** (7 of the 19). One 24-bit BMP fails every
+  codec except `-cn`. Destroy its `BM` magic and every codec passes; strip its 54-byte header and every
+  codec passes; the file extension is irrelevant, and the archive is 3.4% smaller with the magic intact.
+  So NanoZip detects the bitmap and routes it through a model none of these ports implement. The
+  detector itself is fully mapped (24-bit RGB, or 8-bit with an identity grayscale palette, either way
+  needing width and height above 127).
+- **A `-cd`/`-cD` prefilter-chunk bug** (12 of the 19). Five audio/geometry files fail both and two more
+  fail only `-cD`, while every other codec decodes all of them. These produce the full output and are
+  rejected by the stored checksum.
+
+`-cO`'s own literal model — the long-standing failure this project quoted for months — is **closed**. It
+was two ring-lifetime bugs: the wrap's LZP-table sweep started 64 bytes too low, leaving its last 16
+entries uncleared for the life of the archive, and the window-feed path collapsed four cases into one, so
+a feed crossing the ring end left the cursor in the wrong place and skipped the reset. Because that table
+feeds exactly one of eight mixer inputs, a stale entry moved a single probability by about 1% and flipped
+a bit only where the coder already sat on a decision boundary — one wrong byte with tens of thousands of
+byte-exact bytes on either side.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
