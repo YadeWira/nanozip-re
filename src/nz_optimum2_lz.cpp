@@ -278,6 +278,10 @@ inline std::uint32_t DecodeAdaptive16(RangeDecoder& rc, std::uint8_t* mem, int o
     return DecodeAdaptiveKSB(rc, mem, off, 0x10u, 5u, /*bias=*/true);
 }
 
+// Current ring position, for the rare-branch profiler only (the mixer lambda is
+// nested too deep to see the loop's own counter).
+static std::uint32_t g_rare_pos = 0;
+
 inline std::uint8_t& RingAt(std::uint8_t* base, std::uint32_t logical_pos) {
     return base[static_cast<std::int32_t>(logical_pos)];
 }
@@ -409,6 +413,28 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         std::int32_t sq = (dot >> 16) + 0x800;
         std::uint32_t sqU = (sq < 0) ? 0u : static_cast<std::uint32_t>(sq);
         std::uint32_t sqMin = (sqU < 0xfffu) ? sqU : 0xfffu;
+        // Rare-branch profiling: a probability that is only SLIGHTLY wrong flips a
+        // bit exactly where the coder sits near a decision boundary and nowhere
+        // else, which is what this file does. So the suspect is a branch that
+        // almost never fires. Count each and record where it first does.
+        if (const char* rb = std::getenv("NZO2_RAREBRANCH")) {
+            static long n_neg = 0, n_clamp = 0, n_pfix = 0, n_tot = 0;
+            static std::uint32_t first_neg = 0, first_clamp = 0;
+            ++n_tot;
+            if (sq < 0) { if (!n_neg) first_neg = g_rare_pos; ++n_neg; }
+            if (sqU >= 0xfffu) {
+                if (!n_clamp) first_clamp = g_rare_pos;
+                ++n_clamp;
+                if (std::getenv("NZO2_RAREBRANCH_EVERY"))
+                    std::fprintf(stderr, "[RARE] CLAMP #%ld at pos=%u sq=%d dot=%d\n",
+                                 n_clamp, g_rare_pos, sq, dot);
+            }
+            if (n_tot % 2000000 == 0 || std::getenv("NZO2_RAREBRANCH_EVERY")) {
+                std::fprintf(stderr, "[RARE] bits=%ld sq<0=%ld (first pos %u) sq>=0xfff=%ld (first pos %u)\n",
+                             n_tot, n_neg, first_neg, n_clamp, first_clamp);
+            }
+            (void)rb; (void)n_pfix;
+        }
         std::uint32_t scaled = sqMin * 0xbu;
         std::uint16_t apmSeed = Optimum2Dat081732c0()[sqMin >> 4];
         std::uint32_t frac = scaled & 0xfffu;
@@ -434,6 +460,13 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
             std::int64_t t1 = (static_cast<std::int64_t>(inputs[i]) * err * 16) >> 16;
             std::int64_t delta = (t1 + 1) >> 1;
             std::int64_t nv = delta + w[i];
+            if (std::getenv("NZO2_RAREBRANCH") && (nv < -32768 || nv > 32767)) {
+                static long n_wclamp = 0;
+                ++n_wclamp;
+                if (std::getenv("NZO2_RAREBRANCH_EVERY"))
+                    std::fprintf(stderr, "[RARE] WCLAMP #%ld at pos=%u w[%d] nv=%lld\n",
+                                 n_wclamp, g_rare_pos, i, (long long)nv);
+            }
             std::int16_t clamped = (nv < -32768) ? static_cast<std::int16_t>(-32768)
                                   : (nv > 32767)  ? static_cast<std::int16_t>(32767)
                                                    : static_cast<std::int16_t>(nv);
@@ -725,6 +758,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 Wr16(mem, apm2Near,
                      static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1001e - apm2Old) >> 5) + apm2Old));
 
+                g_rare_pos = local_54;
                 if (getenv("NZOPT2_TRACE")) fprintf(stderr, "pos=%u dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, bit, mixedP, rc.lo, rc.hi, rc.code);
                 if (bit != 0) break;  // literal: fall through to mixer below
 
@@ -962,6 +996,24 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 std::uint32_t srcStart = local_54 - distance;
                 bool underflow = (local_54 < distance);
                 if (underflow) srcStart += ring_.capacity;
+                // Measure the true source mapping instead of guessing at it:
+                // on the FIRST underflowing match after a wrap, dump the ring
+                // plus this match's parameters, so the correct bytes can be
+                // located in the ring offline and the mapping read off.
+                if (underflow && ring_.scrolled_once) {
+                    static bool done = false;
+                    if (!done) {
+                        if (const char* up = std::getenv("NZO2_DUMP_UNDERFLOW")) {
+                            done = true;
+                            char rp[512];
+                            std::snprintf(rp, sizeof(rp), "%s.ring", up);
+                            FILE* rf = fopen(rp, "wb");
+                            if (rf) { fwrite(ring_.storage.data(), 1, ring_.storage.size(), rf); fclose(rf); }
+                            fprintf(stderr, "[O2] UNDERFLOW#1 pos=%u dist=%u len=%u chunk_start=%u capacity=%u srcStart_used=%u ring_bytes=%zu base_off=256\n",
+                                    local_54, distance, length, chunk_start, ring_.capacity, srcStart, ring_.storage.size());
+                        }
+                    }
+                }
                 if (distance >= 4u) {
                     std::uint32_t i = 0;
                     for (; i + 4u <= length; i += 4u) std::memcpy(base + local_54 + i, base + srcStart + i, 4);

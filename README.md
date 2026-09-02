@@ -29,8 +29,10 @@ file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
 | `-cF` (lzpf B)     | 12/12 | `-co` (optimum1)    | 12/12 |
 | `-cc` (cm)         | 12/12 | `-cO` (optimum2)    | 12/12 |
 
-**96/96 (100%) byte-exact native, zero bridge.** The whole post-filter chain is native — param2, param1, all
-six text-transform bits, and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
+**96/96 (100%) byte-exact native, zero bridge** on this fixture set — see the correction below for what a
+wider real-world sample says about `-cO`. The whole post-filter chain is native — param2, param1, all
+six text-transform bits that were known to be emitted (bit `0x40` is a seventh, and is NOT ported — see
+below), and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
 codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
 single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
 output, the 256-bucket MTF/arithmetic entropy layer, and buckets the encoder stored verbatim) with the BWT-only
@@ -71,12 +73,23 @@ entry, not per call** — a valid decode needs exactly 8 bit decodes per output 
 the chunks are cut, and a per-call bound still lets a corrupt header multiply the work by inventing
 chunks.
 
-### The one known decode failure
+### Known decode failures — and an honest correction
 
-`-cO` on one `.dp` document in the real corpus: a single mis-decoded literal at output offset 122018 (after
-101226 correct bytes) cascades. `-co` decodes the same file, so it is specific to optimum2's own literal model.
-Window size, `EnsureHeadroom` and inherited block state are all ruled out. **More instances of this would help
-localise it** — if an archive of yours fails only under `-cO`, that is the interesting report.
+The 60-file corpus above says `-cO` 59/60. **That number was unrepresentative.** Sweeping 200 fresh real
+files (document/text/image, 80 KB–900 KB) found **15 failures under `-cO`, about 7.5%** — the small corpus
+happened to contain exactly one, which made a common bug look like a curiosity. The original round-trips all
+of them losslessly, so they are ours. Two distinct bugs are behind them:
+
+- **optimum2's literal model** (13 of the 15 fail under `-cO` only; one also under `-co`). The first wrong
+  byte is a literal whose *first decoded bit* is wrong, with tens of thousands of byte-exact bytes on either
+  side — the signature of a probability that is very slightly off. Refuted with evidence: the ring wrap and
+  eviction (disabling the wrap entirely still fails), the history-prefix source, resolving underflowing
+  matches modulo the high-water mark, the wrap's `rep[]`/LZP resets, and the mixer's rare clamp branches.
+- **Text-transform bit `0x40` is not ported.** One file (chess notation) fails under `-cd`, `-cD`, `-co`,
+  `-cO` *and* `-cc` while passing `-cn`/`-cf`/`-cF` — the signature of a shared path. It is
+  `TransformText_6` in the reference dispatcher, whose body there is `assert(0)`, so the community decoder
+  never implemented it either. Any claim elsewhere that all the text-transform bits are native should be
+  read as "the six that were known"; this is a seventh, and it is reachable on ordinary text.
 
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
