@@ -48,6 +48,20 @@ the metadata switches and 72 listings. Each shape forces a different branch: dis
 multi-block mix, a `-r` recursive tree, a `-p4` single-file container and a `-p4` **multi-file** one.
 **108/108 extract · 36/36 switches · 72/72 listings.**
 
+### Robustness against input that is not a valid archive
+
+Fuzzed with 761 cases under AddressSanitizer + UBSan — truncations, single-bit flips weighted
+toward the header, corruption runs, and non-archives renamed `.nz`. That found an out-of-bounds
+**write** (a transform that ignored its output capacity), a 214-second denial of service ending in
+a segfault on a 191-byte mutated archive, an out-of-bounds read on a corrupt Huffman table, and two
+signed-overflow sites. All fixed; **761/761 clean**. Worst corrupt case 3.7 s, a non-archive
+refused in ~10 ms.
+
+The reusable invariant from that: **bound decode work against the archive's DECLARED OUTPUT, per
+entry, not per call** — a valid decode needs exactly 8 bit decodes per output byte no matter how
+the chunks are cut, and a per-call bound still lets a corrupt header multiply the work by inventing
+chunks.
+
 ### The one known decode failure
 
 `-cO` on one `.dp` document in the real corpus: a single mis-decoded literal at output offset 122018 (after
