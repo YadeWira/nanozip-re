@@ -32,6 +32,7 @@ trap 'rm -rf "${WORK}"' EXIT
 # Each shape is a directory under $WORK/shapes/<name>; SHAPE_FILES[<name>] is the
 # space-separated argument list handed to `nz a`, relative to $WORK.
 declare -A SHAPE_FILES
+declare -A SHAPE_OPTS   # extra encoder flags for a shape (default none)
 SHAPES=()
 
 mk() { mkdir -p "$(dirname "${WORK}/$1")"; }
@@ -113,6 +114,31 @@ chmod 1777 "${WORK}/shapes/setuid/f3.txt"
 SHAPE_FILES[setuid]="shapes/setuid/f1.txt shapes/setuid/f2.txt shapes/setuid/f3.txt"
 SHAPES+=(setuid)
 
+# recurse: a directory tree added with -r, so the stored paths come from a walk
+# rather than from the argument list. The encoder reorders files by size, so the
+# checksum/mtime/permission lists must be read in ITS order, not the caller's.
+mkdir -p "${WORK}/shapes/recurse/tree/a/b/c" "${WORK}/shapes/recurse/tree/x"
+for f in tree/top.txt tree/a/one.txt tree/a/b/two.txt tree/a/b/c/three.txt tree/x/four.txt; do
+  printf 'content of %s, padded so the sizes differ a little\n' "$f" > "${WORK}/shapes/recurse/${f}"
+done
+SHAPE_FILES[recurse]="-r shapes/recurse/tree"
+SHAPES+=(recurse)
+
+# par1: a parallel (-pN) container. One 1 MB file is enough to make the encoder
+# emit four streams, and a file split across streams has no whole-file checksum
+# -- only a per-slice one. Adopting that slice value as the file's made every
+# parallel archive decline; this shape is the guard for that.
+mkdir -p "${WORK}/shapes/par1"
+head -c 1000000 /dev/zero | openssl enc -aes-256-ctr -pass pass:nzre-par -nosalt 2>/dev/null > "${WORK}/shapes/par1/p.bin" \
+  || head -c 1000000 /dev/urandom > "${WORK}/shapes/par1/p.bin"
+SHAPE_FILES[par1]="shapes/par1/p.bin"
+SHAPE_OPTS[par1]="-p4"
+SHAPES+=(par1)
+
+# NOTE: a parallel container holding SEVERAL files still declines on extract
+# (its per-stream slice framing is not reconstructed); it is deliberately not a
+# shape here, so a green run means green.
+
 METHODS=(cn cf cF cd cD co cO cc)
 # Metadata switches: no timestamps, no permissions, and the four checksum modes.
 OPTSETS=("" "-nt" "-np" "-nt -np" "-hn" "-hc" "-hC")
@@ -133,7 +159,7 @@ for m in "${METHODS[@]}"; do M_PASS[$m]=0; M_FAIL[$m]=0; done
 for shape in "${SHAPES[@]}"; do
   for m in "${METHODS[@]}"; do
     arc="${WORK}/mf_${shape}_${m}.nz"; rm -f "$arc"
-    if ! ( cd "$WORK" && "$LEGACY" a -y -"$m" "$arc" ${SHAPE_FILES[$shape]} ) >/dev/null 2>&1; then
+    if ! ( cd "$WORK" && "$LEGACY" a -y -"$m" ${SHAPE_OPTS[$shape]:-} "$arc" ${SHAPE_FILES[$shape]} ) >/dev/null 2>&1; then
       skip=$((skip+1)); continue
     fi
     od="${WORK}/o_${shape}_${m}"; nd="${WORK}/n_${shape}_${m}"
@@ -163,7 +189,7 @@ lpass=0; lfail=0
 for shape in "${SHAPES[@]}"; do
   for opts in "${OPTSETS[@]}"; do
     arc="${WORK}/lst_${shape}_$(echo "$opts" | tr -d ' -').nz"; rm -f "$arc"
-    if ! ( cd "$WORK" && "$LEGACY" a -y -cf ${opts} "$arc" ${SHAPE_FILES[$shape]} ) >/dev/null 2>&1; then
+    if ! ( cd "$WORK" && "$LEGACY" a -y -cf ${SHAPE_OPTS[$shape]:-} ${opts} "$arc" ${SHAPE_FILES[$shape]} ) >/dev/null 2>&1; then
       continue
     fi
     if diff <( "$LEGACY" l "$arc" 2>/dev/null ) <( "$NATIVE" l "$arc" 2>/dev/null ) >/dev/null 2>&1; then
