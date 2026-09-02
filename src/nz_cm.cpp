@@ -9,17 +9,41 @@
 // Portability helpers
 // ---------------------------------------------------------------------------
 
+// Aligned allocation that stays freeable with plain free(), which every call
+// site here uses (MSVCRT's _aligned_malloc is NOT).
+//
+// The Windows branch used to be a bare malloc, on the grounds that x86-64 malloc
+// is already 16-byte aligned. `_WIN32` is defined for the 32-bit build too, and
+// there malloc guarantees only 8 -- which made `-cc` multi-file archives decline
+// on the 32-bit Windows binary while the 64-bit one and the 32-bit LINUX one
+// (posix_memalign) decoded them fine. Over-allocate and stash the base pointer
+// just below the aligned block so free() still works on what we hand back.
 static void* nz_aligned_malloc(size_t size, size_t align) {
 #if defined(_WIN32)
-    // x86-64 malloc is already 16-byte aligned and the CM decoder uses no SIMD,
-    // so plain malloc satisfies the alignment the original mirrored. Crucially it
-    // stays freeable with plain free() (MSVCRT's _aligned_malloc is not).
-    (void)align;
-    return malloc(size);
+    if (align < sizeof(void*)) align = sizeof(void*);
+    void* base = malloc(size + align + sizeof(void*));
+    if (base == nullptr) return nullptr;
+    unsigned char* p = static_cast<unsigned char*>(base) + sizeof(void*);
+    const size_t rem = reinterpret_cast<size_t>(p) % align;
+    if (rem != 0u) p += align - rem;
+    std::memcpy(p - sizeof(void*), &base, sizeof(void*));
+    return p;
 #else
     void* p = nullptr;
     if (posix_memalign(&p, align, size) != 0) return nullptr;
     return p;
+#endif
+}
+
+// Matching release for the above.
+static void nz_aligned_free(void* p) {
+#if defined(_WIN32)
+    if (p == nullptr) return;
+    void* base = nullptr;
+    std::memcpy(&base, static_cast<unsigned char*>(p) - sizeof(void*), sizeof(void*));
+    free(base);
+#else
+    free(p);
 #endif
 }
 
@@ -1333,24 +1357,24 @@ static CM* CM_Allocate(int a_bits, int b_bits, uint32_t window_size) {
 // ---------------------------------------------------------------------------
 
 static void CM_Free(CM* cm) {
-    free(cm->some_ptr);
-    free(cm->cmb.delta_score);
-    free(cm->cmb.delta_hist);
-    free(cm->cmb.cmt);
-    free(cm->cmb.modelq);
-    free(cm->cmb.modelz);
-    free(cm->cmb.modelx);
-    free(cm->cmb.modely);
-    free(cm->modelg.base_ptr);
-    free(cm->modeld);
-    free(cm->modelb);
+    nz_aligned_free(cm->some_ptr);
+    nz_aligned_free(cm->cmb.delta_score);
+    nz_aligned_free(cm->cmb.delta_hist);
+    nz_aligned_free(cm->cmb.cmt);
+    nz_aligned_free(cm->cmb.modelq);
+    nz_aligned_free(cm->cmb.modelz);
+    nz_aligned_free(cm->cmb.modelx);
+    nz_aligned_free(cm->cmb.modely);
+    nz_aligned_free(cm->modelg.base_ptr);
+    nz_aligned_free(cm->modeld);
+    nz_aligned_free(cm->modelb);
     delete[] cm->cmc;
-    free(cm->modelf);
-    free(cm->modelu);
-    free(cm->modelv);
-    free(cm->modelw);
+    nz_aligned_free(cm->modelf);
+    nz_aligned_free(cm->modelu);
+    nz_aligned_free(cm->modelv);
+    nz_aligned_free(cm->modelw);
     for (size_t i = 0; i < 8; i++)
-        free(cm->modele[i].model);
+        nz_aligned_free(cm->modele[i].model);
     delete[] (cm->cmb.window - 64);
     delete cm;
 }
