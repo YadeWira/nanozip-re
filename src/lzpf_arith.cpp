@@ -1888,6 +1888,13 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     // The old speculative DecodeResidualsStereo (even/odd) was never the real path.
     std::vector<std::int32_t> residuals(n_elems);
     DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
+    if (const char* rd = std::getenv("NZ_PF_DUMP_RESID")) {
+        // One file per prefilter block: the raw residual array BEFORE any LPC/LMS
+        // stage, for diffing against the original's FUN_0809baa0 output.
+        static int seq = 0; char nm[512];
+        std::snprintf(nm, sizeof(nm), "%s.%d", rd, seq++);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(residuals.data(), 4, n_elems, f); std::fclose(f); }
+    }
     // Side-stream bytes consumed (FUN_080a5330 line 263).
     // Uses signed arithmetic: (7 - n_valid) can be negative when n_valid > 7.
     std::int32_t side_bits_signed =
@@ -1906,6 +1913,10 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
                 prefix, avail, n_elems, per_chan, remainder, lms_enable,
                 ch_active[0], ch_order[0], ch_active[1], ch_order[1],
                 consumed_arith, side_consumed);
+        fprintf(stderr, "[pf]   nstages=%u stereo_split=%d act=[%d%d%d%d%d%d] shift=[%u,%u,%u,%u,%u,%u] lms_shift=[%u,%u]\n",
+                nstages, (int)stereo_split, st_act[0],st_act[1],st_act[2],st_act[3],st_act[4],st_act[5],
+                st_shift[0],st_shift[1],st_shift[2],st_shift[3],st_shift[4],st_shift[5],
+                lms_ch1 ? (unsigned)lms_ch1->shift : 0u, lms_ch2 ? (unsigned)lms_ch2->shift : 0u);
     }
     // FUN_080a5330 applies LPC per planar channel (separate predictor state), then the
     // inter-channel LMS, then FUN_080a50c0 (cumsum + L/R | mid/side interleave).

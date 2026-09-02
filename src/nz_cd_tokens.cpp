@@ -776,6 +776,27 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         *recon_advance = base + out_size;
         return n;
     }
+    // Every LZ chunk unconditionally resets the prefilter state object
+    // (FUN_080994b0 calls FUN_080b1950(obj+0x40) on the LZ path). Measured: the
+    // rule is load-bearing -- adjacent 0xc chunks must KEEP state, and 0xc chunks
+    // separated by LZ chunks must each start fresh.
+    //
+    // It has to sit HERE, before the pure-literal / token split. It used to live
+    // inside the token branch, so a pure-literal LZ chunk between two prefilter
+    // runs never reset anything and the second run resumed with the first run's
+    // warm predictor. GDB on the original: the state object at the resumed
+    // run's entry is byte-identical to the cold state, the residuals decode
+    // identically, and only the LPC cascade differs -- a warm 8-tap predictor
+    // handed a cold stream's residuals rings like an unstable filter, which is
+    // why the wrong output looked like a large smooth oscillation rather than
+    // noise. Seven real audio/geometry files failed this way, always at the
+    // first prefilter chunk after such a gap and never in the first run.
+    if (pf_ctx != nullptr) {
+        pf_ctx->ResetAll();
+        if (pf_lms1) pf_lms1->Init();
+        if (pf_lms2) pf_lms2->Init();
+    }
+
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
@@ -959,21 +980,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         if (!CdSkip(r, ratebits_len)) return 0;
     }
 
-    // Every LZ chunk unconditionally resets the prefilter state object
-    // (FUN_080994b0 calls FUN_080b1950(obj+0x40) on the LZ path). Measured: the
-    // rule is load-bearing -- adjacent 0xc chunks must KEEP state, and 0xc chunks
-    // separated by LZ chunks must each start fresh.
-    if (pf_ctx != nullptr) {
-        pf_ctx->ResetAll();
-        if (pf_lms1) pf_lms1->Init();
-        if (pf_lms2) pf_lms2->Init();
-    }
-
     NzCdField fl{g_kCdSlotLit, g_kCdModelLit, 8u};
     NzCdField fo{g_kCdSlotOff, g_kCdModelOff, 4u};
     NzCdField fn{g_kCdSlotLen, g_kCdModelLen, 14u};
     std::vector<std::uint32_t> toks(static_cast<std::size_t>(N) * 3);
     NzCdTokenAssemble(N, lit.data(), off.data(), len.data(), bs, bs_size, fl, fo, fn, toks.data());
+    if (std::getenv("NZOPT_TRACE_CD_TOKENS")) {
+        std::fprintf(stderr, "[CD] tokens dump: N=%u base=%u ring_size=%u out_size=%u\n", N, base, ring_size, out_size);
+        for (std::uint32_t i = 0; i < N && i < 64u; ++i)
+            std::fprintf(stderr, "[CD]   tok[%u] lit_run=%u sel=%u raw=%u\n", i, toks[i*3], toks[i*3+1], toks[i*3+2]);
+    }
 
     // Total literals consumed by recon = out_size - (sum of match lengths): per-token
     // lit_run plus the trailing flush. (Match length doesn't depend on the rep[] MTF,

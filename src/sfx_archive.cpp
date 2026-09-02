@@ -5445,18 +5445,29 @@ static bool TryDecodeLegacyLzhd(
     std::size_t written = 0u;
     bool ok = true;
 
-    // The cross-stream LZ window is a single per-archive ring (the binary's window
-    // object persists across streams). GDB on FUN_08099050 (obj+0x978) shows the ring
-    // size = round(total_output / 0x10000) * 0x10000 (min 0x10000): the encoder sizes
-    // the window to hold the whole COMPACT recon, so the ring cursor (obj+0x980)
-    // advances monotonically and NEVER wraps for real archives (verified across
-    // text50/source.cpp/big_code/repeat_3M = 1/3/19/46 * 64 KB). Large files split the
-    // output into 1 MB streams that reference each other through this shared ring, so
-    // it is allocated ONCE and `ring_pos` threads across stream iterations. (The old
-    // (method_p1+1)*0x10000 lzpf rule under-sized the ring for large files and forced
-    // a wrap the binary never does.)
-    std::uint32_t ring_units = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(total_out) + 0x8000u) / 0x10000u);
+    // The LZ window is a single per-archive ring (FUN_08099050, obj+0x978) sized
+    // bytefloat(method_p1 + 1) * 0x10000 -- the same mantissa/exponent byte the
+    // -cc window and the lzpf dictionary capacity already use: xp1 = p1 + 1,
+    // m = xp1 & 0xf, s = xp1 >> 4, if (s) m = (m + 16) << (s - 1). Below p1 = 15
+    // that is just p1 + 1 units, which is why an earlier LINEAR (p1 + 1) reading
+    // fit small files and under-sized large ones, and why the round(total /
+    // 0x10000) rule that replaced it fit every sample it was measured on
+    // (1/3/19/46 units) and still failed the first real file where the two
+    // disagree: p1 = 33 encodes 36 units, round(2322452 / 65536) gives 35, and
+    // the last chunk then began exactly at the ring end and a match reached past
+    // the whole (undersized) ring -- refused with `offset > ring_size`, a clean
+    // decline. GDB on the original for that file: obj+0x978 = 2359296 = 36 units.
+    // Large files split the output into 1 MB streams that reference each other
+    // through this shared ring, so it is allocated ONCE and `ring_pos` threads
+    // across stream iterations.
+    std::uint32_t ring_units = 0u;
+    {
+        const unsigned xp1 = static_cast<unsigned>(legacy.legacy_method_p1) + 1u;
+        unsigned m = xp1 & 0x0fu;
+        const unsigned sh = xp1 >> 4u;
+        if (sh) m = (m + 16u) << (sh - 1u);
+        ring_units = m;
+    }
     if (ring_units == 0u) ring_units = 1u;
     const std::uint32_t ring_size = ring_units * 0x10000u;
     std::vector<std::uint8_t> ring(ring_size, 0u);
