@@ -1842,7 +1842,27 @@ struct LegacyParallelStream {
     // and the fields above describe it; a multi-file one can have several, of
     // different files (a stream is a worker, not a file).
     std::vector<LegacyParallelSlice> slices;
+    // This stream's own codec record (type 11): p0 = selector, p1 = the window
+    // byte. Every worker writes one; so far they have always agreed with each
+    // other, but the ring below is sized from the stream's OWN byte regardless.
+    std::uint8_t p0 = 0, p1 = 0;
+    bool hasparams = false;
 };
+
+// The -cd/-cD LZ ring, in 64 KB units, from the codec record's p1 byte:
+// bytefloat(p1 + 1) -- xp1 = p1 + 1, m = xp1 & 0xf, s = xp1 >> 4,
+// if (s) m = (m + 16) << (s - 1). The same mantissa/exponent byte the -cc
+// window and the lzpf dictionary capacity use. NOT round(size / 0x10000): that
+// fit every sample it was measured on and failed the first slice where the two
+// disagree (2322452 bytes: p1 = 33 -> 36 units, round gives 35, and a match
+// then reached past the whole ring).
+static std::uint32_t LegacyCdRingUnitsFromP1(std::uint8_t p1) {
+    const unsigned xp1 = static_cast<unsigned>(p1) + 1u;
+    unsigned m = xp1 & 0x0fu;
+    const unsigned sh = xp1 >> 4u;
+    if (sh) m = (m + 16u) << (sh - 1u);
+    return m ? static_cast<std::uint32_t>(m) : 1u;
+}
 
 // Detect and parse a parallel container. The encoder splits the input into one
 // slice per worker and gives each its own record set, tagged with a stream id
@@ -1905,6 +1925,10 @@ bool ParseLegacyParallelStreams(
                     st.slices.push_back(std::move(sl));
                 }
             }
+        } else if (ct == 11u && csz >= 1u) {
+            st.p0 = bytes[p];
+            st.p1 = (csz >= 2u) ? bytes[p + 1u] : 0u;
+            st.hasparams = true;
         } else if (ct == 10u && csz >= 4u) {
             st.ooff = ReadU32LE(bytes.data() + p);
             st.hasoff = true;
@@ -4424,6 +4448,7 @@ bool TryParseLegacyCnArchive(
                             ChecksumMode cmode = ChecksumMode::kNone;
                             std::uint32_t cval = 0;
                             bool hasoff = false, hassz = false;
+                            std::uint8_t p1 = 0; bool hasparams = false;  // own type-11 record
                         };
                         std::map<unsigned, PCdStream> ps;
                         std::size_t p = magic + 3u;
@@ -4450,6 +4475,9 @@ bool TryParseLegacyCnArchive(
                             if (ct == 1u && csz >= 2u) {
                                 std::size_t tp = p; std::uint64_t v = 0;
                                 if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 11u && csz >= 1u) {
+                                s.p1 = (csz >= 2u) ? bytes[p + 1u] : 0u;
+                                s.hasparams = true;
                             } else if (ct == 10u && csz >= 4u) {
                                 s.ooff = static_cast<std::uint32_t>(bytes[p]) |
                                          (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
@@ -4492,14 +4520,15 @@ bool TryParseLegacyCnArchive(
                             std::vector<unsigned char> slice_buf(kCdWindowPad + slice_total, 0u);
                             unsigned char* const slice_window = slice_buf.data() + kCdWindowPad;
 
-                            // Fresh, independent per-stream ring (hypothesis:
-                            // each parallel-encoder thread had its own nz_cd
-                            // instance), sized to this stream's own slice
-                            // output via the same round(slice/0x10000)*0x10000
-                            // formula used for the single-container case.
-                            std::uint32_t sring_units = static_cast<std::uint32_t>(
-                                (static_cast<std::uint64_t>(slice_total) + 0x8000u) / 0x10000u);
-                            if (sring_units == 0u) sring_units = 1u;
+                            // Fresh, independent per-stream ring (each
+                            // parallel-encoder thread had its own nz_cd
+                            // instance), sized from this stream's own codec
+                            // record exactly like the single-container case
+                            // (LegacyCdRingUnitsFromP1). A 4 x 2322452-byte
+                            // container declined under the old round(slice)
+                            // rule: 35 units where p1 = 33 says 36.
+                            const std::uint32_t sring_units = LegacyCdRingUnitsFromP1(
+                                s.hasparams ? s.p1 : static_cast<std::uint8_t>(method_p1));
                             const std::uint32_t sring_size = sring_units * 0x10000u;
                             std::vector<std::uint8_t> sring(sring_size, 0u);
                             std::uint32_t sring_pos = 0u;
@@ -4649,9 +4678,12 @@ bool TryParseLegacyCnArchive(
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>&,
                                     std::vector<unsigned char>* dst) {
-                                    std::uint32_t units = static_cast<std::uint32_t>(
-                                        (out_size + 0x8000u) / 0x10000u);
-                                    if (units == 0u) units = 1u;
+                                    // Ring from the OWNING stream's p1 (found by
+                                    // its chunk list; see LegacyCdRingUnitsFromP1).
+                                    std::uint8_t sp1 = static_cast<std::uint8_t>(method_p1);
+                                    for (const auto& kv : pstreams)
+                                        if (&kv.second.chunks == &chunks && kv.second.hasparams) { sp1 = kv.second.p1; break; }
+                                    const std::uint32_t units = LegacyCdRingUnitsFromP1(sp1);
                                     const std::uint32_t ring_size = units * 0x10000u;
                                     std::vector<std::uint8_t> ring(ring_size, 0u);
                                     std::uint32_t ring_pos = 0u;
