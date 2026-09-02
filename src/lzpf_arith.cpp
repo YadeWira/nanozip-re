@@ -378,7 +378,11 @@ void DecodeHuffmanBytes(HuffmanContext& ctx, BitReader& br,
             }
             sym_offset = val - first;
         }
-        dst[i] = ctx.symbols[sym_offset + ctx.base_index[length]];
+        // A corrupt or truncated table can make this index land outside
+        // symbols[256]; for a well-formed one it never can, so masking is a
+        // no-op on valid input and keeps a hostile archive from reading past the
+        // array (it then fails the checksum, which is the intended outcome).
+        dst[i] = ctx.symbols[(sym_offset + ctx.base_index[length]) & 0xffu];
 
         // Inline-refill the code register: shift out `length` bits, pull in
         // `length` fresh bits. Equivalent to the tail of the slow-path loop in
@@ -1636,23 +1640,35 @@ void ReconstructStereoSamples(std::uint8_t* out, const std::int32_t* ch1,
                               const std::int32_t* ch2, std::uint32_t per_chan,
                               const PrefilterParams* p) {
     const bool fast = (p->flag_a && p->sample_width == 2u && p->endian != 0u);
-    std::int32_t acc1 = 0, acc2 = 0;
+    // Accumulated in UNSIGNED and read back signed: these are running sums of
+    // decoded residuals, so a corrupt or truncated stream can overflow them, and
+    // signed overflow is UB the compiler may exploit at -O2 (this project has
+    // already lost a loop bound that way). Unsigned wraparound is defined and
+    // gives the identical two's-complement result for valid input.
+    std::uint32_t acc1u = 0, acc2u = 0;
+    const auto acc1_of = [&]() { return static_cast<std::int32_t>(acc1u); };
+    const auto acc2_of = [&]() { return static_cast<std::int32_t>(acc2u); };
+    const auto bump = [&](std::int32_t a, std::int32_t b) {
+        acc1u += static_cast<std::uint32_t>(a);
+        acc2u += static_cast<std::uint32_t>(b);
+    };
     std::uint8_t* dst = out;
     if (fast && p->channels == 2) {            // mid/side
         for (std::uint32_t k = 0; k < per_chan; ++k) {
-            acc1 += ch1[k]; acc2 += ch2[k];    // acc1=mid, acc2=side
+            bump(ch1[k], ch2[k]);              // acc1=mid, acc2=side
             std::int16_t s = static_cast<std::int16_t>(
-                static_cast<std::int16_t>(acc2) - static_cast<std::int16_t>(acc1 >> 1));
-            std::int16_t l = static_cast<std::int16_t>(s + static_cast<std::int16_t>(acc1));
+                static_cast<std::int16_t>(acc2_of()) - static_cast<std::int16_t>(acc1_of() >> 1));
+            std::int16_t l = static_cast<std::int16_t>(
+                static_cast<std::uint16_t>(s) + static_cast<std::uint16_t>(acc1_of()));
             std::memcpy(dst, &l, 2); std::memcpy(dst + 2, &s, 2); dst += 4;
         }
         return;
     }
     if (fast && p->channels == 1) {            // L/R
         for (std::uint32_t k = 0; k < per_chan; ++k) {
-            acc1 += ch1[k]; acc2 += ch2[k];
-            std::int16_t l = static_cast<std::int16_t>(acc1);
-            std::int16_t r = static_cast<std::int16_t>(acc2);
+            bump(ch1[k], ch2[k]);
+            std::int16_t l = static_cast<std::int16_t>(acc1_of());
+            std::int16_t r = static_cast<std::int16_t>(acc2_of());
             std::memcpy(dst, &l, 2); std::memcpy(dst + 2, &r, 2); dst += 4;
         }
         return;
@@ -1683,12 +1699,14 @@ void ReconstructStereoSamples(std::uint8_t* out, const std::int32_t* ch1,
     // the fast path (8-bit, 24-bit, or big-endian stereo) decoded wrong.
     const bool mid_side = (p->channels == 2);
     for (std::uint32_t k = 0; k < per_chan; ++k) {
-        acc1 += ch1[k]; acc2 += ch2[k];      // acc1 = mid, acc2 = side accumulator
+        bump(ch1[k], ch2[k]);                // acc1 = mid, acc2 = side accumulator
         if (mid_side) {
-            const std::int32_t side = acc2 - (acc1 >> 1);
-            put(side + acc1); put(side);
+            const std::int32_t side = static_cast<std::int32_t>(
+                acc2u - (static_cast<std::uint32_t>(acc1_of() >> 1)));
+            put(static_cast<std::int32_t>(static_cast<std::uint32_t>(side) + acc1u));
+            put(side);
         } else {
-            put(acc1); put(acc2);
+            put(acc1_of()); put(acc2_of());
         }
     }
 }

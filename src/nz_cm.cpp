@@ -366,6 +366,8 @@ struct CM {
     uint16_t  out_byte_wip;
     int8_t    factors7_div16;
     uint8_t   bit_index_in_byte;
+    // Remaining bit decodes for this entry; see CM_Decode.
+    uint64_t  bit_budget = 0;
     uint8_t   cmb_result;
     uint8_t   errorhist;
     uint8_t   ascii_counter;
@@ -1151,7 +1153,22 @@ static void CM_Decode(CM* cm, const uint8_t* in, uint32_t in_size, uint8_t* out,
 
     if (!out_size)
         return;
+    // A well-formed stream spends exactly 8 bit decodes per output byte, so this
+    // loop always terminates on `--out_size`. A corrupt or truncated one can
+    // leave the bit counter in a state where a byte never completes, and the
+    // loop then spins on an exhausted arithmetic decoder.
+    //
+    // The budget is per ENTRY, not per call, and lives on the decoder: a corrupt
+    // archive can also claim many data chunks, and a per-call bound then lets the
+    // total work grow with the chunk count -- a 191-byte mutated archive burned
+    // 214 seconds that way. Bounding the total against the DECLARED OUTPUT is the
+    // right invariant, because a valid decode needs exactly 8 bits per output
+    // byte no matter how the chunks are cut. Stopping early leaves the output
+    // short, which the caller rejects on size or checksum.
     for (;;) {
+        if (cm->bit_budget == 0u)
+            break;
+        --cm->bit_budget;
         bool flag = adec.ReadHighPrec(cm->next_probability);
         CM_Input_Bit(cm, (uint32_t)flag);
         if (!cm->bit_index_in_byte) {
@@ -1399,6 +1416,10 @@ void NzCmDestroy(NzCmDecoder* cm) {
 
 void NzCmReset(NzCmDecoder* cm) {
     CM_Reset(reinterpret_cast<CM*>(cm));
+}
+
+void NzCmSetBitBudget(NzCmDecoder* cm, uint64_t bits) {
+    reinterpret_cast<CM*>(cm)->bit_budget = bits;
 }
 
 void NzCmDecode(NzCmDecoder* cm, const uint8_t* in, uint32_t in_size,

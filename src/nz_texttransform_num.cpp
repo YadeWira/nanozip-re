@@ -227,6 +227,7 @@ struct TextTransformNumber {
         do {
             u32 d = (number >> (num_digits * 4 - 4)) & 0xf;
             u32 lowercase = (digit_mask >> (num_digits - 1)) & 0x1;
+            if (!room(out, 1)) { *out_ptr = out; return; }
             *out++ = (u8)(d + ((d <= 9) ? '0' : ('A' - 10 + lowercase * 0x20)));
         } while (--num_digits);
         *in_ptr = in;
@@ -340,17 +341,20 @@ struct TextTransformNumber {
         u8 num_buf[16], *s = num_buf;
         while (number >= 10) { *s++ = (u8)('0' + number % 10); number /= 10; }
         *s++ = (u8)('0' + number);
-        while (s <= num_buf + num_zeros) *s++ = '0';
+        while (s <= num_buf + num_zeros && s < num_buf + sizeof(num_buf)) *s++ = '0';
+        if (!room(out, 1)) { *in_ptr = in; *out_ptr = out; return; }
         *out++ = *--s;
         u32 ndig = 0;
         for (in = in_org; in != in_ptr_end; ) {
             digit = *in;
             if (digit >= '0' && digit <= '9') {
                 if (digit != '0') break;
+                if (!room(out, 1)) break;
                 *out++ = *--s;
                 in++;
                 if (++ndig == 8) break;
             } else {
+                if (!room(out, 1)) break;
                 *out++ = (u8)digit;
                 in++;
                 if (digit != 0x2d && digit != 0x2e && digit != 0x3a) break;
@@ -360,13 +364,29 @@ struct TextTransformNumber {
         *out_ptr = out;
     }
 
-    u32 Decode(const u8* in_ptr, u32 in_size, u8* out_ptr) {
+    // Output limit. This decoder is driven by both the byte stream and an
+    // arithmetic side-stream, and a corrupt or truncated pair can make it emit
+    // far more than the caller declared -- out_cap used to be ignored outright,
+    // so a 191-byte mutated archive walked off the end of the output buffer and
+    // segfaulted. Every write site checks this now; hitting it abandons the
+    // transform, and the caller then fails on size or checksum.
+    u8* out_end_ = nullptr;
+    bool overflow_ = false;
+    bool room(const u8* out, u32 n) {
+        if (out_end_ != nullptr && static_cast<u32>(out_end_ - out) < n) { overflow_ = true; return false; }
+        return true;
+    }
+
+    u32 Decode(const u8* in_ptr, u32 in_size, u8* out_ptr, u8* out_limit) {
         if (in_size <= 9) return 0;
+        out_end_ = out_limit;
+        overflow_ = false;
         one_.Initialize();
         two_.Initialize();
         adec_.FillBuffer();
         u8* out_ptr_org = out_ptr;
         const u8* in_ptr_end = in_ptr + in_size;
+        if (!room(out_ptr, 2)) return 0;
         *out_ptr++ = *in_ptr++;
         *out_ptr++ = *in_ptr++;
         while (in_ptr != in_ptr_end) {
@@ -374,7 +394,9 @@ struct TextTransformNumber {
             if ((u32)(digit - '0') <= 9) {
                 if ((u32)(digit - '1') <= 1) Decode_0(&out_ptr, &in_ptr, in_ptr_end, digit);
                 else Decode_1(&out_ptr, &in_ptr, in_ptr_end, digit);
+                if (overflow_) return 0;
             } else {
+                if (!room(out_ptr, 1)) return 0;
                 *out_ptr++ = (u8)digit;
             }
         }
@@ -386,11 +408,11 @@ struct TextTransformNumber {
 
 uint32_t NzTextTransformNumber(const uint8_t* side, uint32_t side_len,
                                const uint8_t* in, uint32_t in_size,
-                               uint8_t* out, uint32_t /*out_cap*/) {
+                               uint8_t* out, uint32_t out_cap) {
     TextTransformNumber* t = new (std::nothrow) TextTransformNumber();
     if (!t) return 0;
     t->adec_.InitializeX(side, side + side_len);
-    uint32_t n = t->Decode(in, in_size, out);
+    uint32_t n = t->Decode(in, in_size, out, out + out_cap);
     delete t;
     return n;
 }

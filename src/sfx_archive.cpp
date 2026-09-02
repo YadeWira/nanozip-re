@@ -5571,6 +5571,11 @@ static bool TryDecodeLegacyCm(
         if (out_error_message) *out_error_message = "cm: allocation failed";
         return false;
     }
+    // One work budget for the whole entry, generous against what a valid stream
+    // needs (8 bit decodes per output byte) and bounded by the DECLARED output
+    // rather than by the chunk count a corrupt header can invent.
+    NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
+                             (1u << 20));
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
     bool ok = true;
     std::size_t pos = 0;

@@ -8,6 +8,11 @@ struct NzCmDecoder;
 NzCmDecoder* NzCmCreate(int a_bits, int b_bits, uint32_t window_size);
 void NzCmDestroy(NzCmDecoder* cm);
 
+// Bound the total bit decodes this decoder will perform for one entry. A valid
+// stream needs exactly 8 per output byte; without a bound, a corrupt archive
+// claiming many data chunks makes the work grow with the chunk count.
+void NzCmSetBitBudget(NzCmDecoder* cm, std::uint64_t bits);
+
 void NzCmReset(NzCmDecoder* cm);
 
 void NzCmDecode(NzCmDecoder* cm, const uint8_t* in, uint32_t in_size,
