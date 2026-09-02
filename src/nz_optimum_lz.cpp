@@ -443,6 +443,15 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
         return std::make_pair(static_cast<std::uint32_t>(curC), static_cast<std::uint32_t>(curD));
     };
 
+    if (const char* rd = getenv("NZOPT_DUMP_RING")) {
+        // Whole ring (with the 256-byte prefix mirror and tail slack) at block
+        // entry, one file per DecodeBlock call, for diffing against the original.
+        static int seq = 0; char nm[512];
+        snprintf(nm, sizeof(nm), "%s.%d", rd, seq++);
+        if (FILE* f = fopen(nm, "wb")) { fwrite(ring_.storage.data(), 1, ring_.storage.size(), f); fclose(f); }
+        fprintf(stderr, "[OPT] DecodeBlock entry: cursor=%u capacity=%u scrolled=%d rep=%u,%u,%u,%u in_len=%u out_size=%u -> %s\n",
+                ring_.cursor, ring_.capacity, (int)ring_.scrolled_once, rep[0], rep[1], rep[2], rep[3], in_len, out_size, nm);
+    }
     std::uint32_t local_74 = 0;     // absolute bytes produced so far (this call)
     std::uint8_t  local_81 = 0xff;  // recent literal(1)/match(0) decision history
     std::uint32_t local_9c = 0;     // recent-2-bytes accumulator (see header comment)

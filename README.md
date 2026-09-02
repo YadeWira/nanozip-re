@@ -106,10 +106,13 @@ sign-sign cascade fed by the four rows above, and an eight-mode pixel predictor 
 above, above-left and above-right neighbours. It decodes byte-exact in all seven codecs on 37 real
 BMPs, on 8/16/24/32-bit and PGM/PPM/TGA/TIFF images, and in mixed archives with audio and text.
 
-Two `-co/-cO` failures remain outside this corpus, found by that BMP sweep and unrelated to images
-(the image model is never entered): a 16-bit BMP whose fourth block, an LZ block after two BWT blocks,
-is declined; and a 1.4 MB BMP the encoder sent through the BWT path (likely the large-bucket case
-below). Both decline cleanly; repros are kept with the project tooling.
+The BMP sweep also surfaced two `-co/-cO` declines outside this corpus that never entered the image
+model, and both were one cause, now fixed: a BWT block's `param15` pass names its match sources as
+absolute offsets into everything decoded so far — the *pre-post-filter* stream the LZ window holds,
+not the final output. The port sourced them from the final output, which the `param1` delta filter had
+already rewritten almost byte for byte, so the copied bytes were wrong and so was the window the next
+LZ block read. Found by dumping the original's window at the failing block's entry and asking where
+its bytes came from: its own window, where ours came from the file.
 
 The `-cd`/`-cD` cluster that stood here earlier the same day (12 failures) was three causes, all now
 closed: the prefilter state was not reset after a pure-literal LZ chunk (the original resets on every
