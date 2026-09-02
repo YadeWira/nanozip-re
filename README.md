@@ -42,6 +42,19 @@ On a 60-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for ev
 Seven of the eight codecs are perfect on it, and a single file remains: `-cO` on `doc/Fonts Poster-color.dp`,
 where one mis-decoded literal bit after 101226 correct bytes cascades.
 
+Both of those suites build **one-file** archives and compare **one** extracted file, so they say nothing about
+multi-file ones. `tests/multifile_v2.sh` covers that separately: 8 archive shapes × 8 methods compared as whole
+extracted **trees** — contents, mode *and* mtime — plus 56 listings across the metadata switches
+(`-nt`/`-np`/`-hn`/`-hc`/`-hC`). Each shape forces a different branch of the per-file metadata records:
+distinct versus repeated permissions, 70 equal modes, setuid/sticky, an all-0600 input (whose permission record
+the encoder omits entirely), a multi-block mix, a `-r` recursive tree, and a `-p4` parallel container.
+**64/64 extract, 56/56 list.** Writing it first was the point — it failed on every gap it later guarded,
+including one where `-co`/`-cO` wrote wrong bytes for a multi-file archive without declining while the two
+suites above reported 88/88 and 479/480.
+
+The remaining known gap is a **parallel (`-pN`) archive holding several files**: it declines rather than
+decoding (never wrong output). Parallel single-file archives are native for all eight methods.
+
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
 
@@ -102,6 +115,11 @@ Produces `build/nz_recon`.
 # Native-only validation: the honest NZ_NO_BRIDGE=1 measurement (see the
 # table above).
 ./tests/native_only_v2.sh
+
+# Multi-file archives: whole-tree comparison (contents, mode and mtime)
+# across archive shapes and metadata switches. The single-file suites
+# above cannot see this class of bug.
+./tests/multifile_v2.sh
 
 # Real-world corpus sweep: same NZ_NO_BRIDGE=1 methodology, but over an
 # arbitrary directory of REAL files instead of a small synthetic fixture
