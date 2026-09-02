@@ -405,6 +405,21 @@ static const unsigned char g_kCdModelLen[64] = {
 };
 // FUN_080b1dc0: bounded LEB-ish varint over a byte cursor (limit bounds byte count).
 struct CdRd { const std::uint8_t* cur; const std::uint8_t* end; };
+// Bytes still readable. NEVER compute this as `(std::size_t)(r.end - r.cur)`:
+// several advances below are driven by a length read out of the stream, and once
+// cur passes end that subtraction underflows to ~2^64, after which the next
+// DecodeArithBuffer call is handed a "size" of two exabytes and reads whatever
+// follows the buffer in memory. A -cdP archive reached exactly that (a 105-byte
+// stream whose chunk consumed 907), so it is not hypothetical.
+static std::size_t CdAvail(const CdRd& r) {
+    return (r.cur < r.end) ? static_cast<std::size_t>(r.end - r.cur) : 0u;
+}
+// Skip n bytes; false (and cur parked at end) when the stream is too short.
+static bool CdSkip(CdRd& r, std::uint32_t n) {
+    if (static_cast<std::size_t>(n) > CdAvail(r)) { r.cur = r.end; return false; }
+    r.cur += n;
+    return true;
+}
 static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
     std::uint8_t b = (r.cur < r.end) ? *r.cur++ : 0;
     if (limit < 0x101u) return b;
@@ -737,7 +752,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         if (flags & 2u) { pf_ctx->ResetAll(); if (pf_lms1) pf_lms1->Init(); if (pf_lms2) pf_lms2->Init(); }
         std::vector<std::uint8_t> pf_out(out_size);
         const std::size_t used = nzr::lzpf::DecodePrefilterStream(
-            r.cur, static_cast<std::size_t>(r.end - r.cur),
+            r.cur, CdAvail(r),
             pf_out.data(), static_cast<std::size_t>(out_size),
             /*is_stereo_variant=*/true, pf_ctx, pf_lms1, pf_lms2);
         if (CdTrace()) {
@@ -760,16 +775,28 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 
     // Helper: decode `n` bytes of literal stream (arith for flag &1, else raw) into dst.
-    auto decode_literals = [&](std::uint8_t* dst, std::uint32_t n) {
+    // Returns false when the sub-stream ran out: DecodeArithBuffer reports how
+    // many bytes it LOGICALLY consumed, which can exceed the buffer it was
+    // handed (it reads zeros past the end), and advancing the cursor by that
+    // count puts it past r.end -- from there every later length check is
+    // computed against an underflowed size. Treat it as a malformed chunk.
+    bool ran_out = false;
+    auto decode_literals = [&](std::uint8_t* dst, std::uint32_t n) -> bool {
         if (flags & 1u) {
-            std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
-                                                          dst, n, 12u);
+            const std::size_t avail = CdAvail(r);
+            std::size_t lc = nzr::lzpf::DecodeArithBuffer(r.cur, avail, dst, n, 12u);
+            if (lc > avail) {
+                CD_FAIL("lit arith overshoot: lc=%zu avail=%zu n=%u\n", lc, avail, n);
+                ran_out = true; r.cur = r.end; return false;
+            }
             r.cur += lc;
         } else {
-            std::uint32_t take = (static_cast<std::size_t>(r.end - r.cur) >= n)
+            std::uint32_t take = (CdAvail(r) >= n)
                                  ? n : static_cast<std::uint32_t>(r.end - r.cur);
             std::memcpy(dst, r.cur, take); r.cur += take;
+            if (take < n) { ran_out = true; return false; }
         }
+        return true;
     };
 
     const std::uint8_t* brle_bits = nullptr;   // block-RLE (&2) run-length bit-stream
@@ -778,8 +805,15 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
 
     if (pure_literal) {
         // The window IS the literal stream (out_size bytes); no cols/tokens/recon.
-        decode_literals(slice.data(), out_size);
-        if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
+        if (!decode_literals(slice.data(), out_size)) {
+            CD_FAIL("pure-literal chunk ran past the stream (out_size=%u)\n", out_size);
+            return 0;
+        }
+        if (flags & 2u) {
+            brle_len = CdReadVar(r, 0x1001u);
+            brle_bits = r.cur;
+            if (!CdSkip(r, brle_len)) return 0;
+        }
         if (flags & 8u) {
         const std::uint8_t* tp_at = r.cur;
         text_param = (r.cur < r.end) ? *r.cur++ : 0;
@@ -826,39 +860,86 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // thr = the RLE run threshold passed by the assembler per column ROLE. The
     // binary hardcodes thr=1 for the LEN column and thr=0 for LIT/OFF
     // (FUN_080aa070 sets the descriptor field; see 0x80aa167 `mov [..+0x20],1`).
+    bool overran = false;
     auto decode_col = [&](std::uint32_t out_n, std::uint32_t thr) -> std::vector<std::uint8_t> {
         std::uint8_t b0 = (r.cur < r.end) ? *r.cur++ : 0;
-        // b0 bit0 selects the column codec: 1 = arith-coded (the normal case; an
-        // arith column with no RLE has b0==1), 0 = raw-store (FUN_080b1c30 path,
-        // taken at 0x80a9e18 when `[esp+0x40]&1`==0) — used for incompressible
-        // columns. Raw = out_n verbatim bytes.
-        if ((b0 & 1u) == 0u) {
-            std::vector<std::uint8_t> raw(out_n + 64, 0);
-            std::uint32_t take = (static_cast<std::size_t>(r.end - r.cur) >= out_n)
-                                 ? out_n : static_cast<std::uint32_t>(r.end - r.cur);
-            std::memcpy(raw.data(), r.cur, take); r.cur += take;
-            raw.resize(out_n); return raw;
+        // b0 splits into two INDEPENDENT fields, and both matter:
+        //   bit 0    codec: 1 = arith-coded (the normal case), 0 = raw-store
+        //            (FUN_080b1c30, taken at 0x80a9e18 when `[esp+0x40]&1`==0)
+        //            for a column the encoder could not compress.
+        //   bits 1+  size-field: when non-zero, that many bytes of per-column
+        //            RLE run bits follow, then a varint symbol count, and the
+        //            column is RLE-expanded up to out_n afterwards.
+        // These were treated as mutually exclusive -- the raw branch returned
+        // out_n verbatim bytes and ignored the size-field entirely. A raw column
+        // WITH RLE (b0 == 0x02) then consumed the wrong number of bytes and the
+        // rest of the chunk was parsed from the wrong offset: the token bitstream
+        // size read as 0, every extra bit came out zero, the match lengths were
+        // wrong, and the literal stream was sought past the end of the stream.
+        // `-cd` never emits that combination (its columns are all b0 == 0x00),
+        // which is why only `-cdP`/`-cDP` hit it.
+        const bool arith = (b0 & 1u) != 0u;
+        const std::uint32_t sf = b0 >> 1;
+        const std::uint8_t* rle = nullptr;
+        std::uint32_t rlen = 0, acount;
+        if (sf) {
+            rle = r.cur; rlen = sf;
+            if (!CdSkip(r, sf)) { overran = true; return std::vector<std::uint8_t>(); }
+            acount = CdReadVar(r, out_size);
+        } else {
+            acount = out_n;
         }
-        std::uint32_t sf = b0 >> 1;             // size-field (RLE bits length)
-        const std::uint8_t* rle = nullptr; std::uint32_t rlen = 0, acount;
-        if (sf) { rle = r.cur; rlen = sf; r.cur += sf; acount = CdReadVar(r, out_size); }
-        else acount = out_n;
         std::vector<std::uint8_t> ar(acount + 64, 0);
-        std::size_t c = nzr::lzpf::DecodeArithBuffer(r.cur, static_cast<std::size_t>(r.end - r.cur),
-                                                     ar.data(), acount, 12u);
-        r.cur += c;
+        if (arith) {
+            const std::size_t col_avail = CdAvail(r);
+            const std::size_t c = nzr::lzpf::DecodeArithBuffer(r.cur, col_avail,
+                                                               ar.data(), acount, 12u);
+            if (c > col_avail) { overran = true; r.cur = r.end; return std::vector<std::uint8_t>(); }
+            r.cur += c;
+        } else {
+            const std::size_t avail = CdAvail(r);
+            const std::uint32_t take = (avail >= acount) ? acount
+                                                         : static_cast<std::uint32_t>(avail);
+            std::memcpy(ar.data(), r.cur, take);
+            r.cur += take;
+            if (take < acount) { overran = true; return std::vector<std::uint8_t>(); }
+        }
         if (sf) {
             std::vector<std::uint8_t> o(out_n + 256, 0);
-            std::uint32_t m = NzCdRleExpand(ar.data(), acount, o.data(), out_n + 256, thr, rle, rlen);
+            const std::uint32_t m =
+                NzCdRleExpand(ar.data(), acount, o.data(), out_n + 256, thr, rle, rlen);
             o.resize(m); return o;
         }
         ar.resize(acount); return ar;
     };
+    // Per-column trace: role, requested length, the codec/RLE selector byte, the
+    // arith symbol count, and the cursor -- enough to see which column's length
+    // field is being misread when a chunk walks off the end of its stream.
+    auto trace_col = [&](const char* role, std::uint32_t out_n) {
+        if (CdTrace())
+            std::fprintf(stderr, "[CD]   col %s: out_n=%u b0=0x%02x cur=%ld avail=%zu\n",
+                         role, out_n, (r.cur < r.end) ? *r.cur : 0,
+                         (long)(r.cur - block), CdAvail(r));
+    };
+    trace_col("lit", N + 1);
     std::vector<std::uint8_t> lit = decode_col(N + 1, 0u); (void)CdReadVar(r, out_size);
+    trace_col("len", N);
     std::vector<std::uint8_t> len = decode_col(N, 1u);     (void)CdReadVar(r, out_size);
+    trace_col("off", N);
     std::vector<std::uint8_t> off = decode_col(N, 0u);
+    if (CdTrace())
+        std::fprintf(stderr, "[CD]   cols done: cur=%ld avail=%zu lit=%zu len=%zu off=%zu\n",
+                     (long)(r.cur - block), CdAvail(r), lit.size(), len.size(), off.size());
+    if (overran) {
+        CD_FAIL("column overran the stream (N=%u out_size=%u)\n", N, out_size);
+        return 0;
+    }
     std::uint32_t bs_size = CdReadVar(r, out_size * 4u);
-    const std::uint8_t* bs = r.cur; r.cur += bs_size;
+    const std::uint8_t* bs = r.cur;
+    if (CdTrace())
+        std::fprintf(stderr, "[CD]   bs_size=%u at cur=%ld avail=%zu\n",
+                     bs_size, (long)(r.cur - block), CdAvail(r));
+    if (!CdSkip(r, bs_size)) return 0;
 
     // `-cD` (nz_lzhds) ONLY: a brand-new, length-prefixed control field
     // ("ratebits" -- the Exp-Golomb run-length/order stream NzLzhdsReconstruct's
@@ -871,7 +952,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     if (is_lzhds) {
         ratebits_len = (r.cur < r.end) ? *r.cur++ : 0u;
         ratebits = r.cur;
-        r.cur += ratebits_len;
+        if (!CdSkip(r, ratebits_len)) return 0;
     }
 
     // Every LZ chunk unconditionally resets the prefilter state object
@@ -910,12 +991,22 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     }
     std::uint32_t total_lit = litsum;
     if (out_size > summlen && out_size - summlen > litsum) total_lit = out_size - summlen;
+    if (CdTrace())
+        std::fprintf(stderr, "[CD]   tokens: N=%u litsum=%u summlen=%u total_lit=%u cur=%ld avail=%zu\n",
+                     N, litsum, summlen, total_lit, (long)(r.cur - block), CdAvail(r));
     std::vector<std::uint8_t> literals(total_lit + 64, 0);
-    decode_literals(literals.data(), total_lit);
+    if (!decode_literals(literals.data(), total_lit)) {
+        CD_FAIL("literal stream ran past the chunk (total_lit=%u)\n", total_lit);
+        return 0;
+    }
 
     // Block-RLE (&2) run bits then text (&8) param trail the literals (same order
     // the dispatcher consumes them); both must be read so the next chunk parses.
-    if (flags & 2u) { brle_len = CdReadVar(r, 0x1001u); brle_bits = r.cur; r.cur += brle_len; }
+    if (flags & 2u) {
+        brle_len = CdReadVar(r, 0x1001u);
+        brle_bits = r.cur;
+        if (!CdSkip(r, brle_len)) return 0;
+    }
     if (flags & 8u) {
         const std::uint8_t* tp_at = r.cur;
         text_param = (r.cur < r.end) ? *r.cur++ : 0;
