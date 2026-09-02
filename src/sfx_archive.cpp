@@ -5911,6 +5911,18 @@ static bool TryDecodeLegacyCm(
         // then 0x08 (dictionary), then 0x02 (insert-LF). Other bits
         // (0x80/0x04/0x20/0x40/0x01) not yet ported -> decline so the caller
         // can bridge.
+        // The text-transform chain's INPUT, before any stage runs. With an
+        // unported bit set this is the only way to get an (input, output) pair
+        // for that stage: the golden file is the chain's OUTPUT and every other
+        // stage in the chain is already ported and invertible.
+        if (tt_enabled) {
+            if (const char* tp = getenv("NZOPT_DUMP_TTIN")) {
+                FILE* f = fopen(tp, "wb");
+                if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
+                        cur_size, tt_flags, tp);
+            }
+        }
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining);
@@ -6588,6 +6600,18 @@ static bool DecodeOptimumBlockSequence(
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
         // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
         // far; any other bit set (0x80/4/0x40/1) declines cleanly.
+        // The text-transform chain's INPUT, before any stage runs. With an
+        // unported bit set this is the only way to get an (input, output) pair
+        // for that stage: the golden file is the chain's OUTPUT and every other
+        // stage in the chain is already ported and invertible.
+        if (tt_enabled) {
+            if (const char* tp = getenv("NZOPT_DUMP_TTIN")) {
+                FILE* f = fopen(tp, "wb");
+                if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
+                        cur_size, tt_flags, tp);
+            }
+        }
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
