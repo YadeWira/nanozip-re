@@ -3338,10 +3338,13 @@ bool TryParseLegacyCnArchive(
             }
             return false;
         }
-        {
+        // Only a PARALLEL container repeats a path, because a file is split
+        // into per-stream slices and each stream's table names it. A sequential
+        // archive that genuinely lists the same file twice must keep both
+        // entries -- the original lists and extracts both.
+        if (has_parallel_streams) {
             const auto known = path_index.find(e.path);
             if (known != path_index.end()) {
-                // Same file, another stream's slice (or another block's table).
                 stream_named[table_stream].push_back(known->second);
                 continue;
             }
@@ -3377,7 +3380,11 @@ bool TryParseLegacyCnArchive(
     // PARTIAL uncompressed size for that stream's portion of each file.  The
     // size_accum map holds the sum across all streams for each filename.
     // Override per-entry sizes from the main-stream table with the totals.
-    if (!size_accum.empty()) {
+    // Only in a PARALLEL container is a repeated path the same file in slices,
+    // so only there does summing the per-table sizes give the true size. A
+    // sequential archive that lists the same file twice has two entries of the
+    // real size; summing them reported each at double, and the total at double.
+    if (has_parallel_streams && !size_accum.empty()) {
         for (auto& e : entries) {
             auto it = size_accum.find(e.path);
             if (it != size_accum.end() && it->second != e.size) {
