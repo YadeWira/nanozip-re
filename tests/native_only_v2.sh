@@ -58,6 +58,23 @@ if [[ -f "${RECON_ROOT}/tests/fixtures/lzpf/stereo_lms.wav" ]] && command -v ope
   FIXTURES+=("mixed_audio_text_229k.bin")
 fi
 
+# A 1.1 MB file mixing high-entropy and compressible data. Every fixture above is
+# small, and size is exactly what this one is for: only at this scale does the
+# encoder pick a BWT block WITH its entropy layer and leave one of the block's
+# 256 buckets large and incompressible, which it then STORES VERBATIM (the
+# bucket table writes in==0 to say so). Reading that as a literal zero left the
+# bucket's bytes unaccounted for and the next bucket parsed garbage -- `-co` (the
+# DEFAULT compressor) and `-cO` declined on an ordinary mixed file, and nothing
+# in this suite or the 60-file real corpus was big enough to notice.
+# openssl keeps it DETERMINISTIC; /dev/urandom would move the block boundaries
+# run to run.
+if command -v openssl >/dev/null 2>&1; then
+  { head -c 1048576 /dev/zero | openssl enc -aes-256-ctr -pass pass:nzre-bwt -nosalt 2>/dev/null
+    for i in $(seq 1 3000); do echo "trailer line $i, compressible, for the bwt bucket case"; done
+  } > "${WORK}/in/mixed_entropy_1m.bin"
+  FIXTURES+=("mixed_entropy_1m.bin")
+fi
+
 METHODS=(cn cf cF cd cD co cO cc)
 
 declare -A M_PASS M_FAIL M_SKIP

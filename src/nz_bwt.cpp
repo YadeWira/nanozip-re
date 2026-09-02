@@ -631,6 +631,7 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
 
     uint32_t out_bytes[256];
     uint32_t in_bytes[256];
+    bool stored_raw[256] = {false};
 
     BackwardsByteStream byte_stream(payload, payload_size);
     uint32_t n = 255;
@@ -646,6 +647,17 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
                 nzeros = (int32_t)byte_stream.ReadBackwardsVarint();
             }
         }
+        // round_in == 0 for a non-empty bucket means the encoder could not
+        // compress it and stored it verbatim: its input length IS its output
+        // length, and there is no per-bucket header to parse. Reading it as a
+        // literal zero left the bucket's bytes unaccounted for, so every later
+        // bucket was distributed from the wrong offset and the first one to
+        // carry a header parsed garbage out of its neighbour's data.
+        stored_raw[n] = (round_out != 0u && round_in == 0u);
+        if (stored_raw[n]) round_in = round_out;
+        if (BwtTrace() && round_out != 0u)
+            std::fprintf(stderr, "[BWT]   bucket %u: out=%u in=%u%s\n",
+                         n, round_out, round_in, stored_raw[n] ? " (stored raw)" : "");
         in_bytes[n] = round_in;
         out_bytes[n] = round_out;
         in_pos += round_in;
@@ -657,6 +669,12 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
         }
     } while ((int32_t)--n != -1);
 
+    if (BwtTrace()) {
+        uint32_t nz = 0, mx = 0;
+        for (uint32_t i = 0; i < 256u; ++i) { if (out_bytes[i]) ++nz; if (out_bytes[i] > mx) mx = out_bytes[i]; }
+        std::fprintf(stderr, "[BWT] table: %u non-empty buckets, largest out=%u, out_pos=%llu/%u in_pos=%llu\n",
+                     nz, mx, (unsigned long long)out_pos, out_size, (unsigned long long)in_pos);
+    }
     // The bucket table must account for exactly the declared output size, and
     // the per-bucket inputs must fit in what's left of the payload after it.
     if (out_pos != out_size) {
@@ -693,6 +711,7 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
 
     for (uint32_t i = 0; i != 256u; ++i) {
         if (out_bytes[i] == 0u) continue;
+        if (stored_raw[i]) continue;   // already sitting in place, verbatim
         BwtUnpackInput unpacker;
         if (unpacker.BwtUnpackMain(offsets[i], in_bytes[i], out_bytes[i]) != out_bytes[i]) {
             BWT_FAIL("bucket %u failed (in=%u out=%u)\n", i, in_bytes[i], out_bytes[i]);
