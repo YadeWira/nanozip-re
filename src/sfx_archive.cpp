@@ -3539,7 +3539,13 @@ bool TryParseLegacyCnArchive(
     for (const auto& kv : path_streams) {
         if (kv.second.size() > 1u) split_paths.insert(kv.first);
     }
+    // No attribute records at all is a legitimate answer, not a failure: -nm
+    // (and -nt -np -hn) produce exactly that. Treating it as a failure fell
+    // through to the old heuristics, one of which scans the metadata span for a
+    // 0x24 byte and calls it a permission tag -- so a stray 0x24 in the
+    // compressed payload made `l` print a 0664 column the original does not.
     const bool metadata_run_parsed =
+        attr_records.empty() ||
         ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries);
     const std::size_t run_metadata_end = first_data_record;
 

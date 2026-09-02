@@ -139,9 +139,15 @@ SHAPES+=(par1)
 # (its per-stream slice framing is not reconstructed); it is deliberately not a
 # shape here, so a green run means green.
 
-METHODS=(cn cf cF cd cD co cO cc)
-# Metadata switches: no timestamps, no permissions, and the four checksum modes.
-OPTSETS=("" "-nt" "-np" "-nt -np" "-hn" "-hc" "-hC")
+# All TWELVE compressor selectors the binary's own usage lists, not the eight
+# this project had been measuring: dp/dP/Dp/DP are encoder-parallelism variants
+# of -cd/-cD that emit the same codec bytes but a single-stream container where
+# the plain ones emit a parallel one.
+METHODS=(cn cf cF cd cdp cdP cD cDp cDP co cO cc)
+# Metadata switches: no timestamps, no permissions, the four checksum modes, and
+# -nm (= -nt -np -hn), which produces a run with NO attribute records at all --
+# a shape that used to fall through to a heuristic and invent a perm column.
+OPTSETS=("" "-nt" "-np" "-nt -np" "-hn" "-hc" "-hC" "-nm")
 
 # Signature of an extracted tree: path, octal mode, size and mtime of every
 # file, plus its content hash. Comparing only contents would miss a permission
