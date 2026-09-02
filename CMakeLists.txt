@@ -17,6 +17,7 @@ set(RECON_SOURCES
     src/nz_cd_texttransform_dict.cpp
     src/nz_lzhds.cpp
     src/nz_text_transform.cpp
+    src/nz_tt_chess.cpp
     src/nz_postfilter.cpp
     src/nz_bwt.cpp
     src/nz_audio.cpp
@@ -51,6 +52,9 @@ add_executable(test_lzpf_arith
     src/nz_cd_tokens.cpp
     src/nz_cd_texttransform_dict.cpp
     src/nz_lzhds.cpp
+    # nz_cd_tokens' text pipeline calls the shared tt 0x40 transform, which
+    # lives in its own dependency-free unit for exactly this reason
+    src/nz_tt_chess.cpp
 )
 target_include_directories(test_lzpf_arith PRIVATE include)
 if(NOT MSVC)

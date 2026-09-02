@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "nz_cd_tokens.h"
+#include "nz_text_transform.h"
 #include "lzpf_arith.h"   // lzpf BitReader (FUN_080b1fb0) for the RLE length coder
 #include "nz_cd_texttransform_dict.h"   // &8 bit 0x8 word-dictionary transform
 #include "nz_lzhds.h"     // -cD (nz_lzhds) literal model
@@ -580,7 +581,7 @@ std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
 // caller bridges. Every text stage EXPANDS, so each intermediate <= the final output.
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
-    const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x1u;
+    const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x40u | 0x1u;
     if (param & ~kSupported) do { CD_FAIL("text pipeline: unsupported bits 0x%x (param=0x%x)\n", param & ~kSupported, param); return 0; } while (0);
     std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
@@ -589,6 +590,9 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
     if (param & 0x80u) { std::uint32_t m = NzCdParam14(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (param & 0x08u) { std::uint32_t m = NzCdDict(cur, n, bufs[bi], out_cap, false); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (param & 0x20u) { std::uint32_t m = NzCdLineRle(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    // 0x40 sits between 0x20 and 0x01 in the reference's dispatch order. Same
+    // codec-agnostic function the -cc/-co chains use (see nz_text_transform.h).
+    if (param & 0x40u) { std::uint32_t m = ::NzTextTransform6(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (param & 0x01u) { std::uint32_t m = NzCdCrlf(cur, n, bufs[bi], out_cap);    if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
     if (n > out_cap) n = out_cap;
     std::memcpy(out, cur, n);

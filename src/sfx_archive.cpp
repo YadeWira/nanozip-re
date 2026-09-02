@@ -5923,7 +5923,7 @@ static bool TryDecodeLegacyCm(
                         cur_size, tt_flags, tp);
             }
         }
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformNumber(
@@ -5995,6 +5995,17 @@ static bool TryDecodeLegacyCm(
             // exactly as it does today.
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x40u)) {
+            // Chess/PGN transform, between 0x20 and 0x01 in the reference's
+            // dispatch order. Not in the community reference at all (its body
+            // is assert(0)); decoded from (input, output) pairs plus the binary.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransform6(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -6612,7 +6623,7 @@ static bool DecodeOptimumBlockSequence(
                         cur_size, tt_flags, tp);
             }
         }
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x01u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
@@ -6676,6 +6687,17 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x40u)) {
+            // Chess/PGN transform, between 0x20 and 0x01 in the reference's
+            // dispatch order. Not in the community reference at all (its body
+            // is assert(0)); decoded from (input, output) pairs plus the binary.
+            std::vector<std::uint8_t> tbuf(remaining);
+            const std::uint32_t n = NzTextTransform6(work.data(), cur_size, tbuf.data(), remaining);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x01u)) {
             // CR/CRLF restoration -- LAST in the reference's chain (after 0x20

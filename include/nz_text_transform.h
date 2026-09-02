@@ -36,6 +36,32 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
 uint32_t NzTextTransformRle(const uint8_t* in, uint32_t in_size,
                             uint8_t* out, uint32_t allocated);
 
+// tt_flags & 0x40: the chess/PGN transform (TransformText_6, FUN_080a3000).
+//
+// NOT in the community reference -- its body there is `assert(0); return 0;` --
+// so this was decoded from (input, output) pairs plus the binary, and validated
+// byte-exact on a 108 KB PGN file. Three token classes:
+//
+//   0xBE..0xFD  a board square -> two ASCII bytes:
+//               i = b - 0xBE, file = 'a' + (i & 7), rank = '1' + ((i >> 3) & 7)
+//   0xFE        the move number: the counter in decimal, then '.', counter++
+//   0xFF <arg>  arg > 0x7f: emit `arg` verbatim -- the escape for a byte that
+//               would otherwise read as a square or a token;
+//               otherwise: emit '[' then copy a cached line up to and
+//               including its ']'.
+//
+// The cache is 128 pointers, 2-way set-associative, all initialised to `out`.
+// A literal '[' hashes the two bytes that follow it:
+//     set = (((c0 + 15) & 15) * 4) + (c1 & 3)          (0..63)
+// and stores the position just past the '[' in way 0, shifting way 0 into
+// way 1. A back-reference reads slot `arg` directly, then updates the SET
+// (arg & 0xfe) the same way -- so referencing way 1 does not preserve it.
+// `]` and a back-reference both reset the move counter to 1; a literal number
+// followed by '.' resyncs it to value + 1 by LOOKAHEAD (the digits themselves
+// are emitted by the normal path).
+uint32_t NzTextTransform6(const uint8_t* in, uint32_t in_size,
+                          uint8_t* out, uint32_t allocated);
+
 // Apply the NanoZip "insert linefeed" inverse transform (tt_flags & 0x02).
 // Ported from TransformText_3_InsertLF in the community reference decoder
 // (encode_su/nzdec_v0/src/NZ_TextTransforms.cpp) -- an adaptive-model pure
