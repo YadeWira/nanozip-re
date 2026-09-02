@@ -281,6 +281,11 @@ inline std::uint32_t DecodeAdaptive16(RangeDecoder& rc, std::uint8_t* mem, int o
 // Current ring position, for the rare-branch profiler only (the mixer lambda is
 // nested too deep to see the loop's own counter).
 static std::uint32_t g_rare_pos = 0;
+// Global count of literal-mixer bit decodes. The port is byte-exact for the
+// whole prefix before the divergence, so this counter also counts the ORIGINAL
+// binary's mixer calls -- which is what lets a GDB `ignore` count land on the
+// exact bit that decodes wrong (see optimum2_gdb/README.md).
+static long g_mixbits = 0;
 
 inline std::uint8_t& RingAt(std::uint8_t* base, std::uint32_t logical_pos) {
     return base[static_cast<std::int32_t>(logical_pos)];
@@ -375,6 +380,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
     auto MixerBit = [&](int ctxP, int ctx2, std::uint32_t ctx1p, int ctx3,
                          std::uint32_t ctx6s, std::uint32_t ctx7s, std::uint32_t ctxC,
                          std::uint32_t* outPFinal) -> std::uint32_t {
+        ++g_mixbits;
         std::uint8_t stateP = Rd8(mem, ctxP);
         int modele0Off = 0x1021900 + static_cast<int>(stateP) * 4;
         std::uint32_t modele0Cur = static_cast<std::uint32_t>(Rd32(mem, modele0Off));
@@ -417,7 +423,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         // bit exactly where the coder sits near a decision boundary and nowhere
         // else, which is what this file does. So the suspect is a branch that
         // almost never fires. Count each and record where it first does.
-        if (const char* rb = std::getenv("NZO2_RAREBRANCH")) {
+        static const char* const rb = std::getenv("NZO2_RAREBRANCH");
+        if (rb != nullptr) {
             static long n_neg = 0, n_clamp = 0, n_pfix = 0, n_tot = 0;
             static std::uint32_t first_neg = 0, first_clamp = 0;
             ++n_tot;
@@ -449,9 +456,29 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         std::uint32_t mixedP = (static_cast<std::uint32_t>(apmSeed) + 2u + interp * 3u) >> 2;
         std::uint32_t pFinal = mixedP + ((mixedP < 0x800u) ? 1u : 0u);
 
+        // NZO2_DUMP_AT_MIX=<mixbit>:<path> -- dump the whole model area at one
+        // exact literal-mixer bit, so it can be diffed against a GDB dump of
+        // the real object taken at the matching A#/B# breakpoint hit.
+        static const char* const da = std::getenv("NZO2_DUMP_AT_MIX");
+        if (da != nullptr) {
+            long want = std::atol(da);
+            const char* colon = std::strchr(da, ':');
+            if (colon && g_mixbits == want) {
+                FILE* f = std::fopen(colon + 1, "wb");
+                if (f) { std::fwrite(mem, 1, kTotalMemSize, f); std::fclose(f); }
+                std::fprintf(stderr, "[O2] mem dump at MIX #%ld -> %s\n", want, colon + 1);
+            }
+        }
+        const std::uint32_t rclo_ = rc.lo, rchi_ = rc.hi, rccode_ = rc.code;
         std::uint32_t bit = rc.DecodeBit(pFinal);
-        if (getenv("NZOPT2_TRACE_MIX")) fprintf(stderr, "  MIX ctxP=%#x ctx2=%#x ctx1p=%u ctx3=%#x ctx6s=%u ctx7s=%u ctxC=%u confByte=%u apmOff=%#x apmNear=%#x apmLo=%u apmHi=%u interp=%u in=[%d,%d,%d,%d,%d,%d,%d,%d] w=[%d,%d,%d,%d,%d,%d,%d,%d] wRowOff=%#x sqMin=%u apmSeed=%u mixedP=%u pFinal=%u bit=%u\n",
-            ctxP, ctx2, ctx1p, ctx3, ctx6s, ctx7s, ctxC, confByte, apmOff, apmNear, apmLo, apmHi, interp, in0,in1,in2,in3,in4,in5,in6,in7, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7], wRowOff, sqMin, apmSeed, mixedP, pFinal, bit);
+        static const char* const mixfrom_ = getenv("NZO2_MIXFROM");
+        static const long mixfrom = mixfrom_ ? atol(mixfrom_) : -1;
+        static const long mixto = getenv("NZO2_MIXTO") ? atol(getenv("NZO2_MIXTO")) : (mixfrom + 8);
+        static const bool trace_mix = getenv("NZOPT2_TRACE_MIX") != nullptr;
+        if (trace_mix || (mixfrom >= 0 && g_mixbits >= mixfrom && g_mixbits <= mixto))
+            fprintf(stderr, "  MIX #%ld ctxP=%#x ctx2=%#x ctx1p=%u ctx3=%#x ctx6s=%u ctx7s=%u ctxC=%u confByte=%u apmOff=%#x apmNear=%#x apmLo=%u apmHi=%u interp=%u in=[%d,%d,%d,%d,%d,%d,%d,%d] w=[%d,%d,%d,%d,%d,%d,%d,%d] wRowOff=%#x sqMin=%u apmSeed=%u mixedP=%u pFinal=%u bit=%u rclo=%#x rchi=%#x rccode=%#x critprob=%u\n",
+            g_mixbits, ctxP, ctx2, ctx1p, ctx3, ctx6s, ctx7s, ctxC, confByte, apmOff, apmNear, apmLo, apmHi, interp, in0,in1,in2,in3,in4,in5,in6,in7, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7], wRowOff, sqMin, apmSeed, mixedP, pFinal, bit, rclo_, rchi_, rccode_,
+            (unsigned)(((rchi_ - rclo_) >> 12) ? ((rccode_ - rclo_) / ((rchi_ - rclo_) >> 12)) : 0u));
 
         Wr16(mem, apmNear,
              static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1003eu - apmOld) >> 6) + apmOld));
@@ -603,14 +630,30 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
     while (local_74 < out_size) {
         std::uint32_t chunk_size = std::min(out_size - local_74, 0x8000u);
         std::uint32_t headroom = ring_.EnsureHeadroom(chunk_size);
+        if (std::getenv("NZO2_TRACE_CHUNK"))
+            std::fprintf(stderr, "[O2] chunk: produced=%u chunk_size=%u cursor=%u capacity=%u -> headroom=%u%s\n",
+                         local_74, chunk_size, ring_.cursor, ring_.capacity, headroom,
+                         headroom == 0 ? "  *** LZP RESET" : "");
         if (headroom == 0) {
             rep[0] = rep[1] = rep[2] = rep[3] = 1;
-            // FUN_080b9150(param_1+0x40): zero the entire LZP hash table
-            // (plus 64 bytes of padding before it) whenever the ring
-            // scrolls -- stale absolute positions from before a scroll must
-            // not be trusted afterward, exactly like the rep-offset reset
-            // just above.
-            std::memset(mem + 0x1042bc0, 0, 0x40000u);
+            // Zero the entire LZP hash table whenever the ring scrolls --
+            // stale positions from before a scroll must not be trusted
+            // afterward, exactly like the rep-offset reset just above.
+            //
+            // The real call is FUN_080b9150(param_1 + 0x40), and that
+            // function memsets `arg + 0x1042bc0` for 0x40000 bytes. The
+            // `+ 0x40` belongs to the CALLER, so the swept range starts at
+            // obj + 0x40 + 0x1042bc0 == obj + 0x1042c00, the table base --
+            // NOT at obj + 0x1042bc0. Dropping the caller's offset shifted
+            // the whole sweep 64 bytes down, which both clobbered 64 bytes
+            // of live dispatch-APM state just below the table and left the
+            // LAST 16 entries (hashes 0xfff0..0xffff) uncleared. A stale
+            // entry there survives a wrap, still passes the 3-byte
+            // validation below, and folds a bogus predicted byte into
+            // ctx7's seed -- the only mixer input the LZP fold reaches --
+            // which is why it showed up as ONE literal bit decoding wrong
+            // with tens of thousands of byte-exact bytes on either side.
+            std::memset(mem + 0x1042c00, 0, 0x40000u);
         }
         if (const char* dp = getenv("NZO2_DUMP_CHUNK")) {
             // Model memory at the start of each 0x8000 chunk, so a divergence that
@@ -759,7 +802,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1001e - apm2Old) >> 5) + apm2Old));
 
                 g_rare_pos = local_54;
-                if (getenv("NZOPT2_TRACE")) fprintf(stderr, "pos=%u dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, bit, mixedP, rc.lo, rc.hi, rc.code);
+                if (getenv("NZOPT2_TRACE")) fprintf(stderr, "pos=%u mixbits=%ld dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, g_mixbits, bit, mixedP, rc.lo, rc.hi, rc.code);
                 if (bit != 0) break;  // literal: fall through to mixer below
 
                 // ===================== MATCH DECODE =====================
@@ -1116,24 +1159,51 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
 
 
 void NzOptimum2LzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
-    // Caveat: when `len` exceeds the ring capacity this writes in
-    // capacity-sized chunks, leaving the cursor at the end of the last one.
-    // Only the final `capacity` bytes are reachable either way, but the exact
-    // cursor the original would land on in that case is NOT verified against
-    // the real binary -- no observed BWT block was larger than the window. If
-    // it ever is, a later match reads the wrong ring position and the block or
-    // the entry checksum fails, i.e. it declines rather than emitting wrong
-    // bytes.
+    // Transcription of FUN_080b9180(ppRing, src, len) -- how the ORIGINAL pushes
+    // bytes that did NOT come out of the LZ engine (stored blocks, post-filter
+    // output) through the same window later matches read from. It has FOUR cases,
+    // and collapsing them into one "reserve then write" (what this used to do)
+    // gets both the final cursor AND the LZP-table lifetime wrong:
+    //
+    //   len > capacity                -> DROP the head, keep the last `capacity`
+    //                                    bytes, reset pos to 0, clear the scroll
+    //                                    flag, zero the LZP table
+    //   len + 0x8000 >= capacity      -> same reset, then write at 0
+    //   len > capacity - pos          -> SPLIT: fill the ring to its END first,
+    //                                    then reserve the remainder (which wraps,
+    //                                    zeroing the LZP table) and write the rest
+    //   otherwise                     -> write in place, pos += len
+    //
+    // The split case is the load-bearing one. Writing the tail first leaves the
+    // cursor at (pos + len) mod capacity instead of len, and its wrap is what
+    // clears the LZP table -- without it stale pre-wrap positions stay live,
+    // still pass the 3-byte validation, and fold a bogus predicted byte into
+    // ctx7's seed. See the equivalent note on the LZP memset in the chunk loop.
     const std::uint32_t cap = ring_.capacity;
-    if (cap == 0u || data == nullptr) return;
-    while (len != 0u) {
-        const std::uint32_t n = (len < cap) ? len : cap;
-        const std::uint32_t start = ring_.EnsureHeadroom(n);
-        std::memcpy(ring_.Base() + start, data, n);
-        ring_.cursor = start + n;
-        data += n;
-        len -= n;
+    if (cap == 0u || data == nullptr || len == 0u) return;
+    std::uint8_t* mem = mem_.data();
+
+    if (len > cap) {
+        data += len - cap;
+        len = cap;
+        ring_.cursor = 0;
+        ring_.scrolled_once = false;
+        std::memset(mem + 0x1042c00, 0, 0x40000u);
+    } else if (len + 0x8000u >= cap) {
+        ring_.cursor = 0;
+        ring_.scrolled_once = false;
+        std::memset(mem + 0x1042c00, 0, 0x40000u);
+    } else if (len > cap - ring_.cursor) {
+        const std::uint32_t tail = cap - ring_.cursor;
+        std::memcpy(ring_.Base() + ring_.cursor, data, tail);
+        ring_.cursor += tail;  // == cap
+        data += tail;
+        len -= tail;
+        if (ring_.EnsureHeadroom(len) == 0u)
+            std::memset(mem + 0x1042c00, 0, 0x40000u);
     }
+    std::memcpy(ring_.Base() + ring_.cursor, data, len);
+    ring_.cursor += len;
 }
 
 }  // namespace optimum2

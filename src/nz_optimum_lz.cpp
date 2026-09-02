@@ -943,24 +943,47 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
 
 void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
-    // Caveat: when `len` exceeds the ring capacity this writes in
-    // capacity-sized chunks, leaving the cursor at the end of the last one.
-    // Only the final `capacity` bytes are reachable either way, but the exact
-    // cursor the original would land on in that case is NOT verified against
-    // the real binary -- no observed BWT block was larger than the window. If
-    // it ever is, a later match reads the wrong ring position and the block or
-    // the entry checksum fails, i.e. it declines rather than emitting wrong
-    // bytes.
+    // Transcription of the compact engine's ring-feed (entry around 0x080bcc60),
+    // which pushes bytes that did NOT come out of the LZ engine (stored blocks,
+    // post-filter output) through the same window later matches read from. It is
+    // the sibling of nz_optimum2_lz.cpp's FeedWindow -- byte-for-byte the same
+    // four cases, minus the LZP-table sweep (this engine has no LZP predictor,
+    // and its split path correspondingly ignores the reserve's return value):
+    //
+    //   len > capacity            -> DROP the head, keep the last `capacity`
+    //                                bytes, pos = 0, clear the scroll flag
+    //   len + 0x8000 >= capacity  -> same reset, then write at 0
+    //   len > capacity - pos      -> SPLIT: fill the ring to its END first, then
+    //                                reserve the remainder (which wraps) and
+    //                                write the rest
+    //   otherwise                 -> write in place, pos += len
+    //
+    // Collapsing these into one "reserve then write" leaves the cursor at `len`
+    // where the original leaves it at (pos + len) mod capacity, so every later
+    // match resolves against the wrong ring offset. Verified against the binary
+    // by watching the persistent ring descriptor's pos field across a feed that
+    // straddles the ring end: both engines walk the identical position sequence.
     const std::uint32_t cap = ring_.capacity;
-    if (cap == 0u || data == nullptr) return;
-    while (len != 0u) {
-        const std::uint32_t n = (len < cap) ? len : cap;
-        const std::uint32_t start = ring_.EnsureHeadroom(n);
-        std::memcpy(ring_.Base() + start, data, n);
-        ring_.cursor = start + n;
-        data += n;
-        len -= n;
+    if (cap == 0u || data == nullptr || len == 0u) return;
+
+    if (len > cap) {
+        data += len - cap;
+        len = cap;
+        ring_.cursor = 0;
+        ring_.scrolled_once = false;
+    } else if (len + 0x8000u >= cap) {
+        ring_.cursor = 0;
+        ring_.scrolled_once = false;
+    } else if (len > cap - ring_.cursor) {
+        const std::uint32_t tail = cap - ring_.cursor;
+        std::memcpy(ring_.Base() + ring_.cursor, data, tail);
+        ring_.cursor += tail;  // == cap
+        data += tail;
+        len -= tail;
+        ring_.EnsureHeadroom(len);
     }
+    std::memcpy(ring_.Base() + ring_.cursor, data, len);
+    ring_.cursor += len;
 }
 
 }  // namespace optimum
