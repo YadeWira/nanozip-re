@@ -1337,6 +1337,8 @@ struct NzImageModel::Impl {
 
     // FUN_080b65b0: turn `pr` (entering as the previous pixel's values) into the
     // 2D prediction. Always operates on 4 lanes; lanes >= nch are harmless.
+    // 32-bit wrap-around add (the original's x86 arithmetic); UBSan-clean on corrupt input.
+    static inline int32_t WrapAdd(int32_t a, int32_t b) { return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(b)); }
     void Predict2D(uint32_t* pr, uint32_t stride, uint32_t mode, uint32_t nch) {
         if (mode == 0u) return;
         const int16_t* above = &ring1_[(r1_ - stride) & 0x7fffu];
@@ -1520,7 +1522,7 @@ struct NzImageModel::Impl {
                     int32_t lms4[4] = {0, 0, 0, 0};  // aiStack_80: plane-4 output per channel
                     for (uint32_t c = 0; c < nch; ++c) {
                         const int32_t r = *rp[c]++;
-                        lms4[c] = plane_[4].pred + r;
+                        lms4[c] = WrapAdd(plane_[4].pred, r);   // 32-bit wrap on corrupt input (UBSan)
                         PlaneStep(plane_[4], r);
                     }
                     if (flags_ & 4u) {
@@ -1537,10 +1539,10 @@ struct NzImageModel::Impl {
                                 const uint32_t q = (uint32_t)(mag >> (casc[s * 4 + c] & 0x1fu));
                                 const int32_t pred = (int32_t)((q ^ (uint32_t)sg) - (uint32_t)sg);
                                 const int32_t in_v = nxt[c];
-                                lvl[s][c] = pred + in_v;
+                                lvl[s][c] = WrapAdd(pred, in_v);
                                 if (in_v != 0) {
                                     const int32_t sgn = in_v >> 31;
-                                    for (int k = 0; k < 4; ++k) st.coef[k] += (st.hist[k] ^ sgn) - sgn;
+                                    for (int k = 0; k < 4; ++k) st.coef[k] = WrapAdd(st.coef[k], (int32_t)(((uint32_t)st.hist[k] ^ (uint32_t)sgn) - (uint32_t)sgn));
                                 }
                             }
                             for (uint32_t c = 0; c < nch; ++c) nxt[c] = lvl[s][c];
@@ -1549,7 +1551,7 @@ struct NzImageModel::Impl {
                         for (uint32_t c = 0; c < nch; ++c) lvl[0][c] = lms4[c];
                     }
                     for (uint32_t c = 0; c < nch; ++c) {
-                        d[c] = plane_[c].pred + lvl[0][c];
+                        d[c] = WrapAdd(plane_[c].pred, lvl[0][c]);
                         PlaneStep(plane_[c], lvl[0][c]);
                     }
                 }

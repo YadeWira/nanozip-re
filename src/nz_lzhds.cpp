@@ -46,9 +46,13 @@ inline std::uint32_t LzhdsBSwap32(std::uint32_t w) {
 }
 
 std::uint32_t LzhdsReadBits(LzhdsBitReader& r, std::uint32_t n) {
+    // A corrupt Exp-Golomb prefix can ask for more than 32 bits; clamp so the
+    // shifts stay defined (the decode is garbage either way and the entry
+    // checksum rejects it). 64-bit intermediates keep a 32-bit shift legal.
+    if (n > 32u) n = 32u;
     std::uint32_t bits = r.bits, word = r.word, res;
     if (bits < n) {
-        std::uint32_t hi = word << (n - bits);
+        std::uint32_t hi = static_cast<std::uint32_t>(static_cast<std::uint64_t>(word) << (n - bits));
         std::uint32_t nb = 32u - (n - bits);
         std::uint32_t neww;
         if (r.cur < r.end) {
@@ -59,7 +63,7 @@ std::uint32_t LzhdsReadBits(LzhdsBitReader& r, std::uint32_t n) {
             neww = nb;
         }
         r.cur += 4;
-        res = hi | (neww >> nb);
+        res = hi | static_cast<std::uint32_t>(static_cast<std::uint64_t>(neww) >> nb);
         bits = nb;
         word = neww;
     } else {
