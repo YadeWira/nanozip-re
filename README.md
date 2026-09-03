@@ -1,255 +1,107 @@
 # nanozip-re
 
-Reverse engineering reconstruction of the **NanoZip 0.09a** archiver CLI (`nz`) in C++17 — without SFX, without the original binary at runtime for supported methods.
+A byte-exact, native C++17 reimplementation of the **NanoZip 0.09 alpha** archiver's decoder (`nz`
+commands `l`, `t`, `x`), with a console identical to the original's. No original binary is needed or
+used at runtime.
 
-NanoZip is a high-performance archiver (circa 2010) with several unique compression algorithms: `nz_lzpf`, `nz_lzhd`, `nz_optimum1/2`, and `nz_cm`. The original binaries are stripped Linux ELF (32-bit and 64-bit) with no public source.
+NanoZip (Sami Runsas, 2008–2011) is a closed-source archiver with five compressors of its own —
+`nz_lzpf`, `nz_lzhd`, `nz_lzhds`, `nz_optimum1/2`, `nz_cm` — plus audio and image models, text
+transforms and an x86 filter. Only stripped Linux and Windows binaries of the last alpha exist.
 
-📖 **[Wiki](https://github.com/YadeWira/nanozip-re/wiki)** — per-codec status detail, reverse-engineering notes, and the full day-by-day changelog live there. This README stays a short overview.
+📖 **[Wiki](https://github.com/YadeWira/nanozip-re/wiki)** · 📋 **[Original quirks catalogue](docs/ORIGINAL_QUIRKS.md)** · ⬇️ **[Releases](https://github.com/YadeWira/nanozip-re/releases)**
 
----
+## Why
 
-## Goals
+NanoZip's author died more than a decade ago; 0.09 alpha is the last build he published, and the
+closed binary is all that exists of the format. This project is preservation: an executable
+specification that keeps `.nz` archives readable once that binary no longer runs.
 
-- Reconstruct the full `l / t / x / a / s` CLI in C++ with byte-exact output.
-- Native (no original binary at runtime) decoding for all compression methods.
-- Document every reverse-engineered finding so the knowledge is not lost.
+The rule that follows is **fidelity first**. Format and output bytes are identical, always; console,
+messages and switches are identical except where timing makes them unobservable; behaviour is
+identical *including the alpha's defects*, so the two binaries can be compared on equal terms and
+every difference is a bug on this side. The defects are catalogued in
+[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md); which to keep and which to fix is a decision for
+the community once the decoder is complete. Until then the only escape hatches are environment
+variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few deliberate departures
+(a path-traversal guard, no crash on an archive of empty files, no infinite prompt on a closed stdin)
+are marked `[pending]` in the catalogue.
 
-## Decode coverage (measured, native only)
+## Status
 
-The honest metric is how much decodes **byte-exact with no original binary at runtime**.
-`tests/native_only_v2.sh` runs extraction and diffs against the legacy oracle (the
-`NZ_NO_BRIDGE=1` it still exports dates from when a fallback to the original existed;
-there is none any more). On a mixed
-corpus (random, text, source, repeats, zeros, audio, a mixed audio/text/high-entropy
-file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
+Everything is measured against the original binary as the oracle: it compresses the fixtures, its
+extraction is the reference, and stdout/stderr/exit status/written trees are compared byte for byte.
 
-| method | native byte-exact | method | native byte-exact |
-|--------|-------------------|--------|-------------------|
-| `-cn` (store)      | 12/12 | `-cd` (lzhd)        | 12/12 |
-| `-cf` (lzpf A)     | 12/12 | `-cD` (lzhd strong) | 12/12 |
-| `-cF` (lzpf B)     | 12/12 | `-co` (optimum1)    | 12/12 |
-| `-cc` (cm)         | 12/12 | `-cO` (optimum2)    | 12/12 |
+| what | result |
+|---|---|
+| Synthetic fixtures, 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact |
+| Multi-file archives, 12 selectors × 9 shapes, whole trees + listings (`tests/multifile_v2.sh`) | 144/144 + 72/72 |
+| Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
+| Real-world corpus, 155 files × 8 codecs | 1240/1240 |
+| Stratified sweep, ~3000 files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | in progress; 3 bugs found and fixed so far |
+| Release package, 47 archives, all four binaries | 95/95 hashes |
+| Console matrices (36 + 77 + 77 cases, pty prompt harness) | identical except progress-redraw timing and the encode commands |
+| Damaged archives, 8 codecs × 6 corruptions | 42/48 identical trees |
+| Fuzzing, ASan + UBSan | 761/761 clean |
 
-**96/96 (100%) byte-exact native** on this fixture set — see the wide real-world sweep
-below for the numbers that actually characterise the decode. The whole post-filter chain is native —
-param2, param1, **all seven** text-transform bits the encoder emits (including `0x40`, the PGN/chess
-transform, which the community reference never implemented either),
-and the `dece` x86 exe-filter — and so is every block/chunk kind the four `0x2b`-family
-codecs emit, including the prefilter sub-chunk and `decr_param==2` audio blocks. `-co`/`-cO` decode
-single-container and parallel-container LZ/CM content plus `decr_param==0` (BWT) blocks in both shapes (raw-stored
-output, the 256-bucket MTF/arithmetic entropy layer, and buckets the encoder stored verbatim) with the BWT-only
-`param14`/`param15` follow-ons.
+Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
+it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
+machine. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
+[Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity),
+[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status),
+[Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
 
-On a 61-file real-world corpus (`tests/real_corpus_sweep.sh`, same corpus for every codec):
-**488/488**, every codec 61/61. That corpus is now saturated, so it cannot detect anything on its own —
-the honest figure comes from the wider sweep below.
+**Not there yet:** encode (`a`, `s`) and self-extractor creation (`w32c`). Known limits: the
+`IO-out` footer figure and the progress redraw count are timing-dependent; the 32-bit builds hold the
+decoded stream in memory; format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image
+predictor modes other than 2) are ported but unexercised.
 
-`tests/multifile_v2.sh` covers what neither of those can: they build **one-file** archives and compare **one**
-extracted file. It runs **all twelve** compressor selectors the binary's own usage lists — `-cdp`/`-cdP`/`-cDp`/`-cDP`
-are encoder-parallelism variants of `-cd`/`-cD`, and testing only eight of them hid a real bug — across nine
-archive shapes, comparing whole extracted **trees** (contents, permissions *and* timestamps), plus extraction under
-the metadata switches and 72 listings. Each shape forces a different branch: distinct versus repeated permissions,
-70 equal modes, setuid/sticky, an all-0600 input (whose permission record the encoder omits entirely), a
-multi-block mix, a `-r` recursive tree, a `-p4` single-file container and a `-p4` **multi-file** one.
-**108/108 extract · 36/36 switches · 12/12 in a bare user environment · 72/72 listings.**
-
-That suite is also where a *flaky* case turned out to be a real defect. NanoZip is multi-threaded by
-default, and each worker writes its own self-describing record run into the container — in
-**thread-scheduling order**, not stream order. About one archive in twenty came out with the runs
-reordered, which this decoder rejected outright as a corrupt header. A flaky test is a defect report:
-re-running until green would have buried a layout that a user hits 5% of the time.
-
-### Measured the way a user runs it
-
-There is **no fallback to the original binary** in this program: nothing searches for an `nz`, nothing
-shells out, and a stream no native decoder accepts is reported as corrupt. Earlier versions carried an
-"extract bridge" that could silently run an original found near the working directory or on `$PATH`;
-it was removed once every corpus decoded natively, after an audit under `strace` (zero foreign
-`execve`, zero probes of an original binary, with one reachable and the bridge still enabled) and a
-run with the originals made unreadable (95/95). `tests/multifile_v2.sh` also runs a copy of the
-binary under `env -i`, with no variables set, and compares against the oracle.
-
-### Why a replica, and why defects included
-
-NanoZip's author, Sami Runsas, died more than a decade ago; 0.09 alpha is the last build he published,
-and the closed 32-bit binary is all that exists of the format. This project is preservation: an
-executable specification that keeps `.nz` archives readable once that binary no longer runs. The rule
-that follows is fidelity first. Format and output bytes are identical, always; console, messages and
-switches are identical except where timing makes them unobservable; behaviour is identical *including
-the alpha's defects*, so that the two binaries can be compared on equal terms and every difference is a
-bug on this side. The defects are catalogued in [docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md);
-which of them to keep and which to fix is a decision for the community once the decoder is complete,
-and until then the only escape hatches are environment variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`),
-never new switches. The few deliberate departures (a path-traversal guard, no crash on an archive of
-empty files, no infinite prompt on a closed stdin) are marked `[pending]` in that catalogue.
-
-### The console is the original's, byte for byte
-
-Everything the decoder prints is matched against `nz` on a 36-case matrix (usage, help, info, list,
-test, extract, filters, `-v`, `-sp`, `-o`, missing and foreign files, truncated and corrupted
-archives, self-extracting `.exe`, the archive-name rule) with stdout, stderr and the created files
-compared byte for byte; the only differences left are the program name in the usage text, the
-thread-dependent order of the per-worker lines on a parallel container, and the encode commands.
-Measured behaviour that was not obvious: the exit status is **always 0**, even for a corrupt archive
-(reproduced; `NZ_SAFE=1` or `NZ_STRICT_EXIT=1` make damaged content return 2, see below); `.nz` is appended to the archive name unless it ends in `.nz` or `.exe`; a
-self-extracting `.exe` opens by seeking past the PE image; the `[N MB]` figure on the compressor
-line is the codec's memory-usage method transcribed (window and table sizes, to the byte); a
-checksum mismatch prints `[stored computed]` and continues; a failed decode is `Archive corrupted.
-Error decoding (code 100)`, or 25600 when the archive is cut short. On a damaged archive the original
-writes whatever it decoded: it flushes its output per codec block (per 1 MB stream for `-cd`/`-cD`, per
-member for `-cf`/`-cF`), so the files of the blocks completed before the failure are on disk, the file
-the failing block starts with is created empty, a file whose checksum fails is written anyway with the
-`Checksum mismatch` line, and the status is still 0. This decoder does the same by default -- measured
-on 48 one-byte corruptions and truncations across eight codecs, 40 leave byte-identical trees; the
-rest differ in the garbage the two decoders produce or in a block-level check of the original not yet
-identified (see [docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md), which lists every rough edge of
-the alpha and what is reproduced). Set `NZ_SAFE=1` to write only entries whose checksum verifies,
-skip the rest with the mismatch line, and exit 2; the progress line shows the
-cumulative megabytes and re-prints the name only when the file changes; names over 40 columns are
-shown as `...` plus their last 37 characters.
-
-### Robustness against input that is not a valid archive
-
-Fuzzed with 761 cases under AddressSanitizer + UBSan — truncations, single-bit flips weighted
-toward the header, corruption runs, and non-archives renamed `.nz`. That found an out-of-bounds
-**write** (a transform that ignored its output capacity), a 214-second denial of service ending in
-a segfault on a 191-byte mutated archive, an out-of-bounds read on a corrupt Huffman table, and two
-signed-overflow sites. All fixed; **761/761 clean**. Worst corrupt case 3.7 s, a non-archive
-refused in ~10 ms.
-
-The reusable invariant from that: **bound decode work against the archive's DECLARED OUTPUT, per
-entry, not per call** — a valid decode needs exactly 8 bit decodes per output byte no matter how
-the chunks are cut, and a per-call bound still lets a corrupt header multiply the work by inventing
-chunks.
-
-### Known decode failures, on a corpus large enough to measure them
-
-A 61-file corpus at 488/488 proves nothing by itself; an earlier release quoted one at 479/480 while
-`-cO` was in fact failing about **7.5% of real files**, because that corpus happened to contain exactly
-one of them. The figure below therefore comes from a **fresh 155-file real-world corpus** (63 MB across
-eight format categories), swept with all eight codecs: **1240/1240 byte-exact**.
-
-| method | pass | fail | | method | pass | fail |
-|--------|------|------|---|--------|------|------|
-| `-cn`  | 155  | 0    | | `-cd`  | 155  | 0    |
-| `-cf`  | 155  | 0    | | `-cD`  | 155  | 0    |
-| `-cF`  | 155  | 0    | | `-co`  | 155  | 0    |
-| `-cc`  | 155  | 0    | | `-cO`  | 155  | 0    |
-
-The last cause standing on this corpus, **the image model, is ported** (`NzImageModel`, `nz_audio.cpp`).
-NanoZip's encoder runs four image detectors (BMP, and the same model is reached by PGM/PPM/TGA and
-uncompressed TIFF) and puts a recognised block on `decr_param = 3`; every codec then decodes it with
-the same function — the CM family's mode 3, `-cd/-cD`'s `0xf` sub-chunk, `-cf/-cF`'s prefilter-slot
-block with bit 3 set. The community reference treats that value as ordinary CM without reset, which
-is why every uncompressed bitmap failed its checksum in every codec. The model is the audio
-decoder's two-dimensional sibling: per-channel LMS planes and the same residual coder, a four-stage
-sign-sign cascade fed by the four rows above, and an eight-mode pixel predictor over the left,
-above, above-left and above-right neighbours. It decodes byte-exact in all seven codecs on 37 real
-BMPs, on 8/16/24/32-bit and PGM/PPM/TGA/TIFF images, and in mixed archives with audio and text.
-
-The BMP sweep also surfaced two `-co/-cO` declines outside this corpus that never entered the image
-model, and both were one cause, now fixed: a BWT block's `param15` pass names its match sources as
-absolute offsets into everything decoded so far — the *pre-post-filter* stream the LZ window holds,
-not the final output. The port sourced them from the final output, which the `param1` delta filter had
-already rewritten almost byte for byte, so the copied bytes were wrong and so was the window the next
-LZ block read. Found by dumping the original's window at the failing block's entry and asking where
-its bytes came from: its own window, where ours came from the file.
-
-The `-cd`/`-cD` cluster that stood here earlier the same day (12 failures) was three causes, all now
-closed: the prefilter state was not reset after a pure-literal LZ chunk (the original resets on every
-LZ chunk); the LZ ring was sized `round(total / 64 KB)` where the real rule is `bytefloat(p1 + 1)` —
-the same mantissa/exponent byte the `-cc` window and the lzpf dictionary use — for single-container
-and per-stream parallel rings alike; and a match reaching back across the ring end is copied
-*linearly* into the zeroed slack past the ring, not modulo the ring.
-
-`-cO`'s own literal model — the long-standing failure this project quoted for months — is **closed**. It
-was two ring-lifetime bugs: the wrap's LZP-table sweep started 64 bytes too low, leaving its last 16
-entries uncleared for the life of the archive, and the window-feed path collapsed four cases into one, so
-a feed crossing the ring end left the cursor in the wrong place and skipped the reset. Because that table
-feeds exactly one of eight mixer inputs, a stale entry moved a single probability by about 1% and flipped
-a bit only where the coder already sat on a decision boundary — one wrong byte with tens of thousands of
-byte-exact bytes on either side.
-
-See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
-full per-codec breakdown, known gaps, and roadmap to 100%.
-
-
-## Architecture
+## Usage
 
 ```
-nz_recon CLI
-├── sfx_archive.cpp    — core: archive format, dispatcher, native decoders
-├── sfx_cli.cpp        — CLI parsing (l/t/x/a/s + switches)
-├── lzpf_arith.cpp     — lzpf arith primitives (BitReader, Huffman, LZ77 A/B)
-├── nz_cm.cpp          — CM decoder: ported from nzdec_v0 NZ_CM.cpp (context mixer, range coder, all tables)
-├── nz_lzhd.cpp        — lzhd decoder: ported from nzdec_v0 NZ_LZ.cpp (DecLZ, PAQ context mixer, 12-bit arith)
-├── nz_optimum_lz.cpp  — real -co (nz_optimum1) LZ/CM engine
-├── nz_optimum2_lz.cpp — real -cO (nz_optimum2) LZ/CM engine
-├── linux32_cm_map.cpp — cm context-mixer vtable mapping (linux32 ELF offsets)
-└── include/
-    ├── lzpf_arith.h
-    ├── nz_cm.h        — CM decoder public API
-    ├── nz_lzhd.h      — lzhd decoder public API
-    └── nz_sfx/        — internal headers
+nz_recon x -y archive.nz        # extract (-y: overwrite without asking)
+nz_recon l archive.nz           # list
+nz_recon t archive.nz           # test: decode and verify, write nothing
+nz_recon x -y -oout/ archive.nz # into a directory; -sp strips paths; -x<glob> excludes
 ```
 
-**One decode layer**: the native C++ reconstruction. A multi-threaded archive (the `-pN` container the
-original writes for anything above ~8 MB) has its worker streams decoded concurrently, one thread per
-stream up to the CPU count (`-t<n>` caps it); the streams are independent by construction and each
-writes its own slice of the output, which is checked to tile the file without overlap before any
-thread starts. There is no bridge to the original binary of any
-kind — not for decoding, not for unknown switches, not for compression. What the native decoders decline
-is reported as `Archive corrupted. Error decoding (code 100)`, exactly as the original reports its own
-failures.
+Switches, messages, prompts and the exit status follow the original exactly (exit status is always 0,
+as in the original). Environment variables, all optional:
+
+| variable | effect |
+|---|---|
+| `NZ_SAFE=1` | on a damaged archive write only entries whose checksum verifies, skip the rest with the `Checksum mismatch` line, exit 2 (the original writes whatever it decoded) |
+| `NZ_STRICT_EXIT=1` | distinct exit codes for damage and usage errors |
+| `NZ_THREADS=n` | decode thread count (default: `-t<n>`, else the CPU count) |
+| `NZ_TRACE_CONSTRUCTS=1` | print each format construct met, once (`[construct] k=v` on stderr) |
 
 ## Build
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Produces `build/nz_recon`.
+Produces `bin/nz_recon`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -Iinclude -static -pthread -o nz_recon src/*.cpp` (and the mingw-w64 equivalents for Windows).
 
 ## Tests
 
-```bash
-# Smoke suite (unit tests for lzpf arith primitives + integration round-trips)
-./tests/smoke_suite.sh
+See [tests/README.md](tests/README.md). The regression set before every commit: `tests/native_only_v2.sh`,
+`tests/multifile_v2.sh`, `tests/real_corpus_sweep.sh` (needs the original binary at `../linux32/nz`
+or `NZ_LEGACY_ORACLE`), plus the release-package hash check and the console matrices kept with the
+project's private tooling.
 
-# Coverage matrix (8-method native_strict benchmark)
-./tests/coverage_matrix.sh
+## How it was done
 
-# Stress (5 consecutive runs, checks for non-determinism)
-./tests/stress_matrix.sh
-
-# Native-only validation (see the table above).
-./tests/native_only_v2.sh
-
-# Multi-file archives: whole-tree comparison (contents, mode and mtime)
-# across archive shapes and metadata switches. The single-file suites
-# above cannot see this class of bug.
-./tests/multifile_v2.sh
-
-# Real-world corpus sweep: same methodology, but over an
-# arbitrary directory of REAL files instead of a small synthetic fixture
-# set. Point NZ_REAL_CORPUS at a directory (a file-format sample
-# collection works well); failures are grouped by the native binary's
-# own decline reason, not just by fixture name. This is how several real
-# bugs were found in code previously believed "done" — see the wiki
-# changelog's 2026-07-29/2026-07-30 entries.
-NZ_REAL_CORPUS=/path/to/real/files ./tests/real_corpus_sweep.sh
-```
-
-## Reverse engineering approach
-
-Ghidra (headless decompile) + GDB (dynamic tracing against the real `linux32/nz` binary) + reference-source diffs
-where a reference exists (`encode_su/nzdec_v0.7z`, incomplete coverage). See the wiki's
-**[Reverse Engineering Notes](https://github.com/YadeWira/nanozip-re/wiki/Reverse-Engineering-Notes)** for the
-tools, workflow, and every specific finding (addresses, formulas, table contents).
+Ghidra (headless decompile), GDB tracing against the real `linux32/nz` (golden vectors, watchpoints,
+per-stage dumps), differential decoding between codecs that share a front end, and diffs against the
+community reference decoder where it exists (`encode_su/nzdec_v0`, incomplete). The tools, workflow
+and every finding (addresses, formulas, table contents) are in the wiki's
+[Reverse Engineering Notes](https://github.com/YadeWira/nanozip-re/wiki/Reverse-Engineering-Notes);
+the source layout is in [Architecture](https://github.com/YadeWira/nanozip-re/wiki/Architecture).
 
 ## License
 
 The reconstruction code in this repository is original work released under the **MIT License**.
 
-NanoZip 0.09a binaries are not included and remain the property of their author. This project contains no extracted binary data, no verbatim decompiled output, and no proprietary assets. The C++ code is an independent reimplementation derived from behavioral observation and dynamic tracing.
+NanoZip 0.09a binaries are not included and remain the property of their author. This project
+contains no extracted binary data, no verbatim decompiled output, and no proprietary assets. The C++
+code is an independent reimplementation derived from behavioral observation and dynamic tracing.
