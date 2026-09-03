@@ -197,14 +197,24 @@ void UpdateFletcher16(std::uint32_t* s1, std::uint32_t* s2, const unsigned char*
     if (s1 == nullptr || s2 == nullptr) {
         return;
     }
-    std::uint32_t a = *s1;
-    std::uint32_t b = *s2;
-    for (std::size_t i = 0; i < size; ++i) {
-        a = (a + data[i]) % 255u;
-        b = (b + a) % 255u;
+    // Deferred modulo: the per-byte `% 255` was 14 % of a 2.29 GB decode (perf,
+    // 2026-09-03). Reducing once per block is exact -- every intermediate a_i is
+    // congruent to its reduced value, so the sum of the unreduced a_i is too.
+    // With 64-bit accumulators a block of 65536 bytes cannot overflow.
+    std::uint64_t a = *s1;
+    std::uint64_t b = *s2;
+    std::size_t i = 0;
+    while (i < size) {
+        const std::size_t end = std::min(size, i + 65536u);
+        for (; i < end; ++i) {
+            a += data[i];
+            b += a;
+        }
+        a %= 255u;
+        b %= 255u;
     }
-    *s1 = a;
-    *s2 = b;
+    *s1 = static_cast<std::uint32_t>(a);
+    *s2 = static_cast<std::uint32_t>(b);
 }
 
 void Fletcher32Step(std::uint32_t* s1, std::uint32_t* s2, std::uint32_t word) {
@@ -245,12 +255,21 @@ void UpdateFletcher32(
         }
     }
 
-    while (i + 1 < size) {
-        const std::uint32_t w =
-            static_cast<std::uint32_t>(data[i]) |
-            (static_cast<std::uint32_t>(data[i + 1u]) << 8u);
-        Fletcher32Step(s1, s2, w);
-        i += 2u;
+    // Deferred modulo (see UpdateFletcher16): words are < 65536, so with 64-bit
+    // accumulators a block of 2^20 words cannot overflow.
+    {
+        std::uint64_t a = *s1, b = *s2;
+        while (i + 1 < size) {
+            const std::size_t end = std::min(size - 1, i + (std::size_t{1} << 21));
+            for (; i + 1 < end + 1 && i + 1 < size; i += 2u) {
+                a += static_cast<std::uint32_t>(data[i]) | (static_cast<std::uint32_t>(data[i + 1u]) << 8u);
+                b += a;
+            }
+            a %= 0xffffu;
+            b %= 0xffffu;
+        }
+        *s1 = static_cast<std::uint32_t>(a);
+        *s2 = static_cast<std::uint32_t>(b);
     }
 
     if (i < size) {
