@@ -1427,7 +1427,7 @@ bool ParseLegacyParallelStreams(
     if (magic == bytes.size() || bytes[magic + 3u] != 0x0fu) return false;
 
     std::size_t p = magic + 3u;
-    for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+    for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
         std::uint64_t r = 0;
         if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) return false;
         unsigned ct = static_cast<unsigned>(r) & 0x0fu;
@@ -2965,7 +2965,12 @@ bool TryParseLegacyCnArchive(
     std::map<std::string, std::set<unsigned>> path_streams;
     bool truncated_input = false;
 
-    for (int guard = 0; guard < 1024 && pos < bytes.size(); ++guard) {
+    // No record-count cap: a 2.29 GB -cf container carries 16 streams x ~144 records
+    // (2300+), and an earlier cap of 1024 made the walker stop half-way, so the
+    // parser saw 8 streams and folded the other 8 into one undecodable slice
+    // (declined as corrupt). Every record consumes at least one byte, so `pos`
+    // alone bounds the loop; the guard only rules out a non-advancing iteration.
+    for (std::size_t guard = 0; guard <= bytes.size() && pos < bytes.size(); ++guard) {
         const std::size_t record_begin = pos;
         std::uint64_t r64 = 0u;
         if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) break;
@@ -3895,7 +3900,7 @@ bool TryParseLegacyCnArchive(
                         std::map<unsigned, PStream> ps;
                         std::size_t p = magic + 3u;
                         bool parse_ok = true;
-                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
                             std::uint64_t r = 0;
                             if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
                             unsigned ct = static_cast<unsigned>(r) & 0x0fu;
@@ -4040,7 +4045,7 @@ bool TryParseLegacyCnArchive(
                         std::map<unsigned, PCdStream> ps;
                         std::size_t p = magic + 3u;
                         bool parse_ok = true;
-                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
                             std::uint64_t r = 0;
                             if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
                             unsigned ct = static_cast<unsigned>(r) & 0x0fu;
@@ -4450,7 +4455,7 @@ bool TryParseLegacyCnArchive(
                         std::map<unsigned, POptStream> ps;
                         std::size_t p = magic + 3u;
                         bool parse_ok = true;
-                        for (int guard = 0; guard < 8192 && p < bytes.size(); ++guard) {
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
                             std::uint64_t r = 0;
                             if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
                             unsigned ct = static_cast<unsigned>(r) & 0x0fu;
@@ -6848,18 +6853,23 @@ struct DecodeProgress {
         current = name;
         if (!started) { started = true; Name(); Field(); next_mark = 1u << 20; }
     }
+    std::chrono::steady_clock::time_point last_refresh = std::chrono::steady_clock::now();
     void Advance(std::uint64_t n) {
-        // One refresh per whole MB crossed, showing the count at that mark -- the
-        // original refreshes per decoded block, roughly a megabyte apart.
-        const std::uint64_t end = done + n;
-        while (started && next_mark <= end) {
-            done = next_mark;
-            if (shown != current) Name();
-            Field();
-            next_mark += 1u << 20;
-        }
-        done = end;
+        // The original redraws from a ~0.5 s timer, and only when the shown figure
+        // changed: a 2.29 GB archive that decodes in 3.3 s shows six refreshes, a
+        // 12 MB one that takes 11 s shows one every 0.4-1.5 s. Same rule here.
+        done += n;
+        if (!started) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_refresh < std::chrono::milliseconds(500)) return;
+        const std::uint64_t mb = (done + 512u * 1024u) >> 20;
+        if (mb == shown_mb && shown == current) return;
+        last_refresh = now;
+        if (shown != current) Name();
+        Field();
+        shown_mb = mb;
     }
+    std::uint64_t shown_mb = 0;
 };
 
 // The CM family's memory method, FUN_080aafb0, transcribed (Ghidra + GDB reads of
@@ -7010,8 +7020,10 @@ int RunLegacyCnExtractOrTest(
     const CliOptions& options,
     const LegacyCnContext& legacy,
     bool test_mode,
-    std::ostream& os) {
-    const auto run_start = std::chrono::steady_clock::now();
+    std::ostream& os,
+    // Start of the whole command (decode included): the footer's "in N s" is the
+    // original's total, not just the copy-out that follows a finished decode.
+    std::chrono::steady_clock::time_point run_start) {
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
@@ -7025,7 +7037,7 @@ int RunLegacyCnExtractOrTest(
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
-            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
         }
         // Native -co (nz_optimum1, method_p0==5, single-container flag 0x05)
         // AND -cO (nz_optimum2, method_p0==6, single-container flag 0x06) via
@@ -7061,7 +7073,7 @@ int RunLegacyCnExtractOrTest(
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
-            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
         } else if (NativeTrace() && !optimum_decode_error.empty()) {
             os << "[native] " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
                << " native decode declined: " << optimum_decode_error << '\n';
@@ -7080,7 +7092,7 @@ int RunLegacyCnExtractOrTest(
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
-            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
         }
         if (NativeTrace() && !cm_decode_error.empty()) {
             os << "[native] -cc native decode declined: " << cm_decode_error << '\n';
@@ -8132,7 +8144,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
                 // Header first, decode second -- the original streams, so a failing
                 // archive still shows "Archive:", "Threads:" and the compressor line.
                 PrintDecodeHeader(os, legacy_cn, options, test_mode);
-                const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os);
+                const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os, run_start);
                 if (legacy_rc != kLegacyNeedCompat) {
                     return legacy_rc;
                 }
