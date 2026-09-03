@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
     // The original's out-of-memory report. The 32-bit builds hold the decoded
     // stream in memory, so an archive whose content does not fit their address
     // space ends here instead of in an uncaught std::bad_alloc abort.
+    nz::recon::SetDecodeThreads(options.threads);
     int rc = 0;
     try {
     switch (options.command) {

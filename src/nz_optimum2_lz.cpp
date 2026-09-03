@@ -280,12 +280,12 @@ inline std::uint32_t DecodeAdaptive16(RangeDecoder& rc, std::uint8_t* mem, int o
 
 // Current ring position, for the rare-branch profiler only (the mixer lambda is
 // nested too deep to see the loop's own counter).
-static std::uint32_t g_rare_pos = 0;
+static thread_local std::uint32_t g_rare_pos = 0;
 // Global count of literal-mixer bit decodes. The port is byte-exact for the
 // whole prefix before the divergence, so this counter also counts the ORIGINAL
 // binary's mixer calls -- which is what lets a GDB `ignore` count land on the
 // exact bit that decodes wrong (see optimum2_gdb/README.md).
-static long g_mixbits = 0;
+static thread_local long g_mixbits = 0;
 
 inline std::uint8_t& RingAt(std::uint8_t* base, std::uint32_t logical_pos) {
     return base[static_cast<std::int32_t>(logical_pos)];

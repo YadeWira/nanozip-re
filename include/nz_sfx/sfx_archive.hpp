@@ -58,6 +58,8 @@ ArchiveOpenError OpenArchive(
 
 int RunAdd(const CliOptions& options, std::ostream& os);
 int RunSimulate(const CliOptions& options, std::ostream& os);
+// Thread count for decoding a parallel container's worker streams (-t<n>; 0 = automatic).
+void SetDecodeThreads(unsigned n);
 int RunList(const CliOptions& options, std::ostream& os);
 int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os);
 int RunInfo(std::ostream& os);
