@@ -60,9 +60,13 @@ uint32_t NzTextTransform6(const uint8_t* in, uint32_t in_size,
             move_no = 1u;
             continue;
         }
-        if (b >= 0x31u && b <= 0x38u) {              // literal number: resync
+        if (b >= 0x31u && b <= 0x39u) {              // literal number ('1'..'9'): resync
             // Pure LOOKAHEAD -- the input cursor does not move and the digits
             // are emitted one at a time by this same loop on later iterations.
+            // The class is '1'..'9' (DAT_081b3060 bit 0x40): with '9' excluded a
+            // "[Date "1889.10.??"]" tag left the move counter at the previous
+            // game's value (LASK01.DOC, one wrong byte under -cd, a failed stage
+            // check under -co/-cO/-cc).
             uint32_t v = static_cast<uint32_t>(b) - 0x30u;
             uint32_t k = 0;
             uint8_t last = 0;

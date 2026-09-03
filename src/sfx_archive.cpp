@@ -5475,6 +5475,7 @@ static bool TryDecodeLegacyLzhd(
 
     // Each type-0 chunk is one stream: stream_tag varint followed by
     // stream_bytes bytes of raw DecLZ compressed data.
+    nzr::cd::NzCdExeFilterReset();
     while (pos < raw_len && written < total_out) {
         // Read stream_tag (ParseChunk-style biased varint).
         std::uint64_t stream_tag = 0u;

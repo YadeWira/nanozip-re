@@ -14,6 +14,9 @@
 
 namespace nzr {
 namespace cd {
+// Absolute output offset of the last chunk that started a new executable (see the
+// exe-filter position reset in DecodeChunk); 0 = the file start.
+static thread_local std::uint32_t g_cd_exe_origin = 0u;
 // NZOPT_TRACE_CD-gated diagnostics, following this project's existing
 // NZOPT_TRACE_* convention (zero cost when unset). This file had NO
 // instrumentation at all, which made every -cd/-cD decline indistinguishable
@@ -606,13 +609,11 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
         }
         if (!m) return 0;
         if (const char* dd = std::getenv("NZOPT_DUMP_CD_TT")) {   // per-stage outputs of this pipeline call
-            static thread_local unsigned call_no = 0; static thread_local unsigned last_param = 0xffffffffu; static thread_local unsigned st = 0;
-            if (p0 == 0 || last_param != param) { }
+            static thread_local unsigned call_no = 0; static thread_local unsigned st = 0;
             char path[512];
-            if (p0 == 0) { ++call_no; st = 0; std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_in.bin", dd, call_no, param); if (FILE* f = std::fopen(path, "wb")) { std::fwrite(src, 1, size, f); std::fclose(f); } }
+            if (cur == src) { ++call_no; st = 0; std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_in.bin", dd, call_no, param); if (FILE* f = std::fopen(path, "wb")) { std::fwrite(src, 1, size, f); std::fclose(f); } }
             std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_stage%u_%02x.bin", dd, call_no, param, ++st, bit);
             if (FILE* f = std::fopen(path, "wb")) { std::fwrite(bufs[bi], 1, m, f); std::fclose(f); }
-            last_param = param;
         }
         cur = bufs[bi]; n = m; bi ^= 1;
     }
@@ -1172,11 +1173,22 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // A chunk can carry &2 and &4 together (flags 0x7, seen on an MSI: 8 of 53
     // chunks); returning straight after the RLE step left those chunks with their
     // call targets still absolute -- 4666 wrong bytes, all right after E8.
-    if (flags & 4u)
-        NzCdExeUnfilter(out, n, out_pos + 4u);
+    if (flags & 4u) {
+        // The dispatcher's running position (*param_1) is reset to 4 when a chunk
+        // longer than 127 bytes starts with "MZ" or "\x7fELF" (FUN_080c03f0): an
+        // executable embedded mid-file starts its own address space. test.nrg (a CD
+        // image) has one at 360448 -- without the reset every call target after it
+        // was off by the executable's offset.
+        if (n > 0x7fu && ((out[0] == 'M' && out[1] == 'Z') ||
+                          (out[0] == 0x7fu && out[1] == 'E' && out[2] == 'L' && out[3] == 'F')))
+            g_cd_exe_origin = out_pos;
+        NzCdExeUnfilter(out, n, out_pos - g_cd_exe_origin + 4u);
+    }
     return n;
 }
 }  // namespace
+
+void NzCdExeFilterReset() { g_cd_exe_origin = 0u; }
 
 // The cross-chunk LZ window is a ring whose size is PER-ARCHIVE (FUN_08099050,
 // obj+0x978): ring_size = (method_p1+1) * 0x10000 — 64 KB when p1=0, 128 KB when

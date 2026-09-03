@@ -150,6 +150,10 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
 // (or filled its output cap); false means it stopped on a malformed chunk.
 bool NzCdLastStreamClean();
 
+// Forget the "embedded executable" origin of the exe filter (call at the start of
+// every entry/stream decode).
+void NzCdExeFilterReset();
+
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* out, std::uint32_t out_cap,
                                std::uint8_t* ring, std::uint32_t ring_size,
