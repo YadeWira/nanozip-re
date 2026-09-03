@@ -523,12 +523,22 @@ fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
 bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
                         std::uint32_t mode) {
 #if defined(_WIN32)
-    // Windows has no POSIX mode bits to hand to the open call, and the
-    // original's Windows build does not restore them either.
     (void)mode;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
-    if (n != 0u) out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    // Never hand the CRT a single write above 2 GB: msvcrt's _write() takes an
+    // unsigned count but returns an int, so a 2.29 GB request completes on disk
+    // and then reports a negative count, which the stream layer treats as a
+    // short write and retries forever (100% CPU after the file is complete --
+    // the first user report). 256 MB pieces keep every count comfortably small.
+    std::size_t off = 0;
+    while (off < n) {
+        const std::size_t piece = std::min<std::size_t>(n - off, std::size_t{1} << 28);
+        out.write(reinterpret_cast<const char*>(data) + off, static_cast<std::streamsize>(piece));
+        if (!out) return false;
+        off += piece;
+    }
+    out.close();
     return static_cast<bool>(out);
 #else
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
