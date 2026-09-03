@@ -1,3 +1,7 @@
+#include "nz_trace.h"
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 #include "nz_sfx/sfx_archive.hpp"
 #include "lzpf_arith.h"
 #include "nz_cm.h"
@@ -795,8 +799,11 @@ std::string FormatMode(std::uint32_t mode) {
 }
 
 std::string FormatMtime(std::int64_t unix_seconds) {
-    if (unix_seconds <= 0) {
-        return "---- --- -- --:--:--";
+    // Measured: a timestamp that comes out as exactly 0 prints as an EMPTY field
+    // (the size column follows straight after "perm "); negative values print
+    // normally (1969-Dec-30 ...).
+    if (unix_seconds == 0) {
+        return "";
     }
 
     const std::time_t t = static_cast<std::time_t>(unix_seconds);
@@ -825,21 +832,53 @@ std::string FormatMtime(std::int64_t unix_seconds) {
 // only compared against itself: it shows up as a whole-hours skew against the
 // original.
 std::int64_t LegacyStoredMtimeToUnix(std::int64_t stored) {
-    if (stored <= 0) return stored;
-    const std::time_t t = static_cast<std::time_t>(stored);
-    std::tm tmv{};
+    // Measured on l/x under TZ=UTC, Asia/Kolkata and America/Sao_Paulo: the
+    // stored value is epoch MINUS the writer's offset; the reader adds ITS OWN
+    // current offset, so the result is only right in the writer's zone (a
+    // 2*offset skew elsewhere -- reproduced, see ORIGINAL_QUIRKS). Everything is
+    // a 32-bit time_t in the original: a 2038+ mtime wraps to 1901/1963.
+    // The offset is the reader's CURRENT one (DST included: Europe/Berlin in
+    // September adds +2 h to a January 1970 stamp), not the offset at the file's
+    // own date -- measured under Berlin, Sydney, Kolkata, Sao Paulo and UTC.
+    const std::int32_t s32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(stored));
+    static const long off = [] {
+        const std::time_t now = std::time(nullptr);
+        std::tm tmv{};
 #if defined(_WIN32)
-    localtime_s(&tmv, &t);
-    const long off = -_timezone;
+        localtime_s(&tmv, &now);
+        return static_cast<long>(-_timezone + (tmv.tm_isdst > 0 ? 3600 : 0));
 #else
-    localtime_r(&t, &tmv);
-    const long off = tmv.tm_gmtoff;
+        localtime_r(&now, &tmv);
+        return static_cast<long>(tmv.tm_gmtoff);
 #endif
-    return stored + static_cast<std::int64_t>(off);
+    }();
+    const std::int64_t sum = static_cast<std::int64_t>(s32) + static_cast<std::int64_t>(off);
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(sum)));
+}
+
+// The plain listing shows names longer than 38 columns as "..." plus their last
+// 35 characters (measured: 36-38 whole, 39+ cut). The progress line has its own
+// rule (40 / 37, DecodeProgress::Name).
+std::string TruncateName40(const std::string& name) {
+    if (name.size() > 38u) return "..." + name.substr(name.size() - 35u);
+    return name;
+}
+
+// The original creates the directories of an extracted path with mode 0700
+// (measured on every tree of the round-3 matrix), whatever the umask says.
+void MakeDirs0700(const fs::path& dir) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    if (fs::exists(dir, ec)) return;
+    MakeDirs0700(dir.parent_path());
+#if defined(_WIN32)
+    fs::create_directory(dir, ec);
+#else
+    ::mkdir(dir.c_str(), 0700);
+#endif
 }
 
 std::string FormatMtimeStored(std::int64_t stored) {
-    if (stored <= 0) return FormatMtime(stored);
     return FormatMtime(LegacyStoredMtimeToUnix(stored));
 }
 
@@ -848,7 +887,7 @@ std::string FormatMtimeStored(std::int64_t stored) {
 // a fractional nanosecond part that a byte-exact tree comparison catches.
 bool SetExtractedMtime(const fs::path& path, std::int64_t stored) {
     const std::int64_t real = LegacyStoredMtimeToUnix(stored);
-    if (real <= 0) return true;
+    if (real == 0) return true;   // measured: a zero timestamp is left alone; negatives are applied
 #if defined(_WIN32)
     // mingw hides the utime() family under -std=c++17 (__STRICT_ANSI__), and
     // Windows has no whole-second-only stat to be exact against anyway.
@@ -1080,6 +1119,11 @@ struct LegacyCnEntry {
     bool has_permissions = false;
     std::int64_t mtime_unix = 0;
     bool has_mtime = false;
+    // -fo archives carry uid/gid runs (record types 8 and 9); `l -fo` shows them
+    // as a "user/grp." column.
+    std::uint32_t uid = 0;
+    std::uint32_t gid = 0;
+    bool has_owner = false;
 };
 
 enum class LegacyPayloadMode {
@@ -1134,10 +1178,22 @@ constexpr int kLegacyNeedCompat = -100;
 
 // Sum of the bytes modulo 255: the one-byte per-stage check the original stores
 // in a block header ("staged" bytes) and verifies after each post-filter stage.
-unsigned Sum255(const std::uint8_t* p, std::size_t n) {
-    std::uint64_t s = 0;
-    for (std::size_t i = 0; i < n; ++i) s += p[i];
-    return static_cast<unsigned>(s % 255u);
+unsigned StageCheck255(const std::uint8_t* p, std::size_t n) {
+    // The per-stage check byte: this archive family's Fletcher-32 (16-bit LE words
+    // mod 0xffff, odd tail byte as its own word, zero sums forced to 0xffff,
+    // packed s1<<16|s2) reduced modulo 255. Verified on five stage buffers of two
+    // codecs (GDB: FUN_080c0220 pops the last staged byte and compares it with
+    // checksum(stage) % 0xff).
+    std::uint32_t s1 = 0, s2 = 0;
+    std::size_t i = 0;
+    for (; i + 1 < n; i += 2) {
+        const std::uint32_t w = static_cast<std::uint32_t>(p[i]) | (static_cast<std::uint32_t>(p[i + 1]) << 8);
+        s1 = (s1 + w) % 0xffffu; s2 = (s2 + s1) % 0xffffu;
+    }
+    if (i < n) { s1 = (s1 + p[i]) % 0xffffu; s2 = (s2 + s1) % 0xffffu; }
+    if (s1 == 0u) s1 = 0xffffu;
+    if (s2 == 0u) s2 = 0xffffu;
+    return static_cast<unsigned>(((s1 << 16) | s2) % 255u);
 }
 
 // NZ_SAFE=1: instead of the original's behaviour on a damaged archive (write
@@ -1314,6 +1370,8 @@ bool ApplyLegacyAttributeRecords(
         std::vector<std::int64_t> mtimes;
         std::vector<std::uint32_t> perms;
         std::vector<std::uint32_t> checksums;
+        std::vector<std::uint32_t> uids;
+        std::vector<std::uint32_t> gids;
     };
     std::map<unsigned, StreamAcc> acc;
 
@@ -1366,6 +1424,28 @@ bool ApplyLegacyAttributeRecords(
                 }
                 break;
             }
+            case 8u:
+            case 9u: {
+                // uid (8) / gid (9): u16 values, run-coded like the permissions
+                // (three files with uid 1000 were stored as e8 03 three times).
+                std::vector<std::uint32_t>& dst = (rtype == 8u) ? a.uids : a.gids;
+                if ((rsize % 2u) != 0u) return false;
+                for (std::size_t p = rbegin; p + 1u < rend; p += 2u) {
+                    const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
+                                            (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                    std::uint32_t id = v;
+                    std::size_t run = 1u;
+                    if (v >= 0x1000u) {
+                        const std::uint32_t coded = v >> 9u;
+                        if (coded < 8u) return false;
+                        run = static_cast<std::size_t>(coded - 6u);
+                        id = v & 0x1ffu;
+                    }
+                    if (run > n - dst.size()) return false;
+                    dst.insert(dst.end(), run, id);
+                }
+                break;
+            }
             case 5u:
             case 6u:
             case 7u: {
@@ -1411,6 +1491,9 @@ bool ApplyLegacyAttributeRecords(
             LegacyCnEntry& e = (*entries)[named[i]];
             if (!a.mtimes.empty()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
             if (!a.perms.empty()) { e.permissions = a.perms[i]; e.has_permissions = true; }
+            if (a.uids.size() == named.size() && a.gids.size() == named.size()) {
+                e.uid = a.uids[i]; e.gid = a.gids[i]; e.has_owner = true;
+            }
             if (!a.checksums.empty()) {
                 if (split_paths.count(e.path) != 0u) {
                     e.checksum_na = true;  // slice checksum, not this file's
@@ -2732,6 +2815,7 @@ bool DecodeLzpfMember(
             // no arith side stream. The dispatcher consumes opcodes until the
             // block output is produced and reports how many input bytes it read.
             const bool mode_lz77_raw = !mode_prefilter && (uvar9 & 2u) && !(uvar9 & 1u);
+            nz_trace::Construct("lzpf_block mode=%s bit3=%u", mode_prefilter ? "prefilter" : mode_literal ? "literal" : mode_lz77_side ? "lz77_side" : "lz77_raw", (uvar9 >> 3) & 1u);
             // Sliding-window wrap (legacy FUN_080b6bb0): zero [cursor, cap+0x8000)
             // then reset the cursor to 0 when fewer than 32 KiB remain.
             if (window_capacity - window_cursor < window_wrap_threshold) {
@@ -2987,7 +3071,7 @@ bool DecodeLzpfMember(
 // type since it now also serves -cO's NzOptimum2LzDecoder (single-container
 // path only, in TryDecodeLegacyOptimum) -- the parallel-container branch
 // below only ever instantiates it with NzOptimumLzDecoder (-co parallel
-// containers only; -cO parallel containers remain out of scope).
+// containers; parallel -cO containers are wired too, see TryParseLegacyCnArchive).
 template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
     const unsigned char* raw,
@@ -3187,7 +3271,7 @@ bool TryParseLegacyCnArchive(
         // Per-file attribute records, and the first main-stream data record.
         if (found_codec) {
             if (csize > 0u && (ctype == 2u || ctype == 4u || ctype == 5u ||
-                               ctype == 6u || ctype == 7u)) {
+                               ctype == 6u || ctype == 7u || ctype == 8u || ctype == 9u)) {
                 attr_records.push_back({static_cast<std::size_t>(cstream),
                                         static_cast<std::size_t>(ctype), pos, pos + csize});
             } else if (ctype == 0u && is_main) {
@@ -5192,7 +5276,7 @@ bool TryParseLegacyCnArchive(
         //    NzOptimumLzDecoder (FUN_0809e600 port).
         //  - 0x3b p0=6 (-cO, nz_optimum2) -> TryDecodeLegacyOptimum, backed by
         //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
-        //    parallel-container -cO (flag 0x0f) and decr_param==0 (BWT) still
+        //    (historical note: parallel-container -cO and decr_param==0 BWT were once unported; both are native now)
         //    bridge (see nz_optimum2_lz.h for scope).
         if (!spliced_data.empty()) {
             ctx.data = std::move(spliced_data);
@@ -5232,6 +5316,14 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     if (has_perm) {
         os << "perm ";
     }
+    // Measured: `-fo` adds a "user/grp." column only when the archive carries
+    // ownership records (an archive made without -fo shows no column).
+    bool has_owner = false;
+    for (const LegacyCnEntry& e : legacy.entries) if (e.has_owner) { has_owner = true; break; }
+    const bool show_owner = options.restore_ownership && has_owner;
+    if (show_owner) {
+        os << "user/grp. ";
+    }
     if (has_date) {
         os << "yyyy-mmm-dd hh:mm:ss";
     }
@@ -5254,13 +5346,18 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
         if (has_perm) {
             os << std::setw(4) << std::right << FormatMode(e.permissions) << ' ';
         }
+        if (show_owner) {
+            os << std::setw(4) << std::right << e.uid << '/' << std::setw(4) << std::right << e.gid << ' ';
+        }
         if (has_date) {
             os << FormatMtimeStored(e.mtime_unix);
         }
         if (options.verbose) {
             os << std::setw(15) << std::right << FormatGrouped(e.size) << "  " << e.path << '\n';
         } else {
-            os << FormatSizeColumn(e.size) << "  " << e.path << '\n';
+            // Measured: the plain listing shortens names over 40 columns to "..."
+            // plus their last 37 characters, like the progress line; -v does not.
+            os << FormatSizeColumn(e.size) << "  " << TruncateName40(e.path) << '\n';
         }
 
         total_size += e.size;
@@ -5622,6 +5719,7 @@ static bool TryDecodeLegacyCm(
         // early-returns for both). Reading them with the ordinary layout takes
         // mode2_type for param6 and then walks into the following record.
         if (decr_param == 2u || decr_param == 3u) {
+            nz_trace::Construct("audio_image_block decr=%u", decr_param);
             std::uint8_t mode2_type = 0;
             if (decr_param == 2u) {
                 if (pos >= stream_end) { ok = false; break; }
@@ -5705,7 +5803,27 @@ static bool TryDecodeLegacyCm(
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t staged_count = raw[pos++];
         if (pos + staged_count > stream_end) { ok = false; break; }
+        const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
         pos += staged_count;
+        // Per-stage check bytes, verified as in DecodeOptimumBlockSequence.
+        static const bool trace_stg = (getenv("NZOPT_TRACE_STG") != nullptr);
+        std::string stg;
+        std::size_t stage_idx = 0;
+        bool stage_bad = false;
+        const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
+            const unsigned got = StageCheck255(p, n);
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got) stage_bad = true;
+            ++stage_idx;
+            if (!trace_stg) return;
+            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
+        };
+        const auto stg_report = [&]() {
+            if (!trace_stg) return;
+            std::string hx; char b[8];
+            for (std::uint8_t v : staged) { snprintf(b, sizeof(b), "%02x", v); hx += b; }
+            fprintf(stderr, "[STG] cc block decr=%u param6=%u staged=[%s]%s verify=%s\n", decr_param, param6, hx.c_str(), stg.c_str(),
+                    stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
+        };
 
         // Read param2 flag + vector.
         if (pos >= stream_end) { ok = false; break; }
@@ -5805,30 +5923,36 @@ static bool TryDecodeLegacyCm(
         // param2, where omitting the feed produced the same corruption this port
         // was producing. Feed the model here so any subsequent CM block sees the
         // context an unbroken pass over the file would have produced.
+        // param6 == 0 marks a STORED block (the CM could not compress) -- the payload
+        // is the block output BEFORE the post-filters, which still run: an .ape file
+        // under -cc came out as stored blocks with a param1 (AddBytes) delta filter,
+        // and skipping straight to the output left 6 MB of wrong bytes. The CM model
+        // must still observe every byte (see the comment on NzCmFeedByte below).
+        std::vector<std::uint8_t> work;
+        std::uint32_t cur_size = 0;
         if (!param6 || out_size == 0u) {
+            nz_trace::Construct("cc_stored decr=%u p2=%u p1=%u tt=0x%02x dece=%u", decr_param, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param);
             for (std::uint32_t i = 0; i < payload_size; ++i) {
                 NzCmFeedByte(cm, payload[i]);
             }
-            out_data->insert(out_data->end(), payload, payload + payload_size);
-            continue;
+            work.assign(payload, payload + payload_size);
+            cur_size = payload_size;
+            stgmark("payload", payload, payload_size);
+        } else {
+            if (decr_param == 1u) NzCmReset(cm);
+            work.resize(out_size);
+            NzCmDecode(cm, payload, payload_size, work.data(), out_size);
+            cur_size = out_size;
+            stgmark("payload", payload, payload_size);
+            stgmark("cm", work.data(), cur_size);
         }
-
-        if (decr_param == 1u) NzCmReset(cm);
-
-        // Reference DecodeFromStream pipeline (post CM decode):
-        //   CM -> param2 (RLE u32 expand) -> param1 (AddBytes) -> text-transform
-        //   -> dece (exe filter).  Decode CM into a working buffer, then apply the
-        //   filters that are present in order. Filters not yet ported decline so
-        //   the caller can fall back to the extract bridge.
-        std::vector<std::uint8_t> work(out_size);
-        NzCmDecode(cm, payload, payload_size, work.data(), out_size);
-        std::uint32_t cur_size = out_size;
 
         const std::size_t prev_size = out_data->size();
         const std::uint32_t remaining =
             static_cast<std::uint32_t>(legacy.total_data_size) -
             static_cast<std::uint32_t>(prev_size);
 
+        nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDCC] pre-filters: decr_param=%u param6=%u param2_flag=%u param1_flag=%u "
                             "tt_enabled=%u tt_flags=%u out_size=%u pos=%zu stream_end=%zu\n",
@@ -5849,6 +5973,7 @@ static bool TryDecodeLegacyCm(
             exp.resize(esz);
             work.swap(exp);
             cur_size = esz;
+            stgmark("p2", work.data(), cur_size);
         }
 
         // param1: AddBytesFilter (delta filter, output size == input size).
@@ -5863,13 +5988,14 @@ static bool TryDecodeLegacyCm(
             }
             if (!p1ok) { ok = false; break; }
             work.swap(tbuf);
+            stgmark("p1", work.data(), cur_size);
             // cur_size unchanged
         }
 
         // Text transforms, applied in reference order: 0x10 (number transform),
         // then 0x08 (dictionary), then 0x02 (insert-LF). Other bits
-        // (0x80/0x04/0x20/0x40/0x01) not yet ported -> decline so the caller
-        // can bridge.
+        // Every bit but 0x80 (param14 text transform) is ported; 0x80 declines
+        // (never seen on a -cc/-co/-cO block in any corpus so far).
         // The text-transform chain's INPUT, before any stage runs. With an
         // unported bit set this is the only way to get an (input, output) pair
         // for that stage: the golden file is the chain's OUTPUT and every other
@@ -5983,6 +6109,7 @@ static bool TryDecodeLegacyCm(
             cur_size = n;
         }
 
+        if (tt_enabled) stgmark("tt", work.data(), cur_size);
         if (dece_param) {
             // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
             // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
@@ -6005,6 +6132,8 @@ static bool TryDecodeLegacyCm(
             exe.Reset();
         }
 
+        stg_report();
+        if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         }
     }
@@ -6051,7 +6180,8 @@ static bool TryDecodeLegacyCm(
     // correctness signal for CM: the block framing can parse cleanly and the
     // sizes can add up exactly while the entropy-decoded content diverges.
     //
-    // The underlying CM divergence on that archive is a separate, still-open
+    // (The CM divergence on that archive was fixed later by the cross-chunk model
+    // feed, 25d2f75; the gate stays as the safety net it is.) Historical:
     // bug; this gate is what makes it a clean decline rather than corruption.
     if (legacy.checksum_verification_supported &&
         legacy.checksum_mode != ChecksumMode::kNone &&
@@ -6073,6 +6203,7 @@ static bool TryDecodeLegacyCm(
                 // Fall back to a checksum record found mid-stream. Only for the
                 // single-entry case: with several entries there is no way to tell
                 // from here which entry a mid-stream record belongs to.
+                if (inline_checksum_seen) nz_trace::Construct("cc_midstream_checksum entries=%zu", legacy.entries.size());
                 if (!inline_checksum_seen || legacy.entries.size() != 1u) {
                     out_data->clear();
                     if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
@@ -6193,6 +6324,7 @@ static bool DecodeOptimumBlockSequence(
         // then walks off into the next record -- which is exactly why every
         // audio-bearing archive used to die before its first block trace.
         if (decr_param == 2u || decr_param == 3u) {
+            nz_trace::Construct("audio_image_block decr=%u", decr_param);
             std::uint8_t mode2_type = 0;
             if (decr_param == 2u) {
                 if (pos >= stream_end) { ok = false; break; }
@@ -6268,9 +6400,20 @@ static bool DecodeOptimumBlockSequence(
         pos += staged_count;
         static const bool trace_stg = (getenv("NZOPT_TRACE_STG") != nullptr);
         std::string stg;
+        // The original's per-stage check (FUN_080c0220): after each stage it pops
+        // the LAST remaining staged byte and compares it with Fletcher32(stage
+        // output) % 255; a mismatch is "Archive corrupted. Error decoding" with
+        // nothing of the block written. Stage k therefore checks staged[count-1-k].
+        // Verified only when this port's stage count matches the header's, so an
+        // unmodelled stage (the exe filter?) can never fail a good archive.
+        std::size_t stage_idx = 0;
+        bool stage_bad = false;
         const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
+            const unsigned got = StageCheck255(p, n);
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got) stage_bad = true;
+            ++stage_idx;
             if (!trace_stg) return;
-            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, Sum255(p, n)); stg += b;
+            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
         };
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u param6=%u out_size=%u staged_count=%u pos=%zu stream_end=%zu\n",
@@ -6444,6 +6587,7 @@ static bool DecodeOptimumBlockSequence(
                 }
                 if (!bdi_ok) { ok = false; break; }
                 cur_size = out_size;
+                stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
             }
             const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
             if (getenv("NZOPT_TRACE_TDO")) {
@@ -6598,7 +6742,7 @@ static bool DecodeOptimumBlockSequence(
             stgmark("p1", work.data(), cur_size);
         }
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
-        // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
+        // 0x08, 4, 2, 0x20, 0x40, 1. Every bit but 0x80 is ported; 0x80 declines
         // far; any other bit set (0x80/4/0x40/1) declines cleanly.
         // The text-transform chain's INPUT, before any stage runs. With an
         // unported bit set this is the only way to get an (input, output) pair
@@ -6698,6 +6842,7 @@ static bool DecodeOptimumBlockSequence(
             if (n == 0) { ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
+        if (tt_enabled) stgmark("tt", work.data(), cur_size);
         if (dece_param) {
             // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
             // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
@@ -6720,14 +6865,16 @@ static bool DecodeOptimumBlockSequence(
             exe.Reset();
         }
 
-        stgmark("final", work.data(), cur_size);
         if (trace_stg) {
             std::string hx; char b[8];
             for (std::uint8_t v : staged) { snprintf(b, sizeof(b), "%02x", v); hx += b; }
-            fprintf(stderr, "[STG] block decr=%u param6=%u tt=%s%02x staged=[%s]%s\n", decr_param, param6,
-                    tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, hx.c_str(), stg.c_str());
+            fprintf(stderr, "[STG] block decr=%u param6=%u tt=%s%02x dece=%u staged=[%s]%s verify=%s\n", decr_param, param6,
+                    tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, dece_param, hx.c_str(), stg.c_str(),
+                    stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
         }
+        if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
                     cur_size, out_data->size(), (unsigned long long)total_size_hint,
@@ -7373,7 +7520,7 @@ int RunLegacyCnExtractOrTest(
         // any malformed-bitstream/out-of-window condition already declines
         // before reaching here -- no extra bridge cross-check needed.
         // Parallel-container -cO (flag 0x0f) and decr_param==0 (BWT, either
-        // engine) remain unported and continue to route to the bridge below,
+        // engine) -- historical note: both were once unported; both are native now,
         // as does the parallel-container case for -co (TryDecodeLegacyOptimum
         // only parses a single stream_tag's worth of blocks; parallel-
         // container framing would fail that parse and decline harmlessly, or
@@ -7552,8 +7699,14 @@ int RunLegacyCnExtractOrTest(
                 : SanitizeExtractPath(e.path);
             if (options.forceout) safe_rel = fs::path(options.positional.empty() ? std::string("*") : options.positional.front());
             if (safe_rel.empty()) {
-                os << "Skipping unsafe path in archive: " << e.path << '\n';
+                // The original writes such a path as it is (`../../x`, `/abs/x` with
+                // the leading slash dropped) -- a deliberate departure, pending the
+                // community's decision (ORIGINAL_QUIRKS). Reported on stderr so the
+                // stdout stays byte-identical; counted like every other entry.
+                std::cerr << "Skipping unsafe path in archive: " << e.path << '\n';
                 ++failed;
+                bytes_ok += e.size;
+                progress.Advance(e.size);
                 continue;
             }
 
@@ -7565,12 +7718,16 @@ int RunLegacyCnExtractOrTest(
             bool write_it = true;
             if (!yes_to_all && fs::exists(out_path, ec)) {
                 for (;;) {
+                    // Measured through a pty: the status line is cleared, then one more
+                    // '\r', then the question; the answer is a LINE whose first character
+                    // must be a lowercase y / n / a -- anything else (uppercase included,
+                    // an empty line) asks again.
                     ClearStatusLine(os);
-                    os << "Overwrite " << e.path << " (Yes/No/Always)? ";
+                    os << '\r' << "Overwrite " << e.path << " (Yes/No/Always)? ";
                     os.flush();
                     std::string answer;
                     if (!std::getline(std::cin, answer)) { write_it = false; break; }
-                    const char k = answer.empty() ? '\0' : static_cast<char>(std::tolower(static_cast<unsigned char>(answer[0])));
+                    const char k = answer.empty() ? '\0' : answer[0];
                     if (k == 'y') break;
                     if (k == 'n') { write_it = false; break; }
                     if (k == 'a') { yes_to_all = true; break; }
@@ -7578,12 +7735,16 @@ int RunLegacyCnExtractOrTest(
             }
             if (write_it) {
                 if (out_path.has_parent_path()) {
-                    fs::create_directories(out_path.parent_path(), ec);
+                    MakeDirs0700(out_path.parent_path());
                 }
                 if (!WriteExtractedFile(out_path, ptr, n,
                                         e.has_permissions ? e.permissions : 0600u)) {
-                    os << "Cannot write output file: " << out_path.string() << '\n';
+                    // Measured: "Cannot write: <path>" on a fresh line, per file, and
+                    // the run goes on to the footer.
+                    os << '\n' << "Cannot write: " << out_path.string() << '\n';
                     ++failed;
+                    bytes_ok += e.size;
+                    progress.Advance(e.size);
                     continue;
                 }
                 if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) && NativeTrace()) {
@@ -8092,7 +8253,7 @@ int RunAddNativeLegacyStream(const CliOptions& options, const std::vector<Source
     const fs::path out_path = ResolveArchivePath(options);
     std::error_code ec;
     if (out_path.has_parent_path()) {
-        fs::create_directories(out_path.parent_path(), ec);
+        MakeDirs0700(out_path.parent_path());
     }
 
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
@@ -8308,7 +8469,7 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     const fs::path out_path = ResolveArchivePath(options);
     std::error_code ec;
     if (out_path.has_parent_path()) {
-        fs::create_directories(out_path.parent_path(), ec);
+        MakeDirs0700(out_path.parent_path());
     }
 
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
@@ -8606,7 +8767,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             out_path = output_root / safe_rel;
             std::error_code ec;
             if (out_path.has_parent_path()) {
-                fs::create_directories(out_path.parent_path(), ec);
+                MakeDirs0700(out_path.parent_path());
             }
             out.open(out_path, std::ios::binary | std::ios::trunc);
             if (!out) {

@@ -74,6 +74,9 @@ struct CliOptions {
     std::uint64_t write_buffer_bytes = 0;
     bool swapinout = false;
     bool forceout = false;
+    bool restore_ownership = false;    // -fo: list (user/grp. column) and restore ownership
+    bool pause = false;                // -pause: "Press enter to continue..." at the end
+    bool deprecated_forcemem = false;  // -forcemem: warning, then the run continues
 
     std::vector<std::string> unknown_switches;
     std::vector<std::string> passthrough_args;

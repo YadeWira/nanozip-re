@@ -179,7 +179,10 @@ CliOptions ParseCli(int argc, char** argv) {
         else if (sw == "nofilenameext") out.no_filename_ext = true;
         else if (sw == "swapinout")     out.swapinout = true;
         else if (sw == "forceout")      out.forceout = true;
-        else if (sw == "fo" || sw == "pause") { /* accepted, no effect on decode */ }
+        else if (sw == "fo")            out.restore_ownership = true;
+        else if (sw == "pause")         out.pause = true;
+        else if (sw == "continue")      { /* accepted silently by the original */ }
+        else if (sw == "forcemem")      out.deprecated_forcemem = true;
         else if (sw[0] == 'c') {
             bool cok = false;
             out.compressor = ParseCompressor(sw.substr(1), &cok);

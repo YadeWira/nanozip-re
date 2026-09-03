@@ -1,84 +1,45 @@
 # Tests
 
-Cobertura actual automatizada:
+Everything here measures the native decoder against the original `nz` 0.09a (`../linux32/nz`,
+the oracle: it compresses the fixtures and its own extraction is the reference output). There is
+no bridge of any kind; the environment variables about bridges that older scripts export are
+ignored by the binary.
 
-- `smoke_suite.sh`:
-  - parseo CLI base (sin args, comando desconocido, faltantes);
-  - errores de archivo (`Cannot open`, `not nanozip`, version incompatible);
-  - smoke de metadata de extraccion (`perm` + `mtime`) para formato reconstruido.
-- `coverage_matrix.sh`:
-  - matriz de `l/t/x` sobre corpus generado por backend legado;
-  - matriz de `a/s` por metodo `-c*` con clasificacion por `[compat]`/`[bridge]`;
-  - resumen de porcentajes de uso real y nivel nativo.
-- `legacy_optimum_raw_wrapper.sh`:
-  - regression del subcaso `-co/-cO` raw-wrapper observado en entradas incomprimibles;
-  - fuerza `NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`;
-  - exige `t/x` sin `[compat]` y `cmp` de payload extraido.
-- `legacy_optimum_bwt_tail_primary.sh`:
-  - regression del subtipo BWT donde `primary index` viene en trailer de 16 bytes (`offset +5`, LE u24);
-  - cubre `-co` y `-cO` con payloads single-file de 8 KiB;
-  - exige `t/x` sin `[compat]` con bridges desactivados.
-- `legacy_optimum_trace_path.sh`:
-  - traza de ruta interna en backend legacy (`linux32/nz`) para `-co/-cO`;
-  - reporta hit-order de funciones clave (`aa850`, `a9d370`, `a9a250`, `acaf0`, etc.);
-  - util para clasificar stream subtipos antes de portar decoder C++.
-- `legacy_optimum_path_matrix.py`:
-  - clasifica un lote de `.nz` por ruta interna (`legacy_optimum_trace_path.sh`);
-  - cruza cada grupo contra `nz_recon` con bridges de extraccion desactivados;
-  - resume por grupo `t_ok/x_ok` y presencia de `[compat]`.
+## Regression suites (run before every commit)
 
-## Scripts utiles
+| script | what it checks |
+|---|---|
+| `native_only_v2.sh` | 12 synthetic fixtures × 8 codecs, byte-diffed against the original; includes a hand-built BWT-with-entropy-layer case. Headline: 96/96. |
+| `multifile_v2.sh` | Multi-file archives: whole-tree compare (contents, mode, mtime) over 12 compressor selectors × 9 shapes, metadata switches (`-nt -np -nm -hn -hc -hC`), 72 `l` listings. Pins the metadata record layout. 144 + 72. |
+| `real_corpus_sweep.sh` | Real-world files: every file in `$NZ_REAL_CORPUS` compressed by the original under all 8 codecs and decoded by both. Resumable (`NZ_RESULTS_TSV`), shardable (`NZ_SHARD=i/N`), directory fixtures (`NZ_DIR_MODE=1`), per-call `NZ_TIMEOUT`. Collects `[construct]` lines (see below). |
+| `stress_matrix.sh` | 5 consecutive runs × 8 codecs over single/multi/multi-block shapes: a non-determinism tripwire. |
+| `smoke_suite.sh` | CLI basics (no args, unknown command/switch), file errors, extraction metadata smoke. |
+| `coverage_matrix.sh` | `l`/`t`/`x` matrix over a corpus built by the original. |
+| `test_lzpf_arith.cpp`, `test_optimum_lz.cpp`, `test_optimum2_lz.cpp` | Unit tests against GDB-captured golden vectors (lzpf bit reader/Huffman/LZ77, `-co` and `-cO` engines). |
 
-- Smoke suite:
+`~/.cache/nzre_tools/release_verify_pkg/check.sh <binary>` (47 archives, 95 hashes) is the release gate;
+`~/.cache/nzre_tools/cli_parity/` holds the console-parity matrices (`matrix.sh`, `matrix2.sh`,
+`matrix3.sh`, `pty_prompt.py`) and `corrupt_compare_all.sh` (damaged-archive parity, 48 cases).
+
+## The wide sweep
 
 ```bash
-./smoke_suite.sh
+tests/corpus_select.sh /tmp/nzre_corpus            # ~3000 stratified files from the sample collection
+tests/sweep_run.sh /tmp/nzre_corpus 8 /tmp/nzre_sweep/results.tsv   # 8 background shards, resumable
+tests/sweep_report.py /tmp/nzre_sweep/results.tsv /tmp/nzre_corpus/MANIFEST.tsv
 ```
 
-- Matriz de cobertura:
+Do not rebuild `bin/nz_recon` while shards run (it invents failures). To rerun only the failures
+after a fix: `grep -v FAIL results.tsv > r && mv r results.tsv`, then `sweep_run.sh` again.
 
-```bash
-./coverage_matrix.sh
-```
+`NZ_TRACE_CONSTRUCTS=1` makes the decoder print one `[construct] key=value` line per distinct
+format construct it meets (sub-chunk kinds, image-model modes, text-transform bits, block kinds,
+mid-stream checksum records); the sweep aggregates them into a "constructs observed" table so a
+release can say what was exercised. `tests/gen_image_variants.py <dir>` writes BMP/PGM/PPM/PBM/TGA/
+TIFF variants that trigger the image detectors.
 
-- Regression optimum raw-wrapper:
+## RE helpers
 
-```bash
-./legacy_optimum_raw_wrapper.sh
-```
-
-- Regression optimum BWT trailer-primary:
-
-```bash
-./legacy_optimum_bwt_tail_primary.sh
-```
-
-- Medicion sin bridges (avance C++ puro):
-
-```bash
-NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1 ./coverage_matrix.sh
-```
-
-- Medicion de compresion con fallback bridge desactivado (modo nativo estricto):
-
-```bash
-NZ_DISABLE_COMPRESS_BRIDGE=1 ./coverage_matrix.sh
-```
-
-- Dump de stream legacy para RE:
-
-```bash
-./legacy_stream_dump.py /ruta/archivo.nz
-```
-
-- Traza de ruta runtime `-co/-cO` en backend legacy:
-
-```bash
-./legacy_optimum_trace_path.sh /ruta/archivo.nz
-```
-
-- Matriz de rutas runtime vs pureza C++ (`-co/-cO`):
-
-```bash
-./legacy_optimum_path_matrix.py '/tmp/nz_co_grid/*.nz' '/tmp/nz_co_pairs/*.nz'
-```
+`legacy_optimum_trace_path.sh`, `legacy_optimum_path_matrix.py`, `legacy_stream_dump.py`,
+`legacy_optimum_raw_wrapper.sh`, `legacy_optimum_bwt_tail_primary.sh`: tracing and record dumps
+of the original, used while porting; not assertions.

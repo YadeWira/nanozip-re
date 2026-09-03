@@ -50,12 +50,9 @@
 // NzOptimum2LzDecoder instance alive for an entire stream's sequence of
 // blocks, not construct a fresh one per block.
 //
-// Scope of this port: SINGLE-CONTAINER only (archive header flag 0x06, one
-// stream_tag's worth of blocks). Parallel-container `-cO` (flag 0x0f) and
-// decr_param==0 (BWT) blocks are explicitly OUT OF SCOPE for this port (they
-// continue to decline cleanly to the bridge), matching this project's own
-// incremental-shipping precedent for `-co` (ship one shape byte-exact,
-// extend later).
+// Scope: single-container (flag 0x06) AND parallel-container (flag 0x0f)
+// archives, decr_param==0 (BWT) blocks included -- all native since 2026-09.
+// (The note that once limited this to single containers is historical.)
 //
 // STATUS: WIRED into sfx_archive.cpp / TryDecodeLegacyOptimum for
 // method_p0==6u (checksum-gated exactly like the sibling -co path). Passes

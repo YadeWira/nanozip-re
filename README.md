@@ -69,6 +69,20 @@ it was removed once every corpus decoded natively, after an audit under `strace`
 run with the originals made unreadable (95/95). `tests/multifile_v2.sh` also runs a copy of the
 binary under `env -i`, with no variables set, and compares against the oracle.
 
+### Why a replica, and why defects included
+
+NanoZip's author, Sami Runsas, died more than a decade ago; 0.09 alpha is the last build he published,
+and the closed 32-bit binary is all that exists of the format. This project is preservation: an
+executable specification that keeps `.nz` archives readable once that binary no longer runs. The rule
+that follows is fidelity first. Format and output bytes are identical, always; console, messages and
+switches are identical except where timing makes them unobservable; behaviour is identical *including
+the alpha's defects*, so that the two binaries can be compared on equal terms and every difference is a
+bug on this side. The defects are catalogued in [docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md);
+which of them to keep and which to fix is a decision for the community once the decoder is complete,
+and until then the only escape hatches are environment variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`),
+never new switches. The few deliberate departures (a path-traversal guard, no crash on an archive of
+empty files, no infinite prompt on a closed stdin) are marked `[pending]` in that catalogue.
+
 ### The console is the original's, byte for byte
 
 Everything the decoder prints is matched against `nz` on a 36-case matrix (usage, help, info, list,

@@ -49,9 +49,7 @@
 // capacity derived from method_p1. See sfx_archive.cpp's
 // DecodeOptimumBlockSequence (the extracted, reusable block-record decode
 // loop) and the -co parallel branch inside TryParseLegacyCnArchive that
-// calls it per stream. Only method_p0==5 (-co, nz_optimum1) is wired this
-// way; method_p0==6 (-cO, nz_optimum2) parallel containers still decline
-// cleanly (the literal-mixer variant differs and hasn't been ported).
+// calls it per stream, for both engines (method_p0==5 -co and method_p0==6 -cO).
 #pragma once
 #include <cstdint>
 #include <cstddef>

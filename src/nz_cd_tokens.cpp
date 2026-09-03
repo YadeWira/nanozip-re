@@ -1,5 +1,6 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
+#include "nz_trace.h"
 #include <cstdio>
 #include <cstdlib>
 #include "nz_cd_tokens.h"
@@ -581,6 +582,7 @@ std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
 // caller bridges. Every text stage EXPANDS, so each intermediate <= the final output.
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
+    nz_trace::Construct("cd_tt_param=0x%x", param);
     const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x40u | 0x1u;
     if (param & ~kSupported) do { CD_FAIL("text pipeline: unsupported bits 0x%x (param=0x%x)\n", param & ~kSupported, param); return 0; } while (0);
     std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
@@ -733,6 +735,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     //                       &1 = LZ, &2 = block-RLE, &4 = exe, &8 = param14
     const bool is_pf_chunk = (flags != 0xfu) && ((flags & 0xcu) == 0xcu);
     const bool is_cm_chunk = (flags == 0xfu);   // image model (FUN_080a9ca0), same framing
+    nz_trace::Construct("cd_chunk_flags=0x%x", flags);
     bool full_literal_chunk = false;   // the size_field==0 flavour of pure-literal
     if (size == 0) {
         out_size = 0x8000u; pure_literal = true; full_literal_chunk = true;
@@ -1098,6 +1101,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     RingRead(ring, ring_size, base, slice.data(), out_size);
     }
 
+    // NZOPT_DUMP_CD_SLICE=<dir>: one file per chunk with the COMPACT recon slice
+    // (before RLE/exe/text post-filters), for differential debugging between
+    // -cd and -cD of the same input.
+    if (const char* dd = std::getenv("NZOPT_DUMP_CD_SLICE")) {
+        static thread_local unsigned idx = 0;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/chunk%03u_f%x_%u.bin", dd, idx++, flags, out_size);
+        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(slice.data(), 1, out_size, f); std::fclose(f); }
+    }
+
     *block_pos = static_cast<std::size_t>(r.cur - block);
 
     // Post-filter the compact recon slice into `out`. The ring base advances by the
@@ -1110,11 +1123,19 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         std::uint32_t n = NzCdTextPipeline(slice.data(), out_size, out, out_cap, text_param);
         return n;
     }
-    if (flags & 2u)     // block-RLE: re-expand collapsed zero-runs
-        return NzCdRleExpand(slice.data(), out_size, out, out_cap, 1u, brle_bits, brle_len);
-    std::uint32_t n = (out_size <= out_cap) ? out_size : out_cap;
-    std::memcpy(out, slice.data(), n);
-    if (flags & 4u)     // exe: x86 E8/E9 address un-transform (in place on the output)
+    std::uint32_t n;
+    if (flags & 2u) {   // block-RLE: re-expand collapsed zero-runs
+        n = NzCdRleExpand(slice.data(), out_size, out, out_cap, 1u, brle_bits, brle_len);
+        if (n == 0u) return 0;
+    } else {
+        n = (out_size <= out_cap) ? out_size : out_cap;
+        std::memcpy(out, slice.data(), n);
+    }
+    // exe: x86 E8/E9 address un-transform, in place on the (RLE-expanded) output.
+    // A chunk can carry &2 and &4 together (flags 0x7, seen on an MSI: 8 of 53
+    // chunks); returning straight after the RLE step left those chunks with their
+    // call targets still absolute -- 4666 wrong bytes, all right after E8.
+    if (flags & 4u)
         NzCdExeUnfilter(out, n, out_pos + 4u);
     return n;
 }

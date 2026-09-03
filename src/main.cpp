@@ -27,8 +27,11 @@ int main(int argc, char** argv) {
     // Measured messages, each WITHOUT the usage text and without a leading blank
     // line: "Unknown command q", "Error: Archive name missing...",
     // "Unknown argument: -zz" (the first unknown switch stops the run).
-    if (!options.unknown_command.empty()) {
-        std::cout << "Unknown command " << options.unknown_command << '\n';
+    if (options.command == Command::kUnknown) {
+        // Measured: a one-character token is "Unknown command q" (%c); anything
+        // else, the empty token included, is "Unknown command: qq" (: %s).
+        if (options.unknown_command.size() == 1u) std::cout << "Unknown command " << options.unknown_command << '\n';
+        else std::cout << "Unknown command: " << options.unknown_command << '\n';
         return finish(1);
     }
     if (!options.error.empty()) {
@@ -59,6 +62,8 @@ int main(int argc, char** argv) {
     // stream in memory, so an archive whose content does not fit their address
     // space ends here instead of in an uncaught std::bad_alloc abort.
     nz::recon::SetDecodeThreads(options.threads);
+    // Measured: the deprecated switch is reported first, then the run goes on.
+    if (options.deprecated_forcemem) std::cout << "Warning: Ignoring deprecated option -forcemem.\n";
     int rc = 0;
     try {
     switch (options.command) {
@@ -93,6 +98,13 @@ int main(int argc, char** argv) {
     // undecodable. The original exits 0 there too, and so does this program by
     // default; NZ_SAFE=1 (write only verified entries) and NZ_STRICT_EXIT=1
     // report it.
+    if (options.pause) {
+        // -pause: "Press enter to continue..." (no newline), then one line of input.
+        std::cout << "Press enter to continue...";
+        std::cout.flush();
+        std::string line;
+        std::getline(std::cin, line);
+    }
     if (rc == 2 && std::getenv("NZ_SAFE") != nullptr) return 2;
     return finish(rc);
 }

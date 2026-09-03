@@ -1,6 +1,7 @@
 // nz_audio.cpp — NanoZip decr_param == 2 ("audio") block decoding, ported from
 // the community reference decoder (nzdec_v0 NZ_Audio.cpp). Faithful
 // reimplementation.
+#include "nz_trace.h"
 #include "nz_audio.h"
 #include "lzpf_arith.h"
 
@@ -447,6 +448,13 @@ class AudioBitcountDecoderB {
 // GDB GROUND TRUTH, 2026-09-01 -- what the real binary actually does for a
 // `decr_param == 2` block, and why this AudioPred transcription only agrees with
 // it under `-cO`.
+//
+// HISTORICAL INVESTIGATION RECORD (2026-09-01). The audio path is fully ported
+// and byte-exact for -co, -cO and -cc (suite 88/88, 85d046e): every "NOT ported" /
+// "unported" below describes the state at the time and was resolved -- the -co
+// bit-count class (FUN_0809bdc0) is SetBitcountVariantB, FUN_080958d0 is the
+// extra -co/-cc predictor stage, FUN_08096160 the -cO inter-channel stage. Kept
+// because the measurement method and the refuted hypotheses are still useful.
 //
 // Captured against `linux32/nz` on the three archives in ~/.cache/nzre_aud by
 // watchpointing the residual array the real decoder hands to its reconstruction
@@ -1474,6 +1482,7 @@ struct NzImageModel::Impl {
             const size_t n = (used_bytes < *remaining) ? used_bytes : *remaining;
             *consumed += n; *remaining -= n;
         }
+        nz_trace::Construct("image_mode=%u nch=%u bps=%u", mode, nch, bps);
         IMG_TRACE("chunk=%u h=%02x prefix=%u W=%u nch=%u bps=%u tail=%u per_ch=%u mode=%u pshift=%u,%u,%u,%u,%u r0=%u r1=%u col=%u row=%u\n",
                   chunk, h, prefix, W, nch, bps, rem_mod, per_ch, mode,
                   plane_shift_[0], plane_shift_[1], plane_shift_[2], plane_shift_[3], plane_shift_[4],
