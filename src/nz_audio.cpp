@@ -2,6 +2,9 @@
 // the community reference decoder (nzdec_v0 NZ_Audio.cpp). Faithful
 // reimplementation.
 #include "nz_env.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include "nz_trace.h"
 #include "nz_audio.h"
 #include "lzpf_arith.h"
@@ -543,6 +546,56 @@ static inline void CopyHist(int16_t* dst, const int16_t* src, uint32_t n) {
     for (; n; n--) *dst++ = *src++;
 }
 
+// The real predictor (FUN_08095d90) runs these three loops in MMX, 16 taps per
+// iteration: paddsw/psubsw for the saturating factor update, pmaddwd + paddd for
+// the dot product. SSE2 does the same eight lanes at a time; the results are
+// bit-identical (saturation is saturation, and the int32 partial sums wrap the
+// same way in any order). The scalar tails handle order % 8 and non-SSE2 builds.
+static inline void FactorsUpdateSat(int16_t* factors, const int16_t* logs, uint32_t order, bool add) {
+    uint32_t i = 0;
+#if defined(__SSE2__)
+    for (; i + 8u <= order; i += 8u) {
+        const __m128i f = _mm_loadu_si128(reinterpret_cast<const __m128i*>(factors + i));
+        const __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i*>(logs + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(factors + i),
+                         add ? _mm_adds_epi16(f, l) : _mm_subs_epi16(f, l));
+    }
+#endif
+    if (add) for (; i != order; i++) factors[i] = (int16_t)Clamp16((int32_t)((uint32_t)factors[i] + (uint32_t)logs[i]));
+    else     for (; i != order; i++) factors[i] = (int16_t)Clamp16((int32_t)((uint32_t)factors[i] - (uint32_t)logs[i]));
+}
+static inline void FactorsUpdateWrap(int16_t* factors, const int16_t* logs, uint32_t order, bool add) {
+    uint32_t i = 0;
+#if defined(__SSE2__)
+    for (; i + 8u <= order; i += 8u) {
+        const __m128i f = _mm_loadu_si128(reinterpret_cast<const __m128i*>(factors + i));
+        const __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i*>(logs + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(factors + i),
+                         add ? _mm_add_epi16(f, l) : _mm_sub_epi16(f, l));
+    }
+#endif
+    if (add) for (; i != order; i++) factors[i] = (int16_t)((uint32_t)factors[i] + (uint32_t)logs[i]);
+    else     for (; i != order; i++) factors[i] = (int16_t)((uint32_t)factors[i] - (uint32_t)logs[i]);
+}
+static inline uint32_t DotI16(const int16_t* a, const int16_t* b, uint32_t order) {
+    uint32_t usum = 0, i = 0;
+#if defined(__SSE2__)
+    if (order >= 8u) {
+        __m128i acc = _mm_setzero_si128();
+        for (; i + 8u <= order; i += 8u) {
+            const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+            const __m128i y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+            acc = _mm_add_epi32(acc, _mm_madd_epi16(x, y));
+        }
+        alignas(16) uint32_t lanes[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(lanes), acc);
+        usum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    }
+#endif
+    for (; i != order; i++) usum += (uint32_t)((int32_t)a[i] * (int32_t)b[i]);
+    return usum;
+}
+
 struct LinearPredictor {
     int32_t predicted_value_;
     uint16_t order_;
@@ -570,13 +623,7 @@ struct LinearPredictor {
     void UpdateBig(int32_t sample, int32_t delta) {
         const uint32_t order = order_;
         int16_t* cur_ptr = cur_ptr_;
-        if (delta < 0) {
-            for (uint32_t i = 0; i != order; i++)
-                factors_[i] = (int16_t)Clamp16((int32_t)((uint32_t)factors_[i] - (uint32_t)cur_ptr[i + (size_t)512]));
-        } else if (delta > 0) {
-            for (uint32_t i = 0; i != order; i++)
-                factors_[i] = (int16_t)Clamp16((int32_t)((uint32_t)factors_[i] + (uint32_t)cur_ptr[i + (size_t)512]));
-        }
+        if (delta != 0) FactorsUpdateSat(factors_, cur_ptr + 512, order, delta > 0);
         cur_ptr_ = cur_ptr - 1;
         if (cur_ptr_ < hist_) {
             cur_ptr_ = &hist_[2560 - order];
@@ -589,10 +636,7 @@ struct LinearPredictor {
         const int32_t log = (clamped_sample ? (int32_t)BSR((uint32_t)std::abs(clamped_sample)) : 0) + 1;
         cur_ptr_[512] = (int16_t)(((clamped_sample >> 31) ^ log) - (clamped_sample >> 31));
 
-        uint32_t usum = 0;
-        for (uint32_t i = 0; i != order; i++)
-            usum += (uint32_t)((int32_t)cur_ptr_[i] * (int32_t)factors_[i]);
-        const int32_t sum = (int32_t)usum;
+        const int32_t sum = (int32_t)DotI16(cur_ptr_, factors_, order);
         predicted_value_ = ((sum >> 31) ^ (int32_t)((uint32_t)std::abs(sum) >> shift_)) - (sum >> 31);
     }
 
@@ -613,13 +657,7 @@ struct LinearPredictor {
             *samples++ = outvalue;
 
             int16_t* cur_ptr = cur_ptr_;
-            if (delta <= 0) {
-                for (uint32_t i = 0; i != order; i++)
-                    factors_[i] = (int16_t)((uint32_t)factors_[i] + (uint32_t)cur_ptr[i + (size_t)512]);
-            } else {
-                for (uint32_t i = 0; i != order; i++)
-                    factors_[i] = (int16_t)((uint32_t)factors_[i] - (uint32_t)cur_ptr[i + (size_t)512]);
-            }
+            FactorsUpdateWrap(factors_, cur_ptr + 512, order, delta <= 0);
             cur_ptr_ = cur_ptr - 1;
             if (cur_ptr_ < hist_) {
                 cur_ptr_ = &hist_[2560 - order];
@@ -630,10 +668,7 @@ struct LinearPredictor {
             cur_ptr_[0] = (int16_t)outvalue;
             cur_ptr_[512] = (int16_t)((int16_t)outvalue ? (((outvalue >> 14) & 2) - 1) : 0);
 
-            uint32_t usum = 0;
-            for (uint32_t i = 0; i != order; i++)
-                usum += (uint32_t)((int32_t)cur_ptr_[i] * (int32_t)factors_[i]);
-            predicted_value_ = (int32_t)usum >> shift_;
+            predicted_value_ = (int32_t)DotI16(cur_ptr_, factors_, order) >> shift_;
         }
     }
 
