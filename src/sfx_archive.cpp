@@ -1109,6 +1109,10 @@ struct LegacyCnContext {
     // Parallel (-pN) container: one entry per worker stream, that stream's own
     // window byte (p1). The original prints one "Compressor #k" line per worker.
     std::vector<std::uint8_t> parallel_p1;
+    // The parser already checked every entry's checksum over `data` (its
+    // validate_decoded_candidate gate): the extractor need not run the same pass
+    // over gigabytes a second time.
+    bool checksums_verified = false;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -2951,6 +2955,7 @@ static void ConfigureOptimumModels(std::uint32_t p0, nzr::audio::NzAudioPred& au
 }
 
 std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n);
+void StageMark(const char* what);
 
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
@@ -2981,6 +2986,7 @@ bool TryParseLegacyCnArchive(
             if (!input) bytes.resize(static_cast<std::size_t>(input.gcount()));
         }
     }
+    StageMark("archive read");
     // A self-extracting archive (`w32c`) is a Windows PE stub with the archive
     // appended; the original opens those by seeking past the image (FUN_080b0e50),
     // and so does `l`/`x`/`t` here. Everything below indexes `bytes`, so dropping
@@ -4061,7 +4067,7 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PStream& s = *plist[idx];
                             std::vector<unsigned char> payload;
@@ -4086,7 +4092,9 @@ bool TryParseLegacyCnArchive(
                                         slice.data(), slice.size());
                             return true;
                         });
+                        StageMark("streams decoded");
                         if (all_ok && validate_decoded_candidate(assembled)) {
+                            StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = assembled.size();
@@ -4213,7 +4221,7 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PCdStream& s = *plist[idx];
                             const std::size_t slice_total = static_cast<std::size_t>(s.osz);
@@ -4263,7 +4271,9 @@ bool TryParseLegacyCnArchive(
                                         slice_window, slice_total);
                             return true;
                         });
+                        StageMark("streams decoded");
                         if (all_ok && validate_decoded_candidate(assembled)) {
+                            StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = assembled.size();
@@ -4442,7 +4452,9 @@ bool TryParseLegacyCnArchive(
                                 },
                                 &assembled);
                         }
+                        StageMark("streams decoded");
                         if (got && validate_decoded_candidate(assembled)) {
+                            StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = assembled.size();
@@ -4469,7 +4481,7 @@ bool TryParseLegacyCnArchive(
                                 st.osz > total_data_size - st.ooff) { all_ok = false; break; }
                             plist.push_back(&st); pranges.emplace_back(st.ooff, st.osz);
                         }
-                        if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             const LegacyParallelStream& st = *plist[idx];
                             LegacyCnContext sub;
@@ -4498,7 +4510,9 @@ bool TryParseLegacyCnArchive(
                                         slice.data(), slice.size());
                             return true;
                         });
+                        StageMark("streams decoded");
                         if (all_ok && validate_decoded_candidate(assembled)) {
+                            StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = assembled.size();
@@ -4636,7 +4650,7 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
                         // One worker stream per thread (see ParallelForEach); every stream
                         // writes its own disjoint slice of `assembled`.
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
@@ -4664,7 +4678,9 @@ bool TryParseLegacyCnArchive(
                                         slice.data(), slice.size());
                             return true;
                         });
+                        StageMark("streams decoded");
                         if (all_ok && validate_decoded_candidate(assembled)) {
+                            StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
                             literal_data_size = assembled.size();
@@ -5002,6 +5018,8 @@ bool TryParseLegacyCnArchive(
     ctx.cm_window_size = cm_window_size;
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
+    // Every native_literal_payload path above went through validate_decoded_candidate.
+    ctx.checksums_verified = native_literal_payload && checksum_verification_supported;
     if (has_parallel_streams) {
         std::map<unsigned, LegacyParallelStream> pstreams;
         if (ParseLegacyParallelStreams(bytes, &pstreams)) {
@@ -5065,6 +5083,7 @@ bool TryParseLegacyCnArchive(
         }
     }
 
+    StageMark("context built");
     *out_context = std::move(ctx);
     if (out_error_message != nullptr) {
         out_error_message->clear();
@@ -6867,6 +6886,19 @@ std::string LegacyProbeMessage(const std::string& path) {
     return std::string(buf);
 }
 
+// Stage timer for the big-archive profile (NZ_VERBOSE_NATIVE): "+delta (total)".
+void StageMark(const char* what) {
+    static const bool on = (std::getenv("NZ_VERBOSE_NATIVE") != nullptr);
+    if (!on) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    static auto last = t0;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[time] %-20s +%6.2fs  (t=%6.2fs)\n", what,
+                 std::chrono::duration<double>(now - last).count(),
+                 std::chrono::duration<double>(now - t0).count());
+    last = now;
+}
+
 bool NativeTrace() {
     static const bool t = (std::getenv("NZ_VERBOSE_NATIVE") != nullptr);
     return t;
@@ -6894,8 +6926,10 @@ std::uint64_t LegacyWindowBytes(std::uint32_t p1) {
 //     lzhd           W + 0x210000          lzhds       W + 0x350040
 //     cm / optimum1 / optimum2   see LegacyCmFamilyWorkingSet
 std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W);
-std::uint64_t LegacyEngineWorkingSet(const LegacyCnContext& c) {
-    const std::uint64_t W = LegacyWindowBytes(c.legacy_method_p1);
+std::uint64_t LegacyEngineWorkingSetP1(const LegacyCnContext& c, std::uint8_t p1);
+std::uint64_t LegacyEngineWorkingSet(const LegacyCnContext& c) { return LegacyEngineWorkingSetP1(c, c.legacy_method_p1); }
+std::uint64_t LegacyEngineWorkingSetP1(const LegacyCnContext& c, std::uint8_t p1) {
+    const std::uint64_t W = LegacyWindowBytes(p1);
     if (c.legacy_method_p0 == 0u) return W;
     if (c.legacy_method == 0x2bu) {
         switch (c.legacy_method_p0) {
@@ -7071,9 +7105,11 @@ void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOp
     // that worker's own window byte.
     const std::size_t n = ctx.parallel_p1.empty() ? 1u : ctx.parallel_p1.size();
     for (std::size_t k = 0; k < n; ++k) {
-        LegacyCnContext c = ctx;
-        if (!ctx.parallel_p1.empty()) c.legacy_method_p1 = ctx.parallel_p1[k];
-        const std::uint64_t bytes = LegacyEngineWorkingSet(c);
+        // (This used to copy the whole context -- including the decoded data --
+        // once per worker line: 16 x 2.3 GB of memcpy, 16 of the 23 seconds the
+        // 2.29 GB archive took.)
+        const std::uint8_t p1 = ctx.parallel_p1.empty() ? ctx.legacy_method_p1 : ctx.parallel_p1[k];
+        const std::uint64_t bytes = LegacyEngineWorkingSetP1(ctx, p1);
         ClearStatusLine(os);
         os << "Compressor #" << k << ": " << label << " [" << (((bytes >> 19) + 1u) >> 1) << " MB]";
         if (verbose) os << " IO-buffers: 0+" << (test_mode ? 1 : 4) << " MB.";
@@ -7108,6 +7144,31 @@ void PrintDecodeFooter(std::ostream& os, std::uint64_t bytes, double seconds) {
     os << buf << '\n';
 }
 
+// Every field of a context except its (possibly gigabytes of) payload -- the
+// re-entrant call below replaces the payload with the decoded bytes anyway, so
+// copying the compressed one first was pure memcpy waste on big archives.
+LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
+    LegacyCnContext r;
+    r.archive_path = c.archive_path;
+    r.checksum_mode = c.checksum_mode;
+    r.checksum_verification_supported = c.checksum_verification_supported;
+    r.legacy_method = c.legacy_method;
+    r.legacy_method_p0 = c.legacy_method_p0;
+    r.legacy_method_p1 = c.legacy_method_p1;
+    r.cm_a_bits = c.cm_a_bits;
+    r.cm_b_bits = c.cm_b_bits;
+    r.cm_window_size = c.cm_window_size;
+    r.native_payload_supported = c.native_payload_supported;
+    r.truncated_input = c.truncated_input;
+    r.parallel_p1 = c.parallel_p1;
+    r.checksums_verified = c.checksums_verified;
+    r.payload_mode = c.payload_mode;
+    r.entries = c.entries;
+    r.data_offset = c.data_offset;
+    r.total_data_size = c.total_data_size;
+    return r;
+}
+
 int RunLegacyCnExtractOrTest(
     const CliOptions& options,
     const LegacyCnContext& legacy,
@@ -7120,7 +7181,7 @@ int RunLegacyCnExtractOrTest(
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
         if (TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error)) {
-            LegacyCnContext bridged = legacy;
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(bridged_data);
@@ -7155,7 +7216,7 @@ int RunLegacyCnExtractOrTest(
         std::string optimum_decode_error;
         std::vector<unsigned char> optimum_native_data;
         if (TryDecodeLegacyOptimum(legacy, &optimum_native_data, &optimum_decode_error)) {
-            LegacyCnContext bridged = legacy;
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(optimum_native_data);
@@ -7175,7 +7236,7 @@ int RunLegacyCnExtractOrTest(
         const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);
         // Native -cc CM decode; checksum-gated inside TryDecodeLegacyCm.
         if (cm_native_ok) {
-            LegacyCnContext bridged = legacy;
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(cm_native_data);
@@ -7208,6 +7269,7 @@ int RunLegacyCnExtractOrTest(
     // it too. `yes_to_all` is a local copy: the "Always" answer flips it.
     bool yes_to_all = options.yes_to_all;
     DecodeProgress progress(os);
+    StageMark("extract start");
     for (const LegacyCnEntry& e : legacy.entries) {
         if (cursor > legacy.data.size() || e.size > legacy.data.size() - cursor) {
             os << "Data corrupted while reading file payload: " << e.path << '\n';
@@ -7237,7 +7299,7 @@ int RunLegacyCnExtractOrTest(
         // cleared line, then the run CONTINUES (the file is still written, the
         // footer still counts its bytes, and the exit status stays 0).
         bool checksum_bad = false;
-        if (e.has_checksum && legacy.checksum_verification_supported &&
+        if (e.has_checksum && legacy.checksum_verification_supported && !legacy.checksums_verified &&
             options.checksum != ChecksumMode::kNone) {
             const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
             if (got != e.checksum) {
@@ -7248,6 +7310,7 @@ int RunLegacyCnExtractOrTest(
             }
         }
         (void)checksum_bad;
+        StageMark("entry checksum");
 
         if (!test_mode) {
             // -sp strips the stored directories on extraction too.
@@ -7296,6 +7359,7 @@ int RunLegacyCnExtractOrTest(
             }
         }
 
+        StageMark("entry written");
         ++processed;
         bytes_ok += e.size;
         progress.Advance(e.size);
