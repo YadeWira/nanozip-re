@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <new>
 
 int main(int argc, char** argv) {
     using nz::recon::CliOptions;
@@ -54,7 +55,11 @@ int main(int argc, char** argv) {
         return finish(1);
     }
 
+    // The original's out-of-memory report. The 32-bit builds hold the decoded
+    // stream in memory, so an archive whose content does not fit their address
+    // space ends here instead of in an uncaught std::bad_alloc abort.
     int rc = 0;
+    try {
     switch (options.command) {
         case Command::kAdd:
             rc = nz::recon::RunAdd(options, std::cout); break;
@@ -77,6 +82,11 @@ int main(int argc, char** argv) {
         default:
             nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz_recon", std::cout);
             rc = 1; break;
+    }
+    } catch (const std::bad_alloc&) {
+        nz::recon::ClearStatusLine(std::cout);
+        std::cout << "Out of memory!\n";
+        rc = 1;
     }
     return finish(rc);
 }
