@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // tt_flags & 0x40: the chess/PGN transform (TransformText_6, FUN_080a3000).
@@ -109,10 +110,19 @@ uint32_t NzTextTransform6(const uint8_t* in, uint32_t in_size,
             const uint32_t c0 = ip[0];
             const uint32_t c1 = ip[1];
             const uint32_t set = ((((c0 + 15u) & 15u) * 4u) + (c1 & 3u)) * 2u;
-            if (op == out_end) return 0;
+            if (out_end - op < 3) return 0;
             *op++ = b;
             table[set + 1u] = table[set];
             table[set] = op;                         // the byte just past '['
+            // The two hashed bytes are copied RAW and consumed (FUN_080a3000:
+            // `pbVar7[1] = c0; pbVar7[2] = c1; local_238 = pbVar11 + 3`). Feeding
+            // them back through the loop looked equivalent on chess text, but on
+            // wiki markup ("[[Special:...") the second '[' then caches a second
+            // line and every later back-reference in that set resolves to the
+            // wrong line (MediaWiki SQL dump under -cd, 2026-09-03 sweep).
+            *op++ = static_cast<uint8_t>(c0);
+            *op++ = static_cast<uint8_t>(c1);
+            ip += 2;
             continue;
         }
         if (op == out_end) return 0;

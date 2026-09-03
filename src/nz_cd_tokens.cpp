@@ -589,13 +589,33 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
     const std::uint8_t* cur = src;
     std::uint32_t n = size; int bi = 0;
-    if (param & 0x80u) { std::uint32_t m = NzCdParam14(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
-    if (param & 0x08u) { std::uint32_t m = NzCdDict(cur, n, bufs[bi], out_cap, false); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
-    if (param & 0x20u) { std::uint32_t m = NzCdLineRle(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
-    // 0x40 sits between 0x20 and 0x01 in the reference's dispatch order. Same
-    // codec-agnostic function the -cc/-co chains use (see nz_text_transform.h).
-    if (param & 0x40u) { std::uint32_t m = ::NzTextTransform6(cur, n, bufs[bi], out_cap); if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
-    if (param & 0x01u) { std::uint32_t m = NzCdCrlf(cur, n, bufs[bi], out_cap);    if (!m) return 0; cur = bufs[bi]; n = m; bi ^= 1; }
+    // Stage order as FUN_080a3c90 dispatches them (GDB-confirmed on a param14 +
+    // dict + chess chunk: param14 -> dict -> chess).
+    static const std::string order_env = "80,08,20,40,01";
+    for (std::size_t p0 = 0; p0 < order_env.size(); p0 += 3) {
+        const unsigned bit = static_cast<unsigned>(std::strtoul(order_env.c_str() + p0, nullptr, 16));
+        if (!(param & bit)) continue;
+        std::uint32_t m = 0;
+        switch (bit) {
+            case 0x80u: m = NzCdParam14(cur, n, bufs[bi], out_cap); break;
+            case 0x08u: m = NzCdDict(cur, n, bufs[bi], out_cap, false); break;
+            case 0x20u: m = NzCdLineRle(cur, n, bufs[bi], out_cap); break;
+            case 0x40u: m = ::NzTextTransform6(cur, n, bufs[bi], out_cap); break;
+            case 0x01u: m = NzCdCrlf(cur, n, bufs[bi], out_cap); break;
+            default: return 0;
+        }
+        if (!m) return 0;
+        if (const char* dd = std::getenv("NZOPT_DUMP_CD_TT")) {   // per-stage outputs of this pipeline call
+            static thread_local unsigned call_no = 0; static thread_local unsigned last_param = 0xffffffffu; static thread_local unsigned st = 0;
+            if (p0 == 0 || last_param != param) { }
+            char path[512];
+            if (p0 == 0) { ++call_no; st = 0; std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_in.bin", dd, call_no, param); if (FILE* f = std::fopen(path, "wb")) { std::fwrite(src, 1, size, f); std::fclose(f); } }
+            std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_stage%u_%02x.bin", dd, call_no, param, ++st, bit);
+            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(bufs[bi], 1, m, f); std::fclose(f); }
+            last_param = param;
+        }
+        cur = bufs[bi]; n = m; bi ^= 1;
+    }
     if (n > out_cap) n = out_cap;
     std::memcpy(out, cur, n);
     return n;
