@@ -170,7 +170,11 @@ nz_recon CLI
     └── nz_sfx/        — internal headers
 ```
 
-**One decode layer**: the native C++ reconstruction. There is no bridge to the original binary of any
+**One decode layer**: the native C++ reconstruction. A multi-threaded archive (the `-pN` container the
+original writes for anything above ~8 MB) has its worker streams decoded concurrently, one thread per
+stream up to the CPU count (`-t<n>` caps it); the streams are independent by construction and each
+writes its own slice of the output, which is checked to tile the file without overlap before any
+thread starts. There is no bridge to the original binary of any
 kind — not for decoding, not for unknown switches, not for compression. What the native decoders decline
 is reported as `Archive corrupted. Error decoding (code 100)`, exactly as the original reports its own
 failures.
