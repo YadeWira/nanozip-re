@@ -280,6 +280,18 @@ CliOptions ParseCli(int argc, char** argv) {
     }
 
     out.archive_path = argv[i++];
+    // The original appends ".nz" to whatever archive name it is given unless the
+    // name already ends in ".nz" or ".exe" (a self-extractor), case-sensitively
+    // (measured: m.bin -> m.bin.nz, m.NZ -> m.NZ.nz, m.EXE -> m.EXE.nz, m.exe and
+    // m.tar.nz untouched), or -nofilenameext is set. Same rule for every command.
+    if (!out.no_filename_ext) {
+        const std::string& a = out.archive_path;
+        const auto ends = [&a](const char* suf) {
+            const std::size_t n = std::strlen(suf);
+            return a.size() >= n && a.compare(a.size() - n, n, suf) == 0;
+        };
+        if (!ends(".nz") && !ends(".exe")) out.archive_path += ".nz";
+    }
     for (; i < argc; ++i) {
         if (argv[i] != nullptr) {
             out.positional.emplace_back(argv[i]);
@@ -513,13 +525,19 @@ std::string HostSummaryLine() {
 
 void PrintBanner(std::ostream& os) {
     // Layout matched to the original, which prints the product line and then the
-    // host summary with no leading blank. The build tag stays "/Reconstruction"
-    // (the original says "/Linux32"): everything else is 1:1, but the binary
-    // should not claim to BE nanozip.
-    // Leading CR and BOTH lines go to stderr in the original -- everything else it
-    // prints goes to stdout, so piping stdout gives you just the data. Measured by
-    // capturing the two streams separately.
-    os << "\rNanoZip 0.09 alpha/Reconstruction  (C) 2008-2011 Sami Runsas  www.nanozip.net\n";
+    // host summary with no leading blank. The build tag names the platform the way
+    // the original's builds do ("/Linux32" and "/Linux64" are its own strings; the
+    // Windows pair follows the same pattern -- the original Windows binary is
+    // packed, so its exact tag could not be read and "Win32"/"Win64" is the
+    // natural reading). Leading CR and BOTH lines go to stderr in the original --
+    // everything else it prints goes to stdout, so piping stdout gives you just
+    // the data. Measured by capturing the two streams separately.
+#if defined(_WIN32)
+    const char* tag = (sizeof(void*) == 8) ? "Win64" : "Win32";
+#else
+    const char* tag = (sizeof(void*) == 8) ? "Linux64" : "Linux32";
+#endif
+    os << "\rNanoZip 0.09 alpha/" << tag << "  (C) 2008-2011 Sami Runsas  www.nanozip.net\n";
     os << HostSummaryLine() << '\n';
 }
 

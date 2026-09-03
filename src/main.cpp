@@ -2,6 +2,7 @@
 #include "nz_sfx/sfx_cli.hpp"
 #include "nz_cm.h"
 
+#include <cstdlib>
 #include <iostream>
 
 int main(int argc, char** argv) {
@@ -14,16 +15,33 @@ int main(int argc, char** argv) {
     std::cout << std::flush;
 
     CliOptions options = nz::recon::ParseCli(argc, argv);
+
+    // The original's process exit status is 0 on EVERY path -- unknown command,
+    // missing archive, corrupt data, checksum mismatch (all measured). Scripts
+    // that want a meaningful status can set NZ_STRICT_EXIT=1 to get this port's
+    // own codes instead.
+    const bool strict_exit = (std::getenv("NZ_STRICT_EXIT") != nullptr);
+    const auto finish = [strict_exit](int rc) { return strict_exit ? rc : 0; };
+
+    // Measured messages, each WITHOUT the usage text and without a leading blank
+    // line: "Unknown command q", "Error: Archive name missing...",
+    // "Unknown argument: -zz" (the first unknown switch stops the run).
     if (!options.unknown_command.empty()) {
-        std::cout << "\nUnknown command " << options.unknown_command << '\n';
+        std::cout << "Unknown command " << options.unknown_command << '\n';
+        return finish(1);
     }
     if (!options.error.empty()) {
-        std::cout << "Error: " << options.error << '\n';
+        if (options.error == "archive name missing") {
+            std::cout << "Error: Archive name missing...\n";
+        } else {
+            std::cout << "Error: " << options.error << '\n';
+        }
+        return finish(1);
     }
 
     if (options.show_usage) {
         nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz_recon", std::cout);
-        return options.unknown_command.empty() && options.error.empty() ? 0 : 1;
+        return 0;
     }
 
     if (options.show_advanced_help || options.command == Command::kHelp) {
@@ -32,42 +50,40 @@ int main(int argc, char** argv) {
     }
 
     if (!options.unknown_switches.empty()) {
-        std::cout << "Warning: unsupported switch(es) in reconstruction:";
-        for (const std::string& sw : options.unknown_switches) {
-            std::cout << ' ' << sw;
-        }
-        std::cout << '\n';
+        std::cout << "Unknown argument: " << options.unknown_switches.front() << '\n';
+        return finish(1);
     }
 
     if (nz::recon::ShouldUseLegacyBackend(options)) {
         int legacy_exit = 0;
         if (nz::recon::TryRunLegacyBackend(options, std::cout, &legacy_exit)) {
-            return legacy_exit;
+            return finish(legacy_exit);
         }
     }
 
+    int rc = 0;
     switch (options.command) {
         case Command::kAdd:
-            return nz::recon::RunAdd(options, std::cout);
+            rc = nz::recon::RunAdd(options, std::cout); break;
         case Command::kSimulate:
-            return nz::recon::RunSimulate(options, std::cout);
+            rc = nz::recon::RunSimulate(options, std::cout); break;
         case Command::kList:
-            return nz::recon::RunList(options, std::cout);
+            rc = nz::recon::RunList(options, std::cout); break;
         case Command::kTest:
-            return nz::recon::RunExtractOrTest(options, true, std::cout);
+            rc = nz::recon::RunExtractOrTest(options, true, std::cout); break;
         case Command::kExtract:
-            return nz::recon::RunExtractOrTest(options, false, std::cout);
+            rc = nz::recon::RunExtractOrTest(options, false, std::cout); break;
         case Command::kInfo:
-            return nz::recon::RunInfo(std::cout);
+            rc = nz::recon::RunInfo(std::cout); break;
         case Command::kW32c:
             std::cout << "SFX creation is intentionally omitted in this reconstruction.\n";
-            return 2;
+            rc = 2; break;
         case Command::kHelp:
-            nz::recon::PrintAdvancedHelp(std::cout);
-            return 0;
+            nz::recon::PrintAdvancedHelp(std::cout); break;
         case Command::kUnknown:
         default:
             nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz_recon", std::cout);
-            return 1;
+            rc = 1; break;
     }
+    return finish(rc);
 }

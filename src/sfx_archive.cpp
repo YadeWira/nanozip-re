@@ -10,6 +10,7 @@
 #include "nz_postfilter.h"
 #include "nz_bwt.h"
 #include "nz_audio.h"
+#include <iterator>
 #include "nz_exefilter.h"
 #include "nz_texttransform_num.h"
 
@@ -1324,6 +1325,13 @@ struct LegacyCnContext {
     int cm_b_bits = 25;
     std::uint32_t cm_window_size = 1024u * 1024u;
     bool native_payload_supported = false;
+    // The record walker stopped at a record that runs past the end of the file
+    // (a cut-off archive). The original reports such a decode failure as
+    // "Error decoding (code 25600)" where an in-range corruption is code 100.
+    bool truncated_input = false;
+    // Parallel (-pN) container: one entry per worker stream, that stream's own
+    // window byte (p1). The original prints one "Compressor #k" line per worker.
+    std::vector<std::uint8_t> parallel_p1;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -3321,6 +3329,8 @@ static void ConfigureOptimumModels(std::uint32_t p0, nzr::audio::NzAudioPred& au
     }
 }
 
+std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n);
+
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
     LegacyCnContext* out_context,
@@ -3340,6 +3350,15 @@ bool TryParseLegacyCnArchive(
     std::vector<unsigned char> bytes(
         (std::istreambuf_iterator<char>(input)),
         std::istreambuf_iterator<char>());
+    // A self-extracting archive (`w32c`) is a Windows PE stub with the archive
+    // appended; the original opens those by seeking past the image (FUN_080b0e50),
+    // and so does `l`/`x`/`t` here. Everything below indexes `bytes`, so dropping
+    // the stub up front keeps every offset consistent.
+    if (bytes.size() > 0x40u && bytes[0] == 'M' && bytes[1] == 'Z') {
+        const std::size_t off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? bytes.size() : 4096u);
+        if (std::getenv("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
+        if (off > 1u && off < bytes.size()) bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(off));
+    }
     if (bytes.size() < 24u) {
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
@@ -3413,6 +3432,7 @@ bool TryParseLegacyCnArchive(
     // Which streams' tables mention each path; more than one means the file is
     // split across parallel streams and has no whole-file checksum.
     std::map<std::string, std::set<unsigned>> path_streams;
+    bool truncated_input = false;
 
     for (int guard = 0; guard < 1024 && pos < bytes.size(); ++guard) {
         const std::size_t record_begin = pos;
@@ -3435,7 +3455,7 @@ bool TryParseLegacyCnArchive(
             if (cstream == 0u) ctype += 15u;
         }
 
-        if (pos + csize > bytes.size()) break;
+        if (pos + csize > bytes.size()) { truncated_input = true; break; }
         const bool is_main = (cstream == 0u);
         if (std::getenv("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] @%zu ctype=%u cstream=%u csize=%zu codec=%d table=%d\n",
@@ -5363,6 +5383,15 @@ bool TryParseLegacyCnArchive(
     ctx.cm_b_bits = cm_b_bits;
     ctx.cm_window_size = cm_window_size;
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
+    ctx.truncated_input = truncated_input;
+    if (has_parallel_streams) {
+        std::map<unsigned, LegacyParallelStream> pstreams;
+        if (ParseLegacyParallelStreams(bytes, &pstreams)) {
+            for (const auto& kv : pstreams) {
+                ctx.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
+            }
+        }
+    }
     if (native_store_payload) {
         ctx.payload_mode = LegacyPayloadMode::kStore;
     } else if (native_literal_payload) {
@@ -5450,7 +5479,8 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     if (has_date) {
         os << "yyyy-mmm-dd hh:mm:ss";
     }
-    os << "     size  file\n";
+    // -v widens the size column to exact, space-grouped byte counts (%15s).
+    os << (options.verbose ? "           size  file\n" : "     size  file\n");
 
     std::uint64_t total_size = 0;
     std::size_t total_files = 0;
@@ -5474,7 +5504,11 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
         if (has_date) {
             os << FormatMtimeStored(e.mtime_unix);
         }
-        os << FormatSizeColumn(e.size) << "  " << e.path << '\n';
+        if (options.verbose) {
+            os << std::setw(15) << std::right << FormatGrouped(e.size) << "  " << e.path << '\n';
+        } else {
+            os << FormatSizeColumn(e.size) << "  " << e.path << '\n';
+        }
 
         total_size += e.size;
         ++total_files;
@@ -7108,13 +7142,224 @@ static bool TryDecodeLegacyOptimum(
 // this port's own allocation for that engine -- the original's number comes from its
 // own budgeting (it reports 13 MB where this engine allocates 0.3 MB), so this is
 // the one field in the decode banner that is deliberately OUR value and not a clone.
-std::uint64_t LegacyEngineWorkingSet(std::uint32_t method, std::uint32_t p0, std::uint32_t p1) {
-    (void)p1;
-    if (p0 == 0u) return 0u;   // store: the original reports [0 MB]
-    if (method == 0x3bu) return (p0 == 6u) ? 0x1083080ull : 0x3f780ull;   // -cO / -co
-    if (method == 0x4bu) return 0x2000000ull;                            // -cc
-    if (method == 0x2bu) return 0x400000ull;                             // lzpf / lzhd family
-    return 0x10000ull;
+// This port's own diagnostics ("[native] ...", "[bridge] ...") used to ride on -v;
+// the original's -v adds nothing but an IO-buffers figure to the header, so they
+// now live behind NZ_VERBOSE_NATIVE to keep -v output byte-identical.
+// What the original says about a file that is not one of its archives -- its
+// opener (FUN_08092ca0) transcribed. It reads records as `varint (size<<4|type)`
+// with the type-15 stream extension, each with up to 64 bytes of content: the
+// first must be type 14 (the "NanoZip 0.09 alpha" string); if it is not, it
+// resyncs once on the magic string within the first 4 KB and retries. The second
+// record must be type 30 (the extension with stream 0) of size 1 holding the
+// version byte 9 (= "0.09"); anything else is reported as
+// "Archive file is made with incompatible version (%u.%02u)" with the byte it
+// found -- the previous record's first content byte when the second header
+// could not be read at all. Running out of input elsewhere is
+// "File is not a NanoZip archive.".
+// FUN_080b0e50: where an archive appended to a Windows PE image begins -- the
+// end of the last section, rounded up to 512 bytes -- or 0 when the buffer is
+// not a PE image (1 when it is one this code cannot measure).
+std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n) {
+    auto u16 = [b](std::size_t o) { return static_cast<std::uint32_t>(b[o]) | (static_cast<std::uint32_t>(b[o + 1]) << 8); };
+    auto u32 = [b, u16](std::size_t o) { return u16(o) | (u16(o + 2) << 16); };
+    if (n <= 0x40u || u16(0) != 0x5a4du) return 0;
+    const std::uint32_t pe = u32(0x3c);
+    if (pe >= n - 4u || u32(pe) != 0x4550u) return 0;
+    const std::uint32_t optsz = u16(pe + 0x14u);
+    std::size_t sect = static_cast<std::size_t>(pe) + optsz + 0x18u;
+    if (sect >= n || optsz >= 0x4001u) return 1;
+    const std::uint32_t nsec = u16(pe + 6u);
+    std::size_t total = 0;
+    if (nsec != 0u) {
+        std::uint32_t left = nsec;
+        while (sect < n - 0x28u) {
+            total += u32(sect + 0x10u);
+            sect += 0x28u;
+            if (--left == 0u) break;
+        }
+        if (left != 0u) return 1;
+    }
+    return ((sect + 0x1ffu) & ~static_cast<std::size_t>(0x1ffu)) + total;
+}
+
+std::string LegacyProbeMessage(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "Cannot open archive!";
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::size_t pos = 0;
+    struct Rec { unsigned type = 0; std::size_t size = 0; unsigned char content[64]; bool have = false; };
+    Rec rec;
+    auto read_header = [&](Rec& r) -> bool {   // false = EOF / oversize (record not consumed)
+        std::uint64_t v = 0;
+        std::size_t p2 = pos;
+        if (!ReadLegacyVarint(bytes, &p2, bytes.size(), &v)) return false;
+        unsigned type = static_cast<unsigned>(v & 0xfu);
+        std::size_t size = static_cast<std::size_t>(v >> 4u);
+        if (type == 15u) {
+            if (p2 >= bytes.size()) return false;
+            unsigned ext = bytes[p2++];
+            if (ext >= 0xf8u) {
+                if (p2 >= bytes.size()) return false;
+                ext = (ext & 7u) + 0xf8u + 8u * bytes[p2++];
+            }
+            type = ext & 0xfu;
+            if ((ext >> 4u) == 0u) type += 15u;
+            size = ext >> 4u ? size : size;   // the size field is unchanged
+        }
+        pos = p2;
+        if (size > 64u) return false;
+        r.type = type; r.size = size; r.have = true;
+        const std::size_t avail = bytes.size() - pos;
+        const std::size_t n = size < avail ? size : avail;
+        std::memcpy(r.content, bytes.data() + pos, n);
+        pos += size < avail ? size : avail;
+        return true;
+    };
+    const char* not_archive = "File is not a NanoZip archive.";
+    bool ok = read_header(rec) && rec.type == 14u;
+    if (!ok) {
+        // Resync (FUN_08092220 -> FUN_080b0e50): the file may be a self-extracting
+        // .exe with the archive appended after the PE image; seek past the image.
+        const std::size_t off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? bytes.size() : 4096u);
+        if (off == 0u) return not_archive;
+        pos = off;
+        if (!read_header(rec) || rec.type != 14u) return not_archive;
+    }
+    Rec second = rec;
+    const bool second_ok = read_header(second);
+    unsigned version = 0;
+    if (second_ok && second.type == 30u && second.size == 1u) {
+        version = second.content[0];
+        if (version == 9u) return std::string();   // a real 0.09 archive
+    } else if (second.size != 0u) {
+        version = second.content[0];   // the last header that was read, even a failed one
+    } else {
+        if (pos >= bytes.size()) return not_archive;
+        version = bytes[pos];
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "Archive file is made with incompatible version (%u.%02u).", version / 100u, version % 100u);
+    return std::string(buf);
+}
+
+bool NativeTrace() {
+    static const bool t = (std::getenv("NZ_VERBOSE_NATIVE") != nullptr);
+    return t;
+}
+
+// bytefloat(p1 + 1) in 64 KB units -- the window size every codec derives from
+// its p1 byte (the same mantissa/exponent code the -cc window and the lzpf
+// dictionary use).
+std::uint64_t LegacyWindowBytes(std::uint32_t p1) {
+    const std::uint32_t xp1 = p1 + 1u;
+    std::uint32_t m = xp1 & 0xfu;
+    const std::uint32_t sft = xp1 >> 4u;
+    if (sft) m = (m + 16u) << (sft - 1u);
+    return static_cast<std::uint64_t>(m) << 16u;
+}
+
+// The byte figure behind "Compressor #n: <name> [<N> MB]" -- the value the
+// original's per-codec memory-usage method (vtable slot 0: FUN_08094f10 store,
+// FUN_08097550 lzpf, FUN_08099440 lzhd, FUN_080aafb0 CM family) returns, which the
+// printer rounds with ((bytes >> 19) + 1) >> 1. The exact returns were read with
+// GDB at that call for every codec; the window term is bytefloat(p1+1)*64 KB and
+// the constants are the codec objects' fixed allocations:
+//     none           W
+//     lzpf           W + 0x618000          lzpf_large  W + 0x4410000
+//     lzhd           W + 0x210000          lzhds       W + 0x350040
+//     cm / optimum1 / optimum2   see LegacyCmFamilyWorkingSet
+std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W);
+std::uint64_t LegacyEngineWorkingSet(const LegacyCnContext& c) {
+    const std::uint64_t W = LegacyWindowBytes(c.legacy_method_p1);
+    if (c.legacy_method_p0 == 0u) return W;
+    if (c.legacy_method == 0x2bu) {
+        switch (c.legacy_method_p0) {
+            case 1u: return W + 0x618000ull;
+            case 2u: return W + 0x4410000ull;
+            case 3u: return W + 0x210000ull;
+            case 4u: return W + 0x350040ull;
+            default: return W;
+        }
+    }
+    if (c.legacy_method == 0x4bu || c.legacy_method == 0x3bu) return LegacyCmFamilyWorkingSet(c, W);
+    return W;
+}
+
+// Running "<name>     \b\b\b\b<N MB>    \b..." display of a decode, as the original
+// draws it: the name is written when a file starts, the MB field is the
+// CUMULATIVE decoded size rounded to whole MB, and the display refreshes at block
+// boundaries -- name again only if the file changed since the last refresh, then
+// the field. Blocks are approximated here as every whole MB of output, which
+// reproduces the original byte for byte on anything that fits in one block (one
+// name, one "0 MB") and tracks it closely on long decodes.
+struct DecodeProgress {
+    std::ostream& os;
+    std::uint64_t done = 0;
+    std::uint64_t next_mark = 0;
+    std::string current;
+    std::string shown;
+    bool started = false;
+    explicit DecodeProgress(std::ostream& o) : os(o) {}
+    void Field() {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%llu MB",
+                      static_cast<unsigned long long>((done + 512u * 1024u) >> 20));
+        os << b << "    ";
+        for (std::size_t i = 0, n = std::strlen(b) + 4u; i < n; ++i) os << '\b';
+        os.flush();
+    }
+    // Names longer than 40 columns are shown as "..." plus their last 37 characters.
+    void Name() {
+        ClearStatusLine(os);
+        if (current.size() > 40u) os << "..." << current.substr(current.size() - 37u);
+        else os << current;
+        os << "     " << "\b\b\b\b";
+        shown = current;
+    }
+    void Begin(const std::string& name) {
+        current = name;
+        if (!started) { started = true; Name(); Field(); next_mark = 1u << 20; }
+    }
+    void Advance(std::uint64_t n) {
+        // One refresh per whole MB crossed, showing the count at that mark -- the
+        // original refreshes per decoded block, roughly a megabyte apart.
+        const std::uint64_t end = done + n;
+        while (started && next_mark <= end) {
+            done = next_mark;
+            if (shown != current) Name();
+            Field();
+            next_mark += 1u << 20;
+        }
+        done = end;
+    }
+};
+
+// The CM family's memory method, FUN_080aafb0, transcribed (Ghidra + GDB reads of
+// every component on nine archives, all reproduced to the byte):
+//   FUN_080c0070(window object) = W + 0x1008ab + 5*P + ((0x100000 + P/32 + 1) >> 1)
+//                                 + (0x20001 >> 1) + FUN_080b88b0(P) [+ CM tables]
+//   where P = the object's primary buffer: max(W, 1 MB) for -co/-cO, a fixed 1 MB
+//   for -cc; FUN_080b88b0 is two halved table sizes = 2775628 at P = 1 MB growing
+//   by 69/1280 of P beyond that (exact on 1.375/2/6 MB); the -cc tables are
+//   2^a + 4*2^b + 23280971 (a, b = the two size nibbles the archive carries).
+//   Then + 0x210000 (the audio/image object) and the per-mode tail: -co 0x8b600 +
+//   0x3f700 + 0x1000 + 0x80000, -cc 0x8b600 + 0x1000, -cO 0x118f240 alone.
+std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W) {
+    const std::uint64_t MB = 1048576ull;
+    const std::uint64_t P = (c.legacy_method_p0 == 7u) ? MB : (W > MB ? W : MB);
+    std::uint64_t f88b0 = 2775628ull;
+    if (P > MB) f88b0 += ((P - MB) * 69ull + 640ull) / 1280ull;
+    std::uint64_t core = W + 0x1008abull + 5ull * P + ((0x100000ull + P / 32ull + 1ull) >> 1)
+                       + (0x20001ull >> 1) + f88b0;
+    if (c.legacy_method_p0 == 7u) core += (1ull << c.cm_a_bits) + (4ull << c.cm_b_bits) + 23280971ull;
+    // -cO takes the method's early return: core + audio object + 0x118f240, with
+    // NO dispatcher term (verified: 30643511 / 37663236 / 63120695 for W = 384 KB /
+    // 2 MB / 6 MB). -co and -cc go through the common tail with the dispatcher.
+    if (c.legacy_method_p0 == 6u) return core + 0x210000ull + 0x118f240ull;
+    std::uint64_t total = core + 0x210000ull + 0x8b600ull;
+    if (c.legacy_method_p0 == 5u) total += 0x3f700ull + 0x1000ull + 0x80000ull;
+    else total += 0x1000ull;
+    return total;
 }
 
 // Throughput unit, chosen the way the original does: it prints "6000 B/s" for a
@@ -7173,13 +7418,25 @@ void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t o
     os << buf << '\n';
 }
 
-void PrintDecodeHeader(std::ostream& os, const std::string& archive_path,
-                       const std::string& compressor_label, std::uint64_t engine_bytes) {
-    os << "Archive: " << archive_path << '\n';
+void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, bool verbose, bool test_mode) {
+    os << "Archive: " << ctx.archive_path << '\n';
     os << "Threads: " << HostThreadCount() << '\n';
-    ClearStatusLine(os);
-    os << "Compressor #0: " << compressor_label << " ["
-       << ((engine_bytes + 512u * 1024u) / (1024u * 1024u)) << " MB]\n";
+    const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
+    // Rounding is the original's ((bytes >> 19) + 1) >> 1. Under -v it appends its
+    // IO buffer split: no read-ahead, a 1 MB write-behind for `t`, 4 MB for `x`.
+    // A parallel container gets one line per worker (the original emits them in
+    // thread-scheduling order; this port uses stream order), each sized from
+    // that worker's own window byte.
+    const std::size_t n = ctx.parallel_p1.empty() ? 1u : ctx.parallel_p1.size();
+    for (std::size_t k = 0; k < n; ++k) {
+        LegacyCnContext c = ctx;
+        if (!ctx.parallel_p1.empty()) c.legacy_method_p1 = ctx.parallel_p1[k];
+        const std::uint64_t bytes = LegacyEngineWorkingSet(c);
+        ClearStatusLine(os);
+        os << "Compressor #" << k << ": " << label << " [" << (((bytes >> 19) + 1u) >> 1) << " MB]";
+        if (verbose) os << " IO-buffers: 0+" << (test_mode ? 1 : 4) << " MB.";
+        os << '\n';
+    }
 }
 
 // `<name>` then five spaces, then the running figure rewritten in place: back four,
@@ -7188,7 +7445,7 @@ void PrintDecodeHeader(std::ostream& os, const std::string& archive_path,
 // The four-character field the original rewrites in place: megabytes done.
 std::string FormatSizeColumnCompact(std::uint64_t bytes) {
     char b[32];
-    std::snprintf(b, sizeof(b), "%llu MB", (unsigned long long)(bytes / (1024u * 1024u)));
+    std::snprintf(b, sizeof(b), "%llu MB", (unsigned long long)((bytes + 512u * 1024u) / (1024u * 1024u)));
     return std::string(b);
 }
 
@@ -7215,7 +7472,6 @@ int RunLegacyCnExtractOrTest(
     bool test_mode,
     std::ostream& os) {
     const auto run_start = std::chrono::steady_clock::now();
-    bool header_printed = false;
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
@@ -7224,7 +7480,7 @@ int RunLegacyCnExtractOrTest(
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(bridged_data);
-            if (options.verbose) {
+            if (NativeTrace()) {
                 os << "[native] decoded -cd payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
@@ -7259,14 +7515,14 @@ int RunLegacyCnExtractOrTest(
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(optimum_native_data);
-            if (options.verbose) {
+            if (NativeTrace()) {
                 os << "[native] decoded " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
                    << " payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
-        } else if (options.verbose && !optimum_decode_error.empty()) {
+        } else if (NativeTrace() && !optimum_decode_error.empty()) {
             os << "[native] " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
                << " native decode declined: " << optimum_decode_error << '\n';
         }
@@ -7299,7 +7555,7 @@ int RunLegacyCnExtractOrTest(
                     && std::memcmp(cm_native_data.data(), bridge_data.data(),
                                    cm_native_data.size()) == 0) {
                     cm_verified = true;
-                } else if (options.verbose) {
+                } else if (NativeTrace()) {
                     os << "[native] CM native output differs from legacy; "
                           "falling back to extract bridge.\n";
                 }
@@ -7325,7 +7581,7 @@ int RunLegacyCnExtractOrTest(
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(bridged_data);
-            if (options.verbose) {
+            if (NativeTrace()) {
                 os << "[native] decoded -cc payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
@@ -7338,7 +7594,7 @@ int RunLegacyCnExtractOrTest(
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(bridged_data);
-            if (options.verbose) {
+            if (NativeTrace()) {
                 os << "[bridge] decoded legacy payload via extract bridge ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
@@ -7351,14 +7607,14 @@ int RunLegacyCnExtractOrTest(
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
             bridged.data = std::move(bridged_data);
-            if (options.verbose) {
+            if (NativeTrace()) {
                 os << "[bridge] decoded legacy payload via gdb trace bridge ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
                    << ").\n";
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
-        if (options.verbose) {
+        if (NativeTrace()) {
             if (!extract_bridge_error.empty()) {
                 os << "[bridge] extract bridge failed: " << extract_bridge_error << '\n';
             }
@@ -7380,13 +7636,11 @@ int RunLegacyCnExtractOrTest(
     std::uint64_t bytes_ok = 0;
     std::size_t cursor = 0;
 
-    if (!header_printed) {
-        header_printed = true;
-        PrintDecodeHeader(os, legacy.archive_path,
-                          LegacyCompressorName(legacy.legacy_method, legacy.legacy_method_p0),
-                          LegacyEngineWorkingSet(legacy.legacy_method, legacy.legacy_method_p0,
-                                                 legacy.legacy_method_p1));
-    }
+    // The header (Archive / Threads / Compressor) is printed by the caller before
+    // the decode is attempted, as the original does, so a failing decode shows
+    // it too. `yes_to_all` is a local copy: the "Always" answer flips it.
+    bool yes_to_all = options.yes_to_all;
+    DecodeProgress progress(os);
     for (const LegacyCnEntry& e : legacy.entries) {
         if (cursor > legacy.data.size() || e.size > legacy.data.size() - cursor) {
             os << "Data corrupted while reading file payload: " << e.path << '\n';
@@ -7398,24 +7652,37 @@ int RunLegacyCnExtractOrTest(
         const std::size_t n = static_cast<std::size_t>(e.size);
         cursor += n;
 
+        // The original decodes the whole stream whatever the file filter says, so
+        // its progress display and the "Decompressed N bytes" footer cover EVERY
+        // entry; the filter only decides what gets written and checked.
+        progress.Begin(e.path);
         if (!selected) {
+            bytes_ok += e.size;
+            progress.Advance(e.size);
             continue;
         }
 
+        // Measured: "Checksum mismatch [<stored> <computed>]: <path>" on its own
+        // cleared line, then the run CONTINUES (the file is still written, the
+        // footer still counts its bytes, and the exit status stays 0).
+        bool checksum_bad = false;
         if (e.has_checksum && legacy.checksum_verification_supported &&
             options.checksum != ChecksumMode::kNone) {
             const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
             if (got != e.checksum) {
-                os << "Checksum mismatch: " << e.path << " (expected "
-                   << FormatChecksum(legacy.checksum_mode, e.checksum) << ", got "
-                   << FormatChecksum(legacy.checksum_mode, got) << ")\n";
-                ++failed;
-                continue;
+                checksum_bad = true;
+                ClearStatusLine(os);
+                os << "Checksum mismatch [" << FormatChecksum(legacy.checksum_mode, e.checksum)
+                   << ' ' << FormatChecksum(legacy.checksum_mode, got) << "]: " << e.path << '\n';
             }
         }
+        (void)checksum_bad;
 
         if (!test_mode) {
-            const fs::path safe_rel = SanitizeExtractPath(e.path);
+            // -sp strips the stored directories on extraction too.
+            const fs::path safe_rel = options.strip_paths
+                ? fs::path(SanitizeExtractPath(e.path)).filename()
+                : SanitizeExtractPath(e.path);
             if (safe_rel.empty()) {
                 os << "Skipping unsafe path in archive: " << e.path << '\n';
                 ++failed;
@@ -7424,30 +7691,42 @@ int RunLegacyCnExtractOrTest(
 
             const fs::path out_path = output_root / safe_rel;
             std::error_code ec;
-            if (out_path.has_parent_path()) {
-                fs::create_directories(out_path.parent_path(), ec);
+            // "Overwrite <name> (Yes/No/Always)? " -- the original asks per existing
+            // file unless -y; it reads a key, so any other answer re-asks. End of
+            // input counts as No (the original would spin forever there).
+            bool write_it = true;
+            if (!yes_to_all && fs::exists(out_path, ec)) {
+                for (;;) {
+                    ClearStatusLine(os);
+                    os << "Overwrite " << e.path << " (Yes/No/Always)? ";
+                    os.flush();
+                    std::string answer;
+                    if (!std::getline(std::cin, answer)) { write_it = false; break; }
+                    const char k = answer.empty() ? '\0' : static_cast<char>(std::tolower(static_cast<unsigned char>(answer[0])));
+                    if (k == 'y') break;
+                    if (k == 'n') { write_it = false; break; }
+                    if (k == 'a') { yes_to_all = true; break; }
+                }
             }
-            if (!WriteExtractedFile(out_path, ptr, n,
-                                    e.has_permissions ? e.permissions : 0600u)) {
-                os << "Cannot write output file: " << out_path.string() << '\n';
-                ++failed;
-                continue;
-            }
-
-            if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) &&
-                options.verbose) {
-                os << "Warning: cannot apply mtime to " << out_path.string() << '\n';
+            if (write_it) {
+                if (out_path.has_parent_path()) {
+                    fs::create_directories(out_path.parent_path(), ec);
+                }
+                if (!WriteExtractedFile(out_path, ptr, n,
+                                        e.has_permissions ? e.permissions : 0600u)) {
+                    os << "Cannot write output file: " << out_path.string() << '\n';
+                    ++failed;
+                    continue;
+                }
+                if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) && NativeTrace()) {
+                    os << "Warning: cannot apply mtime to " << out_path.string() << '\n';
+                }
             }
         }
-
-        PrintFileProgress(os, e.path, FormatSizeColumnCompact(e.size));
 
         ++processed;
         bytes_ok += e.size;
-        if (options.verbose) {
-            ClearStatusLine(os);
-            os << (test_mode ? "tested " : "extract ") << e.path << '\n';
-        }
+        progress.Advance(e.size);
     }
 
     if (failed > 0) {
@@ -8403,14 +8682,28 @@ int RunSimulate(const CliOptions& options, std::ostream& os) {
     return 0;
 }
 
+// The line under "Archive:" when an archive cannot be used: the original's own
+// probe verdict for a file that exists but is not a 0.09 archive, else the
+// opener's message ("Cannot open archive!").
+static std::string LegacyOpenFailureMessage(ArchiveOpenError open_error, const std::string& path,
+                                            const std::string& legacy_error, const std::string& error) {
+    if (open_error == ArchiveOpenError::kCannotOpen) return error;
+    const std::string probe = LegacyProbeMessage(path);
+    if (!probe.empty()) return probe;
+    return legacy_error.empty() ? error : legacy_error;
+}
+
 int RunList(const CliOptions& options, std::ostream& os) {
     ArchiveContext context;
     std::string error;
     const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);
     if (open_error != ArchiveOpenError::kNone) {
-        if (open_error == ArchiveOpenError::kUnsupportedFormat) {
+        std::string legacy_error;
+        // Anything that exists but is not this port's own container may be a
+        // legacy archive -- including a self-extracting .exe, whose first bytes
+        // are the PE stub's, not the archive magic.
+        if (open_error != ArchiveOpenError::kCannotOpen) {
             LegacyCnContext legacy_cn;
-            std::string legacy_error;
             if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
                 return RunLegacyCnList(options, legacy_cn, os);
             }
@@ -8419,12 +8712,12 @@ int RunList(const CliOptions& options, std::ostream& os) {
             if (TryRunLegacyBackend(options, os, &code)) {
                 return code;
             }
-            if (!legacy_error.empty()) {
-                os << legacy_error << '\n';
-                return 1;
-            }
         }
-        os << error << '\n';
+        // Measured: `l` on a missing or foreign file prints the archive line, the
+        // reason, and an empty total.
+        os << "Archive: " << options.archive_path << '\n';
+        os << LegacyOpenFailureMessage(open_error, options.archive_path, legacy_error, error) << '\n';
+        os << "Total of 0 files, 0 bytes.\n";
         return 1;
     }
 
@@ -8467,10 +8760,16 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
     std::string error;
     const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);
     if (open_error != ArchiveOpenError::kNone) {
-        if (open_error == ArchiveOpenError::kUnsupportedFormat) {
+        std::string legacy_error;
+        // Anything that exists but is not this port's own container may be a
+        // legacy archive -- including a self-extracting .exe, whose first bytes
+        // are the PE stub's, not the archive magic.
+        if (open_error != ArchiveOpenError::kCannotOpen) {
             LegacyCnContext legacy_cn;
-            std::string legacy_error;
             if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
+                // Header first, decode second -- the original streams, so a failing
+                // archive still shows "Archive:", "Threads:" and the compressor line.
+                PrintDecodeHeader(os, legacy_cn, options.verbose, test_mode);
                 const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os);
                 if (legacy_rc != kLegacyNeedCompat) {
                     return legacy_rc;
@@ -8480,10 +8779,15 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
                 if (TryRunLegacyBackend(options, os, &code)) {
                     return code;
                 }
-                os << "Legacy compressor stream is not reconstructed yet "
-                      "(native extract/test currently supports -cn, literal-only substreams of -cf/-cF/-cd/-cD, "
-                      "the observed small-file BWT wrapper of -co/-cO, and the observed literal-wrapper substream of -cc). "
-                   << "Detected payload mode: " << LegacyPayloadModeLabel(legacy_cn.payload_mode) << ".\n";
+                // Measured: an undecodable payload is "Archive corrupted. Error
+                // decoding (code 100)"; one cut off before its end is code 25600.
+                ClearStatusLine(os);
+                os << "Archive corrupted. Error decoding (code "
+                   << (legacy_cn.truncated_input ? 25600 : 100) << ")\n";
+                if (NativeTrace()) {
+                    os << "[native] no native decoder accepted this stream; payload mode: "
+                       << LegacyPayloadModeLabel(legacy_cn.payload_mode) << '\n';
+                }
                 return 1;
             }
 
@@ -8491,12 +8795,9 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             if (TryRunLegacyBackend(options, os, &code)) {
                 return code;
             }
-            if (!legacy_error.empty()) {
-                os << legacy_error << '\n';
-                return 1;
-            }
         }
-        os << error << '\n';
+        os << "Archive: " << options.archive_path << '\n';
+        os << LegacyOpenFailureMessage(open_error, options.archive_path, legacy_error, error) << '\n';
         return 1;
     }
 

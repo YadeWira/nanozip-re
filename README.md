@@ -67,6 +67,22 @@ how anyone who downloads a binary runs it — and the difference mattered: with 
 reported them green. `tests/multifile_v2.sh` now also runs a copy of the binary under `env -i`,
 with no variables set and no legacy `nz` anywhere near it, and compares against the oracle.
 
+### The console is the original's, byte for byte
+
+Everything the decoder prints is matched against `nz` on a 36-case matrix (usage, help, info, list,
+test, extract, filters, `-v`, `-sp`, `-o`, missing and foreign files, truncated and corrupted
+archives, self-extracting `.exe`, the archive-name rule) with stdout, stderr and the created files
+compared byte for byte; the only differences left are the program name in the usage text, the
+thread-dependent order of the per-worker lines on a parallel container, and the encode commands.
+Measured behaviour that was not obvious: the exit status is **always 0** (set `NZ_STRICT_EXIT=1`
+for real codes); `.nz` is appended to the archive name unless it ends in `.nz` or `.exe`; a
+self-extracting `.exe` opens by seeking past the PE image; the `[N MB]` figure on the compressor
+line is the codec's memory-usage method transcribed (window and table sizes, to the byte); a
+checksum mismatch prints `[stored computed]` and continues; a failed decode is `Archive corrupted.
+Error decoding (code 100)`, or 25600 when the archive is cut short; the progress line shows the
+cumulative megabytes and re-prints the name only when the file changes; names over 40 columns are
+shown as `...` plus their last 37 characters.
+
 ### Robustness against input that is not a valid archive
 
 Fuzzed with 761 cases under AddressSanitizer + UBSan — truncations, single-bit flips weighted
