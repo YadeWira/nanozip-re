@@ -27,9 +27,10 @@ int main(int argc, char** argv) {
     // Measured messages, each WITHOUT the usage text and without a leading blank
     // line: "Unknown command q", "Error: Archive name missing...",
     // "Unknown argument: -zz" (the first unknown switch stops the run).
-    if (options.command == Command::kUnknown) {
+    if (options.command == Command::kUnknown && argc >= 2) {
         // Measured: a one-character token is "Unknown command q" (%c); anything
-        // else, the empty token included, is "Unknown command: qq" (: %s).
+        // else, the empty token included (`nz "" archive`), is "Unknown command: qq"
+        // (: %s). No arguments at all prints the usage instead (below).
         if (options.unknown_command.size() == 1u) std::cout << "Unknown command " << options.unknown_command << '\n';
         else std::cout << "Unknown command: " << options.unknown_command << '\n';
         return finish(1);
