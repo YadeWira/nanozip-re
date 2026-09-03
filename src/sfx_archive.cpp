@@ -1113,6 +1113,10 @@ struct LegacyCnContext {
     // validate_decoded_candidate gate): the extractor need not run the same pass
     // over gigabytes a second time.
     bool checksums_verified = false;
+    // Per-entry verdict when checksums_verified (1 = matches its stored checksum).
+    // Empty = every entry matched. A damaged archive whose decode still completed
+    // gets its good files written and the bad ones reported and skipped.
+    std::vector<std::uint8_t> entry_checksum_ok;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -1121,6 +1125,30 @@ struct LegacyCnContext {
 };
 
 constexpr int kLegacyNeedCompat = -100;
+
+std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size);
+
+// Per-entry checksum verdicts over a decoded payload. Returns false only when the
+// entry sizes do not add up to the payload (a decode that did not complete);
+// `*bad` counts the entries whose stored checksum does not match.
+bool CheckEntries(const std::vector<LegacyCnEntry>& entries, ChecksumMode mode, bool supported,
+                  const unsigned char* data, std::size_t size,
+                  std::vector<std::uint8_t>* ok, std::size_t* bad) {
+    ok->assign(entries.size(), 1u);
+    *bad = 0;
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const LegacyCnEntry& e = entries[i];
+        if (e.size > size - cursor) return false;
+        const std::size_t n = static_cast<std::size_t>(e.size);
+        if (e.has_checksum && supported && mode != ChecksumMode::kNone &&
+            ComputeBufferChecksum(mode, data + cursor, n) != e.checksum) {
+            (*ok)[i] = 0u; ++*bad;
+        }
+        cursor += n;
+    }
+    return cursor == size;
+}
 
 
 
@@ -3931,6 +3959,22 @@ bool TryParseLegacyCnArchive(
         }
         return cursor == candidate.size();
     };
+    // Option (c) for damaged archives: a candidate whose decode completed (sizes
+    // add up) but whose per-entry checksums do not all match is kept as a
+    // fallback; if no fully verified candidate turns up, it is adopted and the
+    // extractor writes the good entries and reports the bad ones. Always returns
+    // false so the adopting branch is skipped at the call site.
+    std::vector<unsigned char> partial_candidate;
+    std::vector<std::uint8_t> partial_ok;
+    const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
+        if (!partial_candidate.empty() || candidate.size() != static_cast<std::size_t>(total_data_size)) return false;
+        std::vector<std::uint8_t> ok; std::size_t bad = 0;
+        if (CheckEntries(entries, checksum_mode, checksum_verification_supported, candidate.data(), candidate.size(), &ok, &bad) && bad > 0) {
+            partial_candidate = std::move(candidate);
+            partial_ok = std::move(ok);
+        }
+        return false;
+    };
 
     // A multi-block archive interleaves the next block's table/mtime/perm/
     // checksum records BETWEEN its data records, so the raw tail is not a valid
@@ -4093,7 +4137,7 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && validate_decoded_candidate(assembled)) {
+                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4272,7 +4316,7 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && validate_decoded_candidate(assembled)) {
+                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4453,7 +4497,7 @@ bool TryParseLegacyCnArchive(
                                 &assembled);
                         }
                         StageMark("streams decoded");
-                        if (got && validate_decoded_candidate(assembled)) {
+                        if (got && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4511,7 +4555,7 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && validate_decoded_candidate(assembled)) {
+                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4679,7 +4723,7 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && validate_decoded_candidate(assembled)) {
+                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4774,7 +4818,14 @@ bool TryParseLegacyCnArchive(
                                 cur += (std::size_t)e.size;
                             }
                         }
-                        if (!vdc) return false;
+                        if (!vdc) {
+                            // Option (c): the derived window (first candidate) of a damaged
+                            // archive decodes to the right size but fails its checksum; keep
+                            // it as the fallback so the good entries still come out.
+                            std::vector<unsigned char> copy = dec;
+                            record_partial(copy);
+                            return false;
+                        }
                         if (entries_have_checksum) return true;
                         std::uint8_t tag = 0; std::size_t cw = 0;
                         switch (checksum_mode) {
@@ -5016,9 +5067,18 @@ bool TryParseLegacyCnArchive(
     ctx.cm_a_bits = cm_a_bits;
     ctx.cm_b_bits = cm_b_bits;
     ctx.cm_window_size = cm_window_size;
+    if (!native_literal_payload && !native_store_payload && !partial_candidate.empty()) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = partial_candidate.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(partial_candidate);
+        ctx.entry_checksum_ok = std::move(partial_ok);
+    }
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
-    // Every native_literal_payload path above went through validate_decoded_candidate.
+    // Every native_literal_payload path above went through validate_decoded_candidate
+    // (or the partial fallback, whose verdicts are in entry_checksum_ok).
     ctx.checksums_verified = native_literal_payload && checksum_verification_supported;
     if (has_parallel_streams) {
         std::map<unsigned, LegacyParallelStream> pstreams;
@@ -5338,10 +5398,8 @@ static bool TryDecodeLegacyLzhd(
             if (e.has_checksum) {
                 const std::uint32_t got =
                     ComputeBufferChecksum(legacy.checksum_mode, window_base + cursor, n);
-                if (got != e.checksum) {
-                    if (out_error_message) *out_error_message = "lzhd: checksum mismatch";
-                    return false;
-                }
+                (void)got;   // verdict recorded by the caller (CheckEntries); a
+                             // mismatch marks the entry, it no longer voids the decode
             }
             cursor += n;
         }
@@ -5953,11 +6011,7 @@ static bool TryDecodeLegacyCm(
                 fprintf(stderr, "[TDCC]   entry n=%zu expected=0x%08x computed=0x%08x %s\n",
                         n, expected, got, got == expected ? "OK" : "MISMATCH");
             }
-            if (got != expected) {
-                out_data->clear();
-                if (out_error_message) *out_error_message = "cm: checksum mismatch";
-                return false;
-            }
+            (void)got; (void)expected;   // verdict recorded by the caller (CheckEntries)
             cursor += n;
         }
     }
@@ -6757,11 +6811,7 @@ static bool TryDecodeLegacyOptimum(
             }
             const std::uint32_t got =
                 ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
-            if (got != e.checksum) {
-                out_data->clear();
-                if (out_error_message) *out_error_message = "optimum: checksum mismatch";
-                return false;
-            }
+            (void)got;   // verdict recorded by the caller (CheckEntries)
             cursor += n;
         }
     }
@@ -7162,6 +7212,7 @@ LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
     r.truncated_input = c.truncated_input;
     r.parallel_p1 = c.parallel_p1;
     r.checksums_verified = c.checksums_verified;
+    r.entry_checksum_ok = c.entry_checksum_ok;
     r.payload_mode = c.payload_mode;
     r.entries = c.entries;
     r.data_offset = c.data_offset;
@@ -7184,7 +7235,17 @@ int RunLegacyCnExtractOrTest(
             LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
             bridged.data = std::move(bridged_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
             if (NativeTrace()) {
                 os << "[native] decoded -cd payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
@@ -7219,7 +7280,17 @@ int RunLegacyCnExtractOrTest(
             LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
             bridged.data = std::move(optimum_native_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
             if (NativeTrace()) {
                 os << "[native] decoded " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
                    << " payload natively ("
@@ -7239,7 +7310,17 @@ int RunLegacyCnExtractOrTest(
             LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
             bridged.data = std::move(cm_native_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
             if (NativeTrace()) {
                 os << "[native] decoded -cc payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
@@ -7298,18 +7379,29 @@ int RunLegacyCnExtractOrTest(
         // Measured: "Checksum mismatch [<stored> <computed>]: <path>" on its own
         // cleared line, then the run CONTINUES (the file is still written, the
         // footer still counts its bytes, and the exit status stays 0).
+        // Option (c) for damaged archives: an entry whose checksum does not match
+        // is reported the way the original reports it and NOT written; the run
+        // continues with the other entries and exits with status 2.
         bool checksum_bad = false;
-        if (e.has_checksum && legacy.checksum_verification_supported && !legacy.checksums_verified &&
-            options.checksum != ChecksumMode::kNone) {
-            const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
-            if (got != e.checksum) {
-                checksum_bad = true;
-                ClearStatusLine(os);
-                os << "Checksum mismatch [" << FormatChecksum(legacy.checksum_mode, e.checksum)
-                   << ' ' << FormatChecksum(legacy.checksum_mode, got) << "]: " << e.path << '\n';
+        if (e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
+            const std::size_t idx = static_cast<std::size_t>(&e - legacy.entries.data());
+            const bool known_bad = legacy.checksums_verified && idx < legacy.entry_checksum_ok.size() && !legacy.entry_checksum_ok[idx];
+            if (known_bad || !legacy.checksums_verified) {
+                const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
+                if (got != e.checksum) {
+                    checksum_bad = true;
+                    ClearStatusLine(os);
+                    os << "Checksum mismatch [" << FormatChecksum(legacy.checksum_mode, e.checksum)
+                       << ' ' << FormatChecksum(legacy.checksum_mode, got) << "]: " << e.path << '\n';
+                }
             }
         }
-        (void)checksum_bad;
+        if (checksum_bad) {
+            ++failed;
+            bytes_ok += e.size;
+            progress.Advance(e.size);
+            continue;
+        }
         StageMark("entry checksum");
 
         if (!test_mode) {
@@ -7365,14 +7457,9 @@ int RunLegacyCnExtractOrTest(
         progress.Advance(e.size);
     }
 
-    if (failed > 0) {
-        ClearStatusLine(os);
-        os << (test_mode ? "Tested " : "Extracted ") << processed << " files, "
-           << FormatGrouped(bytes_ok) << " bytes. Failures: " << failed << ".\n";
-    } else {
-        PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
-    }
-
+    // The original prints its normal footer after a checksum mismatch; so do we.
+    // The exit status (2) is the one deliberate departure: scripts need to know.
+    PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
     return failed == 0 ? 0 : 2;
 }
 
@@ -8316,7 +8403,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
                     os << "[native] no native decoder accepted this stream; payload mode: "
                        << LegacyPayloadModeLabel(legacy_cn.payload_mode) << '\n';
                 }
-                return 1;
+                return 2;   // status 2: damaged / undecodable content
             }
 
         }
