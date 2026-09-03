@@ -911,7 +911,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         //     resets: the `v2 == 0` flavour, whose window is the shorter compact
         //     recon, does not (tombofchrist10.adf carries two 17-byte ones and needs
         //     the state kept across them).
-        if (is_lzhds && full_literal_chunk &&
+        //   - 2026-09-03, from the driver's decompile (FUN_080994b0 @ 0x080999ff):
+        //     after appending a pure-literal chunk to the window it calls the
+        //     model's reset slot (vtbl+0x10 = FUN_080beea0) `if (0xff < size)`.
+        //     So the rule is the SIZE, not the flavour: any pure-literal chunk
+        //     longer than 255 bytes resets (uitrack.pod: 7959- and 24842-byte
+        //     v2==0 chunks do; tombofchrist's 17-byte ones do not; a full 0x8000
+        //     window always does). Prefilter (0xc) sub-chunks take another path
+        //     and never reset (Moly). GDB: two reset calls from 0x08099bfe on
+        //     uitrack, none for its three 17-byte chunks.
+        if (is_lzhds && pure_literal && !is_pf_chunk && !is_cm_chunk && out_size > 0xffu &&
             lzhds_ctx_table != nullptr && lzhds_ctx_index != nullptr) {
             NzLzhdsInitCtxTable(lzhds_ctx_table);
             *lzhds_ctx_index = 0u;
@@ -1088,6 +1097,14 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // (garbage or format-mismatched bytecode) and refused rather than risk an
     // OOB ring access; propagate that failure so the caller rejects the chunk
     // instead of reading an incomplete/undefined ring back out.
+    if (const char* dl = std::getenv("NZOPT_DUMP_CD_LITS")) {   // literal stream + tokens of this chunk
+        static thread_local unsigned lidx = 0;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/lits%03u_%u.bin", dl, lidx, out_size);
+        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(literals.data(), 1, literals.size(), f); std::fclose(f); }
+        std::snprintf(path, sizeof(path), "%s/toks%03u_%u.txt", dl, lidx++, out_size);
+        if (FILE* f = std::fopen(path, "w")) { for (std::size_t i = 0; i < N; ++i) std::fprintf(f, "%u %u %u\n", toks[3 * i], toks[3 * i + 1], toks[3 * i + 2]); std::fclose(f); }
+    }
     if (is_lzhds) {
         if (NzLzhdsReconstruct(toks.data(), N, literals.data(), literals.size(),
                                ratebits, ratebits_len,
