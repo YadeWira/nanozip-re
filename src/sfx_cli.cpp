@@ -490,8 +490,17 @@ void PrintBanner(std::ostream& os) {
 #else
     const char* tag = (sizeof(void*) == 8) ? "Linux64" : "Linux32";
 #endif
-    os << "\rNanoZip 0.09 alpha/" << tag << "  (C) 2008-2011 Sami Runsas  www.nanozip.net\n";
-    os << HostSummaryLine() << '\n';
+    // The original emits the whole thing in one write(2) -- the CR, the product
+    // line, its newline and the host summary with no trailing newline -- then a
+    // separate write of the closing "\n" (measured: a 145-byte write followed by a
+    // 1-byte write on stderr). std::cerr is unit-buffered, so each `<<` would be
+    // its own syscall; build the block and write it once to match.
+    std::string block = "\rNanoZip 0.09 alpha/";
+    block += tag;
+    block += "  (C) 2008-2011 Sami Runsas  www.nanozip.net\n";
+    block += HostSummaryLine();
+    os.write(block.data(), static_cast<std::streamsize>(block.size()));
+    os << '\n';
 }
 
 void PrintUsage(const char* program_name, std::ostream& os) {
