@@ -41,7 +41,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Release package, 47 archives, all four binaries | 95/95 hashes |
 | Console matrices (36 + 77 + 77 cases, pty prompt harness) | identical except progress-redraw timing and the encode commands |
 | Damaged archives, 8 codecs × 6 corruptions | 42/48 identical trees |
-| Fuzzing, ASan + UBSan | 761/761 clean |
+| Fuzzing, ASan + UBSan, 1228 corrupt and non-archive inputs (`~/.cache/nzre_tools/fuzz/fuzz.sh`) | 1228/1228 clean, worst case 4.9 s |
 
 Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
 it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
