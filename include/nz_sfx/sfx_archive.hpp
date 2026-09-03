@@ -62,8 +62,6 @@ int RunList(const CliOptions& options, std::ostream& os);
 int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os);
 int RunInfo(std::ostream& os);
 
-bool ShouldUseLegacyBackend(const CliOptions& options);
-bool TryRunLegacyBackend(const CliOptions& options, std::ostream& os, int* exit_code);
 
 }  // namespace recon
 }  // namespace nz

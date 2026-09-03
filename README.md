@@ -14,11 +14,12 @@ NanoZip is a high-performance archiver (circa 2010) with several unique compress
 - Native (no original binary at runtime) decoding for all compression methods.
 - Document every reverse-engineered finding so the knowledge is not lost.
 
-## Decode coverage (measured, no bridge)
+## Decode coverage (measured, native only)
 
 The honest metric is how much decodes **byte-exact with no original binary at runtime**.
-`tests/native_only_v2.sh` runs extraction under `NZ_NO_BRIDGE=1` (which disables the
-legacy `nz` fallback entirely) and diffs against the legacy oracle. On a mixed
+`tests/native_only_v2.sh` runs extraction and diffs against the legacy oracle (the
+`NZ_NO_BRIDGE=1` it still exports dates from when a fallback to the original existed;
+there is none any more). On a mixed
 corpus (random, text, source, repeats, zeros, audio, a mixed audio/text/high-entropy
 file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
 
@@ -29,7 +30,7 @@ file, and a 1.1 MB mixed-entropy file; 12 fixtures × 8 methods):
 | `-cF` (lzpf B)     | 12/12 | `-co` (optimum1)    | 12/12 |
 | `-cc` (cm)         | 12/12 | `-cO` (optimum2)    | 12/12 |
 
-**96/96 (100%) byte-exact native, zero bridge** on this fixture set — see the wide real-world sweep
+**96/96 (100%) byte-exact native** on this fixture set — see the wide real-world sweep
 below for the numbers that actually characterise the decode. The whole post-filter chain is native —
 param2, param1, **all seven** text-transform bits the encoder emits (including `0x40`, the PGN/chess
 transform, which the community reference never implemented either),
@@ -60,12 +61,13 @@ re-running until green would have buried a layout that a user hits 5% of the tim
 
 ### Measured the way a user runs it
 
-Every suite sets `NZ_NO_BRIDGE=1`. That is the honest way to measure *native* decode, but it is not
-how anyone who downloads a binary runs it — and the difference mattered: with the bridge merely
-*enabled* and no legacy binary reachable, the CM path treated "the cross-check could not run" as
-"unverified" and declined, so **`-cc` archives failed by default for every user** while the suites
-reported them green. `tests/multifile_v2.sh` now also runs a copy of the binary under `env -i`,
-with no variables set and no legacy `nz` anywhere near it, and compares against the oracle.
+There is **no fallback to the original binary** in this program: nothing searches for an `nz`, nothing
+shells out, and a stream no native decoder accepts is reported as corrupt. Earlier versions carried an
+"extract bridge" that could silently run an original found near the working directory or on `$PATH`;
+it was removed once every corpus decoded natively, after an audit under `strace` (zero foreign
+`execve`, zero probes of an original binary, with one reachable and the bridge still enabled) and a
+run with the originals made unreadable (95/95). `tests/multifile_v2.sh` also runs a copy of the
+binary under `env -i`, with no variables set, and compares against the oracle.
 
 ### The console is the original's, byte for byte
 
@@ -102,7 +104,7 @@ chunks.
 A 61-file corpus at 488/488 proves nothing by itself; an earlier release quoted one at 479/480 while
 `-cO` was in fact failing about **7.5% of real files**, because that corpus happened to contain exactly
 one of them. The figure below therefore comes from a **fresh 155-file real-world corpus** (63 MB across
-eight format categories), swept with all eight codecs: **1240/1240 byte-exact, zero bridge**.
+eight format categories), swept with all eight codecs: **1240/1240 byte-exact**.
 
 | method | pass | fail | | method | pass | fail |
 |--------|------|------|---|--------|------|------|
@@ -148,10 +150,6 @@ byte-exact bytes on either side.
 See the wiki's **[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status)** page for the
 full per-codec breakdown, known gaps, and roadmap to 100%.
 
-> The older `tests/native_only.sh` is a **false positive**: it checks byte-exact
-> equality but does NOT verify the bridge was avoided (`FindLegacyBackend` silently
-> finds a system `nz` in `$PATH`). Use `native_only_v2.sh` + `NZ_NO_BRIDGE=1` for the
-> real figure.
 
 ## Architecture
 
@@ -172,14 +170,10 @@ nz_recon CLI
     └── nz_sfx/        — internal headers
 ```
 
-**Decode layers (priority order)**: (1) **Native** — pure C++ reconstruction, no original binary; (2) **Extract
-bridge** — shells out to the original `nz -x` in a tmpdir, the automatic fallback whenever native decode declines
-or a checksum mismatch is detected; (3) **Compat** — forwards unknown CLI switches to the original binary
-(CLI-level only, not decode). The legacy **compression** bridge is fully disabled
-(`IsInternalLegacyCompressionBridgeCompressor` returns `false` unconditionally) — codecs the native encoder can't
-handle produce an explicit error rather than silently invoking the original binary. `NZ_NO_BRIDGE=1` disables the
-extract bridge too, turning a missing native path into a hard error — this is what `native_only_v2.sh` uses to
-measure honestly.
+**One decode layer**: the native C++ reconstruction. There is no bridge to the original binary of any
+kind — not for decoding, not for unknown switches, not for compression. What the native decoders decline
+is reported as `Archive corrupted. Error decoding (code 100)`, exactly as the original reports its own
+failures.
 
 ## Build
 
@@ -202,8 +196,7 @@ Produces `build/nz_recon`.
 # Stress (5 consecutive runs, checks for non-determinism)
 ./tests/stress_matrix.sh
 
-# Native-only validation: the honest NZ_NO_BRIDGE=1 measurement (see the
-# table above).
+# Native-only validation (see the table above).
 ./tests/native_only_v2.sh
 
 # Multi-file archives: whole-tree comparison (contents, mode and mtime)
@@ -211,7 +204,7 @@ Produces `build/nz_recon`.
 # above cannot see this class of bug.
 ./tests/multifile_v2.sh
 
-# Real-world corpus sweep: same NZ_NO_BRIDGE=1 methodology, but over an
+# Real-world corpus sweep: same methodology, but over an
 # arbitrary directory of REAL files instead of a small synthetic fixture
 # set. Point NZ_REAL_CORPUS at a directory (a file-format sample
 # collection works well); failures are grouped by the native binary's

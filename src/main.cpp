@@ -54,13 +54,6 @@ int main(int argc, char** argv) {
         return finish(1);
     }
 
-    if (nz::recon::ShouldUseLegacyBackend(options)) {
-        int legacy_exit = 0;
-        if (nz::recon::TryRunLegacyBackend(options, std::cout, &legacy_exit)) {
-            return finish(legacy_exit);
-        }
-    }
-
     int rc = 0;
     switch (options.command) {
         case Command::kAdd:

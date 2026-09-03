@@ -1021,252 +1021,17 @@ std::string GdbQuote(const std::string& raw) {
     return out;
 }
 
-bool IsEnvEnabled(const char* name) {
-    if (name == nullptr) {
-        return false;
-    }
-    const char* value = std::getenv(name);
-    if (value == nullptr) {
-        return false;
-    }
-    std::string s(value);
-    for (char& c : s) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (s.empty() || s == "0" || s == "false" || s == "no" || s == "off") {
-        return false;
-    }
-    return true;
-}
 
-bool IsExecutableFile(const fs::path& path) {
-    std::error_code ec;
-    if (!fs::exists(path, ec) || ec) {
-        return false;
-    }
-    if (fs::is_directory(path, ec) || ec) {
-        return false;
-    }
-#if defined(__unix__) || defined(__APPLE__)
-    return ::access(path.c_str(), X_OK) == 0;
-#else
-    return true;
-#endif
-}
 
-// When NZ_NO_BRIDGE is set (to anything other than "0"), the reconstruction
-// must decode/compress entirely natively: every legacy-binary fallback is
-// disabled and a missing native path becomes a hard error instead of a silent
-// shell-out. This is the measurement tool for "true" native coverage — see the
-// extract-bridge false-positive note in HANDOFF_IA.txt §12.
-bool LegacyBridgeDisabled() {
-    const char* env = std::getenv("NZ_NO_BRIDGE");
-    return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
-}
+// There is no fallback to an original `nz` binary anywhere in this program: every
+// decode is native, and a stream no native decoder accepts is reported as corrupt.
+// (`NZ_NO_BRIDGE`, which the test suites still export, is simply ignored.)
 
-fs::path FindLegacyBackend32() {
-    if (LegacyBridgeDisabled()) {
-        return {};
-    }
-    if (const char* env = std::getenv("NZ_LEGACY_BRIDGE_BACKEND")) {
-        fs::path p(env);
-        std::error_code ec;
-        if (fs::is_directory(p, ec) && !ec) {
-            const fs::path nested = p / "nz";
-            if (IsExecutableFile(nested)) {
-                return nested;
-            }
-        } else if (IsExecutableFile(p)) {
-            return p;
-        }
-    }
 
-    if (const char* env = std::getenv("NZ_LEGACY_BACKEND")) {
-        fs::path p(env);
-        std::error_code ec;
-        if (fs::is_directory(p, ec) && !ec) {
-            const fs::path nested = p / "nz";
-            if (IsExecutableFile(nested)) {
-                return nested;
-            }
-        } else if (IsExecutableFile(p) && p.string().find("linux32") != std::string::npos) {
-            return p;
-        }
-    }
 
-    std::error_code ec;
-    fs::path cur = fs::current_path(ec);
-    if (ec) {
-        return {};
-    }
 
-    static constexpr std::array<const char*, 2> kRelativeCandidates = {
-        "work/linux32/nz",
-        "linux32/nz",
-    };
 
-    for (int depth = 0; depth < 8; ++depth) {
-        for (const char* rel : kRelativeCandidates) {
-            const fs::path candidate = cur / rel;
-            if (IsExecutableFile(candidate)) {
-                return candidate;
-            }
-        }
-        if (!cur.has_parent_path()) {
-            break;
-        }
-        fs::path parent = cur.parent_path();
-        if (parent == cur) {
-            break;
-        }
-        cur = parent;
-    }
-    return {};
-}
 
-fs::path FindExecutableInPath(const std::string& name) {
-    const char* env = std::getenv("PATH");
-    if (env == nullptr || *env == '\0') {
-        return {};
-    }
-
-    std::string path_value(env);
-    std::size_t start = 0;
-    while (start <= path_value.size()) {
-        const std::size_t end = path_value.find(':', start);
-        const std::string token =
-            (end == std::string::npos) ? path_value.substr(start) : path_value.substr(start, end - start);
-        const fs::path dir = token.empty() ? fs::current_path() : fs::path(token);
-        const fs::path candidate = dir / name;
-        if (IsExecutableFile(candidate)) {
-            return candidate;
-        }
-        if (end == std::string::npos) {
-            break;
-        }
-        start = end + 1u;
-    }
-    return {};
-}
-
-std::string MakeTempPath(const char* prefix, const char* suffix) {
-    std::error_code ec;
-    fs::path tmp = fs::temp_directory_path(ec);
-    if (ec || tmp.empty()) {
-        tmp = fs::current_path(ec);
-        if (ec || tmp.empty()) {
-            tmp = ".";
-        }
-    }
-    const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-#if defined(__unix__) || defined(__APPLE__)
-    const long pid = static_cast<long>(::getpid());
-#else
-    const long pid = 0;
-#endif
-    std::ostringstream oss;
-    oss << prefix << '_' << pid << '_' << now << suffix;
-    return (tmp / oss.str()).string();
-}
-
-fs::path FindLegacyBackend() {
-    if (LegacyBridgeDisabled()) {
-        return {};
-    }
-    if (const char* env = std::getenv("NZ_LEGACY_BACKEND")) {
-        fs::path p(env);
-        std::error_code ec;
-        if (fs::is_directory(p, ec) && !ec) {
-            const fs::path nested = p / "nz";
-            if (IsExecutableFile(nested)) {
-                return nested;
-            }
-        } else if (IsExecutableFile(p)) {
-            return p;
-        }
-    }
-
-    std::error_code ec;
-    fs::path cur = fs::current_path(ec);
-    if (ec) {
-        return {};
-    }
-
-    static constexpr std::array<const char*, 4> kRelativeCandidates = {
-        "work/linux64/nz",
-        "work/linux32/nz",
-        "linux64/nz",
-        "linux32/nz",
-    };
-
-    for (int depth = 0; depth < 8; ++depth) {
-        for (const char* rel : kRelativeCandidates) {
-            const fs::path candidate = cur / rel;
-            if (IsExecutableFile(candidate)) {
-                return candidate;
-            }
-        }
-
-        if (!cur.has_parent_path()) {
-            break;
-        }
-        fs::path parent = cur.parent_path();
-        if (parent == cur) {
-            break;
-        }
-        cur = parent;
-    }
-
-    const fs::path path_nz = FindExecutableInPath("nz");
-    if (!path_nz.empty()) {
-        return path_nz;
-    }
-
-    return {};
-}
-
-int RunLegacyWithSystem(const fs::path& backend, const std::vector<std::string>& passthrough_args) {
-    std::string cmd = ShellQuote(backend.string());
-    for (const std::string& arg : passthrough_args) {
-        cmd.push_back(' ');
-        cmd += ShellQuote(arg);
-    }
-
-    const int raw = std::system(cmd.c_str());
-#if defined(__unix__) || defined(__APPLE__)
-    if (raw == -1) {
-        return 1;
-    }
-    if (WIFEXITED(raw)) {
-        return WEXITSTATUS(raw);
-    }
-    return 1;
-#else
-    return raw;
-#endif
-}
-
-int RunLegacyWithSystemQuiet(const fs::path& backend, const std::vector<std::string>& passthrough_args) {
-    std::string cmd = ShellQuote(backend.string());
-    for (const std::string& arg : passthrough_args) {
-        cmd.push_back(' ');
-        cmd += ShellQuote(arg);
-    }
-    cmd += " >/dev/null 2>&1";
-
-    const int raw = std::system(cmd.c_str());
-#if defined(__unix__) || defined(__APPLE__)
-    if (raw == -1) {
-        return 1;
-    }
-    if (WIFEXITED(raw)) {
-        return WEXITSTATUS(raw);
-    }
-    return 1;
-#else
-    return raw;
-#endif
-}
 
 std::string ParseProcValue(const char* path, const char* key_prefix) {
     std::ifstream input(path);
@@ -1341,241 +1106,7 @@ struct LegacyCnContext {
 
 constexpr int kLegacyNeedCompat = -100;
 
-bool TryDecodeLegacyWithGdbBridge(
-    const LegacyCnContext& legacy,
-    std::vector<unsigned char>* out_data,
-    std::string* out_error_message) {
-    if (out_data == nullptr) {
-        return false;
-    }
-    out_data->clear();
 
-    if (legacy.legacy_method != 0x2bu &&
-        legacy.legacy_method != 0x3bu &&
-        legacy.legacy_method != 0x4bu) {
-        return false;
-    }
-    if (legacy.total_data_size == 0u) {
-        return false;
-    }
-    if (std::getenv("NZ_DISABLE_GDB_BRIDGE") != nullptr) {
-        return false;
-    }
-
-    std::string bp_condition;
-    switch (legacy.legacy_method_p0) {
-        case 1u:  // nz_lzpf
-        case 2u:  // nz_lzpf_large
-            bp_condition = "(*(unsigned int*)$esp)>=0x08097570 && (*(unsigned int*)$esp)<0x08097e20";
-            break;
-        case 5u:  // nz_optimum1
-        case 6u:  // nz_optimum2
-        case 7u:  // nz_cm
-            // Observed stable output callback site for payload chunks.
-            bp_condition = "(*(unsigned int*)$esp)==0x08095981";
-            break;
-        default:
-            return false;
-    }
-
-    const fs::path backend32 = FindLegacyBackend32();
-    if (backend32.empty()) {
-        if (out_error_message != nullptr) {
-            *out_error_message = "linux32 legacy backend not found for gdb bridge";
-        }
-        return false;
-    }
-
-    const std::string out_bin = MakeTempPath("nzre_legacy_bridge", ".bin");
-    const std::string gdb_script = MakeTempPath("nzre_legacy_bridge", ".gdb");
-
-    {
-        std::ofstream g(gdb_script, std::ios::binary | std::ios::trunc);
-        if (!g) {
-            if (out_error_message != nullptr) {
-                *out_error_message = "cannot create temporary gdb script";
-            }
-            return false;
-        }
-        g << "set pagination off\n";
-        g << "set confirm off\n";
-        g << "file " << GdbQuote(backend32.string()) << '\n';
-        g << "shell rm -f " << ShellQuote(out_bin) << '\n';
-        g << "b *0x080dbdd0 if " << bp_condition << '\n';
-        g << "commands\n";
-        g << "silent\n";
-        g << "set $p=*(unsigned int*)($esp+8)\n";
-        g << "set $n=*(unsigned int*)($esp+12)\n";
-        g << "if $n>0\n";
-        g << "append binary memory " << out_bin << " $p $p+$n\n";
-        g << "end\n";
-        g << "continue\n";
-        g << "end\n";
-        g << "run t " << GdbQuote(legacy.archive_path) << '\n';
-        g << "quit\n";
-    }
-
-    std::string cmd = "gdb -q --batch -x ";
-    cmd += ShellQuote(gdb_script);
-    cmd += " >/dev/null 2>&1";
-    const int raw = std::system(cmd.c_str());
-#if defined(__unix__) || defined(__APPLE__)
-    if (raw == -1 || !WIFEXITED(raw) || WEXITSTATUS(raw) != 0) {
-#else
-    if (raw != 0) {
-#endif
-        std::error_code ec_rm;
-        fs::remove(gdb_script, ec_rm);
-        fs::remove(out_bin, ec_rm);
-        if (out_error_message != nullptr) {
-            *out_error_message = "gdb bridge execution failed";
-        }
-        return false;
-    }
-
-    std::ifstream input(out_bin, std::ios::binary);
-    if (!input) {
-        std::error_code ec_rm;
-        fs::remove(gdb_script, ec_rm);
-        fs::remove(out_bin, ec_rm);
-        if (out_error_message != nullptr) {
-            *out_error_message = "gdb bridge did not produce payload dump";
-        }
-        return false;
-    }
-    std::vector<unsigned char> bytes(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-
-    std::error_code ec_rm;
-    fs::remove(gdb_script, ec_rm);
-    fs::remove(out_bin, ec_rm);
-
-    if (bytes.size() < legacy.total_data_size) {
-        if (out_error_message != nullptr) {
-            std::ostringstream oss;
-            oss << "gdb bridge produced " << bytes.size() << " bytes, expected " << legacy.total_data_size;
-            *out_error_message = oss.str();
-        }
-        return false;
-    }
-    if (bytes.size() > legacy.total_data_size) {
-        bytes.resize(static_cast<std::size_t>(legacy.total_data_size));
-    }
-
-    *out_data = std::move(bytes);
-    if (out_error_message != nullptr) {
-        out_error_message->clear();
-    }
-    return true;
-}
-
-bool TryDecodeLegacyWithExtractBridge(
-    const LegacyCnContext& legacy,
-    std::vector<unsigned char>* out_data,
-    std::string* out_error_message) {
-    if (out_data == nullptr) {
-        return false;
-    }
-    out_data->clear();
-
-    if (legacy.entries.empty() || legacy.total_data_size == 0u) {
-        return false;
-    }
-    if (std::getenv("NZ_DISABLE_EXTRACT_BRIDGE") != nullptr) {
-        return false;
-    }
-
-    const fs::path backend = FindLegacyBackend();
-    if (backend.empty()) {
-        if (out_error_message != nullptr) {
-            *out_error_message = LegacyBridgeDisabled()
-                ? "native decoder missing for this stream and NZ_NO_BRIDGE is set "
-                  "(refusing to shell out to the original binary)"
-                : "legacy backend not found for extract bridge";
-        }
-        return false;
-    }
-
-    const fs::path tmp_root = MakeTempPath("nzre_extract_bridge", "");
-    std::error_code ec;
-    fs::create_directories(tmp_root, ec);
-    if (ec) {
-        if (out_error_message != nullptr) {
-            *out_error_message = "cannot create temporary extract-bridge directory";
-        }
-        return false;
-    }
-
-    const std::vector<std::string> args = {
-        "x",
-        "-y",
-        std::string("-o") + tmp_root.string(),
-        legacy.archive_path
-    };
-    const int rc = RunLegacyWithSystemQuiet(backend, args);
-    if (rc != 0) {
-        fs::remove_all(tmp_root, ec);
-        if (out_error_message != nullptr) {
-            std::ostringstream oss;
-            oss << "extract bridge failed with backend rc=" << rc;
-            *out_error_message = oss.str();
-        }
-        return false;
-    }
-
-    std::vector<unsigned char> decoded;
-    decoded.reserve(static_cast<std::size_t>(legacy.total_data_size));
-    for (const LegacyCnEntry& entry : legacy.entries) {
-        const fs::path rel = SanitizeExtractPath(entry.path);
-        if (rel.empty()) {
-            fs::remove_all(tmp_root, ec);
-            if (out_error_message != nullptr) {
-                *out_error_message = "extract bridge found unsafe archive path";
-            }
-            return false;
-        }
-
-        const fs::path extracted = tmp_root / rel;
-        std::ifstream in(extracted, std::ios::binary);
-        if (!in) {
-            fs::remove_all(tmp_root, ec);
-            if (out_error_message != nullptr) {
-                *out_error_message = "extract bridge missing extracted entry";
-            }
-            return false;
-        }
-
-        std::vector<unsigned char> chunk(
-            (std::istreambuf_iterator<char>(in)),
-            std::istreambuf_iterator<char>());
-        if (chunk.size() != entry.size) {
-            fs::remove_all(tmp_root, ec);
-            if (out_error_message != nullptr) {
-                *out_error_message = "extract bridge entry size mismatch";
-            }
-            return false;
-        }
-        decoded.insert(decoded.end(), chunk.begin(), chunk.end());
-    }
-
-    fs::remove_all(tmp_root, ec);
-
-    if (decoded.size() != legacy.total_data_size) {
-        if (out_error_message != nullptr) {
-            std::ostringstream oss;
-            oss << "extract bridge produced " << decoded.size() << " bytes, expected " << legacy.total_data_size;
-            *out_error_message = oss.str();
-        }
-        return false;
-    }
-
-    *out_data = std::move(decoded);
-    if (out_error_message != nullptr) {
-        out_error_message->clear();
-    }
-    return true;
-}
 
 std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size) {
     switch (mode) {
@@ -7139,7 +6670,7 @@ static bool TryDecodeLegacyOptimum(
 // this port's own allocation for that engine -- the original's number comes from its
 // own budgeting (it reports 13 MB where this engine allocates 0.3 MB), so this is
 // the one field in the decode banner that is deliberately OUR value and not a clone.
-// This port's own diagnostics ("[native] ...", "[bridge] ...") used to ride on -v;
+// This port's own diagnostics ("[native] ...") used to ride on -v;
 // the original's -v adds nothing but an IO-buffers figure to the header, so they
 // now live behind NZ_VERBOSE_NATIVE to keep -v output byte-identical.
 // What the original says about a file that is not one of its archives -- its
@@ -7538,58 +7069,12 @@ int RunLegacyCnExtractOrTest(
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
         const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);
-        // Verify the native CM output against the legacy extract bridge before trusting
-        // it. The native CM decoder currently has a known architectural mismatch with
-        // the legacy decoder for short inputs (4-byte patterns repeated 3+ times), and
-        // that mismatch surfaces as a silent data corruption that only the downstream
-        // checksum would catch. Full-buffer comparison: if any byte differs, fall
-        // through to the extract bridge path so the user gets byte-exact output.
-        // The cross-check is skipped when the extract bridge is disabled (NZ_DISABLE_
-        // EXTRACT_BRIDGE) to preserve the legacy fast path in CI.
-        // The CM mixing bug (factors0_err arithmetic-shift port error) was fixed
-        // 2026-06-08, so native CM is byte-exact for the general case. The bridge
-        // cross-check is kept as a safety net ONLY when the bridge is available
-        // (catches any residual edge case, e.g. tt16 word-list / stereo CM). When
-        // the bridge is disabled (NZ_NO_BRIDGE), trust the native result directly.
-        bool cm_verified = false;
-        if (cm_native_ok
-            && !LegacyBridgeDisabled()
-            && std::getenv("NZ_DISABLE_EXTRACT_BRIDGE") == nullptr
-            && !legacy.entries.empty()
-            && legacy.total_data_size > 0u) {
-            std::vector<unsigned char> bridge_data;
-            std::string verify_error;
-            if (TryDecodeLegacyWithExtractBridge(legacy, &bridge_data, &verify_error)) {
-                if (cm_native_data.size() == bridge_data.size()
-                    && std::memcmp(cm_native_data.data(), bridge_data.data(),
-                                   cm_native_data.size()) == 0) {
-                    cm_verified = true;
-                } else if (NativeTrace()) {
-                    os << "[native] CM native output differs from legacy; "
-                          "falling back to extract bridge.\n";
-                }
-            } else {
-                // The cross-check COULD NOT RUN -- there is no legacy binary
-                // reachable. That is the normal case for anyone who just
-                // downloaded this decoder, and it must not turn a good native
-                // decode into a refusal: "bridge enabled by configuration" and
-                // "bridge actually available" are different things, and
-                // conflating them made every `-cc` archive decline unless the
-                // user happened to set NZ_NO_BRIDGE. The native result is
-                // already gated on the stored per-file checksum inside
-                // TryDecodeLegacyCm; this comparison is a bonus, not a
-                // requirement.
-                cm_verified = true;
-            }
-        } else if (cm_native_ok) {
-            cm_verified = true;
-        }
-        if (cm_verified) {
-            bridged_data = std::move(cm_native_data);
+        // Native -cc CM decode; checksum-gated inside TryDecodeLegacyCm.
+        if (cm_native_ok) {
             LegacyCnContext bridged = legacy;
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;
-            bridged.data = std::move(bridged_data);
+            bridged.data = std::move(cm_native_data);
             if (NativeTrace()) {
                 os << "[native] decoded -cc payload natively ("
                    << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
@@ -7597,39 +7082,8 @@ int RunLegacyCnExtractOrTest(
             }
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
         }
-        std::string extract_bridge_error;
-        if (TryDecodeLegacyWithExtractBridge(legacy, &bridged_data, &extract_bridge_error)) {
-            LegacyCnContext bridged = legacy;
-            bridged.native_payload_supported = true;
-            bridged.data_offset = 0u;
-            bridged.data = std::move(bridged_data);
-            if (NativeTrace()) {
-                os << "[bridge] decoded legacy payload via extract bridge ("
-                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
-                   << ").\n";
-            }
-            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
-        }
-        std::string gdb_bridge_error;
-        if (TryDecodeLegacyWithGdbBridge(legacy, &bridged_data, &gdb_bridge_error)) {
-            LegacyCnContext bridged = legacy;
-            bridged.native_payload_supported = true;
-            bridged.data_offset = 0u;
-            bridged.data = std::move(bridged_data);
-            if (NativeTrace()) {
-                os << "[bridge] decoded legacy payload via gdb trace bridge ("
-                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
-                   << ").\n";
-            }
-            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os);
-        }
-        if (NativeTrace()) {
-            if (!extract_bridge_error.empty()) {
-                os << "[bridge] extract bridge failed: " << extract_bridge_error << '\n';
-            }
-            if (!gdb_bridge_error.empty()) {
-                os << "[bridge] gdb bridge failed: " << gdb_bridge_error << '\n';
-            }
+        if (NativeTrace() && !cm_decode_error.empty()) {
+            os << "[native] -cc native decode declined: " << cm_decode_error << '\n';
         }
         return kLegacyNeedCompat;
     }
@@ -7946,50 +7400,8 @@ ArchiveOpenError OpenArchive(
     return ArchiveOpenError::kNone;
 }
 
-bool ShouldUseLegacyBackend(const CliOptions& options) {
-    if (options.command == Command::kW32c) {
-        return false;
-    }
 
-    if (!options.unknown_switches.empty()) {
-        return true;
-    }
 
-    const bool internal_bridge_supported = (options.compressor != Compressor::kNone);
-    if ((options.command == Command::kAdd || options.command == Command::kSimulate) &&
-        options.compressor != Compressor::kNone &&
-        !internal_bridge_supported) {
-        return true;
-    }
-
-    return false;
-}
-
-bool TryRunLegacyBackend(const CliOptions& options, std::ostream& os, int* exit_code) {
-    const fs::path backend = FindLegacyBackend();
-    if (backend.empty()) {
-        return false;
-    }
-
-    os << "[compat] forwarding command to legacy backend: " << backend.string() << '\n' << std::flush;
-    const int rc = RunLegacyWithSystem(backend, options.passthrough_args);
-    if (exit_code != nullptr) {
-        *exit_code = rc;
-    }
-    return true;
-}
-
-bool IsInternalLegacyCompressionBridgeCompressor(Compressor c) {
-    // Disabled (2026-06-04): the legacy compression bridge was a fallback
-    // for codecs the native encoder could not handle (e.g. -cO optimum
-    // variants, -cc cm). Per the project goal of being 100% pure native
-    // RE (no dependency on the original binary at runtime), the bridge
-    // is disabled unconditionally. Codecs the native encoder cannot
-    // handle now produce an explicit "unsupported" error rather than
-    // silently invoking the legacy binary.
-    (void)c;
-    return false;
-}
 
 enum class LegacyNativeWrapper {
     kLzpfLiteralBits,
@@ -8062,9 +7474,6 @@ bool IsNativeLegacyCompressionAvailable(const CliOptions& options) {
     return ResolveLegacyNativeSpec(options.compressor, &spec);
 }
 
-bool IsLegacyCompressionBridgeDisabled() {
-    return IsEnvEnabled("NZ_DISABLE_COMPRESS_BRIDGE");
-}
 
 bool BuildLegacyLiteralFilenameTable(
     const std::vector<SourceFile>& sources,
@@ -8161,7 +7570,7 @@ bool BuildNativeLegacyStreamPayload(
                 if (out_error_message != nullptr) {
                     std::ostringstream oss;
                     oss << "native -co/-cO writer currently supports up to " << kNativeBwtMaxBytes
-                        << " bytes (use legacy bridge for larger payloads)";
+                        << " bytes";
                     *out_error_message = oss.str();
                 }
                 return false;
@@ -8449,39 +7858,10 @@ int RunSimulateNativeLegacyStream(
     return 0;
 }
 
-bool TryRunLegacyCompressionBridge(const CliOptions& options, std::ostream& os, int* exit_code) {
-    if (options.command != Command::kAdd && options.command != Command::kSimulate) {
-        return false;
-    }
-    if (!IsInternalLegacyCompressionBridgeCompressor(options.compressor)) {
-        return false;
-    }
-    if (IsLegacyCompressionBridgeDisabled()) {
-        return false;
-    }
-
-    const fs::path backend = FindLegacyBackend();
-    if (backend.empty()) {
-        return false;
-    }
-
-    os << "[bridge] using legacy compressor backend: " << backend.string() << '\n' << std::flush;
-    const int rc = RunLegacyWithSystem(backend, options.passthrough_args);
-    if (exit_code != nullptr) {
-        *exit_code = rc;
-    }
-    return true;
-}
 
 int RunAdd(const CliOptions& options, std::ostream& os) {
     const auto add_start = std::chrono::steady_clock::now();
     const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
-    if (!native_legacy_stream && IsInternalLegacyCompressionBridgeCompressor(options.compressor)) {
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            return bridge_exit;
-        }
-    }
 
     std::vector<SourceFile> sources;
     std::vector<std::string> warnings;
@@ -8489,10 +7869,6 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
 
     const bool need_checksums = (options.checksum != ChecksumMode::kNone);
     if (!BuildSourceList(options, &sources, &warnings, &error, need_checksums)) {
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            return bridge_exit;
-        }
         for (const std::string& w : warnings) {
             os << "Warning: " << w << '\n';
         }
@@ -8512,13 +7888,6 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
             return 0;
         }
 
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            if (options.verbose) {
-                os << "Warning: native writer failed; used legacy bridge backend instead.\n";
-            }
-            return bridge_exit;
-        }
 
         os << native_log.str();
         return native_exit;
@@ -8627,22 +7996,12 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
 
 int RunSimulate(const CliOptions& options, std::ostream& os) {
     const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
-    if (!native_legacy_stream && IsInternalLegacyCompressionBridgeCompressor(options.compressor)) {
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            return bridge_exit;
-        }
-    }
 
     std::vector<SourceFile> sources;
     std::vector<std::string> warnings;
     std::string error;
 
     if (!BuildSourceList(options, &sources, &warnings, &error, false)) {
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            return bridge_exit;
-        }
         for (const std::string& w : warnings) {
             os << "Warning: " << w << '\n';
         }
@@ -8662,13 +8021,6 @@ int RunSimulate(const CliOptions& options, std::ostream& os) {
             return 0;
         }
 
-        int bridge_exit = 0;
-        if (TryRunLegacyCompressionBridge(options, os, &bridge_exit)) {
-            if (options.verbose) {
-                os << "Warning: native simulation failed; used legacy bridge backend instead.\n";
-            }
-            return bridge_exit;
-        }
 
         os << native_log.str();
         return native_exit;
@@ -8722,10 +8074,6 @@ int RunList(const CliOptions& options, std::ostream& os) {
                 return RunLegacyCnList(options, legacy_cn, os);
             }
 
-            int code = 0;
-            if (TryRunLegacyBackend(options, os, &code)) {
-                return code;
-            }
         }
         // Measured: `l` on a missing or foreign file prints the archive line, the
         // reason, and an empty total.
@@ -8789,10 +8137,6 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
                     return legacy_rc;
                 }
 
-                int code = 0;
-                if (TryRunLegacyBackend(options, os, &code)) {
-                    return code;
-                }
                 // Measured: an undecodable payload is "Archive corrupted. Error
                 // decoding (code 100)"; one cut off before its end is code 25600.
                 ClearStatusLine(os);
@@ -8805,10 +8149,6 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
                 return 1;
             }
 
-            int code = 0;
-            if (TryRunLegacyBackend(options, os, &code)) {
-                return code;
-            }
         }
         os << "Archive: " << options.archive_path << '\n';
         os << LegacyOpenFailureMessage(open_error, options.archive_path, legacy_error, error) << '\n';
