@@ -67,6 +67,14 @@ struct CliOptions {
     std::string output_path;
     std::vector<std::string> exclude_patterns;
 
+    // -t<n>: thread count to report (0 = auto); -br/-bw: IO buffer sizes in bytes
+    // (0 = auto, not shown); -swapinout / -forceout: the benchmark helpers.
+    unsigned threads = 0;
+    std::uint64_t read_buffer_bytes = 0;
+    std::uint64_t write_buffer_bytes = 0;
+    bool swapinout = false;
+    bool forceout = false;
+
     std::vector<std::string> unknown_switches;
     std::vector<std::string> passthrough_args;
 

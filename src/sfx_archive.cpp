@@ -5484,11 +5484,8 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
 
     std::uint64_t total_size = 0;
     std::size_t total_files = 0;
+    // Measured: `l` lists every entry whatever file arguments follow the archive.
     for (const LegacyCnEntry& e : legacy.entries) {
-        if (!MatchesAnyPattern(e.path, options.positional)) {
-            continue;
-        }
-
         if (has_checksum) {
             if (e.checksum_na) {
                 os << "     n/a ";
@@ -7418,9 +7415,21 @@ void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t o
     os << buf << '\n';
 }
 
-void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, bool verbose, bool test_mode) {
+void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOptions& options, bool test_mode) {
+    const bool verbose = options.verbose;
     os << "Archive: " << ctx.archive_path << '\n';
-    os << "Threads: " << HostThreadCount() << '\n';
+    // -t<n> caps the reported thread count (n = 0 or above the CPU count = auto);
+    // -br/-bw show as ", IO-read-buffer: N MB" / ", IO-write-buffer: N MB", or
+    // ", IO-buffers: R+W MB" when both are given, N rounded to whole MB (512k -> 1).
+    unsigned threads = HostThreadCount();
+    if (options.threads > 0u && options.threads < threads) threads = options.threads;
+    os << "Threads: " << threads;
+    const auto mb = [](std::uint64_t b) { return (b + 512u * 1024u) >> 20; };
+    if (options.read_buffer_bytes && options.write_buffer_bytes)
+        os << ", IO-buffers: " << mb(options.read_buffer_bytes) << '+' << mb(options.write_buffer_bytes) << " MB";
+    else if (options.read_buffer_bytes)  os << ", IO-read-buffer: " << mb(options.read_buffer_bytes) << " MB";
+    else if (options.write_buffer_bytes) os << ", IO-write-buffer: " << mb(options.write_buffer_bytes) << " MB";
+    os << '\n';
     const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
     // Rounding is the original's ((bytes >> 19) + 1) >> 1. Under -v it appends its
     // IO buffer split: no read-ahead, a 1 MB write-behind for `t`, 4 MB for `x`.
@@ -7647,7 +7656,11 @@ int RunLegacyCnExtractOrTest(
             return 2;
         }
 
-        const bool selected = MatchesAnyPattern(e.path, options.positional);
+        // -x<pattern> excludes (`*` crosses directories); -forceout keeps the
+        // filter but names every output file after the first file argument ("*"
+        // when there is none), so later entries overwrite earlier ones.
+        const bool selected = MatchesAnyPattern(e.path, options.positional) &&
+                              !IsExcluded(e.path, options.exclude_patterns);
         const unsigned char* ptr = legacy.data.data() + cursor;
         const std::size_t n = static_cast<std::size_t>(e.size);
         cursor += n;
@@ -7680,9 +7693,10 @@ int RunLegacyCnExtractOrTest(
 
         if (!test_mode) {
             // -sp strips the stored directories on extraction too.
-            const fs::path safe_rel = options.strip_paths
+            fs::path safe_rel = options.strip_paths
                 ? fs::path(SanitizeExtractPath(e.path)).filename()
                 : SanitizeExtractPath(e.path);
+            if (options.forceout) safe_rel = fs::path(options.positional.empty() ? std::string("*") : options.positional.front());
             if (safe_rel.empty()) {
                 os << "Skipping unsafe path in archive: " << e.path << '\n';
                 ++failed;
@@ -8769,7 +8783,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
                 // Header first, decode second -- the original streams, so a failing
                 // archive still shows "Archive:", "Threads:" and the compressor line.
-                PrintDecodeHeader(os, legacy_cn, options.verbose, test_mode);
+                PrintDecodeHeader(os, legacy_cn, options, test_mode);
                 const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os);
                 if (legacy_rc != kLegacyNeedCompat) {
                     return legacy_rc;

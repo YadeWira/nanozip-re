@@ -132,154 +132,109 @@ CliOptions ParseCli(int argc, char** argv) {
         return out;
     }
 
-    bool parse_switches = true;
-    int i = 2;
-    for (; i < argc; ++i) {
+    // The original scans EVERY argument after the command for switches -- a "-y"
+    // after the archive name is still a switch (measured: `x arc -y` overwrites,
+    // `x arc -v -y` shows the -v header). Values must be attached (`-o out` makes
+    // "out" the archive; `-x` alone is "Unknown argument: -x"), and a lone "-" is
+    // rejected the same way on the decode commands. The first switch it cannot
+    // parse stops the run with "Unknown argument: <switch>".
+    std::vector<std::string> plain;
+    for (int i = 2; i < argc; ++i) {
         const char* raw = argv[i];
-        if (raw == nullptr) {
-            continue;
-        }
-
+        if (raw == nullptr) continue;
         const std::string token(raw);
-        if (!parse_switches || token.empty() || token[0] != '-') {
-            break;
-        }
-
-        if (token == "-") {
-            parse_switches = false;
-            continue;
-        }
-
+        if (token.empty() || token[0] != '-') { plain.push_back(token); continue; }
         const std::string sw = token.substr(1);
-        if (sw.empty()) {
-            continue;
-        }
-
-        if (sw == "r") {
-            out.recurse = true;
-            continue;
-        }
-        if (sw == "y") {
-            out.yes_to_all = true;
-            continue;
-        }
-        if (sw == "v") {
-            out.verbose = true;
-            continue;
-        }
-        if (sw == "sp") {
-            out.strip_paths = true;
-            continue;
-        }
-        if (sw == "nt") {
-            out.no_timestamps = true;
-            continue;
-        }
-        if (sw == "np") {
-            out.no_permissions = true;
-            continue;
-        }
-        if (sw == "nm") {
-            out.no_timestamps = true;
-            out.no_permissions = true;
-            out.checksum = ChecksumMode::kNone;
-            continue;
-        }
-        if (sw == "nofilenameext") {
-            out.no_filename_ext = true;
-            continue;
-        }
-
-        if (StartsWith(sw, "c")) {
-            bool ok = false;
-            const std::string suffix = sw.substr(1);
-            out.compressor = ParseCompressor(suffix, &ok);
-            if (!ok) {
-                out.unknown_switches.push_back(token);
+        const auto is_digits = [](const std::string& v) {
+            return std::all_of(v.begin(), v.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; });
+        };
+        // <n>[k,m,g] with an optional decimal part ("-m1.5g" is accepted).
+        const auto parse_size = [&](const std::string& v, std::uint64_t* out_bytes) {
+            if (v.empty()) { *out_bytes = 0; return true; }
+            std::string num = v; std::uint64_t unit = 1;
+            const char last = num.back();
+            if (last == 'k' || last == 'm' || last == 'g') {
+                unit = (last == 'k') ? 1024ull : (last == 'm') ? 1048576ull : 1073741824ull;
+                num.pop_back();
             }
-            continue;
-        }
-
-        if (StartsWith(sw, "h")) {
-            const std::string suffix = sw.substr(1);
-            if (suffix == "n") {
-                out.checksum = ChecksumMode::kNone;
-            } else if (suffix == "c") {
-                out.checksum = ChecksumMode::kCrc16;
-            } else if (suffix == "C") {
-                out.checksum = ChecksumMode::kCrc32;
-            } else if (suffix == "f") {
-                out.checksum = ChecksumMode::kFletcher16;
-            } else {
-                out.unknown_switches.push_back(token);
-            }
-            continue;
-        }
-
-        if (StartsWith(sw, "o")) {
-            const std::string suffix = sw.substr(1);
-            if (suffix.empty()) {
-                if (i + 1 < argc && argv[i + 1] != nullptr) {
-                    ++i;
-                    out.output_path = argv[i];
-                } else {
-                    out.error = "missing value for -o<path>";
-                    out.show_usage = true;
-                    return out;
-                }
-            } else {
-                out.output_path = suffix;
-            }
-            continue;
-        }
-
-        if (StartsWith(sw, "x")) {
-            const std::string suffix = sw.substr(1);
-            if (suffix.empty()) {
-                if (i + 1 < argc && argv[i + 1] != nullptr) {
-                    ++i;
-                    out.exclude_patterns.emplace_back(argv[i]);
-                } else {
-                    out.error = "missing value for -x<file>";
-                    out.show_usage = true;
-                    return out;
-                }
-            } else {
-                out.exclude_patterns.push_back(suffix);
-            }
-            continue;
-        }
-
-        // Parsed but ignored (kept for CLI compatibility).
-        if (StartsWith(sw, "m") || StartsWith(sw, "p") || StartsWith(sw, "t") ||
-            StartsWith(sw, "br") || StartsWith(sw, "bw") || StartsWith(sw, "s") ||
-            sw == "fo" || sw == "pause" || sw == "swapinout" || sw == "forceout") {
-            continue;
-        }
-
-        out.unknown_switches.push_back(token);
+            if (num.empty()) return false;
+            const std::size_t dot = num.find('.');
+            const std::string ip = (dot == std::string::npos) ? num : num.substr(0, dot);
+            const std::string fp = (dot == std::string::npos) ? "" : num.substr(dot + 1);
+            if (!is_digits(ip) || !is_digits(fp) || (ip.empty() && fp.empty())) return false;
+            double val = ip.empty() ? 0.0 : static_cast<double>(std::stoull(ip));
+            if (!fp.empty()) val += std::stod("0." + fp);
+            *out_bytes = static_cast<std::uint64_t>(val * static_cast<double>(unit));
+            return true;
+        };
+        bool ok = true;
+        if (sw.empty())                 ok = false;
+        else if (sw == "r")             out.recurse = true;
+        else if (sw == "y")             out.yes_to_all = true;
+        else if (sw == "v")             out.verbose = true;
+        else if (sw == "sp")            out.strip_paths = true;
+        else if (sw == "nt")            out.no_timestamps = true;
+        else if (sw == "np")            out.no_permissions = true;
+        else if (sw == "nm")            { out.no_timestamps = true; out.no_permissions = true; out.checksum = ChecksumMode::kNone; }
+        else if (sw == "nofilenameext") out.no_filename_ext = true;
+        else if (sw == "swapinout")     out.swapinout = true;
+        else if (sw == "forceout")      out.forceout = true;
+        else if (sw == "fo" || sw == "pause") { /* accepted, no effect on decode */ }
+        else if (sw[0] == 'c') {
+            bool cok = false;
+            out.compressor = ParseCompressor(sw.substr(1), &cok);
+            ok = cok;
+        } else if (sw[0] == 'h') {
+            const std::string v = sw.substr(1);
+            if (v == "n") out.checksum = ChecksumMode::kNone;
+            else if (v == "c") out.checksum = ChecksumMode::kCrc16;
+            else if (v == "C") out.checksum = ChecksumMode::kCrc32;
+            else if (v == "f") out.checksum = ChecksumMode::kFletcher16;
+            else ok = false;
+        } else if (sw[0] == 's') {
+            const std::string v = sw.substr(1);
+            ok = (v == "n" || v == "e" || v == "a" || v == "s");
+        } else if (sw[0] == 'o') {
+            out.output_path = sw.substr(1);            // may be empty: no effect
+        } else if (sw[0] == 'x') {
+            if (sw.size() < 2u) ok = false; else out.exclude_patterns.push_back(sw.substr(1));
+        } else if (sw.compare(0, 2, "br") == 0) {
+            ok = parse_size(sw.substr(2), &out.read_buffer_bytes);
+        } else if (sw.compare(0, 2, "bw") == 0) {
+            ok = parse_size(sw.substr(2), &out.write_buffer_bytes);
+        } else if (sw[0] == 't') {
+            const std::string v = sw.substr(1);
+            if (!is_digits(v)) ok = false;
+            else out.threads = v.empty() ? 0u : static_cast<unsigned>(std::stoul(v));
+        } else if (sw[0] == 'p') {
+            ok = is_digits(sw.substr(1));
+        } else if (sw[0] == 'm') {
+            std::uint64_t dummy = 0; ok = parse_size(sw.substr(1), &dummy);
+        } else ok = false;
+        if (!ok) { out.unknown_switches.push_back(token); return out; }
     }
 
     if (out.command == Command::kW32c) {
-        // `w32c` requires archive in original NanoZip. We keep parser permissive.
-        if (i < argc && argv[i] != nullptr) {
-            out.archive_path = argv[i++];
-        }
-        for (; i < argc; ++i) {
-            if (argv[i] != nullptr) {
-                out.positional.emplace_back(argv[i]);
-            }
-        }
+        if (!plain.empty()) { out.archive_path = plain.front(); plain.erase(plain.begin()); }
+        out.positional = plain;
         return out;
     }
 
-    if (i >= argc || argv[i] == nullptr) {
+    if (plain.empty()) {
         out.show_usage = true;
         out.error = "archive name missing";
         return out;
     }
-
-    out.archive_path = argv[i++];
+    out.archive_path = plain.front();
+    plain.erase(plain.begin());
+    out.positional = plain;
+    // -swapinout: the archive name and the first file argument change places (with
+    // "*" standing in for a missing file argument -- measured "Archive: *.nz").
+    if (out.swapinout) {
+        std::string first = out.positional.empty() ? std::string("*") : out.positional.front();
+        if (out.positional.empty()) out.positional.push_back(out.archive_path); else out.positional.front() = out.archive_path;
+        out.archive_path = first;
+    }
     // The original appends ".nz" to whatever archive name it is given unless the
     // name already ends in ".nz" or ".exe" (a self-extractor), case-sensitively
     // (measured: m.bin -> m.bin.nz, m.NZ -> m.NZ.nz, m.EXE -> m.EXE.nz, m.exe and
@@ -291,11 +246,6 @@ CliOptions ParseCli(int argc, char** argv) {
             return a.size() >= n && a.compare(a.size() - n, n, suf) == 0;
         };
         if (!ends(".nz") && !ends(".exe")) out.archive_path += ".nz";
-    }
-    for (; i < argc; ++i) {
-        if (argv[i] != nullptr) {
-            out.positional.emplace_back(argv[i]);
-        }
     }
 
     if ((out.command == Command::kAdd || out.command == Command::kSimulate) && out.positional.empty()) {
