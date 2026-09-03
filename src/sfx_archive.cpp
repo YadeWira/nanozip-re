@@ -15,6 +15,7 @@
 #include "nz_bwt.h"
 #include "nz_audio.h"
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <iterator>
 #include "nz_exefilter.h"
@@ -1193,6 +1194,230 @@ struct LegacyCnContext {
     std::vector<unsigned char> data;
 };
 
+// ---------------------------------------------------------------------------
+// Progress engine: the original's status line as decompiled (FUN_0804b740 /
+// FUN_0804b8d0 / FUN_0804ba70; ~/.cache/nzre_tools/cli_parity/PROGRESS_ENGINE.md).
+//  * One slot per worker stream, holding the bytes that stream has produced.
+//    Eight are visible (the struct holds eight); a worker tick prints them
+//    joined by '|' up to the first empty one, each "<N> MB" (MB up to 9 GB, then
+//    GB, then TB -- FUN_0804be20), then four spaces and one backspace per
+//    character written.
+//  * A worker tick is gated by time(): nothing is redrawn while the whole second
+//    is the one of the previous tick. Ticks come from every completed block, so
+//    the line refreshes about once a second while blocks complete.
+//  * The writer's tick (FUN_0804ab00 first) clears the line, prints the file name
+//    in 40 columns plus a space, then the same fields; its gate is a second
+//    variable of its own. It fires when a file starts.
+//  * The "Archive / Threads / Compressor" header precedes all of this. Some of
+//    our decodes run while the archive is still being parsed, so the header
+//    printer is registered up front and fired by the first tick or explicitly.
+// Measured too: a single-container decode shows "0 MB" right after the name (the
+// original's first tick lands within the first block); a parallel one shows an
+// empty field until the first stream has produced something.
+namespace progress {
+
+constexpr std::size_t kMaxSlots = 256;
+constexpr std::size_t kVisibleSlots = 8;
+
+struct Engine {
+    std::mutex mu;
+    std::ostream* os = nullptr;                       // null = engine off (l, own container)
+    std::function<void(std::ostream&)> header;
+    bool header_done = false;
+    LegacyCnContext snapshot;                         // header fields published by the parser
+    bool have_snapshot = false;
+    bool parallel = false;
+    std::array<std::atomic<std::uint64_t>, kMaxSlots> done{};
+    std::atomic<std::uint64_t> total{0};
+    std::string name, shown_name;
+    bool worker_gate = false, writer_gate = false;
+    std::time_t worker_sec = 0, writer_sec = 0;
+};
+
+inline Engine& E() { static Engine e; return e; }
+inline thread_local std::size_t t_slot = 0;
+
+// FUN_0804a990(buf, name, 0x28): a name longer than 40 columns is "..." plus its
+// last 37 characters (the listing's 38/35 rule is a different formatter).
+inline std::string Name40(const std::string& name) {
+    if (name.size() <= 40u) return name;
+    return "..." + name.substr(name.size() - 37u);
+}
+
+inline std::string HumanSize(std::uint64_t bytes) {
+    // FUN_0804be20 with start unit MB: the unit rises while the value exceeds
+    // 9 units of the next one; rounding is half-up.
+    unsigned unit = 2;
+    while (unit < 4 && bytes > (9ull << (10u * (unit + 1u)))) ++unit;
+    const unsigned shift = 10u * unit;
+    const std::uint64_t v = (bytes + (1ull << (shift - 1u))) >> shift;
+    static const char* const names[] = {" B", " KB", " MB", " GB", " TB"};
+    return std::to_string(v) + names[unit];
+}
+
+inline std::string FieldsLocked(Engine& e) {
+    std::string f;
+    for (std::size_t i = 0; i < kVisibleSlots; ++i) {
+        const std::uint64_t v = e.done[i].load(std::memory_order_relaxed);
+        if (v == 0u) break;
+        if (i) f += '|';
+        f += HumanSize(v);
+    }
+    return f;
+}
+
+inline void WriteFieldLocked(Engine& e, std::string prefix, const std::string& fields) {
+    prefix += fields;
+    prefix += "    ";
+    prefix.append(fields.size() + 4u, '\b');
+    e.os->write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    e.os->flush();
+}
+
+inline void EnsureHeaderLocked(Engine& e) {
+    if (e.header_done || e.os == nullptr) return;
+    e.header_done = true;
+    if (e.header) e.header(*e.os);
+}
+
+// Main registers the header printer before the archive is parsed.
+inline void Begin(std::ostream* os, std::function<void(std::ostream&)> header) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.os = os; e.header = std::move(header); e.header_done = false;
+    e.have_snapshot = false; e.parallel = false;
+    for (auto& d : e.done) d.store(0u, std::memory_order_relaxed);
+    e.total.store(0u, std::memory_order_relaxed);
+    e.name.clear(); e.shown_name.clear();
+    e.worker_gate = e.writer_gate = false;
+}
+inline void End() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.os = nullptr; e.header = nullptr;
+}
+inline bool Active() { return E().os != nullptr; }
+
+// The parser publishes what the header needs before any decode it runs itself.
+inline void Publish(const LegacyCnContext& snap) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (e.os == nullptr) return;
+    e.snapshot = snap; e.have_snapshot = true;
+}
+inline bool HaveSnapshot() { return E().have_snapshot; }
+inline const LegacyCnContext& Snapshot() { return E().snapshot; }
+
+// Called by the header printer once the header lines are out: the original's
+// writer prints the first file's name at once for a single container (the
+// writer starts as soon as the first block lands) and a first "0 MB" tick
+// follows within the same instant; a parallel container shows an empty field.
+inline void WriterStartLocked(Engine& e);
+inline void HeaderPrinted(bool parallel, const std::string& first_name) {
+    Engine& e = E();   // caller holds e.mu (runs inside EnsureHeaderLocked)
+    e.parallel = parallel;
+    e.name = first_name;
+    if (!parallel) WriterStartLocked(e);
+    // Parallel: the original's header ends with a name tick whose name is not
+    // known yet (a run of spaces of varying length, left alone here); the first
+    // worker tick then prints the empty field, which happens here too.
+}
+
+inline void EnsureHeader() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    EnsureHeaderLocked(e);
+}
+
+inline void WorkerTickLocked(Engine& e) {
+    const std::time_t now = std::time(nullptr);
+    if (e.worker_gate && now == e.worker_sec) return;
+    e.worker_gate = true; e.worker_sec = now;
+    EnsureHeaderLocked(e);
+    WriteFieldLocked(e, std::string(), FieldsLocked(e));
+}
+
+// The writer starts on the first block of the first stream: name + empty field,
+// then the "0 MB" tick, exactly the single-container start (measured on a 4-stream
+// 2 MB archive: "name     \b\b\b\b" then "0 MB    \b...", as for one stream).
+inline void WriterStartLocked(Engine& e) {
+    if (e.name.empty() || e.name == e.shown_name) return;
+    EnsureHeaderLocked(e);
+    ClearStatusLine(*e.os);
+    WriteFieldLocked(e, Name40(e.name) + " ", std::string());
+    e.shown_name = e.name;
+    e.writer_gate = true; e.writer_sec = std::time(nullptr);
+    WriteFieldLocked(e, std::string(), HumanSize(0));
+    e.worker_gate = true; e.worker_sec = e.writer_sec;
+}
+
+// Worker side: n more output bytes from this thread's stream.
+inline void Add(std::uint64_t n) {
+    Engine& e = E();
+    if (e.os == nullptr || n == 0u) return;
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    const bool first_of_stream0 = slot == 0u && e.done[0].load(std::memory_order_relaxed) == 0u;
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (first_of_stream0 && e.parallel) WriterStartLocked(e);
+    e.done[slot].fetch_add(n, std::memory_order_relaxed);
+    e.total.fetch_add(n, std::memory_order_relaxed);
+    WorkerTickLocked(e);
+}
+inline bool Decoded() { return E().total.load(std::memory_order_relaxed) != 0u; }
+
+// A decode attempt that fails is retried with other parameters or declined;
+// its figures must not stay on the counter. Scope rewinds unless committed.
+inline std::uint64_t Mark() {
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    return E().done[slot].load(std::memory_order_relaxed);
+}
+inline void Rewind(std::uint64_t mark) {
+    Engine& e = E();
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    const std::uint64_t cur = e.done[slot].load(std::memory_order_relaxed);
+    if (cur > mark) {
+        e.done[slot].store(mark, std::memory_order_relaxed);
+        e.total.fetch_sub(cur - mark, std::memory_order_relaxed);
+    }
+}
+struct Scope {
+    std::uint64_t mark;
+    bool committed = false;
+    Scope() : mark(Mark()) {}
+    ~Scope() { if (!committed) Rewind(mark); }
+    void Commit() { committed = true; }
+    void Restart() { Rewind(mark); }
+};
+
+// Writer side: a file starts. Prints name + fields, gated to one per second;
+// the same name twice in a row is not reprinted.
+inline void FileStart(const std::string& name) {
+    Engine& e = E();
+    if (e.os == nullptr) return;
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.name = name;
+    if (name.empty() || name == e.shown_name) return;
+    const std::time_t now = std::time(nullptr);
+    if (e.writer_gate && now == e.writer_sec) return;
+    e.writer_gate = true; e.writer_sec = now;
+    EnsureHeaderLocked(e);
+    ClearStatusLine(*e.os);
+    WriteFieldLocked(e, Name40(name) + " ", FieldsLocked(e));
+    e.shown_name = name;
+}
+
+// A worker stream finished. For a parallel container the writer starts with
+// the first stream, so the first file's name appears then.
+inline void StreamDone(std::size_t) {}
+
+struct SlotScope {
+    std::size_t saved;
+    explicit SlotScope(std::size_t slot) : saved(t_slot) { t_slot = slot; }
+    ~SlotScope() { t_slot = saved; }
+};
+
+}  // namespace progress
+
 constexpr int kLegacyNeedCompat = -100;
 
 // Sum of the bytes modulo 255: the one-byte per-stage check the original stores
@@ -1757,7 +1982,9 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     std::atomic<bool> oom{false};
     if (threads <= 1u) {
         for (std::size_t i = 0; i < n && ok; ++i) {
+            progress::SlotScope slot(i);
             if (!fn(i)) ok = false;
+            else progress::StreamDone(i);
         }
         return ok;
     }
@@ -1767,7 +1994,9 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
             const std::size_t i = next.fetch_add(1u);
             if (i >= n || !ok) return;
             try {
+                progress::SlotScope slot(i);
                 if (!fn(i)) ok = false;
+                else progress::StreamDone(i);
             } catch (const std::bad_alloc&) {
                 oom = true; ok = false;
             }
@@ -2696,6 +2925,7 @@ bool DecodeLzpfMember(
     bool derived_cap_only,
     Verify&& verify,
     std::vector<unsigned char>* out) {
+    progress::Scope pscope;
     if (first_block_pos + first_stream_len > bytes.size()) return false;
     // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
     // header fields) plus the decline point — the fastest way to tell whether a
@@ -2775,6 +3005,7 @@ bool DecodeLzpfMember(
     std::vector<unsigned char> first_prefix;
     bool first_candidate = true;
     for (const std::size_t window_capacity : cap_candidates) {
+        pscope.Restart();
         std::size_t member_done = 0;
         std::size_t stream_data_end = first_block_pos + first_stream_len;
         std::vector<std::uint8_t> window_alloc(
@@ -2917,6 +3148,7 @@ bool DecodeLzpfMember(
                     }
                 }
                 total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
                 continue;
             }
             if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { decode_ok = false; break; }
@@ -3016,6 +3248,7 @@ bool DecodeLzpfMember(
                 apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
                 input_pos += static_cast<std::size_t>(block_out_size);
                 total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
                 continue;
             }
             // Obtain the LZ77 opcode bytecode: either arith-decoded from a
@@ -3063,6 +3296,7 @@ bool DecodeLzpfMember(
                         static_cast<std::size_t>(block_out_size));
             apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
             total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
         }
         if (trace_lzpf) {
             if (const char* dp = std::getenv("NZOPT_DUMP_LZPF")) {
@@ -3085,6 +3319,7 @@ bool DecodeLzpfMember(
         }
         if (decode_ok && total_written == total && verify(decoded)) {
             *out = std::move(decoded);
+            pscope.Commit();
             return true;
         }
     }
@@ -4163,6 +4398,26 @@ bool TryParseLegacyCnArchive(
         }
     }
 
+    if (progress::Active() && !entries.empty()) {
+        // Some decodes below run here, at parse time; the progress engine prints
+        // the "Archive / Threads / Compressor" header lazily from this snapshot.
+        LegacyCnContext snap;
+        snap.archive_path = archive_path;
+        snap.legacy_method = method;
+        snap.legacy_method_p0 = method_p0;
+        snap.legacy_method_p1 = method_p1;
+        snap.cm_a_bits = cm_a_bits;
+        snap.cm_b_bits = cm_b_bits;
+        snap.cm_window_size = cm_window_size;
+        if (has_parallel_streams) {
+            std::map<unsigned, LegacyParallelStream> pstreams;
+            if (ParseLegacyParallelStreams(bytes, &pstreams))
+                for (const auto& kv : pstreams)
+                    snap.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
+        }
+        snap.entries.push_back(entries.front());
+        progress::Publish(snap);
+    }
     if (!native_store_payload && !entries.empty() && payload_start <= bytes.size()) {
                 // Parallel multi-stream container (header flag byte 0x0f, used by
                 // the multi-threaded encoder for inputs >~8 MB). The output is cut
@@ -4470,6 +4725,7 @@ bool TryParseLegacyCnArchive(
                                     &s_pf, &s_lms1, &s_lms2, &s_img);
                                 if (produced == 0u) return false;
                                 pwritten += produced;
+                                progress::Add(produced);
                             }
                             if (pwritten != slice_total) return false;
                             if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) return false;
@@ -4610,6 +4866,7 @@ bool TryParseLegacyCnArchive(
                                             &s_pf, &s_lms1, &s_lms2, &s_img);
                                         if (produced == 0u) return false;
                                         written += produced;
+        progress::Add(produced);
                                     }
                                     return written == out_size;
                                 },
@@ -5413,6 +5670,7 @@ static bool TryDecodeLegacyLzhd(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
     std::string* out_error_message) {
+    progress::Scope pscope;
     if (out_data == nullptr) return false;
     out_data->clear();
 
@@ -5555,6 +5813,7 @@ static bool TryDecodeLegacyLzhd(
             ok = false; break;
         }
         written += produced;
+        progress::Add(produced);
     }
 
     // The original flushes its output per stream (measured: 1 MB multiples on a
@@ -5608,6 +5867,7 @@ static bool TryDecodeLegacyLzhd(
         }
     }
     out_data->assign(window_base, window_base + total_out);
+    pscope.Commit();
     return true;
 }
 
@@ -5619,6 +5879,7 @@ static bool TryDecodeLegacyCm(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
     std::string* out_error_message) {
+    progress::Scope pscope;
     if (out_data == nullptr) return false;
     out_data->clear();
 
@@ -5795,6 +6056,7 @@ static bool TryDecodeLegacyCm(
                 // decr_param==0 CM block ever turns up after an audio block and
                 // decodes wrong, this is the first place to look.
                 out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+                progress::Add(abuf.size());
                 continue;
             }
 
@@ -5812,6 +6074,7 @@ static bool TryDecodeLegacyCm(
             }
             if (iused == 0u) { ok = false; break; }
             out_data->insert(out_data->end(), work3.begin(), work3.end());
+            progress::Add(work3.size());
             continue;
         }
         // Every non-audio block resets the audio predictor.
@@ -6167,6 +6430,7 @@ static bool TryDecodeLegacyCm(
         stg_report();
         if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        progress::Add(cur_size);
         }
     }
 
@@ -6253,6 +6517,7 @@ static bool TryDecodeLegacyCm(
             cursor += n;
         }
     }
+    pscope.Commit();
     return true;
 }
 
@@ -6329,6 +6594,7 @@ static bool DecodeOptimumBlockSequence(
     NzExeFilter& exe,
     std::vector<std::uint8_t>& raw_stream,
     std::vector<unsigned char>* out_data) {
+    progress::Scope pscope;
     std::size_t pos = blocks_begin;
     const std::size_t stream_end = blocks_end;
     bool ok = true;
@@ -6389,6 +6655,7 @@ static bool DecodeOptimumBlockSequence(
                 }
                 if (iused == 0u) { ok = false; break; }
                 out_data->insert(out_data->end(), ibuf.begin(), ibuf.end());
+                progress::Add(ibuf.size());
                 continue;
             }
             // An audio block resets the predictor only when mode2_type is set.
@@ -6407,6 +6674,7 @@ static bool DecodeOptimumBlockSequence(
             }
             if (!aok) { ok = false; break; }
             out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+                progress::Add(abuf.size());
             continue;
         }
         // Every non-audio block resets the audio predictor (reference
@@ -6906,6 +7174,7 @@ static bool DecodeOptimumBlockSequence(
         }
         if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        progress::Add(cur_size);
         nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
@@ -6914,6 +7183,7 @@ static bool DecodeOptimumBlockSequence(
         }
     }
 
+    if (ok) pscope.Commit();
     return ok;
 }
 
@@ -6921,6 +7191,7 @@ static bool TryDecodeLegacyOptimum(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
     std::string* out_error_message) {
+    progress::Scope pscope;
     if (out_data == nullptr) return false;
     out_data->clear();
 
@@ -7097,6 +7368,7 @@ static bool TryDecodeLegacyOptimum(
             cursor += n;
         }
     }
+    pscope.Commit();
     return true;
 }
 
@@ -7276,58 +7548,13 @@ std::uint64_t LegacyEngineWorkingSetP1(const LegacyCnContext& c, std::uint8_t p1
     return W;
 }
 
-// Running "<name>     \b\b\b\b<N MB>    \b..." display of a decode, as the original
-// draws it: the name is written when a file starts, the MB field is the
-// CUMULATIVE decoded size rounded to whole MB, and the display refreshes at block
-// boundaries -- name again only if the file changed since the last refresh, then
-// the field. Blocks are approximated here as every whole MB of output, which
-// reproduces the original byte for byte on anything that fits in one block (one
-// name, one "0 MB") and tracks it closely on long decodes.
+// The extract loop's view of the progress engine: a file starting is the
+// writer's tick (name + fields, once per second); on a stored archive, where no
+// decoder ran, the copied bytes are the figure.
 struct DecodeProgress {
-    std::ostream& os;
-    std::uint64_t done = 0;
-    std::uint64_t next_mark = 0;
-    std::string current;
-    std::string shown;
-    bool started = false;
-    explicit DecodeProgress(std::ostream& o) : os(o) {}
-    void Field() {
-        char b[32];
-        std::snprintf(b, sizeof(b), "%llu MB",
-                      static_cast<unsigned long long>((done + 512u * 1024u) >> 20));
-        os << b << "    ";
-        for (std::size_t i = 0, n = std::strlen(b) + 4u; i < n; ++i) os << '\b';
-        os.flush();
-    }
-    // Names longer than 40 columns are shown as "..." plus their last 37 characters.
-    void Name() {
-        ClearStatusLine(os);
-        if (current.size() > 40u) os << "..." << current.substr(current.size() - 37u);
-        else os << current;
-        os << "     " << "\b\b\b\b";
-        shown = current;
-    }
-    void Begin(const std::string& name) {
-        current = name;
-        if (!started) { started = true; Name(); Field(); next_mark = 1u << 20; }
-    }
-    std::chrono::steady_clock::time_point last_refresh = std::chrono::steady_clock::now();
-    void Advance(std::uint64_t n) {
-        // The original redraws from a ~0.5 s timer, and only when the shown figure
-        // changed: a 2.29 GB archive that decodes in 3.3 s shows six refreshes, a
-        // 12 MB one that takes 11 s shows one every 0.4-1.5 s. Same rule here.
-        done += n;
-        if (!started) return;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_refresh < std::chrono::milliseconds(500)) return;
-        const std::uint64_t mb = (done + 512u * 1024u) >> 20;
-        if (mb == shown_mb && shown == current) return;
-        last_refresh = now;
-        if (shown != current) Name();
-        Field();
-        shown_mb = mb;
-    }
-    std::uint64_t shown_mb = 0;
+    explicit DecodeProgress(std::ostream&) {}
+    void Begin(const std::string& name) { progress::FileStart(name); }
+    void Advance(std::uint64_t n) { if (!progress::Decoded()) progress::Add(n); }
 };
 
 // The CM family's memory method, FUN_080aafb0, transcribed (Ghidra + GDB reads of
@@ -8730,10 +8957,22 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
         // are the PE stub's, not the archive magic.
         if (open_error != ArchiveOpenError::kCannotOpen) {
             LegacyCnContext legacy_cn;
+            bool parsed = false;
+            // Header first, decode second -- the original streams, so a failing
+            // archive still shows "Archive:", "Threads:" and the compressor line.
+            // Parts of the decode run inside the parser, so the header printer is
+            // registered with the progress engine and fired by the first progress
+            // tick (from the parser's snapshot) or explicitly after the parse.
+            progress::Begin(&os, [&](std::ostream& o) {
+                const LegacyCnContext& c = parsed ? legacy_cn : progress::Snapshot();
+                PrintDecodeHeader(o, c, options, test_mode);
+                progress::HeaderPrinted(!c.parallel_p1.empty(),
+                                        c.entries.empty() ? std::string() : c.entries.front().path);
+            });
+            struct ProgressEnd { ~ProgressEnd() { progress::End(); } } progress_end;
             if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
-                // Header first, decode second -- the original streams, so a failing
-                // archive still shows "Archive:", "Threads:" and the compressor line.
-                PrintDecodeHeader(os, legacy_cn, options, test_mode);
+                parsed = true;
+                progress::EnsureHeader();
                 const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os, run_start);
                 if (legacy_rc != kLegacyNeedCompat) {
                     return legacy_rc;
