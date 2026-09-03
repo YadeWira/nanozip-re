@@ -1,3 +1,4 @@
+#include "nz_env.h"
 #include "nz_trace.h"
 #if !defined(_WIN32)
 #include <sys/stat.h>
@@ -1444,7 +1445,7 @@ unsigned StageCheck255(const std::uint8_t* p, std::size_t n) {
 // whatever was decoded, checksum mismatches included, exit 0) write only the
 // entries whose checksum verifies, skip the rest and exit 2.
 bool SafeMode() {
-    static const bool on = (std::getenv("NZ_SAFE") != nullptr);
+    static const bool on = (NZ_ENV("NZ_SAFE") != nullptr);
     return on;
 }
 
@@ -1905,11 +1906,11 @@ bool ParseLegacyParallelStreams(
         } else if (ct == 0u && csz > 0u) {
             st.chunks.emplace_back(p, csz);
         }
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[PAR] rec sid=%u ct=%u csz=%zu at %zu\n", sid, ct, csz, p);
         p += csz;
     }
-    if (std::getenv("NZ_TRACE_PARSTREAM")) {
+    if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
         for (const auto& kv : *out_streams) {
             std::fprintf(stderr, "[PAR] stream %u: osz=%llu(%d) ooff=%llu(%d) cmode=%d chunks=%zu slices=%zu\n",
                          kv.first, (unsigned long long)kv.second.osz, (int)kv.second.hassz,
@@ -1949,7 +1950,7 @@ bool ParseLegacyParallelStreams(
 unsigned g_decode_threads = 0;   // -t<n> (0 = automatic)
 
 unsigned DecodeThreadCount() {
-    if (const char* e = std::getenv("NZ_THREADS")) {
+    if (const char* e = NZ_ENV("NZ_THREADS")) {
         const long v = std::strtol(e, nullptr, 10);
         if (v > 0) return static_cast<unsigned>(std::min<long>(v, 256));
     }
@@ -2126,7 +2127,7 @@ bool TryAssembleParallelStore(
         const LegacyParallelStream& st = kv.second;
         if (st.chunks.empty()) continue;
         if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone) {
-            if (std::getenv("NZ_TRACE_PARSTREAM"))
+            if (NZ_ENV("NZ_TRACE_PARSTREAM"))
                 std::fprintf(stderr, "[PAR] store: stream %u missing off/sz/cksum\n", kv.first);
             return false;
         }
@@ -2146,7 +2147,7 @@ bool TryAssembleParallelStore(
         covered += st.osz;
     }
     if (covered != total_size) {
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[PAR] store: covered=%llu != total=%llu\n",
                          (unsigned long long)covered, (unsigned long long)total_size);
         return false;
@@ -2930,7 +2931,7 @@ bool DecodeLzpfMember(
     // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
     // header fields) plus the decline point — the fastest way to tell whether a
     // failing member even reaches the stereo prefilter path.
-    const bool trace_lzpf = (std::getenv("NZOPT_TRACE_LZPF") != nullptr);
+    const bool trace_lzpf = (NZ_ENV("NZOPT_TRACE_LZPF") != nullptr);
     auto decode_lzpf_header = [&](std::size_t& pos, std::uint32_t& out_uvar9) -> bool {
         if (pos >= bytes.size()) return false;
         std::uint8_t b0 = bytes[pos++];
@@ -3299,7 +3300,7 @@ bool DecodeLzpfMember(
                 progress::Add(block_out_size);
         }
         if (trace_lzpf) {
-            if (const char* dp = std::getenv("NZOPT_DUMP_LZPF")) {
+            if (const char* dp = NZ_ENV("NZOPT_DUMP_LZPF")) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s.cap%zu", dp, window_capacity);
                 if (FILE* fp = fopen(path, "wb")) {
@@ -3411,7 +3412,7 @@ bool TryParseLegacyCnArchive(
     // the stub up front keeps every offset consistent.
     if (bytes.size() > 0x40u && bytes[0] == 'M' && bytes[1] == 'Z') {
         const std::size_t off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? bytes.size() : 4096u);
-        if (std::getenv("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
+        if (NZ_ENV("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
         if (off > 1u && off < bytes.size()) bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(off));
     }
     if (bytes.size() < 24u) {
@@ -3517,7 +3518,7 @@ bool TryParseLegacyCnArchive(
 
         if (pos + csize > bytes.size()) { truncated_input = true; break; }
         const bool is_main = (cstream == 0u);
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] @%zu ctype=%u cstream=%u csize=%zu codec=%d table=%d\n",
                          pos, ctype, cstream, (size_t)csize, (int)found_codec, (int)found_table);
 
@@ -3640,7 +3641,7 @@ bool TryParseLegacyCnArchive(
     const bool native_store_payload = (method_p0 == 0u);
 
     if (table_end > bytes.size()) {
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] BAIL table_end=%zu > size=%zu\n", (size_t)table_end, bytes.size());
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
@@ -3708,7 +3709,7 @@ bool TryParseLegacyCnArchive(
         path_index.emplace(e.path, entries.size());
         stream_named[table_stream].push_back(entries.size());
         total_data_size += file_size;
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] store size check: total_data_size=%llu size=%zu\n",
                          (unsigned long long)total_data_size, bytes.size());
         if (native_store_payload && total_data_size > bytes.size()) {
@@ -3985,7 +3986,7 @@ bool TryParseLegacyCnArchive(
                 break;
             }
         }
-        if (std::getenv("NZ_TRACE_PARSTREAM"))
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%zu table_end=%zu prefix_found=%d entries=%zu\n",
                          (unsigned long long)total_data_size, data_offset, (size_t)table_end,
                          (int)prefix_found, entries.size());
@@ -4097,7 +4098,7 @@ bool TryParseLegacyCnArchive(
 
     // Dumps the front metadata run, which is where the entry tags (mtime 0x42,
     // permissions 0x24, checksum 0x45/0x47/0x26) are expected to sit contiguously.
-    if (getenv("NZOPT_TRACE_META")) {
+    if (NZ_ENV("NZOPT_TRACE_META")) {
         fprintf(stderr, "[META] entries=%zu metadata=[%zu,%zu) cksum_mode=%d bytes=",
                 entries.size(), metadata_begin, metadata_end, (int)checksum_mode);
         for (std::size_t k = metadata_begin; k < metadata_end && k < metadata_begin + 32u; ++k)
@@ -5224,7 +5225,7 @@ bool TryParseLegacyCnArchive(
                     }
                     auto member_verify = [&](const std::vector<unsigned char>& dec) -> bool {
                         const bool vdc = validate_decoded_candidate(dec);
-                        if (getenv("NZOPT_TRACE_LZPF")) {
+                        if (NZ_ENV("NZOPT_TRACE_LZPF")) {
                             fprintf(stderr, "[lzpf] member_verify: size=%zu vdc=%d entries=%zu have_cksum=%d mode=%d\n",
                                     dec.size(), (int)vdc, entries.size(), (int)entries_have_checksum, (int)checksum_mode);
                             std::size_t cur = 0;
@@ -5674,18 +5675,18 @@ static bool TryDecodeLegacyLzhd(
     if (out_data == nullptr) return false;
     out_data->clear();
 
-    if (getenv("NZOPT_TRACE_CD")) {
+    if (NZ_ENV("NZOPT_TRACE_CD")) {
         fprintf(stderr, "[LZHD] enter: method=0x%x p0=%u p1=%u total=%llu data=%zu\n",
                 legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1,
                 (unsigned long long)legacy.total_data_size, legacy.data.size());
     }
     if (legacy.legacy_method != 0x2bu ||
         (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u)) {
-        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
         return false;
     }
     if (legacy.data.empty()) {
-        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
         return false;
     }
 
@@ -5801,7 +5802,7 @@ static bool TryDecodeLegacyLzhd(
             ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
             is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
             &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img);
-        if (getenv("NZOPT_TRACE_CD")) {
+        if (NZ_ENV("NZOPT_TRACE_CD")) {
             fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);
         }
@@ -5809,7 +5810,7 @@ static bool TryDecodeLegacyLzhd(
         if (!nzr::cd::NzCdLastStreamClean()) {
             // The stream stopped on a malformed chunk: the original reports the
             // error here (code 5) and has flushed only the streams before it.
-            if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
+            if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
             ok = false; break;
         }
         written += produced;
@@ -5821,12 +5822,12 @@ static bool TryDecodeLegacyLzhd(
     // one count as written: a stream that produced nothing left `written` at the
     // boundary already; one that stopped short is dropped below.
     if (!ok) {
-        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
         out_data->assign(window_base, window_base + std::min(written, total_out));
         return false;
     }
-    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
         // Dump before BOTH the size check and the checksum gate, so a short
         // decode is diffable too (its prefix is still meaningful) -- not just a
         // full-size wrong-bytes one.
@@ -5835,7 +5836,7 @@ static bool TryDecodeLegacyLzhd(
         fprintf(stderr, "[LZHD] dumped %zu of %zu bytes to %s\n", written, (size_t)total_out, dp);
     }
     if (written != total_out) {
-        if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
         // Every stream decoded cleanly yet the output is short: the original has
         // flushed all of it (the last file cut short) and reports "Archive
         // corrupted. Unexpected end of file." instead of an error code.
@@ -5981,7 +5982,7 @@ static bool TryDecodeLegacyCm(
                                       (static_cast<std::uint32_t>(raw[pos + 1]) << 8u);
                     inline_checksum_seen = true;
                 }
-                if (inline_checksum_seen && getenv("NZOPT_TRACE_TDO")) {
+                if (inline_checksum_seen && NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDCC] inline type-%u checksum record: 0x%08x\n",
                             chunk_type, inline_checksum);
                 }
@@ -6025,7 +6026,7 @@ static bool TryDecodeLegacyCm(
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
                         payload_size, decr_param, mode2_type, alt_out_size, pos, stream_end);
             }
@@ -6036,7 +6037,7 @@ static bool TryDecodeLegacyCm(
             if (decr_param == 2u) {
                 if (alt_out_size == 0u) continue;
                 // An audio block resets the predictor only when mode2_type is set.
-                if (const char* adp = getenv("NZOPT_DUMP_AUDIO")) {
+                if (const char* adp = NZ_ENV("NZOPT_DUMP_AUDIO")) {
                     FILE* f = fopen(adp, "wb");
                     if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
                     fprintf(stderr, "[TDCC] dumped audio payload (%u bytes, out_size=%u) to %s\n",
@@ -6045,7 +6046,7 @@ static bool TryDecodeLegacyCm(
                 if (mode2_type) aud.Reset();
                 std::vector<std::uint8_t> abuf(alt_out_size);
                 const bool aok = aud.Decode(payload, payload_size, abuf.data(), alt_out_size);
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDCC] audio Decode(payload_size=%u out_size=%u) -> %d\n",
                             payload_size, alt_out_size, aok ? 1 : 0);
                 }
@@ -6068,7 +6069,7 @@ static bool TryDecodeLegacyCm(
             if (alt_out_size == 0u) continue;
             std::vector<std::uint8_t> work3(alt_out_size);
             const std::size_t iused = img.Decode(payload, payload_size, work3.data(), alt_out_size);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
                         payload_size, alt_out_size, iused);
             }
@@ -6101,7 +6102,7 @@ static bool TryDecodeLegacyCm(
         const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
         pos += staged_count;
         // Per-stage check bytes, verified as in DecodeOptimumBlockSequence.
-        static const bool trace_stg = (getenv("NZOPT_TRACE_STG") != nullptr);
+        static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
         std::string stg;
         std::size_t stage_idx = 0;
         bool stage_bad = false;
@@ -6248,7 +6249,7 @@ static bool TryDecodeLegacyCm(
             static_cast<std::uint32_t>(prev_size);
 
         nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDCC] pre-filters: decr_param=%u param6=%u param2_flag=%u param1_flag=%u "
                             "tt_enabled=%u tt_flags=%u out_size=%u pos=%zu stream_end=%zu\n",
                     decr_param, param6, param2_flag, param1_flag, tt_enabled, tt_flags, out_size, pos, stream_end);
@@ -6260,7 +6261,7 @@ static bool TryDecodeLegacyCm(
             const bool p2ok = NzBwtRleDecodeU32(param2_data.data(),
                                    static_cast<std::uint32_t>(param2_data.size()),
                                    work.data(), cur_size, exp.data(), &esz);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] param2: data.size=%zu cur_size=%u -> ok=%d esz=%u\n",
                         param2_data.size(), cur_size, p2ok ? 1 : 0, esz);
             }
@@ -6277,7 +6278,7 @@ static bool TryDecodeLegacyCm(
             const bool p1ok = NzAddBytesFilter(param1_data.data(),
                                   static_cast<std::uint32_t>(param1_data.size()),
                                   work.data(), cur_size, tbuf.data());
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] param1: data.size=%zu cur_size=%u -> ok=%d\n",
                         param1_data.size(), cur_size, p1ok ? 1 : 0);
             }
@@ -6296,7 +6297,7 @@ static bool TryDecodeLegacyCm(
         // for that stage: the golden file is the chain's OUTPUT and every other
         // stage in the chain is already ported and invertible.
         if (tt_enabled) {
-            if (const char* tp = getenv("NZOPT_DUMP_TTIN")) {
+            if (const char* tp = NZ_ENV("NZOPT_DUMP_TTIN")) {
                 FILE* f = fopen(tp, "wb");
                 if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
                 fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
@@ -6416,7 +6417,7 @@ static bool TryDecodeLegacyCm(
             const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
                                  work.data(), cur_size, tbuf.data(), remaining, &n);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] dece: param=%u data=%zu in=%u -> %d out=%u\n",
                         dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
             }
@@ -6436,7 +6437,7 @@ static bool TryDecodeLegacyCm(
 
     NzCmDestroy(cm);
 
-    if (getenv("NZOPT_TRACE_TDO")) {
+    if (NZ_ENV("NZOPT_TRACE_TDO")) {
         fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%zu total_data_size=%llu\n",
                 ok ? 1 : 0, pos, raw_len, out_data->size(),
                 static_cast<unsigned long long>(legacy.total_data_size));
@@ -6454,7 +6455,7 @@ static bool TryDecodeLegacyCm(
     }
 
     // Checksum self-verify, mirroring the sibling TryDecodeLegacyLzhd and
-    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
         FILE* f = fopen(dp, "wb");
         if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
         fprintf(stderr, "[TDCC] dumped pre-checksum output (%zu bytes) to %s\n", out_data->size(), dp);
@@ -6483,14 +6484,14 @@ static bool TryDecodeLegacyCm(
         legacy.checksum_mode != ChecksumMode::kNone &&
         !legacy.entries.empty()) {
         std::size_t cursor = 0;
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDCC] checksum gate: mode=%d entries=%zu outsize=%zu\n",
                     (int)legacy.checksum_mode, legacy.entries.size(), out_data->size());
         }
         for (const LegacyCnEntry& e : legacy.entries) {
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (cursor + n > out_data->size()) break;
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC]   entry: size=%zu has_cksum=%d cursor=%zu outsize=%zu\n",
                         n, (int)e.has_checksum, cursor, out_data->size());
             }
@@ -6509,7 +6510,7 @@ static bool TryDecodeLegacyCm(
             }
             const std::uint32_t got =
                 ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC]   entry n=%zu expected=0x%08x computed=0x%08x %s\n",
                         n, expected, got, got == expected ? "OK" : "MISMATCH");
             }
@@ -6635,7 +6636,7 @@ static bool DecodeOptimumBlockSequence(
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
                         payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
             }
@@ -6649,7 +6650,7 @@ static bool DecodeOptimumBlockSequence(
                 audio.Reset();
                 std::vector<std::uint8_t> ibuf(audio_out_size);
                 const std::size_t iused = image.Decode(payload, payload_size, ibuf.data(), audio_out_size);
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
                             payload_size, audio_out_size, iused);
                 }
@@ -6659,7 +6660,7 @@ static bool DecodeOptimumBlockSequence(
                 continue;
             }
             // An audio block resets the predictor only when mode2_type is set.
-            if (const char* adp = getenv("NZOPT_DUMP_AUDIO")) {
+            if (const char* adp = NZ_ENV("NZOPT_DUMP_AUDIO")) {
                 FILE* f = fopen(adp, "wb");
                 if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
                 fprintf(stderr, "[TDO] dumped audio payload (%u bytes, out_size=%u, mode2=%u) to %s\n",
@@ -6668,7 +6669,7 @@ static bool DecodeOptimumBlockSequence(
             if (mode2_type) audio.Reset();
             std::vector<std::uint8_t> abuf(audio_out_size);
             const bool aok = audio.Decode(payload, payload_size, abuf.data(), audio_out_size);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] audio Decode(payload_size=%u out_size=%u) -> %d\n",
                         payload_size, audio_out_size, aok ? 1 : 0);
             }
@@ -6698,7 +6699,7 @@ static bool DecodeOptimumBlockSequence(
         if (pos + staged_count > stream_end) { ok = false; break; }
         const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
         pos += staged_count;
-        static const bool trace_stg = (getenv("NZOPT_TRACE_STG") != nullptr);
+        static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
         std::string stg;
         // The original's per-stage check (FUN_080c0220): after each stage it pops
         // the LAST remaining staged byte and compares it with Fletcher32(stage
@@ -6715,7 +6716,7 @@ static bool DecodeOptimumBlockSequence(
             if (!trace_stg) return;
             char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
         };
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u param6=%u out_size=%u staged_count=%u pos=%zu stream_end=%zu\n",
                     payload_size, decr_param, param6, out_size, staged_count, pos, stream_end);
         }
@@ -6757,7 +6758,7 @@ static bool DecodeOptimumBlockSequence(
             if (pos >= stream_end) { ok = false; break; }
             param15_flag = raw[pos++];
             if (param15_flag && !read_u32vec(param15_data)) { ok = false; break; }
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] BWT hdr: param7=%u bwt_start_pos=%u param14=%u (%zu bytes) param15=%u (%zu bytes) pos=%zu\n",
                         bwt_param7, bwt_start_pos, param14_flag, param14_data.size(),
                         param15_flag, param15_data.size(), pos);
@@ -6815,7 +6816,7 @@ static bool DecodeOptimumBlockSequence(
             if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
             if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
         }
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u tt16_data.size=%zu pos=%zu stream_end=%zu\n",
                     param2_flag, param1_flag, tt_enabled, tt_flags, tt16_data.size(), pos, stream_end);
         }
@@ -6833,7 +6834,7 @@ static bool DecodeOptimumBlockSequence(
             dece_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] dece_param=%u pos=%zu stream_end=%zu param6=%u out_size=%u\n",
                     dece_param, pos, stream_end, param6, out_size);
         }
@@ -6861,7 +6862,7 @@ static bool DecodeOptimumBlockSequence(
         const bool bwt_raw = (decr_param == 0u && param6 == 0u);
         if (!stored_block && (!param6 || out_size == 0u)) continue;
 
-        if (const char* dpp = getenv("NZOPT_DUMP_PAYLOAD")) {
+        if (const char* dpp = NZ_ENV("NZOPT_DUMP_PAYLOAD")) {
             FILE* f = fopen(dpp, "wb");
             fwrite(payload, 1, payload_size, f);
             fclose(f);
@@ -6881,7 +6882,7 @@ static bool DecodeOptimumBlockSequence(
                 // per-leading-symbol MTF/arith buckets). size18 is its size.
                 work.resize(out_size);
                 const bool bdi_ok = NzBwtDecodeInput(payload, payload_size, out_size, work.data());
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] BWT DecodeInput(payload_size=%u out_size=%u) -> %d\n",
                             payload_size, out_size, bdi_ok ? 1 : 0);
                 }
@@ -6890,7 +6891,7 @@ static bool DecodeOptimumBlockSequence(
                 stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
             }
             const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
                         cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
             }
@@ -6911,7 +6912,7 @@ static bool DecodeOptimumBlockSequence(
                 const bool p14ok = NzBwtParam14(param14_data.data(),
                                        static_cast<std::uint32_t>(param14_data.size()),
                                        work.data(), cur_size, t14.data(), cap, &n14);
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
                             param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
                 }
@@ -6941,7 +6942,7 @@ static bool DecodeOptimumBlockSequence(
                                        raw_stream.data(), raw_stream.size(),
                                        t15.data(), cap, &n15);
                 raw_stream.resize(prev);
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
                             param15_data.size(), cur_size, p15ok ? 1 : 0, n15);
                 }
@@ -6974,7 +6975,7 @@ static bool DecodeOptimumBlockSequence(
                 work.assign(payload, payload + payload_size);
                 cur_size = payload_size;
                 dec.FeedWindow(work.data(), cur_size);
-                if (getenv("NZOPT_TRACE_TDO")) {
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] stored LZ block: payload_size=%u (param6=0, no size18)\n",
                             payload_size);
                 }
@@ -6986,14 +6987,14 @@ static bool DecodeOptimumBlockSequence(
                 // boundary is: its correct prefix ends exactly at the first
                 // wrong decision. Without this the pre-checksum dump only ever
                 // showed the blocks that already succeeded.
-                if (const char* bp = getenv("NZOPT_DUMP_FAILBLOCK")) {
+                if (const char* bp = NZ_ENV("NZOPT_DUMP_FAILBLOCK")) {
                     FILE* bf = fopen(bp, "wb");
                     if (bf) { fwrite(work.data(), 1, out_size, bf); fclose(bf); }
                     fprintf(stderr, "[TDO] dumped failing block (%u bytes, out_data so far %zu) to %s\n",
                             out_size, out_data->size(), bp);
                 }
             }
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
                         payload_size, out_size, decode_block_ok ? 1 : 0);
             }
@@ -7032,7 +7033,7 @@ static bool DecodeOptimumBlockSequence(
             const bool p1ok = NzAddBytesFilter(param1_data.data(),
                                   static_cast<std::uint32_t>(param1_data.size()),
                                   work.data(), cur_size, tbuf.data());
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] param1: data.size=%zu cur_size=%u -> %d\n",
                         param1_data.size(), cur_size, p1ok ? 1 : 0);
             }
@@ -7049,7 +7050,7 @@ static bool DecodeOptimumBlockSequence(
         // for that stage: the golden file is the chain's OUTPUT and every other
         // stage in the chain is already ported and invertible.
         if (tt_enabled) {
-            if (const char* tp = getenv("NZOPT_DUMP_TTIN")) {
+            if (const char* tp = NZ_ENV("NZOPT_DUMP_TTIN")) {
                 FILE* f = fopen(tp, "wb");
                 if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
                 fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
@@ -7154,7 +7155,7 @@ static bool DecodeOptimumBlockSequence(
             const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
                                  work.data(), cur_size, tbuf.data(), remaining, &n);
-            if (getenv("NZOPT_TRACE_TDO")) {
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] dece: param=%u data=%zu in=%u -> %d out=%u\n",
                         dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
             }
@@ -7176,7 +7177,7 @@ static bool DecodeOptimumBlockSequence(
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         progress::Add(cur_size);
         nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
                     cur_size, out_data->size(), (unsigned long long)total_size_hint,
                     param2_flag, param1_flag, tt_enabled, tt_flags, dece_param);
@@ -7239,12 +7240,12 @@ static bool TryDecodeLegacyOptimum(
     const std::uint32_t window_capacity =
         nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
     if (window_capacity == 0u) return false;
-    if (getenv("NZOPT_TRACE_TDO")) {
+    if (NZ_ENV("NZOPT_TRACE_TDO")) {
         fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
                 legacy.legacy_method_p1, window_capacity,
                 (unsigned long long)legacy.total_data_size);
     }
-    if (const char* dp = getenv("NZOPT_DUMP_RAW")) {
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_RAW")) {
         FILE* f = fopen(dp, "wb");
         if (f) { fwrite(raw, 1, raw_len, f); fclose(f); }
     }
@@ -7296,7 +7297,7 @@ static bool TryDecodeLegacyOptimum(
         const std::uint64_t stream_bytes = stream_tag >> 4u;
         if (stream_bytes > raw_len - p) { ok = false; break; }
         const std::size_t stream_end = p + static_cast<std::size_t>(stream_bytes);
-        if (getenv("NZOPT_TRACE_TDO")) {
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] chain segment: p=%zu stream_end=%zu out_data_size_before=%zu\n",
                     p, stream_end, out_data->size());
         }
@@ -7304,7 +7305,7 @@ static bool TryDecodeLegacyOptimum(
         seg_pos = stream_end;
     }
 
-    if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
         // Dump BEFORE the size gate as well as the checksum gate, so a decode
         // that gave up part-way is diffable too -- its correct prefix is where
         // the interesting boundary is. Sitting after the size check made this
@@ -7492,7 +7493,7 @@ std::string LegacyProbeMessage(const std::string& path) {
 
 // Stage timer for the big-archive profile (NZ_VERBOSE_NATIVE): "+delta (total)".
 void StageMark(const char* what) {
-    static const bool on = (std::getenv("NZ_VERBOSE_NATIVE") != nullptr);
+    static const bool on = (NZ_ENV("NZ_VERBOSE_NATIVE") != nullptr);
     if (!on) return;
     static const auto t0 = std::chrono::steady_clock::now();
     static auto last = t0;
@@ -7504,7 +7505,7 @@ void StageMark(const char* what) {
 }
 
 bool NativeTrace() {
-    static const bool t = (std::getenv("NZ_VERBOSE_NATIVE") != nullptr);
+    static const bool t = (NZ_ENV("NZ_VERBOSE_NATIVE") != nullptr);
     return t;
 }
 

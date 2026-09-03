@@ -1,5 +1,6 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
+#include "nz_env.h"
 #include "nz_trace.h"
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +24,7 @@ static thread_local std::uint32_t g_cd_exe_origin = 0u;
 // from every other -- the reason -cD sat at 34/60 on the real corpus without
 // anyone being able to say why.
 static bool CdTrace() {
-    static const bool on = (std::getenv("NZOPT_TRACE_CD") != nullptr);
+    static const bool on = (NZ_ENV("NZOPT_TRACE_CD") != nullptr);
     return on;
 }
 #define CD_FAIL(...) do { if (CdTrace()) std::fprintf(stderr, "[CD] " __VA_ARGS__); } while (0)
@@ -608,7 +609,7 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
             default: return 0;
         }
         if (!m) return 0;
-        if (const char* dd = std::getenv("NZOPT_DUMP_CD_TT")) {   // per-stage outputs of this pipeline call
+        if (const char* dd = NZ_ENV("NZOPT_DUMP_CD_TT")) {   // per-stage outputs of this pipeline call
             static thread_local unsigned call_no = 0; static thread_local unsigned st = 0;
             char path[512];
             if (cur == src) { ++call_no; st = 0; std::snprintf(path, sizeof(path), "%s/call%03u_p%02x_in.bin", dd, call_no, param); if (FILE* f = std::fopen(path, "wb")) { std::fwrite(src, 1, size, f); std::fclose(f); } }
@@ -1054,7 +1055,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     NzCdField fn{g_kCdSlotLen, g_kCdModelLen, 14u};
     std::vector<std::uint32_t> toks(static_cast<std::size_t>(N) * 3);
     NzCdTokenAssemble(N, lit.data(), off.data(), len.data(), bs, bs_size, fl, fo, fn, toks.data());
-    if (std::getenv("NZOPT_TRACE_CD_TOKENS")) {
+    if (NZ_ENV("NZOPT_TRACE_CD_TOKENS")) {
         std::fprintf(stderr, "[CD] tokens dump: N=%u base=%u ring_size=%u out_size=%u\n", N, base, ring_size, out_size);
         for (std::uint32_t i = 0; i < N && i < 64u; ++i)
             std::fprintf(stderr, "[CD]   tok[%u] lit_run=%u sel=%u raw=%u\n", i, toks[i*3], toks[i*3+1], toks[i*3+2]);
@@ -1125,7 +1126,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // (garbage or format-mismatched bytecode) and refused rather than risk an
     // OOB ring access; propagate that failure so the caller rejects the chunk
     // instead of reading an incomplete/undefined ring back out.
-    if (const char* dl = std::getenv("NZOPT_DUMP_CD_LITS")) {   // literal stream + tokens of this chunk
+    if (const char* dl = NZ_ENV("NZOPT_DUMP_CD_LITS")) {   // literal stream + tokens of this chunk
         static thread_local unsigned lidx = 0;
         char path[512];
         std::snprintf(path, sizeof(path), "%s/lits%03u_%u.bin", dl, lidx, out_size);
@@ -1149,7 +1150,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // NZOPT_DUMP_CD_SLICE=<dir>: one file per chunk with the COMPACT recon slice
     // (before RLE/exe/text post-filters), for differential debugging between
     // -cd and -cD of the same input.
-    if (const char* dd = std::getenv("NZOPT_DUMP_CD_SLICE")) {
+    if (const char* dd = NZ_ENV("NZOPT_DUMP_CD_SLICE")) {
         static thread_local unsigned idx = 0;
         char path[512];
         std::snprintf(path, sizeof(path), "%s/chunk%03u_f%x_%u.bin", dd, idx++, flags, out_size);

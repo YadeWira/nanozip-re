@@ -1,6 +1,7 @@
 // nz_exefilter.cpp — the `dece` post-filter: x86 CALL/JMP address
 // un-relativiser, ported from the community reference decoder (nzdec_v0
 // NZ_x86.cpp). Faithful reimplementation.
+#include "nz_env.h"
 #include "nz_exefilter.h"
 
 #include <cstdio>
@@ -16,7 +17,7 @@ extern uint16_t kModelLutLookup[4096];
 namespace {
 
 static bool ExeTrace() {
-    static const bool on = (std::getenv("NZOPT_TRACE_DECE") != nullptr);
+    static const bool on = (NZ_ENV("NZOPT_TRACE_DECE") != nullptr);
     return on;
 }
 #define EXE_FAIL(...) do { if (ExeTrace()) std::fprintf(stderr, "[DECE] " __VA_ARGS__); } while (0)

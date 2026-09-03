@@ -7,6 +7,7 @@
 // `local_58 < 5` re-zero condition, the two-level Elias-delta-style run-length
 // code). Validated byte-exact against 3 real GDB-captured chunks (see the
 // session's research artifacts) before this C++ transcription.
+#include "nz_env.h"
 #include "nz_lzhds.h"
 #include <cstdio>
 #include <cstdlib>
@@ -250,7 +251,7 @@ int g_call_index = -1;
 long g_trace_want = -2;
 bool TraceOn() {
     if (g_trace_want == -2) {
-        const char* e = std::getenv("NZOPT_TRACE_LZHDS");
+        const char* e = NZ_ENV("NZOPT_TRACE_LZHDS");
         g_trace_want = (e == nullptr) ? -1 : ((*e == 'a') ? -3 : std::atol(e));
     }
     return g_trace_want == -3 || (g_trace_want >= 0 && g_call_index == (int)g_trace_want);
@@ -294,13 +295,13 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
     std::uint32_t run_ctr = LzhdsExpGolomb(rb) + 1;
 
     ++g_call_index;
-    if (const char* dc = std::getenv("NZ_LH_DUMP_CTX")) {
+    if (const char* dc = NZ_ENV("NZ_LH_DUMP_CTX")) {
         // Per call: the 16 KB per-context MTF table + the ctx index, to diff against
         // a GDB dump of the original's object (table at obj+0x20, index at obj+4).
         char nm[512]; std::snprintf(nm, sizeof(nm), "%s.%d", dc, g_call_index);
         if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(ctx_table, 1, kLzhdsCtxTableSize, f); std::fwrite(ctx_index, 4, 1, f); std::fclose(f); }
     }
-    if (const char* dc = std::getenv("NZ_LH_DUMP_CTX")) {
+    if (const char* dc = NZ_ENV("NZ_LH_DUMP_CTX")) {
         char nm[512]; std::snprintf(nm, sizeof(nm), "%s.tok.%d", dc, g_call_index);
         if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tokens, 4, static_cast<std::size_t>(num_tokens) * 3, f); std::fclose(f); }
         std::snprintf(nm, sizeof(nm), "%s.lit.%d", dc, g_call_index);

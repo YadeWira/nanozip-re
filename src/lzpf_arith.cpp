@@ -1,3 +1,4 @@
+#include "nz_env.h"
 #include "lzpf_arith.h"
 
 #include <algorithm>
@@ -1894,7 +1895,7 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
     // The old speculative DecodeResidualsStereo (even/odd) was never the real path.
     std::vector<std::int32_t> residuals(n_elems);
     DecodeResidualsMono(residuals.data(), n_elems, arith_buf.data(), &br);
-    if (const char* rd = std::getenv("NZ_PF_DUMP_RESID")) {
+    if (const char* rd = NZ_ENV("NZ_PF_DUMP_RESID")) {
         // One file per prefilter block: the raw residual array BEFORE any LPC/LMS
         // stage, for diffing against the original's FUN_0809baa0 output.
         static int seq = 0; char nm[512];
@@ -1911,7 +1912,7 @@ static std::size_t DecodePFBlock(const std::uint8_t* input, std::size_t input_si
         : 0u;
     if (side_consumed > remaining) side_consumed = remaining;
 
-    if (std::getenv("NZOPT_TRACE_PF") != nullptr) {
+    if (NZ_ENV("NZOPT_TRACE_PF") != nullptr) {
         fprintf(stderr,
                 "[pf] hdr=%02x fa=%u ch=%d sw=%u end=%u pfx=%u avail=%u nel=%u per=%u rem=%u "
                 "G=%u a0=%u o0=%u a1=%u o1=%u arith=%zu side=%zu\n",

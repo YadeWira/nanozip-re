@@ -33,6 +33,7 @@
 //     persistent member (one NzOptimumLzDecoder instance per container stream)
 //     since a single container can have multiple sequential decr_param==1
 //     blocks sharing one window.
+#include "nz_env.h"
 #include "nz_optimum_lz.h"
 #include "nz_optimum_lz_tables.h"
 #include "nz_cm.h"  // kLzModelInterpolation (== the real DAT_08172900, confirmed
@@ -328,7 +329,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
         std::int32_t w1 = Rd32(mem, wRowOff + 4);
         std::int32_t w2 = Rd32(mem, wRowOff + 8);
         std::int32_t w3 = Rd32(mem, wRowOff + 12);
-        if (const char* dpp = getenv("NZOPT_TRACE3_POS")) {
+        if (const char* dpp = NZ_ENV("NZOPT_TRACE3_POS")) {
             if (debugPos == static_cast<std::uint32_t>(atoi(dpp))) {
                 fprintf(stderr, "    MixerBit pos=%u wRowOff=%#x w=(%d,%d,%d,%d) sA=%u sB=%u sC=%u sD=%u stA=%d stB=%d stC=%d stD=%d apm2RowExtra=%u uVar10=%u uVar15b=%u lo=%#x hi=%#x code=%#x\n",
                         debugPos, wRowOff, w0, w1, w2, w3, sA, sB, sC, sD, stA, stB, stC, stD, apm2RowExtra, uVar10, uVar15b, rc.lo, rc.hi, rc.code);
@@ -383,7 +384,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
     // context indices for the following bit.
     auto NodeAdvance = [&](std::uint32_t bit, std::uint32_t pFinal, int& ctxA, int& ctxB,
                            std::uint32_t uVar15b_old) -> std::pair<std::uint32_t, std::uint32_t> {
-        if (getenv("NZOPT_TRACE_NA") && debugPos == static_cast<std::uint32_t>(atoi(getenv("NZOPT_TRACE_NA")))) {
+        if (NZ_ENV("NZOPT_TRACE_NA") && debugPos == static_cast<std::uint32_t>(atoi(NZ_ENV("NZOPT_TRACE_NA")))) {
             fprintf(stderr, "  NA-IN bit=%u pFinal=%u ctxA=%#x ctxB=%#x uVar15b_old=%u subcIn=%u shiftregIn=%u\n",
                     bit, pFinal, ctxA, ctxB, uVar15b_old, Rd8(mem, 0x2968d), Rd8(mem, 0x2968c));
         }
@@ -435,7 +436,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                 Wr16(mem, 0x29682, curC);
             }
         }
-        if (getenv("NZOPT_TRACE_NA") && debugPos == static_cast<std::uint32_t>(atoi(getenv("NZOPT_TRACE_NA")))) {
+        if (NZ_ENV("NZOPT_TRACE_NA") && debugPos == static_cast<std::uint32_t>(atoi(NZ_ENV("NZOPT_TRACE_NA")))) {
             fprintf(stderr, "  NA-OUT ctxA=%#x ctxB=%#x curC=%u curD=%u m29690=%u m29684=%#x m29688=%#x m2968f=%u m2968d=%u\n",
                     ctxA, ctxB, curC, curD, Rd8(mem, 0x29690), Rd16(mem, 0x29684), Rd16(mem, 0x29688),
                     Rd8(mem, 0x2968f), Rd8(mem, 0x2968d));
@@ -443,7 +444,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
         return std::make_pair(static_cast<std::uint32_t>(curC), static_cast<std::uint32_t>(curD));
     };
 
-    if (const char* rd = getenv("NZOPT_DUMP_RING")) {
+    if (const char* rd = NZ_ENV("NZOPT_DUMP_RING")) {
         // Whole ring (with the 256-byte prefix mirror and tail slack) at block
         // entry, one file per DecodeBlock call, for diffing against the original.
         static int seq = 0; char nm[512];
@@ -497,8 +498,8 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
         do {  // one (literal run; one match) cycle
             std::uint32_t uVar15 = 0;  // dispatch-bit packed matchmask/predicted_byte
             for (;;) {  // LOOP-A: dispatch bit, one output position per iter
-                if (const char* dlh = getenv("NZOPT_DUMP_LOHI"); dlh && local_54 <= static_cast<std::uint32_t>(atoi(dlh))) {
-                    const char* dlm = getenv("NZOPT_DUMP_LOHI_MIN");
+                if (const char* dlh = NZ_ENV("NZOPT_DUMP_LOHI"); dlh && local_54 <= static_cast<std::uint32_t>(atoi(dlh))) {
+                    const char* dlm = NZ_ENV("NZOPT_DUMP_LOHI_MIN");
                     std::uint32_t minp = dlm ? static_cast<std::uint32_t>(atoi(dlm)) : 0u;
                     if (local_54 >= minp) {
                         fprintf(stderr, "%u %#x %#x %#x rep=[%u,%u,%u,%u]\n", local_54, rc.lo, rc.hi, rc.code,
@@ -559,10 +560,10 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                 Wr16(mem, nearOff,
                      static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1001e - apmOld) >> 5) + apmOld));
 
-                if (getenv("NZOPT_TRACE") && local_54 >= 873 && local_54 <= 880) fprintf(stderr, "pos=%u dispatch_bit=%u\n", local_54, bit);
+                if (NZ_ENV("NZOPT_TRACE") && local_54 >= 873 && local_54 <= 880) fprintf(stderr, "pos=%u dispatch_bit=%u\n", local_54, bit);
                 if (bit == 0) break;  // MATCH path
 
-                if (const char* dp = getenv("NZOPT_DUMP_POS")) {
+                if (const char* dp = NZ_ENV("NZOPT_DUMP_POS")) {
                     if (local_54 == static_cast<std::uint32_t>(atoi(dp))) {
                         auto dump = [&](const char* name, int off, int len) {
                             std::string path = std::string("/tmp/claude-1000/-home-forum-git-nanozip/93d70e29-fad1-41da-9662-f8517e7dfa01/scratchpad/port_") + name + ".bin";
@@ -624,7 +625,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                 std::uint32_t uVar10 = ctxC_idx;
                 std::uint32_t uVar15b = ctxD_seed;
                 debugPos = local_54;
-                bool trace = getenv("NZOPT_TRACE2") && local_54 <= 1;
+                bool trace = NZ_ENV("NZOPT_TRACE2") && local_54 <= 1;
                 if (trace) fprintf(stderr, "LIT pos=0 ctxA=%#x ctxB=%#x ctxC_seed=%u ctxD_seed=%u predB=%u matchmask=%u\n",
                                     ctxA, ctxB, ctxC_idx, ctxD_seed, predicted_byte, uVar15 & 0xfu);
 
@@ -655,7 +656,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                     local_a4 = Rd8(mem, 0x29690);  // refresh for the NEXT iteration's bit1
                 }
                 if (trace) fprintf(stderr, "LIT pos=0 byte=%#x (%u)\n", local_9c & 0xffu, local_9c & 0xffu);
-                if (getenv("NZOPT_TRACE_LIT") && local_54 >= 132400 && local_54 <= 132410) {
+                if (NZ_ENV("NZOPT_TRACE_LIT") && local_54 >= 132400 && local_54 <= 132410) {
                     fprintf(stderr, "LIT pos=%u byte=%#x w29682=%#x w29684=%#x w29688=%#x w2968c=%#x w2968d=%#x w2968f=%#x w29690=%#x\n",
                             local_54, local_9c & 0xffu,
                             Rd16(mem, 0x29682), Rd16(mem, 0x29684), Rd16(mem, 0x29688),
@@ -671,7 +672,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
             // ===================== MATCH DECODE =====================
             {
-                if (const char* dp = getenv("NZOPT_DUMP_POS")) {
+                if (const char* dp = NZ_ENV("NZOPT_DUMP_POS")) {
                     if (local_54 == static_cast<std::uint32_t>(atoi(dp))) {
                         FILE* f = fopen("/tmp/claude-1000/-home-forum-git-nanozip/93d70e29-fad1-41da-9662-f8517e7dfa01/scratchpad/port_lentable.bin", "wb");
                         fwrite(mem + 0x396c0, 1, 0x39f40 - 0x396c0, f);
@@ -680,10 +681,10 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                     }
                 }
                 int unit_idx = static_cast<int>(((uVar15 & 7u) * 0x10u + (local_81 & 0xfu)) * 8u);
-                if (getenv("NZOPT_TRACE_RS")) fprintf(stderr, "REPSEL pos=%u uVar15&7=%u local_81=%#x unit_idx=%d addr=%#x lo=%#x hi=%#x code=%#x\n",
+                if (NZ_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "REPSEL pos=%u uVar15&7=%u local_81=%#x unit_idx=%d addr=%#x lo=%#x hi=%#x code=%#x\n",
                                                         local_54, uVar15 & 7u, local_81, unit_idx, 0x3d980+unit_idx*2, rc.lo, rc.hi, rc.code);
                 std::uint32_t b1 = DecodeAdaptive16(rc, mem, 0x3d980 + unit_idx * 2);
-                if (getenv("NZOPT_TRACE_RS")) fprintf(stderr, "  after B1: b1=%u lo=%#x hi=%#x code=%#x\n", b1, rc.lo, rc.hi, rc.code);
+                if (NZ_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "  after B1: b1=%u lo=%#x hi=%#x code=%#x\n", b1, rc.lo, rc.hi, rc.code);
                 unit_idx += 1;
                 std::uint32_t slot_group = 0;   // 0 == brand-new distance
                 if (b1 == 0) {
@@ -751,7 +752,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                         std::uint32_t iVar9u = persisted + U1 * 32u + 0x60u;
                         int cellOff = 0x396c0 + static_cast<int>(iVar9u) * 2;
                         std::uint32_t bit = DecodeAdaptiveKS(rc, mem, cellOff, 8u, 4u);
-                        if (getenv("NZOPT_TRACE_RS")) fprintf(stderr, "  extrabit[%u]=%u cellOff=%#x lo=%#x hi=%#x code=%#x\n", i, bit, cellOff, rc.lo, rc.hi, rc.code);
+                        if (NZ_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "  extrabit[%u]=%u cellOff=%#x lo=%#x hi=%#x code=%#x\n", i, bit, cellOff, rc.lo, rc.hi, rc.code);
                         persisted = bit + persisted * 2u;
                         local_a4v = bit + local_a4v * 2u;
                     }
@@ -763,10 +764,10 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                     }
                 }
                 std::uint32_t length = local_a4v + 2u;
-                if (getenv("NZOPT_TRACE_RS")) fprintf(stderr, "  LENGTH raw=%u U1=%u local_a4v=%u length=%u lo=%#x hi=%#x code=%#x\n", raw, U1, local_a4v, length, rc.lo, rc.hi, rc.code);
+                if (NZ_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "  LENGTH raw=%u U1=%u local_a4v=%u length=%u lo=%#x hi=%#x code=%#x\n", raw, U1, local_a4v, length, rc.lo, rc.hi, rc.code);
 
                 if (local_94 < length) {
-                    if (getenv("NZOPT_DEBUG")) fprintf(stderr, "FAIL@length: local_74=%u local_54=%u local_94=%u length=%u slot_group=%u U1=%u\n", local_74, local_54, local_94, length, slot_group, U1);
+                    if (NZ_ENV("NZOPT_DEBUG")) fprintf(stderr, "FAIL@length: local_74=%u local_54=%u local_94=%u length=%u slot_group=%u U1=%u\n", local_74, local_54, local_94, length, slot_group, U1);
                     failed = true; break;
                 }
 
@@ -811,13 +812,13 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                         Wr16(mem, cell2Off, static_cast<std::uint16_t>(upd2lo));
                         Wr16(mem, cell2Off + 2, static_cast<std::uint16_t>(upd2hi));
 
-                        if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "    slot-tree bit[%d]=%u treepos_before=%u lo=%#x hi=%#x code=%#x combined=%u cell1Off=%#x cell2Off=%#x\n",
+                        if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "    slot-tree bit[%d]=%u treepos_before=%u lo=%#x hi=%#x code=%#x combined=%u cell1Off=%#x cell2Off=%#x\n",
                                                                 i, bit, treepos, rc.lo, rc.hi, rc.code, combined, cell1Off, cell2Off);
                         treepos = bit + treepos * 2u;
                         slotAcc = bit + slotAcc * 2u;
                     }
                     std::uint32_t slot = slotAcc ^ 0x1fu;
-                    if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "  after slot-tree: lo=%#x hi=%#x code=%#x slot=%u\n", rc.lo, rc.hi, rc.code, slot);
+                    if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "  after slot-tree: lo=%#x hi=%#x code=%#x slot=%u\n", rc.lo, rc.hi, rc.code, slot);
 
                     std::uint32_t acc = (slot != 0u) ? 1u : 0u;
                     // tier 1: always runs (n1 adaptive bits, MSB-first, its own
@@ -834,7 +835,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                             acc = bit + acc * 2u;
                         }
                     }
-                    if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "  after tier1: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
+                    if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "  after tier1: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
                     // tier 2: slot>2, LSB-first bits via the external "align"
                     // table (its own small bit-tree, update (K=0x10,S=5),
                     // NO +1 bias -- confirmed via disassembly, distinct from
@@ -846,12 +847,12 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                         for (std::uint32_t i = 0; i < n2; i++) {
                             int cellOff = kAlignTableOff + static_cast<int>(t2pos) * 2;
                             std::uint32_t bit = DecodeAdaptiveKSB(rc, mem, cellOff, 0x10u, 5u, /*bias=*/false);
-                            if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "    tier2 bit[%u]=%u lo=%#x hi=%#x code=%#x t2pos=%u\n", i, bit, rc.lo, rc.hi, rc.code, t2pos);
+                            if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "    tier2 bit[%u]=%u lo=%#x hi=%#x code=%#x t2pos=%u\n", i, bit, rc.lo, rc.hi, rc.code, t2pos);
                             t2pos = bit + t2pos * 2u;
                             acc |= bit << i;
                         }
                     }
-                    if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "  after tier2: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
+                    if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "  after tier2: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
                     // tier 3: slot>6, MSB-first bits via a per-(slot-6) adaptive
                     // sub-table (FLAT/incrementing index, NOT a doubling tree;
                     // update (K=0x20,S=6)); final combine matches the raw
@@ -859,23 +860,23 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                     if (slot > 6u) {
                         std::uint32_t n3 = slot - 6u;
                         std::uint32_t hi_bits = 0;
-                        if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "  tier3 start: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
+                        if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "  tier3 start: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
                         for (std::uint32_t i = 0; i < n3; i++) {
                             std::uint32_t iVar9u = i + 0x380u + (slot - 6u) * 0x60u;
                             int cellOff = 0x39f40 + static_cast<int>(iVar9u) * 2;
                             std::uint32_t bit = DecodeAdaptiveKS(rc, mem, cellOff, 0x20u, 6u);
-                            if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "    tier3 bit[%u]=%u cellOff=%#x\n", i, bit, cellOff);
+                            if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "    tier3 bit[%u]=%u cellOff=%#x\n", i, bit, cellOff);
                             hi_bits = (hi_bits << 1) | bit;
                         }
                         std::uint32_t low4 = acc & 0xfu;
                         std::uint32_t hiPart = acc & 0xfffffff0u;
-                        if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "    tier3 hi_bits=%u low4=%u hiPart=%u n3=%u acc_before=%u\n", hi_bits, low4, hiPart, n3, acc);
+                        if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "    tier3 hi_bits=%u low4=%u hiPart=%u n3=%u acc_before=%u\n", hi_bits, low4, hiPart, n3, acc);
                         acc = (hi_bits << 4) | (hiPart << n3) | low4;
                     }
-                    if (getenv("NZOPT_TRACE_T3")) fprintf(stderr, "  slot=%u acc_final=%u (dist-1)\n", slot, acc);
+                    if (NZ_ENV("NZOPT_TRACE_T3")) fprintf(stderr, "  slot=%u acc_final=%u (dist-1)\n", slot, acc);
 
                     if (ring_.capacity <= acc) {
-                        if (getenv("NZOPT_DEBUG")) fprintf(stderr, "FAIL@distance: local_74=%u local_54=%u acc=%u capacity=%u slot=%u\n", local_74, local_54, acc, ring_.capacity, slot);
+                        if (NZ_ENV("NZOPT_DEBUG")) fprintf(stderr, "FAIL@distance: local_74=%u local_54=%u acc=%u capacity=%u slot=%u\n", local_74, local_54, acc, ring_.capacity, slot);
                         failed = true; break;
                     }
                     rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = acc;
@@ -886,7 +887,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                 }
 
                 std::uint32_t distance = rep[0] + 1u;
-                if (getenv("NZOPT_TRACE_MATCH")) fprintf(stderr, "MATCH pos=%u length=%u distance=%u slot_group=%u rep=[%u,%u,%u,%u]\n",
+                if (NZ_ENV("NZOPT_TRACE_MATCH")) fprintf(stderr, "MATCH pos=%u length=%u distance=%u slot_group=%u rep=[%u,%u,%u,%u]\n",
                                                            local_54, length, distance, slot_group, rep[0], rep[1], rep[2], rep[3]);
                 local_81 = static_cast<std::uint8_t>(local_81 * 2);
 
@@ -924,7 +925,7 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
     chunk_done:
         if (failed) {
-            if (getenv("NZOPT_DEBUG_DUMP")) {
+            if (NZ_ENV("NZOPT_DEBUG_DUMP")) {
                 std::uint32_t n = local_54 - chunk_start;
                 std::memcpy(out + local_74, base + chunk_start, n);
                 fprintf(stderr, "partial bytes written this call: %u\n", local_74 + n);

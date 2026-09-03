@@ -1,5 +1,6 @@
 // nz_bwt.cpp — NanoZip decr_param == 0 ("BWT") block decoding, ported from the
 // community reference decoder (nzdec_v0 NZ.cpp). Faithful reimplementation.
+#include "nz_env.h"
 #include "nz_bwt.h"
 
 #include <algorithm>
@@ -13,7 +14,7 @@ namespace {
 // NZOPT_TRACE_BWT-gated diagnostics, following this project's existing
 // NZOPT_TRACE_* convention (zero cost when the variable is unset).
 static bool BwtTrace() {
-    static const bool on = (std::getenv("NZOPT_TRACE_BWT") != nullptr);
+    static const bool on = (NZ_ENV("NZOPT_TRACE_BWT") != nullptr);
     return on;
 }
 #define BWT_FAIL(...) do { if (BwtTrace()) std::fprintf(stderr, "[BWT] " __VA_ARGS__); } while (0)

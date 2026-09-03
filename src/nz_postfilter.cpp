@@ -1,5 +1,6 @@
 // nz_postfilter.cpp — NanoZip CM/BWT post-filters, ported from nzdec_v0 NZ.cpp
 // (BwtRleExpander) and nz.h (ArithmeticDecoder). Faithful reimplementation.
+#include "nz_env.h"
 #include "nz_postfilter.h"
 #include <cstring>
 #include <cstdio>
@@ -68,7 +69,7 @@ struct BwtRleExpander {
 
     // u32-wise RLE: pairs of equal u32 words introduce a coded run of additional copies.
     bool DecodeU32(const uint8_t* in, uint32_t in_size, uint8_t* out, uint32_t* out_size_ptr) {
-        const bool trace = std::getenv("NZOPT_TRACE_RLE") != nullptr;
+        const bool trace = NZ_ENV("NZOPT_TRACE_RLE") != nullptr;
         const uint32_t out_size_orig = *out_size_ptr;
         uint32_t out_size_u32 = *out_size_ptr >> 2;
         uint32_t in_size_u32 = in_size >> 2;

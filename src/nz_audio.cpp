@@ -1,6 +1,7 @@
 // nz_audio.cpp — NanoZip decr_param == 2 ("audio") block decoding, ported from
 // the community reference decoder (nzdec_v0 NZ_Audio.cpp). Faithful
 // reimplementation.
+#include "nz_env.h"
 #include "nz_trace.h"
 #include "nz_audio.h"
 #include "lzpf_arith.h"
@@ -22,7 +23,7 @@ namespace {
 // NZOPT_TRACE_AUDIO-gated diagnostics, following this project's existing
 // NZOPT_TRACE_* convention (zero cost when the variable is unset).
 static bool AudioTrace() {
-    static const bool on = (std::getenv("NZOPT_TRACE_AUDIO") != nullptr);
+    static const bool on = (NZ_ENV("NZOPT_TRACE_AUDIO") != nullptr);
     return on;
 }
 #define AUD_FAIL(...) do { if (AudioTrace()) std::fprintf(stderr, "[AUD] " __VA_ARGS__); } while (0)
@@ -1076,7 +1077,7 @@ struct NzAudioPred::Impl {
                 (int)use_stereo_dec,
                 use_lp[0][0], use_lp[0][1], use_lp[1][0], use_lp[1][1], use_lp[2][0], use_lp[2][1]);
         }
-        if (const char* dp = getenv("NZOPT_DUMP_AUDCOUNTS")) {
+        if (const char* dp = NZ_ENV("NZOPT_DUMP_AUDCOUNTS")) {
             // Dump the per-sample bit-count array exactly where the real decoder
             // passes it to FUN_0809bbf0 (its 3rd argument), so a GDB capture of
             // that call splits "our bit-count decode is wrong" from "our residual
@@ -1090,7 +1091,7 @@ struct NzAudioPred::Impl {
         }
         if (!DecodeInt32Array(samples, nsamples, bitcount, &bit_reader)) return 0;
 
-        if (const char* dp = getenv("NZOPT_DUMP_AUDPOST")) {
+        if (const char* dp = NZ_ENV("NZOPT_DUMP_AUDPOST")) {
             // Dump the residual array immediately after the residual decode, i.e.
             // exactly where FUN_0809bbf0 returns in the real decoder -- the
             // remaining split point between "residual decode wrong" and
@@ -1105,7 +1106,7 @@ struct NzAudioPred::Impl {
 
         in += bit_reader.BytesRead();
 
-        const char* pdump = getenv("NZOPT_DUMP_AUDPLANE");
+        const char* pdump = NZ_ENV("NZOPT_DUMP_AUDPLANE");
         int pseq = 0;
         for (int i = 2; i >= 0; i--) {
             for (int j = 0; j < (fmt.channels ? 2 : 1); j++) {
@@ -1129,7 +1130,7 @@ struct NzAudioPred::Impl {
             nzr::lzpf::ApplyLmsInterChannel(samples, samples + nframes, nframes,
                                             &lms_[0], &lms_[1]);
 
-        if (const char* dp = getenv("NZOPT_DUMP_AUDRESID")) {
+        if (const char* dp = NZ_ENV("NZOPT_DUMP_AUDRESID")) {
             // Dump the residual array exactly where the real decoder hands it to
             // FUN_080a50c0 (its 3rd argument), so a GDB capture of that call can be
             // diffed against this port stage by stage.
@@ -1193,7 +1194,7 @@ bool NzAudioPred::Decode(const std::uint8_t* in, std::uint32_t in_size,
 namespace {
 
 inline bool ImgTrace() {
-    static const bool t = (std::getenv("NZ_IMG_TRACE") != nullptr);
+    static const bool t = (NZ_ENV("NZ_IMG_TRACE") != nullptr);
     return t;
 }
 #define IMG_TRACE(...) do { if (ImgTrace()) std::fprintf(stderr, "[IMG] " __VA_ARGS__); } while (0)
