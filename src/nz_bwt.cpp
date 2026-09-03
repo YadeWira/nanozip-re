@@ -607,11 +607,17 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     std::vector<uint32_t> table(data_size);
     for (uint32_t i = 0; i != data_size; ++i) table[byte_count[source[i]]++] = i;
 
+    const uint32_t start = bwt_pos;
     for (uint32_t i = 0; i != data_size; ++i) {
         const uint32_t v = table[bwt_pos];
         data[i] = source[v];
         bwt_pos = v;
     }
+    // A genuine BWT is one cycle of length data_size, so the walk ends where it
+    // began. Corrupt input (a flipped byte changes the symbol counts) breaks the
+    // permutation into several cycles and the walk ends elsewhere: the original
+    // reports such a block as "Error decoding (code 100)" without writing it.
+    if (bwt_pos != start) return false;
     return true;
 }
 

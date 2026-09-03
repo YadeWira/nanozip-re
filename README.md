@@ -77,15 +77,20 @@ archives, self-extracting `.exe`, the archive-name rule) with stdout, stderr and
 compared byte for byte; the only differences left are the program name in the usage text, the
 thread-dependent order of the per-worker lines on a parallel container, and the encode commands.
 Measured behaviour that was not obvious: the exit status is **always 0**, even for a corrupt archive
-(this decoder keeps 0 for success and usage errors but returns **2** when content is damaged or
-undecodable; `NZ_STRICT_EXIT=1` gives distinct codes for everything); `.nz` is appended to the archive name unless it ends in `.nz` or `.exe`; a
+(reproduced; `NZ_SAFE=1` or `NZ_STRICT_EXIT=1` make damaged content return 2, see below); `.nz` is appended to the archive name unless it ends in `.nz` or `.exe`; a
 self-extracting `.exe` opens by seeking past the PE image; the `[N MB]` figure on the compressor
 line is the codec's memory-usage method transcribed (window and table sizes, to the byte); a
 checksum mismatch prints `[stored computed]` and continues; a failed decode is `Archive corrupted.
-Error decoding (code 100)`, or 25600 when the archive is cut short (the original then leaves partial,
-wrong files behind; this decoder writes only the entries whose checksum verifies, prints the mismatch
-line for the rest and skips them, and returns 2 -- see [docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md)
-for the full list of the alpha's rough edges and what is reproduced); the progress line shows the
+Error decoding (code 100)`, or 25600 when the archive is cut short. On a damaged archive the original
+writes whatever it decoded: it flushes its output per codec block (per 1 MB stream for `-cd`/`-cD`, per
+member for `-cf`/`-cF`), so the files of the blocks completed before the failure are on disk, the file
+the failing block starts with is created empty, a file whose checksum fails is written anyway with the
+`Checksum mismatch` line, and the status is still 0. This decoder does the same by default -- measured
+on 48 one-byte corruptions and truncations across eight codecs, 40 leave byte-identical trees; the
+rest differ in the garbage the two decoders produce or in a block-level check of the original not yet
+identified (see [docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md), which lists every rough edge of
+the alpha and what is reproduced). Set `NZ_SAFE=1` to write only entries whose checksum verifies,
+skip the rest with the mismatch line, and exit 2; the progress line shows the
 cumulative megabytes and re-prints the name only when the file changes; names over 40 columns are
 shown as `...` plus their last 37 characters.
 
@@ -181,7 +186,7 @@ writes its own slice of the output, which is checked to tile the file without ov
 thread starts. There is no bridge to the original binary of any
 kind — not for decoding, not for unknown switches, not for compression. What the native decoders decline
 is reported as `Archive corrupted. Error decoding (code 100)`, exactly as the original reports its own
-failures, with exit status 2.
+failures.
 
 ## Build
 

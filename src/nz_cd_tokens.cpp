@@ -1142,6 +1142,8 @@ std::uint32_t NzCdDecodeLzChunk(const std::uint8_t* block, std::size_t block_len
                        false, nullptr, nullptr, &local_pf, &l1, &l2, nullptr);
 }
 
+static thread_local bool g_cd_stream_clean = true;
+
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* out, std::uint32_t out_cap,
                                std::uint8_t* ring, std::uint32_t ring_size,
@@ -1184,8 +1186,13 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
         written += n;
         *ring_pos = adv;                    // adv is the new absolute ring position
     }
+    // Clean = every input byte consumed (or the output cap reached). A stream
+    // that stopped on a malformed chunk is the one the original reports.
+    g_cd_stream_clean = (pos >= block_len) || (written >= out_cap);
     return written;
 }
+
+bool NzCdLastStreamClean() { return g_cd_stream_clean; }
 
 std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
                               std::uint8_t* out, std::uint32_t out_cap,

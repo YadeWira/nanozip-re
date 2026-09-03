@@ -89,10 +89,10 @@ int main(int argc, char** argv) {
         std::cout << "Out of memory!\n";
         rc = 1;
     }
-    // Status 2 = the archive was processed but some content is damaged (a file
-    // failed its checksum and was not written) or undecodable. That is the one
-    // place this program departs from the original's always-0 status, on
-    // purpose: a script must be able to tell a damaged extraction from a good one.
-    if (rc == 2) return 2;
+    // Status 2 = the archive was processed but some content is damaged or
+    // undecodable. The original exits 0 there too, and so does this program by
+    // default; NZ_SAFE=1 (write only verified entries) and NZ_STRICT_EXIT=1
+    // report it.
+    if (rc == 2 && std::getenv("NZ_SAFE") != nullptr) return 2;
     return finish(rc);
 }

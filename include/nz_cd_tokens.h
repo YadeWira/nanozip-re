@@ -146,6 +146,10 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
 // once via NzLzhdsInitCtxTable and threaded (along with `*lzhds_ctx_index`)
 // across every NzCdDecodeStream call for the whole `-cD` archive/stream. Both
 // are ignored when `is_lzhds` is false.
+// Whether the last NzCdDecodeStream call on this thread consumed its whole input
+// (or filled its output cap); false means it stopped on a malformed chunk.
+bool NzCdLastStreamClean();
+
 std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* out, std::uint32_t out_cap,
                                std::uint8_t* ring, std::uint32_t ring_size,

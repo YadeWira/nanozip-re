@@ -1117,6 +1117,12 @@ struct LegacyCnContext {
     // Empty = every entry matched. A damaged archive whose decode still completed
     // gets its good files written and the bad ones reported and skipped.
     std::vector<std::uint8_t> entry_checksum_ok;
+    // Set when the decode failed part-way: `data` then holds only the blocks
+    // completed before the failure (the original writes exactly those).
+    bool decode_failed = false;
+    // With decode_failed: the streams all decoded cleanly but the output came
+    // out short -- reported as "Unexpected end of file." rather than a code.
+    bool decode_eof = false;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -1125,6 +1131,31 @@ struct LegacyCnContext {
 };
 
 constexpr int kLegacyNeedCompat = -100;
+
+// Sum of the bytes modulo 255: the one-byte per-stage check the original stores
+// in a block header ("staged" bytes) and verifies after each post-filter stage.
+unsigned Sum255(const std::uint8_t* p, std::size_t n) {
+    std::uint64_t s = 0;
+    for (std::size_t i = 0; i < n; ++i) s += p[i];
+    return static_cast<unsigned>(s % 255u);
+}
+
+// NZ_SAFE=1: instead of the original's behaviour on a damaged archive (write
+// whatever was decoded, checksum mismatches included, exit 0) write only the
+// entries whose checksum verifies, skip the rest and exit 2.
+bool SafeMode() {
+    static const bool on = (std::getenv("NZ_SAFE") != nullptr);
+    return on;
+}
+
+// The three single-container decoders report a corrupt stream (as opposed to
+// an unsupported one) with one of these messages; only then is the completed
+// prefix they leave in the output vector written the way the original does.
+bool IsCorruptStreamFailure(const std::string& m) {
+    return m == "optimum: decode failed" || m == "cm: malformed block stream" ||
+           m == "cm: output size mismatch" || m == "lzhd: malformed block stream" ||
+           m == "lzhd: unexpected end of file";
+}
 
 std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size);
 
@@ -2628,7 +2659,13 @@ bool DecodeLzpfMember(
     const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
     const std::size_t window_initial_cursor = 4u;
 
+    // On total failure `out` receives the output of the members (streams) that
+    // decoded completely under the first candidate: the original flushes per
+    // member, so those files are on disk when it reports the error.
+    std::vector<unsigned char> first_prefix;
+    bool first_candidate = true;
     for (const std::size_t window_capacity : cap_candidates) {
+        std::size_t member_done = 0;
         std::size_t stream_data_end = first_block_pos + first_stream_len;
         std::vector<std::uint8_t> window_alloc(
             window_left_pad + window_capacity + window_tail_slack, 0);
@@ -2662,6 +2699,7 @@ bool DecodeLzpfMember(
         while (total_written < total) {
             if (input_pos >= stream_data_end) {
                 if (input_pos != stream_data_end) { decode_ok = false; break; }
+                member_done = total_written;
                 // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
                 // + width) before the next stream tag.
                 while (input_pos < bytes.size()) {
@@ -2929,11 +2967,17 @@ bool DecodeLzpfMember(
                     (unsigned long long)total,
                     (decode_ok && total_written == total) ? (int)verify(decoded) : -1);
         }
+        if (first_candidate) {
+            first_candidate = false;
+            if (member_done > 0 && member_done < total)
+                first_prefix.assign(decoded.begin(), decoded.begin() + static_cast<std::ptrdiff_t>(member_done));
+        }
         if (decode_ok && total_written == total && verify(decoded)) {
             *out = std::move(decoded);
             return true;
         }
     }
+    if (out != nullptr && !first_prefix.empty()) *out = std::move(first_prefix);
     return false;
 }
 
@@ -3966,6 +4010,9 @@ bool TryParseLegacyCnArchive(
     // false so the adopting branch is skipped at the call site.
     std::vector<unsigned char> partial_candidate;
     std::vector<std::uint8_t> partial_ok;
+    // A decode that failed part-way: the output of the members completed before
+    // the failure. Adopted with ctx.decode_failed when nothing better turns up.
+    std::vector<unsigned char> partial_prefix;
     const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
         if (!partial_candidate.empty() || candidate.size() != static_cast<std::size_t>(total_data_size)) return false;
         std::vector<std::uint8_t> ok; std::size_t bad = 0;
@@ -4870,6 +4917,10 @@ bool TryParseLegacyCnArchive(
                         literal_data_size = member_out.size();
                         literal_data_owned = true;
                         literal_data_buffer = std::move(member_out);
+                    } else if (!member_out.empty() && member_out.size() < total_data_size) {
+                        // The members completed before the failing one (see
+                        // DecodeLzpfMember): written the way the original does.
+                        partial_prefix = std::move(member_out);
                     }
                 }
 
@@ -5075,11 +5126,19 @@ bool TryParseLegacyCnArchive(
         literal_data_buffer = std::move(partial_candidate);
         ctx.entry_checksum_ok = std::move(partial_ok);
     }
+    if (!native_literal_payload && !native_store_payload && !partial_prefix.empty()) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = partial_prefix.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(partial_prefix);
+        ctx.decode_failed = true;
+    }
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
     // Every native_literal_payload path above went through validate_decoded_candidate
     // (or the partial fallback, whose verdicts are in entry_checksum_ok).
-    ctx.checksums_verified = native_literal_payload && checksum_verification_supported;
+    ctx.checksums_verified = native_literal_payload && checksum_verification_supported && !ctx.decode_failed;
     if (has_parallel_streams) {
         std::map<unsigned, LegacyParallelStream> pstreams;
         if (ParseLegacyParallelStreams(bytes, &pstreams)) {
@@ -5360,12 +5419,23 @@ static bool TryDecodeLegacyLzhd(
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);
         }
         if (produced == 0u) { ok = false; break; }
+        if (!nzr::cd::NzCdLastStreamClean()) {
+            // The stream stopped on a malformed chunk: the original reports the
+            // error here (code 5) and has flushed only the streams before it.
+            if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
+            ok = false; break;
+        }
         written += produced;
     }
 
+    // The original flushes its output per stream (measured: 1 MB multiples on a
+    // 6 MB file), so on a failure only the streams completed before the failing
+    // one count as written: a stream that produced nothing left `written` at the
+    // boundary already; one that stopped short is dropped below.
     if (!ok) {
         if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
+        out_data->assign(window_base, window_base + std::min(written, total_out));
         return false;
     }
     if (const char* dp = getenv("NZOPT_DUMP_PRECHECK")) {
@@ -5378,7 +5448,11 @@ static bool TryDecodeLegacyLzhd(
     }
     if (written != total_out) {
         if (getenv("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
-        if (out_error_message) *out_error_message = "lzhd: output size mismatch";
+        // Every stream decoded cleanly yet the output is short: the original has
+        // flushed all of it (the last file cut short) and reports "Archive
+        // corrupted. Unexpected end of file." instead of an error code.
+        if (out_error_message) *out_error_message = "lzhd: unexpected end of file";
+        out_data->assign(window_base, window_base + std::min(written, total_out));
         return false;
     }
     // Verify the decoded output against the archive's stored per-file checksum(s).
@@ -5943,12 +6017,13 @@ static bool TryDecodeLegacyCm(
                 static_cast<unsigned long long>(legacy.total_data_size));
     }
     if (!ok) {
-        out_data->clear();
+        // Completed blocks stay in out_data (see TryDecodeLegacyOptimum).
         if (out_error_message) *out_error_message = "cm: malformed block stream";
         return false;
     }
     if (out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
-        out_data->clear();
+        if (out_data->size() > static_cast<std::size_t>(legacy.total_data_size))
+            out_data->resize(static_cast<std::size_t>(legacy.total_data_size));
         if (out_error_message) *out_error_message = "cm: output size mismatch";
         return false;
     }
@@ -6189,7 +6264,14 @@ static bool DecodeOptimumBlockSequence(
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t staged_count = raw[pos++];
         if (pos + staged_count > stream_end) { ok = false; break; }
+        const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
         pos += staged_count;
+        static const bool trace_stg = (getenv("NZOPT_TRACE_STG") != nullptr);
+        std::string stg;
+        const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
+            if (!trace_stg) return;
+            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, Sum255(p, n)); stg += b;
+        };
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u param6=%u out_size=%u staged_count=%u pos=%zu stream_end=%zu\n",
                     payload_size, decr_param, param6, out_size, staged_count, pos, stream_end);
@@ -6346,6 +6428,7 @@ static bool DecodeOptimumBlockSequence(
 
         std::vector<std::uint8_t> work;
         std::uint32_t cur_size = 0;
+        stgmark("payload", payload, payload_size);
         if (decr_param == 0u) {
             if (bwt_raw) {
                 work.assign(payload, payload + payload_size);
@@ -6368,6 +6451,7 @@ static bool DecodeOptimumBlockSequence(
                         cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
             }
             if (!bwt_ok) { ok = false; break; }
+            stgmark("bwt", work.data(), cur_size);
 
             // params 14/15 run here: after the inverse BWT, before the shared
             // param2/param1/text-transform/dece chain (reference
@@ -6389,6 +6473,7 @@ static bool DecodeOptimumBlockSequence(
                 }
                 if (!p14ok || n14 == 0u) { ok = false; break; }
                 t14.resize(n14); work.swap(t14); cur_size = n14;
+                stgmark("p14", work.data(), cur_size);
             }
             if (param15_flag) {
                 // param15 matches are ABSOLUTE offsets into the whole
@@ -6418,6 +6503,7 @@ static bool DecodeOptimumBlockSequence(
                 }
                 if (!p15ok || n15 == 0u) { ok = false; break; }
                 t15.resize(n15); work.swap(t15); cur_size = n15;
+                stgmark("p15", work.data(), cur_size);
             }
 
             // The window is the shared accumulated-block buffer in the
@@ -6471,6 +6557,7 @@ static bool DecodeOptimumBlockSequence(
                 ok = false; break;
             }
             cur_size = out_size;
+            stgmark("lz", work.data(), cur_size);
             }
         }
         // Reference `mem->data += size`: every non-audio block's pre-post-filter
@@ -6490,6 +6577,7 @@ static bool DecodeOptimumBlockSequence(
                                    work.data(), cur_size, exp.data(), &esz)
                 || esz == 0u) { ok = false; break; }
             exp.resize(esz); work.swap(exp); cur_size = esz;
+            stgmark("p2", work.data(), cur_size);
         }
         // param1: AddBytesFilter (delta filter, output size == input size).
         // Same NzAddBytesFilter already used by -cc's TryDecodeLegacyCm --
@@ -6507,6 +6595,7 @@ static bool DecodeOptimumBlockSequence(
             if (!p1ok) { ok = false; break; }
             work.swap(tbuf);
             // cur_size unchanged
+            stgmark("p1", work.data(), cur_size);
         }
         // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
         // 0x08, 4, 2, 0x20, 0x40, 1. Only 0x10/0x08/0x02/0x20 are ported so
@@ -6631,6 +6720,13 @@ static bool DecodeOptimumBlockSequence(
             exe.Reset();
         }
 
+        stgmark("final", work.data(), cur_size);
+        if (trace_stg) {
+            std::string hx; char b[8];
+            for (std::uint8_t v : staged) { snprintf(b, sizeof(b), "%02x", v); hx += b; }
+            fprintf(stderr, "[STG] block decr=%u param6=%u tt=%s%02x staged=[%s]%s\n", decr_param, param6,
+                    tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, hx.c_str(), stg.c_str());
+        }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         if (getenv("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
@@ -6697,6 +6793,10 @@ static bool TryDecodeLegacyOptimum(
         fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
                 legacy.legacy_method_p1, window_capacity,
                 (unsigned long long)legacy.total_data_size);
+    }
+    if (const char* dp = getenv("NZOPT_DUMP_RAW")) {
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(raw, 1, raw_len, f); fclose(f); }
     }
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
     // method_p0==5 -> -co (nz_optimum1, NzOptimumLzDecoder / FUN_0809e600);
@@ -6766,7 +6866,10 @@ static bool TryDecodeLegacyOptimum(
     }
 
     if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
-        out_data->clear();
+        // out_data keeps the blocks completed before the failure: the original
+        // has written exactly those by the time it reports the error.
+        if (out_data->size() > static_cast<std::size_t>(legacy.total_data_size))
+            out_data->resize(static_cast<std::size_t>(legacy.total_data_size));
         if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
     }
@@ -7213,6 +7316,8 @@ LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
     r.parallel_p1 = c.parallel_p1;
     r.checksums_verified = c.checksums_verified;
     r.entry_checksum_ok = c.entry_checksum_ok;
+    r.decode_failed = c.decode_failed;
+    r.decode_eof = c.decode_eof;
     r.payload_mode = c.payload_mode;
     r.entries = c.entries;
     r.data_offset = c.data_offset;
@@ -7331,9 +7436,30 @@ int RunLegacyCnExtractOrTest(
         if (NativeTrace() && !cm_decode_error.empty()) {
             os << "[native] -cc native decode declined: " << cm_decode_error << '\n';
         }
+        // A corrupt stream: the decoder that owns this method left the blocks it
+        // completed in its output vector. The original has already written the
+        // files those blocks cover (and created, empty, the file the failing
+        // block starts with) when it prints "Archive corrupted"; do the same.
+        std::vector<unsigned char>* partial = nullptr;
+        if (IsCorruptStreamFailure(lzhd_decode_error)) partial = &bridged_data;
+        else if (IsCorruptStreamFailure(optimum_decode_error)) partial = &optimum_native_data;
+        else if (IsCorruptStreamFailure(cm_decode_error)) partial = &cm_native_data;
+        // Measured: when nothing was completed the original creates no file at all
+        // (the next output file is opened only after a flush reaches it).
+        if (partial != nullptr && !partial->empty() && partial->size() < legacy.total_data_size) {
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.checksums_verified = false;
+            bridged.entry_checksum_ok.clear();
+            bridged.decode_failed = true;
+            bridged.decode_eof = (lzhd_decode_error == "lzhd: unexpected end of file");
+            bridged.data = std::move(*partial);
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
+        }
         return kLegacyNeedCompat;
     }
-    if (legacy.total_data_size != legacy.data.size()) {
+    if (!legacy.decode_failed && legacy.total_data_size != legacy.data.size()) {
         os << "Data corrupted while reading file payload.\n";
         return 2;
     }
@@ -7351,10 +7477,23 @@ int RunLegacyCnExtractOrTest(
     bool yes_to_all = options.yes_to_all;
     DecodeProgress progress(os);
     StageMark("extract start");
+    // After a part-way decode failure: the entry the decode stopped inside (or
+    // exactly at the start of) is the last one touched -- it is created with the
+    // bytes that were completed, 0 of them included -- and nothing follows.
+    bool stopped = false;
     for (const LegacyCnEntry& e : legacy.entries) {
+        if (stopped) break;
+        bool last_partial = false;
+        std::size_t n = static_cast<std::size_t>(e.size);
         if (cursor > legacy.data.size() || e.size > legacy.data.size() - cursor) {
-            os << "Data corrupted while reading file payload: " << e.path << '\n';
-            return 2;
+            if (!legacy.decode_failed) {
+                os << "Data corrupted while reading file payload: " << e.path << '\n';
+                return 2;
+            }
+            last_partial = true;
+            stopped = true;
+            n = legacy.data.size() - cursor;
+            if (SafeMode()) break;   // never write unverified bytes in safe mode
         }
 
         // -x<pattern> excludes (`*` crosses directories); -forceout keeps the
@@ -7363,7 +7502,6 @@ int RunLegacyCnExtractOrTest(
         const bool selected = MatchesAnyPattern(e.path, options.positional) &&
                               !IsExcluded(e.path, options.exclude_patterns);
         const unsigned char* ptr = legacy.data.data() + cursor;
-        const std::size_t n = static_cast<std::size_t>(e.size);
         cursor += n;
 
         // The original decodes the whole stream whatever the file filter says, so
@@ -7383,7 +7521,7 @@ int RunLegacyCnExtractOrTest(
         // is reported the way the original reports it and NOT written; the run
         // continues with the other entries and exits with status 2.
         bool checksum_bad = false;
-        if (e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
+        if (!last_partial && e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
             const std::size_t idx = static_cast<std::size_t>(&e - legacy.entries.data());
             const bool known_bad = legacy.checksums_verified && idx < legacy.entry_checksum_ok.size() && !legacy.entry_checksum_ok[idx];
             if (known_bad || !legacy.checksums_verified) {
@@ -7398,9 +7536,12 @@ int RunLegacyCnExtractOrTest(
         }
         if (checksum_bad) {
             ++failed;
-            bytes_ok += e.size;
-            progress.Advance(e.size);
-            continue;
+            if (SafeMode()) {
+                bytes_ok += e.size;
+                progress.Advance(e.size);
+                continue;
+            }
+            // Default: the original writes the file anyway -- so do we.
         }
         StageMark("entry checksum");
 
@@ -7457,8 +7598,19 @@ int RunLegacyCnExtractOrTest(
         progress.Advance(e.size);
     }
 
+    if (legacy.decode_failed) {
+        // Measured: no footer, just the error line (code 100; 25600 when the
+        // archive is cut short -- the original has more codes, see
+        // docs/ORIGINAL_QUIRKS.md).
+        ClearStatusLine(os);
+        if (legacy.decode_eof) os << "Archive corrupted. Unexpected end of file.\n";
+        else os << "Archive corrupted. Error decoding (code "
+                << (legacy.truncated_input ? 25600 : 100) << ")\n";
+        return 2;
+    }
     // The original prints its normal footer after a checksum mismatch; so do we.
-    // The exit status (2) is the one deliberate departure: scripts need to know.
+    // Status 2 marks the damage; main() maps it to the original's 0 unless
+    // NZ_SAFE or NZ_STRICT_EXIT is set.
     PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
     return failed == 0 ? 0 : 2;
 }
