@@ -5344,8 +5344,14 @@ static uint8 *FormatIP(uint32 ip, uint8 *out) {
 
 // --- the dictionary expansion (NZ_TextTransforms.cpp 634-742) -----------------
 static uint32 TransformText_1_Dictionary(const uint8 *in, uint in_size, uint8 *out, uint32 allocated) {
-  (void)allocated;
+  // The reference never checks its output; on corrupt input the expansion runs past
+  // the caller's buffer (ASan heap WRITE, fuzz 2026-09-03). Every write below is
+  // guarded against `out_end`; an overflow returns 0 (the chunk is declined).
+  // Callers hand a buffer with >= 64 bytes of slack past `allocated` (the dict copy
+  // writes 8/16-byte groups and the trailing ' ' is written then dropped), so the
+  // guards check the LOGICAL length against `allocated` plus that slack.
   uint8 *out_org = out;
+  uint8 *const out_end = out + allocated + 40;
   if (in_size <= 1 || in[in_size - 1] != ' ')
     return 0;
 
@@ -5416,6 +5422,7 @@ static uint32 TransformText_1_Dictionary(const uint8 *in, uint in_size, uint8 *o
         wp = InsertMidDict(wp, b - 128);
       }
       size_t wl = buf + 6 + 6 + 2 - wp;
+      if (out_end - out < 16 + 16) return 0;     // CopyDictEntWithCase writes up to 16 bytes past out-wl
       out += wl;
       CopyDictEntWithCase(out - wl, wp, (uint32)wl, case_mode);
     } else {
@@ -5426,6 +5433,7 @@ static uint32 TransformText_1_Dictionary(const uint8 *in, uint in_size, uint8 *o
           c ^= 32 * (kCharacterTraits_0[b] & 1);
       } else {
         in++;
+        if (out_end - out < 4) return 0;
         St32(out, dict32);
         uint8 *old_out = out;
         out += (dict32 >> 24);
@@ -5439,12 +5447,14 @@ static uint32 TransformText_1_Dictionary(const uint8 *in, uint in_size, uint8 *o
       }
     }
   output_next_char:
+    if (out >= out_end) return 0;
     *out++ = c;
     if (kCharacterTraits_1[c]) {
       if (in >= in_end)
         break;
       for (;;) {
         c = *in++;
+        if (out >= out_end) return 0;
         *out++ = c;
         if (!kCharacterTraits_1[c])
           break;

@@ -140,10 +140,14 @@ void RangeCoderFinalize(BitReader& r) {
     // cur position so the next decoder (e.g., outer Huffman after meta) sees
     // a properly-aligned bit stream. Without it the outer Huffman starts
     // reading garbage from offset N+4 instead of N+0.
-    const std::int32_t cur_off = static_cast<std::int32_t>(r.cur - r.start);
-    const std::int32_t bits = cur_off * 8 - 31 - static_cast<std::int32_t>(r.n_valid);
-    const std::int32_t bytes = bits >> 3;
-    const std::int32_t remaining = bits & 7;
+    const std::int64_t cur_off = static_cast<std::int64_t>(r.cur - r.start);
+    std::int64_t bits = cur_off * 8 - 31 - static_cast<std::int64_t>(r.n_valid);
+    // Corrupt input can leave the reader within the first word, making `bits`
+    // negative: the legacy then rewinds BEFORE its buffer (a read from memory it
+    // does not own -- SEGV in our build, fuzz 2026-09-03). Clamp to the start.
+    if (bits < 0) bits = 0;
+    const std::int64_t bytes = bits >> 3;
+    const std::int32_t remaining = static_cast<std::int32_t>(bits & 7);
     r.cur = r.start + bytes;
     r.cache = 0;
     r.n_valid = 0;
@@ -371,9 +375,16 @@ void DecodeHuffmanBytes(HuffmanContext& ctx, BitReader& br,
                 int shift = static_cast<int>(31u - length) - 1;
                 while (val < first) {
                     ++length;
+                    if (length >= 31u) break;   // corrupt table: first_code[] has 32 entries (fuzz 2026-09-03: 18 s spins)
                     first = ctx.first_code[length];
                     val = code >> static_cast<unsigned>(shift & 31);
                     --shift;
+                }
+                if (length >= 31u) {
+                    // Nothing valid can follow; zero the rest and stop consuming bits.
+                    std::memset(dst + i, 0, count - i);
+                    ctx.code_register = code;
+                    return;
                 }
             }
             sym_offset = val - first;
@@ -1563,12 +1574,7 @@ void DecodeResidualsMono(std::int32_t* out, std::size_t count,
                 std::uint32_t need      = n_bits - n_valid;
                 std::uint32_t new_nvalid = 32u - need;
                 std::uint32_t word = new_nvalid;
-                if (cur < end_ptr) {
-                    std::uint32_t raw;
-                    __builtin_memcpy(&raw, cur, 4);
-                    word = ((raw >> 24u) & 0xffu) | ((raw >> 8u) & 0xff00u) |
-                           ((raw & 0xff00u) << 8u) | ((raw & 0xffu) << 24u);
-                }
+                if (cur < end_ptr) word = LoadBigEndianU32Bounded(cur, end_ptr);   // never past the buffer (ASan)
                 cur += 4;
                 old_cache = word;
                 bits = (cache << (need & 0x1fu)) | (old_cache >> (new_nvalid & 0x1fu));
@@ -1603,7 +1609,7 @@ void ReconstructOutputSamples(std::uint8_t* out, std::size_t total_bytes,
     std::int32_t accum = 0;
     std::uint8_t* dst  = out;
     for (std::size_t i = 0; i < n_samples; ++i) {
-        accum += residuals[i];
+        accum = static_cast<std::int32_t>(static_cast<std::uint32_t>(accum) + static_cast<std::uint32_t>(residuals[i]));   // 32-bit wrap
         std::int32_t v = accum;
         if (sw == 1u) {
             *dst++ = static_cast<std::uint8_t>(v);
@@ -1993,7 +1999,7 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
         std::size_t used  = DecodePFBlock(
             input + in_off, input_size - in_off,
             output + out_off, chunk, is_stereo_variant, &ctx);
-        if (used == 0) return 0;
+        if (used == 0 || used > input_size - in_off) return 0;   // a block that "consumed" past the input is corrupt
         in_off  += used;
         out_off += chunk;
     }
@@ -2021,7 +2027,7 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
             input + in_off, input_size - in_off,
             output + out_off, chunk, is_stereo_variant, &ctx,
             persistent_lms_ch1, persistent_lms_ch2);
-        if (used == 0) return 0;
+        if (used == 0 || used > input_size - in_off) return 0;   // a block that "consumed" past the input is corrupt
         in_off  += used;
         out_off += chunk;
     }
@@ -2149,12 +2155,12 @@ void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residua
     std::int32_t carry = 0;  // iVar5
     for (std::size_t i = 0; i < n; ++i) {
         std::int32_t res1 = ch1_residuals[i];
-        carry = LmsPredict(*obj_ch1, carry) + res1;
+        carry = static_cast<std::int32_t>(static_cast<std::uint32_t>(LmsPredict(*obj_ch1, carry)) + static_cast<std::uint32_t>(res1));
         LmsUpdate(*obj_ch1, carry, res1);
         ch1_residuals[i] = carry;
 
         std::int32_t res2 = ch2_residuals[i];
-        carry = LmsPredict(*obj_ch2, carry) + res2;
+        carry = static_cast<std::int32_t>(static_cast<std::uint32_t>(LmsPredict(*obj_ch2, carry)) + static_cast<std::uint32_t>(res2));
         LmsUpdate(*obj_ch2, carry, res2);
         ch2_residuals[i] = carry;
     }
@@ -2179,7 +2185,7 @@ std::size_t DecodePrefilterStream(const std::uint8_t* input, std::size_t input_s
         const std::size_t used = DecodePFBlock(
             input + in_off, input_size - in_off,
             output + out_off, chunk, is_stereo_variant, ctx, lms_ch1, lms_ch2);
-        if (used == 0) return 0;
+        if (used == 0 || used > input_size - in_off) return 0;   // a block that "consumed" past the input is corrupt
         in_off  += used;
         out_off += chunk;
     }

@@ -1078,6 +1078,13 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         }
         else summlen += raw + 2u;
     }
+    // The chunk reconstructs out_size bytes, so a valid token list never asks for
+    // more literals than that; corrupt tokens did (millions of Huffman symbols,
+    // 18 s per chunk, fuzz 2026-09-03) -- the per-entry work-budget invariant.
+    if (litsum > out_size || summlen > out_size + 0x1000000u) {
+        CD_FAIL("token list asks for %u literals / %u match bytes on a %u-byte chunk\n", litsum, summlen, out_size);
+        return 0;
+    }
     std::uint32_t total_lit = litsum;
     if (out_size > summlen && out_size - summlen > litsum) total_lit = out_size - summlen;
     if (CdTrace())

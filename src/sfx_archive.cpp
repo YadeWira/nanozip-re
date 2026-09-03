@@ -1270,8 +1270,8 @@ bool ReadLegacyVarint(
     std::size_t* io_pos,
     std::size_t end,
     std::uint64_t* out_value) {
-    if (io_pos == nullptr || out_value == nullptr || *io_pos >= end) {
-        return false;
+    if (io_pos == nullptr || out_value == nullptr || *io_pos >= end || end > bytes.size()) {
+        return false;   // `end` beyond the buffer = a corrupt/truncated header (ASan, fuzz 2026-09-03)
     }
 
     std::size_t pos = *io_pos;
@@ -1924,39 +1924,47 @@ bool TryAssembleStoredBlocks(
     if (out == nullptr || first_prefix > bytes.size() || total == 0u) {
         return false;
     }
-    std::vector<unsigned char> buf;
-    buf.reserve(static_cast<std::size_t>(total));
-    std::size_t p = first_prefix;
-    std::uint64_t acc = 0;
-    while (acc < total) {
-        std::size_t q = p;
-        std::uint64_t tag = 0;
-        if (!ReadLegacyVarint(bytes, &q, bytes.size(), &tag)) {
-            return false;
-        }
-        if ((tag & 0x0fu) != 0u) {
-            return false;  // stored blocks always carry flags == 0
-        }
-        const std::uint64_t len = tag >> 4u;
-        if (len == 0u || len > total - acc ||
-            static_cast<std::uint64_t>(bytes.size() - q) < len) {
-            return false;
-        }
-        const std::size_t ln = static_cast<std::size_t>(len);
-        buf.insert(buf.end(), bytes.begin() + static_cast<std::ptrdiff_t>(q),
-                   bytes.begin() + static_cast<std::ptrdiff_t>(q + ln));
-        acc += len;
-        p = q + ln;
-        if (acc < total) {
-            if (trailer_bytes > bytes.size() - p) {
+    // Two passes: walk the whole block chain structurally first (no allocation, no
+    // copying), copy only when it is consistent. The caller probes this from every
+    // byte between the table end and the data offset; on a truncated 2 MB parallel
+    // store the copying version made that scan a two-minute "hang" (fuzz 2026-09-03).
+    const auto walk = [&](std::vector<unsigned char>* dst) -> bool {
+        std::size_t p = first_prefix;
+        std::uint64_t acc = 0;
+        while (acc < total) {
+            std::size_t q = p;
+            std::uint64_t tag = 0;
+            if (!ReadLegacyVarint(bytes, &q, bytes.size(), &tag)) {
                 return false;
             }
-            p += trailer_bytes;  // skip the inter-block checksum trailer
+            if ((tag & 0x0fu) != 0u) {
+                return false;  // stored blocks always carry flags == 0
+            }
+            const std::uint64_t len = tag >> 4u;
+            if (len == 0u || len > total - acc ||
+                static_cast<std::uint64_t>(bytes.size() - q) < len) {
+                return false;
+            }
+            const std::size_t ln = static_cast<std::size_t>(len);
+            if (dst != nullptr) {
+                dst->insert(dst->end(), bytes.begin() + static_cast<std::ptrdiff_t>(q),
+                            bytes.begin() + static_cast<std::ptrdiff_t>(q + ln));
+            }
+            acc += len;
+            p = q + ln;
+            if (acc < total) {
+                if (trailer_bytes > bytes.size() - p) {
+                    return false;
+                }
+                p += trailer_bytes;  // skip the inter-block checksum trailer
+            }
         }
-    }
-    if (acc != total || p != bytes.size()) {
-        return false;
-    }
+        return acc == total && p == bytes.size();
+    };
+    if (!walk(nullptr)) return false;
+    std::vector<unsigned char> buf;
+    buf.reserve(static_cast<std::size_t>(total));
+    if (!walk(&buf)) return false;
     *out = std::move(buf);
     return true;
 }
@@ -3768,7 +3776,11 @@ bool TryParseLegacyCnArchive(
                 (checksum_mode == ChecksumMode::kNone) ? 0u : 4u;
             const std::size_t store_trailer_bytes =
                 (checksum_mode == ChecksumMode::kNone) ? 0u : (1u + store_checksum_bytes);
-            for (std::size_t s = table_end; s <= data_offset; ++s) {
+            // data_offset comes from the record walk and can point far past a truncated
+            // file; never scan beyond the bytes we have (fuzz 2026-09-03: a 2 MB store cut
+            // at 95 % made this loop run for minutes).
+            const std::size_t scan_end = std::min<std::size_t>(data_offset, bytes.size());
+            for (std::size_t s = table_end; s <= scan_end; ++s) {
                 if (TryAssembleStoredBlocks(bytes, s, total_data_size,
                                             store_trailer_bytes, &store_blocks_buffer)) {
                     store_multiblock = true;
