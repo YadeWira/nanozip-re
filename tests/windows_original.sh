@@ -8,11 +8,15 @@
 # anything the format depends on. Two things only Windows exercises:
 #
 #   * a Windows-made archive stores FILE ATTRIBUTES (record type 3): one nibble
-#     per entry, `8 | READONLY | HIDDEN<<1 | SYSTEM<<2`, absent when every file
-#     is plain. The Linux original maps them to a mode (0400 read-only, 0600
+#     per entry, `8 | READONLY | HIDDEN<<1 | SYSTEM<<2`, omitted for a block
+#     whose files are all plain (so a multi-block archive carries it for some
+#     blocks only). The Linux original maps them to a mode (0400 read-only, 0600
 #     otherwise) and lists them under `perm`; a Windows build names the column
-#     `attr.` and prints "R", "H", "S", "A" in fixed positions, blank for an
-#     archive that carries POSIX modes instead (quirk 48).
+#     `attr.`, prints "R", "H", "S", "A" in fixed positions, restores those
+#     attributes on extraction, and leaves the field blank for an archive that
+#     carries POSIX modes instead (quirk 48). The attribute restore itself only
+#     shows on real Windows -- wine's filesystem does not keep the bits -- so
+#     that half is checked with the same comparison run on a Windows machine.
 #   * the thread count: the original reports the CPU's physical cores, from the
 #     CPU itself and not from the OS.
 #

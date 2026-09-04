@@ -53,6 +53,7 @@
 #if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>   // SetFileAttributes for the attribute records (type 3)
 #endif
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/wait.h>
@@ -918,6 +919,23 @@ std::string FormatMtimeStored(std::int64_t stored) {
 // The original restores a timestamp with utime(), which takes whole seconds and
 // leaves the access time at "now".  Going through std::filesystem instead lands
 // a fractional nanosecond part that a byte-exact tree comparison catches.
+// A Windows-made archive stores file attributes (record type 3); on Windows the
+// original RESTORES them, so a read-only, hidden or system file comes back that
+// way. Measured on a real Windows 10 machine, all four bits. Applied AFTER the
+// data is written and closed, because READONLY would otherwise refuse the write.
+void SetExtractedWinAttributes(const fs::path& path, std::uint8_t attr) {
+#if defined(_WIN32)
+    DWORD flags = 0;
+    if (attr & 1u) flags |= FILE_ATTRIBUTE_READONLY;
+    if (attr & 2u) flags |= FILE_ATTRIBUTE_HIDDEN;
+    if (attr & 4u) flags |= FILE_ATTRIBUTE_SYSTEM;
+    if (attr & 8u) flags |= FILE_ATTRIBUTE_ARCHIVE;
+    if (flags != 0u) SetFileAttributesA(path.string().c_str(), flags);
+#else
+    (void)path; (void)attr;   // on a POSIX host the mode carries this (0400/0600)
+#endif
+}
+
 bool SetExtractedMtime(const fs::path& path, std::int64_t stored) {
     const std::int64_t real = LegacyStoredMtimeToUnix(stored);
     if (real == 0) return true;   // measured: a zero timestamp is left alone; negatives are applied
@@ -2006,6 +2024,7 @@ inline Outcome Finish() {
             f.fd = -1;
             const LegacyCnEntry& en = (*e.entries)[i];
             if (en.has_mtime) (void)SetExtractedMtime(f.path, en.mtime_unix);
+            if (en.has_win_attr) SetExtractedWinAttributes(f.path, en.win_attr);
         }
     }
     o.committed = e.committed; o.stream_failed = e.stream_failed;
@@ -2254,6 +2273,18 @@ bool ApplyLegacyAttributeRecords(
                 // first, zero-padded to a byte. The nibble is
                 // `8 | READONLY | HIDDEN<<1 | SYSTEM<<2`, so 0 can only be
                 // padding (measured on seven files covering every combination).
+                // The record is OMITTED for a block whose files are all plain,
+                // so it has to be aligned to the files of its own block: the
+                // block's type-2 record comes first, which makes mtimes.size()
+                // the file count through this block. The gap is filled with 8
+                // (plain), which is what the original lists for such an entry.
+                std::size_t k = 0;
+                for (std::size_t p = rbegin; p < rend; ++p) {
+                    if (((bytes[p] >> 4) & 0x0fu) != 0u) ++k;
+                    if ((bytes[p] & 0x0fu) != 0u) ++k;
+                }
+                if (a.mtimes.size() >= k && a.attrs.size() < a.mtimes.size() - k)
+                    a.attrs.resize(a.mtimes.size() - k, 8u);
                 for (std::size_t p = rbegin; p < rend; ++p) {
                     for (int half = 1; half >= 0; --half) {
                         const std::uint32_t nib = (static_cast<std::uint32_t>(bytes[p]) >> (half * 4)) & 0x0fu;
@@ -2345,7 +2376,7 @@ bool ApplyLegacyAttributeRecords(
         // end keep has_mtime = false, which prints the same empty column, and
         // the perms and checksums (fixed-width, exact) still apply. Quirk 43.
         if ((!a.perms.empty() && a.perms.size() != n) ||
-            (!a.attrs.empty() && a.attrs.size() != n) ||
+            (!a.attrs.empty() && a.attrs.size() > n) ||
             (!a.checksums.empty() && a.checksums.size() != n) ||
             a.mtimes.size() > n) {
             return false;
@@ -2354,9 +2385,12 @@ bool ApplyLegacyAttributeRecords(
     }
     if (!any) return false;
 
-    for (const auto& kv : acc) {
+    for (auto& kv : acc) {
         const std::vector<std::size_t>& named = stream_named.find(kv.first)->second;
-        const StreamAcc& a = kv.second;
+        StreamAcc& a = kv.second;
+        // An archive that stores attributes at all gives every entry one: the
+        // blocks whose files are plain just omit the record.
+        if (!a.attrs.empty() && a.attrs.size() < named.size()) a.attrs.resize(named.size(), 8u);
         for (std::size_t i = 0; i < named.size(); ++i) {
             LegacyCnEntry& e = (*entries)[named[i]];
             if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
@@ -9244,6 +9278,7 @@ int RunLegacyCnExtractOrTest(
                     progress.Advance(e.size);
                     continue;
                 }
+                if (e.has_win_attr) SetExtractedWinAttributes(out_path, e.win_attr);
                 if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) && NativeTrace()) {
                     os << "Warning: cannot apply mtime to " << out_path.string() << '\n';
                 }
