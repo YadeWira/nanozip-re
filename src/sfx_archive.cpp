@@ -1150,6 +1150,13 @@ struct LegacyCnEntry {
     bool checksum_na = false;
     std::uint32_t permissions = 0;
     bool has_permissions = false;
+    // An archive made by the WINDOWS original stores file attributes (record
+    // type 3) instead of POSIX modes: one nibble per entry, `8 | R | H<<1 | S<<2`
+    // where 8 is the archive bit. The Linux original maps them to a mode -- 0400
+    // for read-only, 0600 otherwise -- and the Windows one prints them as an
+    // "R H S A" field.
+    std::uint8_t win_attr = 0;
+    bool has_win_attr = false;
     std::int64_t mtime_unix = 0;
     bool has_mtime = false;
     // -fo archives carry uid/gid runs (record types 8 and 9); `l -fo` shows them
@@ -1829,7 +1836,9 @@ inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
     if (!f.write_it) return;
     if (f.path.has_parent_path()) MakeDirs0700(f.path.parent_path());
 #if defined(_WIN32)
-    f.fd = ::_open(f.path.string().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    // mingw's <sys/stat.h> does not always expose _S_IREAD/_S_IWRITE, and the
+    // mode is irrelevant on Windows anyway (the permission records are POSIX).
+    f.fd = ::_open(f.path.string().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
 #else
     f.fd = ::open(f.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
                   static_cast<mode_t>((en.has_permissions ? en.permissions : 0600u) & 07777u));
@@ -2205,6 +2214,7 @@ bool ApplyLegacyAttributeRecords(
         std::vector<std::uint32_t> checksums;
         std::vector<std::uint32_t> uids;
         std::vector<std::uint32_t> gids;
+        std::vector<std::uint32_t> attrs;    // Windows attribute nibbles (record type 3)
     };
     std::map<unsigned, StreamAcc> acc;
 
@@ -2237,6 +2247,21 @@ bool ApplyLegacyAttributeRecords(
                     a.mtimes.push_back(cur);
                 }
                 if (p != rend) return false;
+                break;
+            }
+            case 3u: {
+                // Windows file attributes: one NIBBLE per entry, high nibble
+                // first, zero-padded to a byte. The nibble is
+                // `8 | READONLY | HIDDEN<<1 | SYSTEM<<2`, so 0 can only be
+                // padding (measured on seven files covering every combination).
+                for (std::size_t p = rbegin; p < rend; ++p) {
+                    for (int half = 1; half >= 0; --half) {
+                        const std::uint32_t nib = (static_cast<std::uint32_t>(bytes[p]) >> (half * 4)) & 0x0fu;
+                        if (nib == 0u) continue;            // padding
+                        if (a.attrs.size() >= n) return false;
+                        a.attrs.push_back(nib);
+                    }
+                }
                 break;
             }
             case 4u: {
@@ -2320,11 +2345,12 @@ bool ApplyLegacyAttributeRecords(
         // end keep has_mtime = false, which prints the same empty column, and
         // the perms and checksums (fixed-width, exact) still apply. Quirk 43.
         if ((!a.perms.empty() && a.perms.size() != n) ||
+            (!a.attrs.empty() && a.attrs.size() != n) ||
             (!a.checksums.empty() && a.checksums.size() != n) ||
             a.mtimes.size() > n) {
             return false;
         }
-        if (!a.mtimes.empty() || !a.perms.empty() || !a.checksums.empty()) any = true;
+        if (!a.mtimes.empty() || !a.perms.empty() || !a.attrs.empty() || !a.checksums.empty()) any = true;
     }
     if (!any) return false;
 
@@ -2335,6 +2361,13 @@ bool ApplyLegacyAttributeRecords(
             LegacyCnEntry& e = (*entries)[named[i]];
             if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
             if (!a.perms.empty()) { e.permissions = a.perms[i]; e.has_permissions = true; }
+            if (!a.attrs.empty()) {
+                e.win_attr = static_cast<std::uint8_t>(a.attrs[i]);
+                e.has_win_attr = true;
+                // What the Linux original lists and restores for these.
+                e.permissions = (a.attrs[i] & 1u) ? 0400u : 0600u;
+                e.has_permissions = true;
+            }
             if (a.uids.size() == named.size() && a.gids.size() == named.size()) {
                 e.uid = a.uids[i]; e.gid = a.gids[i]; e.has_owner = true;
             }
@@ -4337,7 +4370,7 @@ bool TryParseLegacyCnArchive(
 
         // Per-file attribute records, and the first main-stream data record.
         if (found_codec) {
-            if (csize > 0u && (ctype == 2u || ctype == 4u || ctype == 5u ||
+            if (csize > 0u && (ctype == 2u || ctype == 3u || ctype == 4u || ctype == 5u ||
                                ctype == 6u || ctype == 7u || ctype == 8u || ctype == 9u)) {
                 attr_records.push_back({static_cast<std::size_t>(cstream),
                                         static_cast<std::size_t>(ctype), pos, pos + csize});
@@ -6683,7 +6716,14 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
         os << "checksum ";
     }
     if (has_perm) {
+        // A Windows build names the column "attr." and shows the file's
+        // attributes there instead of a mode; note the original's own header
+        // word is one character wider than the values under it.
+#if defined(_WIN32)
+        os << "attr. ";
+#else
         os << "perm ";
+#endif
     }
     // Measured: `-fo` adds a "user/grp." column only when the archive carries
     // ownership records (an archive made without -fo shows no column).
@@ -6713,7 +6753,20 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
             }
         }
         if (has_perm) {
+#if defined(_WIN32)
+            // "R", "H", "S", "A" in fixed positions; an archive that carries
+            // POSIX modes instead leaves the field blank, as the original does.
+            char attr[5] = {' ', ' ', ' ', ' ', 0};
+            if (e.has_win_attr) {
+                if (e.win_attr & 1u) attr[0] = 'R';
+                if (e.win_attr & 2u) attr[1] = 'H';
+                if (e.win_attr & 4u) attr[2] = 'S';
+                if (e.win_attr & 8u) attr[3] = 'A';
+            }
+            os << attr << ' ';
+#else
             os << std::setw(4) << std::right << FormatMode(e.permissions) << ' ';
+#endif
         }
         if (show_owner) {
             os << std::setw(4) << std::right << e.uid << '/' << std::setw(4) << std::right << e.gid << ' ';

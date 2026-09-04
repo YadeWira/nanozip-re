@@ -383,10 +383,30 @@ void WinCoreCounts(unsigned* physical, unsigned* logical) {
 
 unsigned HostThreadCount() {
 #if defined(_WIN32)
+    // The original reports 16 on a 16-core/32-thread host, on Linux AND under
+    // wine, where GetLogicalProcessorInformation says 32 cores of one thread
+    // each -- so it takes the count from the CPU itself, not from the OS. Do the
+    // same: logical processors divided by the hyper-threading ratio the CPU
+    // reports (logical per package / cores per package), which is exactly what
+    // the Linux path derives from `siblings` and `cpu cores`.
     unsigned physical = 0, logical = 0;
     WinCoreCounts(&physical, &logical);
-    if (physical > 32u) physical = 32u;
-    return physical;
+    if (logical == 0u) logical = 1u;
+    if (logical > 32u) logical = 32u;
+    unsigned ratio = 1u;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid(1u, &a, &b, &c, &d)) {
+        const unsigned logical_per_pkg = (b >> 16u) & 0xffu;
+        unsigned cores_per_pkg = 0;
+        unsigned a4 = 0, b4 = 0, c4 = 0, d4 = 0;
+        if (__get_cpuid_count(4u, 0u, &a4, &b4, &c4, &d4)) cores_per_pkg = ((a4 >> 26u) & 0x3fu) + 1u;
+        if (logical_per_pkg > 0u && cores_per_pkg > 0u && logical_per_pkg > cores_per_pkg)
+            ratio = logical_per_pkg / cores_per_pkg;
+        else if ((d & (1u << 28)) != 0u && logical_per_pkg > 1u && cores_per_pkg == 0u)
+            ratio = 2u;   // hyper-threading advertised, core count unavailable
+    }
+    if (ratio > 1u && logical / ratio >= 1u) logical /= ratio;
+    return logical;
 #else
     unsigned logical = 0;
     std::ifstream in("/proc/cpuinfo");
