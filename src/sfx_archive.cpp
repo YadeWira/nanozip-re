@@ -1908,6 +1908,7 @@ struct LegacyParallelStream {
     // other, but the ring below is sized from the stream's OWN byte regardless.
     std::uint8_t p0 = 0, p1 = 0;
     bool hasparams = false;
+    std::size_t last_table_first = 0;     // index in `slices` of the latest table's first entry
 };
 
 // The -cd/-cD LZ ring, in 64 KB units, from the codec record's p1 byte:
@@ -1969,22 +1970,28 @@ bool ParseLegacyParallelStreams(
         if (csz > bytes.size() - p) return false;
         LegacyParallelStream& st = (*out_streams)[sid];
         if (ct == 1u && csz >= 2u) {
+            // A filename TABLE: (size varint, name\0) pairs, one per file the
+            // block starts (a stream carrying a continued part of a big file
+            // and two small files has a one-entry table + a two-entry table).
+            // The stream-level size is the first entry's (the single-file
+            // container has exactly one).
             std::size_t tp = p;
-            std::uint64_t v = 0;
-            if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) {
-                st.osz = v; st.hassz = true;
+            bool first = true;
+            while (tp < p + csz) {
+                std::uint64_t v = 0;
+                if (!ReadLegacyVarint(bytes, &tp, p + csz, &v)) break;
                 const auto nul_it = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(tp),
                                               bytes.begin() + static_cast<std::ptrdiff_t>(p + csz),
                                               static_cast<unsigned char>(0));
-                if (nul_it != bytes.begin() + static_cast<std::ptrdiff_t>(p + csz)) {
-                    LegacyParallelSlice sl;
-                    sl.path.assign(reinterpret_cast<const char*>(bytes.data() + tp),
-                                   static_cast<std::size_t>(
-                                       std::distance(bytes.begin() + static_cast<std::ptrdiff_t>(tp),
-                                                     nul_it)));
-                    sl.osz = v;
-                    st.slices.push_back(std::move(sl));
-                }
+                if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(p + csz)) break;
+                if (first) { st.osz = v; st.hassz = true; st.last_table_first = st.slices.size(); first = false; }
+                LegacyParallelSlice sl;
+                sl.path.assign(reinterpret_cast<const char*>(bytes.data() + tp),
+                               static_cast<std::size_t>(
+                                   std::distance(bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it)));
+                sl.osz = v;
+                st.slices.push_back(std::move(sl));
+                tp = static_cast<std::size_t>(std::distance(bytes.begin(), nul_it)) + 1u;
             }
         } else if (ct == 11u && csz >= 1u) {
             st.p0 = bytes[p];
@@ -1993,9 +2000,15 @@ bool ParseLegacyParallelStreams(
         } else if (ct == 10u && csz >= 4u) {
             st.ooff = ReadU32LE(bytes.data() + p);
             st.hasoff = true;
-            // The offset belongs to the slice its table just introduced.
-            for (auto it = st.slices.rbegin(); it != st.slices.rend(); ++it) {
-                if (!it->hasoff) { it->ooff = st.ooff; it->hasoff = true; break; }
+            // The offset belongs to the continued file part the table just
+            // introduced: its FIRST entry (a stream resumes a big file first,
+            // then starts new files, which sit at offset 0 of their own).
+            if (st.last_table_first < st.slices.size() && !st.slices[st.last_table_first].hasoff) {
+                st.slices[st.last_table_first].ooff = st.ooff; st.slices[st.last_table_first].hasoff = true;
+            } else {
+                for (auto it = st.slices.rbegin(); it != st.slices.rend(); ++it) {
+                    if (!it->hasoff) { it->ooff = st.ooff; it->hasoff = true; break; }
+                }
             }
         } else if ((ct == 5u || ct == 6u || ct == 7u) && csz > 0u) {
             const ChecksumMode m = (ct == 5u) ? ChecksumMode::kFletcher32
@@ -2184,14 +2197,16 @@ bool AssembleParallelMultiFile(
         if (st.chunks.empty() || st.slices.empty()) continue;
         std::uint64_t stream_out = 0;
         for (const LegacyParallelSlice& sl : st.slices) {
-            if (!sl.has_cksum || sl.osz == 0u) return false;
+            if (sl.osz == 0u) continue;   // an empty file: nothing to decode or place
+            if (!sl.has_cksum) return false;
             const auto it = base.find(sl.path);
             if (it == base.end()) return false;
             if (it->second + sl.ooff + sl.osz > total) return false;
             ranges.emplace_back(it->second + sl.ooff, sl.osz);
             stream_out += sl.osz;
         }
-        if (stream_out == 0u || stream_out > total) return false;
+        if (stream_out > total) return false;
+        if (stream_out == 0u) continue;   // only empty files: no data to decode
         list.push_back(&st);
         outs.push_back(stream_out);
     }
@@ -2204,6 +2219,7 @@ bool AssembleParallelMultiFile(
             if (dec.size() != stream_out) return false;
             std::uint64_t cur = 0;
             for (const LegacyParallelSlice& sl : st.slices) {
+                if (sl.osz == 0u) continue;
                 if (ComputeBufferChecksum(sl.cmode, dec.data() + cur,
                                           static_cast<std::size_t>(sl.osz)) != sl.cval) {
                     return false;
@@ -2217,6 +2233,7 @@ bool AssembleParallelMultiFile(
         if (!accept(decoded)) return false;
         std::uint64_t cursor = 0;
         for (const LegacyParallelSlice& sl : st.slices) {
+            if (sl.osz == 0u) continue;
             const std::uint64_t file_base = base.find(sl.path)->second;
             std::memcpy(assembled.data() + static_cast<std::size_t>(file_base + sl.ooff),
                         decoded.data() + static_cast<std::size_t>(cursor),

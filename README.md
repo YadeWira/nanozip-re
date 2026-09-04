@@ -38,7 +38,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
-| Release package, 52 archives (incl. parallel containers of every codec), all four binaries | 100/100 hashes |
+| Release package, 63 archives (incl. single- and multi-file parallel containers of every codec), all four binaries | 159/159 hashes |
 | Console matrices (36 + 78 + 77 cases, pty prompt harness) | identical except progress-redraw timing, the order of `Compressor` lines of parallel workers, and the encode commands |
 | Damaged archives, 8 codecs × 6 corruptions (`x`, `l`, `t`) | 42/48 identical trees; the `Archive corrupted` / `Internal error` report identical in 39/48 (`l`: 47/48); the rest are the original's crashes and uninitialised memory ([quirks 26, 27](docs/ORIGINAL_QUIRKS.md)) and four `-cf`/`-cF` garbage divergences |
 | Fuzzing, ASan + UBSan, 1358 corrupt and non-archive inputs (`~/.cache/nzre_tools/fuzz/fuzz.sh`) | 1358/1358 clean, worst case 8.1 s (a 4-stream `-cc` archive under ASan) |
