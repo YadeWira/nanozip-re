@@ -12,7 +12,6 @@ set(RECON_SOURCES
     src/linux32_cm_map.cpp
     src/lzpf_arith.cpp
     src/nz_cm.cpp
-    src/nz_lzhd.cpp
     src/nz_cd_tokens.cpp
     src/nz_cd_texttransform_dict.cpp
     src/nz_lzhds.cpp

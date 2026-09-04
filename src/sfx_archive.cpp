@@ -7,7 +7,6 @@
 #include "nz_sfx/sfx_archive.hpp"
 #include "lzpf_arith.h"
 #include "nz_cm.h"
-#include "nz_lzhd.h"
 #include "nz_cd_tokens.h"
 #include "nz_lzhds.h"
 #include "nz_optimum_lz.h"
