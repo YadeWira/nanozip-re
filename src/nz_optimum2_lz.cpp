@@ -184,6 +184,11 @@ inline std::uint16_t Rd16(const std::uint8_t* mem, int off) {
 inline int& O2WatchOff() { static int v = -2; return v; }
 inline long& O2WatchSeq() { static long n = 0; return n; }
 
+// Compiled in only with -DNZO2_WATCH: the hook sits on every model write of the
+// hottest loop in the -cO decoder and its guard alone was measurable.
+#ifndef NZO2_WATCH
+inline void O2Watch(const std::uint8_t*, int, int, const void*) {}
+#else
 inline void O2Watch(const std::uint8_t* mem, int off, int width, const void* newv) {
     if (O2WatchOff() == -2) {
         const char* e = NZ_ENV("NZO2_WATCH");
@@ -198,6 +203,7 @@ inline void O2Watch(const std::uint8_t* mem, int off, int width, const void* new
         std::fprintf(stderr, "[O2W] #%ld off=0x%x w=%d %u -> %u\n",
                      O2WatchSeq()++, off, width, oldv, nv);
 }
+#endif
 
 inline void Wr16(std::uint8_t* mem, int off, std::uint16_t v) {
     O2Watch(mem, off, 2, &v);
