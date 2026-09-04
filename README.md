@@ -35,6 +35,8 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 |---|---|
 | Synthetic fixtures, 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact |
 | Multi-file archives, 12 selectors × 9 shapes, whole trees + listings (`tests/multifile_v2.sh`) | 144/144 + 72/72 |
+| Self-extracting `.exe` archives of the eight codecs (`tests/sfx_exe.sh`) | 8/8 byte-exact |
+| Shapes measured one by one: 70 000 entries, the same file twice, a `-pN` container of duplicates, files of 0 bytes, names of 250 characters | listings, trees, modes and timestamps identical to the original |
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |

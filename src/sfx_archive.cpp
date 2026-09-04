@@ -2306,10 +2306,21 @@ bool ApplyLegacyAttributeRecords(
         const StreamAcc& a = kv.second;
         // Partial coverage means the layout was not the one described above;
         // treat it as not understood rather than filling some files and not
-        // others.
-        if ((!a.mtimes.empty() && a.mtimes.size() != n) ||
-            (!a.perms.empty() && a.perms.size() != n) ||
-            (!a.checksums.empty() && a.checksums.size() != n)) {
+        // others -- EXCEPT for the mtimes, which the original itself leaves
+        // short. An mtime run longer than a record's payload (~32 KB) is split
+        // across several type-2 records, and the original parses each one as a
+        // fresh [u32 absolute][deltas] run: a continuation record's first four
+        // bytes are deltas, so it reads them as an absolute near zero and emits
+        // one value where three or four belonged. Measured on a 70 000-file
+        // archive: entries 0..32764 are right, from 32765 the original lists
+        // 1969-Dec-31 (the epoch in local time) and the LAST SIX entries get no
+        // date column at all, because its value run ran six short. So parse the
+        // records the same way and hand out what there is; the entries past the
+        // end keep has_mtime = false, which prints the same empty column, and
+        // the perms and checksums (fixed-width, exact) still apply. Quirk 43.
+        if ((!a.perms.empty() && a.perms.size() != n) ||
+            (!a.checksums.empty() && a.checksums.size() != n) ||
+            a.mtimes.size() > n) {
             return false;
         }
         if (!a.mtimes.empty() || !a.perms.empty() || !a.checksums.empty()) any = true;
@@ -2321,7 +2332,7 @@ bool ApplyLegacyAttributeRecords(
         const StreamAcc& a = kv.second;
         for (std::size_t i = 0; i < named.size(); ++i) {
             LegacyCnEntry& e = (*entries)[named[i]];
-            if (!a.mtimes.empty()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
+            if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
             if (!a.perms.empty()) { e.permissions = a.perms[i]; e.has_permissions = true; }
             if (a.uids.size() == named.size() && a.gids.size() == named.size()) {
                 e.uid = a.uids[i]; e.gid = a.gids[i]; e.has_owner = true;
@@ -2808,7 +2819,10 @@ bool TryAssembleParallelStore(
             ps.slices.push_back(sl); pstreams.push_back(std::move(ps));
             list.push_back(&st); ranges.emplace_back(st.ooff, st.osz);
         }
-        if (list.empty() || !DisjointCover(ranges, total_size)) return false;
+        // The sink writes each slice where its stream says, so the slices need not
+        // tile the output: a file listed twice has both copies at the same offsets
+        // and they simply overwrite (see the note in the tiling paths).
+        if (list.empty()) return false;
         if (!psink::Publish(*entries, std::move(pstreams), psink::Policy::kStore, 0u, psink::Family::kStore)) return false;
         for (std::size_t idx = 0; idx < list.size(); ++idx) {
             const LegacyParallelStream& st = *list[idx];
@@ -4788,6 +4802,7 @@ bool TryParseLegacyCnArchive(
                 store_multiblock = true;
                 metadata_end = table_end;
                 payload_start = table_end;
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site1 -> %zu\n", payload_start);
                 prefix_found = true;
             }
         }
@@ -4799,6 +4814,7 @@ bool TryParseLegacyCnArchive(
             store_multiblock = true;
             metadata_end = table_end;
             payload_start = table_end;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site2 -> %zu\n", payload_start);
             prefix_found = true;
             nz_trace::Construct("store_assembly=parallel_single");
         }
@@ -4823,6 +4839,7 @@ bool TryParseLegacyCnArchive(
                     store_multiblock = true;
                     metadata_end = s;
                     payload_start = s;
+                    if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site3 -> %zu\n", payload_start);
                     break;
                 }
             }
@@ -4835,6 +4852,7 @@ bool TryParseLegacyCnArchive(
         } else {
             metadata_end = prefix_start;
             payload_start = data_offset;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site4 -> %zu\n", payload_start);
         }
         if (!store_multiblock) {
 
@@ -4887,6 +4905,8 @@ bool TryParseLegacyCnArchive(
             fprintf(stderr, "%02x ", bytes[k]);
         fprintf(stderr, "\n");
     }
+    if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] flags: run_parsed=%d store=%d found_first=%d attr_records=%zu run_end=%zu\n",
+                                            (int)metadata_run_parsed, (int)native_store_payload, (int)found_first_data, attr_records.size(), run_metadata_end);
     // Best-effort metadata extraction (single-file path is the most reliable).
     if (metadata_run_parsed) {
         // Attributes already filled from the record run. For single-file
@@ -4896,6 +4916,7 @@ bool TryParseLegacyCnArchive(
         // tag sniffing.
         if (!native_store_payload && found_first_data) {
             payload_start = run_metadata_end;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site5 -> %zu\n", payload_start);
         }
     } else if (entries.size() == 1u && metadata_end > metadata_begin) {
         std::size_t mp = metadata_begin;
@@ -4928,6 +4949,7 @@ bool TryParseLegacyCnArchive(
         }
         if (!native_store_payload) {
             payload_start = mp;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site6 -> %zu\n", payload_start);
         }
     } else if (metadata_end > metadata_begin) {
         // Multi-file legacy metadata is still partially unknown; expose conservative defaults.
@@ -4984,6 +5006,7 @@ bool TryParseLegacyCnArchive(
             }
             if (q + static_cast<std::size_t>(stream_bytes) == bytes.size()) {
                 payload_start = s;
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site7 -> %zu\n", payload_start);
                 fallback_start = bytes.size();
                 break;
             }
@@ -4993,6 +5016,7 @@ bool TryParseLegacyCnArchive(
         }
         if (payload_start == bytes.size() && fallback_start != bytes.size()) {
             payload_start = fallback_start;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site8 -> %zu\n", payload_start);
         }
     }
 
@@ -5160,12 +5184,13 @@ bool TryParseLegacyCnArchive(
     };
     // Parallel sink (psink): hand a single-file container's streams over. Each
     // stream is one slice of entry 0 at its output offset.
-    const auto publish_single = [&](const auto& list) -> bool {
+    const auto publish_single = [&](const auto& list, const std::vector<std::uint64_t>& dest) -> bool {
         std::vector<psink::Stream> streams;
-        for (const auto* st : list) {
+        for (std::size_t di = 0; di < list.size(); ++di) {
+            const auto* st = list[di];
             psink::Stream ps;
             psink::Slice sl;
-            sl.entry = 0u; sl.file_off = st->ooff; sl.len = st->osz;
+            sl.entry = 0u; sl.file_off = di < dest.size() ? dest[di] : st->ooff; sl.len = st->osz;
             sl.cmode = st->cmode; sl.cval = st->cval; sl.has_cksum = (st->cmode != ChecksumMode::kNone);
             sl.group = 0u;
             ps.slices.push_back(sl);
@@ -5217,6 +5242,11 @@ bool TryParseLegacyCnArchive(
                 spliced_data.insert(spliced_data.end(),
                                     bytes.begin() + static_cast<std::ptrdiff_t>(dr.first),
                                     bytes.begin() + static_cast<std::ptrdiff_t>(dr.second));
+            }
+            if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
+                std::fprintf(stderr, "[SPLICE] records=%zu bytes=%zu head=", data_records.size(), spliced_data.size());
+                for (std::size_t k = 0; k < 12 && k < spliced_data.size(); ++k) std::fprintf(stderr, "%02x", spliced_data[k]);
+                std::fprintf(stderr, " first_rec=(%zu,%zu)\n", data_records[0].first, data_records[0].second);
             }
         }
     }
@@ -5362,8 +5392,21 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
-                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PStream& s = *plist[idx];
                             // One record (the usual case) is decoded in place; several are
@@ -5405,10 +5448,11 @@ bool TryParseLegacyCnArchive(
                             }
                             // Straight into this stream's slice (DisjointCover proved the
                             // slices tile the output before any thread started).
-                            if (static_cast<std::uint64_t>(s.ooff) + s.osz > assembled.size()) return false;
+                            const std::uint64_t s_dest = pdest[idx];
+                            if (s_dest + s.osz > assembled.size()) return false;
                             if (!DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
                                                   is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &unused,
-                                                  assembled.data() + static_cast<std::size_t>(s.ooff), false, nullptr, false, pend)) return false;
+                                                  assembled.data() + static_cast<std::size_t>(s_dest), false, nullptr, false, pend)) return false;
                             slice_done[idx].store(true, std::memory_order_relaxed);
                             return true;
                         });
@@ -5417,7 +5461,7 @@ bool TryParseLegacyCnArchive(
                             // complete the zeros the zero-filled vector used to hold.
                             for (std::size_t q = 0; q < plist.size(); ++q)
                                 if (!slice_done[q].load(std::memory_order_relaxed))
-                                    std::memset(assembled.data() + static_cast<std::size_t>(plist[q]->ooff), 0, plist[q]->osz);
+                                    std::memset(assembled.data() + static_cast<std::size_t>(pdest[q]), 0, plist[q]->osz);
                         }
                         StageMark("streams decoded");
                         if (sink_adopt()) {
@@ -5559,8 +5603,21 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
-                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PCdStream& s = *plist[idx];
                             const std::size_t slice_total = static_cast<std::size_t>(s.osz);
@@ -5620,7 +5677,7 @@ bool TryParseLegacyCnArchive(
                             }
                             if (pwritten != slice_total) return false;
                             if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) return false;
-                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
                                         slice_window, slice_total);
                             return true;
                         });
@@ -5849,8 +5906,21 @@ bool TryParseLegacyCnArchive(
                                 st.osz > total_data_size - st.ooff) { all_ok = false; break; }
                             plist.push_back(&st); pranges.emplace_back(st.ooff, st.osz);
                         }
-                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
-                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             const LegacyParallelStream& st = *plist[idx];
                             LegacyCnContext sub;
@@ -5884,7 +5954,7 @@ bool TryParseLegacyCnArchive(
                                 ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) {
                                 return false;
                             }
-                            std::memcpy(assembled.data() + static_cast<std::size_t>(st.ooff),
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
                                         slice.data(), slice.size());
                             return true;
                         });
@@ -6039,8 +6109,21 @@ bool TryParseLegacyCnArchive(
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
-                        StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
-                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
                         // One worker stream per thread (see ParallelForEach); every stream
                         // writes its own disjoint slice of `assembled`.
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
@@ -6072,7 +6155,7 @@ bool TryParseLegacyCnArchive(
                             }
                             if (!sok || slice.size() != s.osz) return false;
                             if (ComputeBufferChecksum(s.cmode, slice.data(), slice.size()) != s.cval) return false;
-                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
                                         slice.data(), slice.size());
                             return true;
                         });
@@ -6465,6 +6548,10 @@ bool TryParseLegacyCnArchive(
         ctx.decode_failed = so.stream_failed;
         if (!native_store_payload) native_literal_payload = true;
     }
+    if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+        std::fprintf(stderr, "[PAYLOAD] payload_start=%zu first_data_record=%zu data_records=%zu spliced=%zu store=%d literal=%d\n",
+                     payload_start, first_data_record, data_records.size(), spliced_data.size(),
+                     (int)native_store_payload, (int)native_literal_payload);
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
     {
@@ -6602,7 +6689,11 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
         if (show_owner) {
             os << std::setw(4) << std::right << e.uid << '/' << std::setw(4) << std::right << e.gid << ' ';
         }
-        if (has_date) {
+        // An entry with no stored mtime leaves the column EMPTY rather than
+        // printing the epoch: the original does that for the entries its own
+        // mtime reader ran short of (quirk 43), and the rest of the row keeps
+        // its usual spacing.
+        if (has_date && e.has_mtime) {
             os << FormatMtimeStored(e.mtime_unix);
         }
         if (options.verbose) {
@@ -7943,11 +8034,26 @@ static bool DecodeOptimumBlockSequence(
                                        static_cast<std::uint32_t>(param15_data.size()),
                                        raw_stream.data() + prev, cur_size,
                                        raw_stream.data(), raw_stream.size(),
-                                       t15.data(), cap, &n15);
+                                       t15.data(), cap, &n15, dec.WindowCapacity());
                 raw_stream.resize(prev);
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
                             param15_data.size(), cur_size, p15ok ? 1 : 0, n15);
+                }
+                if (const char* dd = NZ_ENV("NZOPT_DUMP_P15")) {
+                    static thread_local unsigned call_no = 0;
+                    ++call_no;
+                    char path[512];
+                    auto wr = [&](const char* what, const void* data, std::size_t n) {
+                        std::snprintf(path, sizeof(path), "%s/p15_%03u_%s.bin", dd, call_no, what);
+                        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(data, 1, n, f); std::fclose(f); }
+                    };
+                    wr("model", param15_data.data(), param15_data.size());
+                    wr("in", raw_stream.data() + prev, cur_size);
+                    wr("window", raw_stream.data(), prev);
+                    wr("out", t15.data(), n15);
+                    std::fprintf(stderr, "[P15] call=%u model=%zu in=%u window=%zu out=%u out_at=%zu ok=%d\n",
+                                 call_no, param15_data.size(), cur_size, prev, n15, out_data->size(), (int)p15ok);
                 }
                 if (!p15ok || n15 == 0u) { ok = false; break; }
                 t15.resize(n15); work.swap(t15); cur_size = n15;

@@ -958,6 +958,8 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 }
 
 
+std::uint32_t NzOptimumLzDecoder::WindowCapacity() const { return ring_.capacity; }
+
 void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
     // Transcription of the compact engine's ring-feed (entry around 0x080bcc60),
     // which pushes bytes that did NOT come out of the LZ engine (stored blocks,

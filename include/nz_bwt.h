@@ -63,7 +63,12 @@ bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
 // therefore pass the base and length of everything decoded so far, with this
 // block's own pre-param15 bytes sitting at its end, and `in` pointing at them.
 // Ported from reference DecodeParam15 (NZ.cpp:843).
+// `window_cap` is the LZ ring's capacity: param15's four raw offset bytes are a
+// position in that ring, so on a stream whose accumulated window has grown past
+// the capacity the real source sits one or more capacities further along. Pass 0
+// to keep the literal (pre-2026-09-04) reading.
 bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
                   const uint8_t* in, uint32_t in_size,
                   const uint8_t* window_base, size_t window_len,
-                  uint8_t* out, uint32_t out_cap, uint32_t* out_size);
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size,
+                  uint32_t window_cap = 0u);

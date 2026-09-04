@@ -1117,7 +1117,8 @@ bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
 bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
                   const uint8_t* in, uint32_t in_size,
                   const uint8_t* window_base, size_t window_len,
-                  uint8_t* out, uint32_t out_cap, uint32_t* out_size) {
+                  uint8_t* out, uint32_t out_cap, uint32_t* out_size,
+                  uint32_t window_cap) {
     if (out_size == nullptr) return false;
     *out_size = 0;
 
@@ -1165,11 +1166,26 @@ bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
             BWT_FAIL("param15: truncated absolute offset\n");
             return false;
         }
-        const uint32_t offs_from_start = ~(((uint32_t)in[0] << 24) |
+        uint32_t offs_from_start = ~(((uint32_t)in[0] << 24) |
                                            ((uint32_t)in[1] << 16) |
                                            ((uint32_t)in[2] << 8) |
                                             (uint32_t)in[3]);
         const uint64_t need = (uint64_t)matchlen + 8u;
+        // The offset is a position in the LZ ring, so on a stream whose window
+        // has already scrolled past the ring capacity the source lies one or
+        // more capacities further along the accumulated bytes. Take the latest
+        // congruent position that still fits before the window's end -- exactly
+        // what the ring holds. MEASURED on a 200 MB -co archive of 16 slices:
+        // its 12th slice reaches 10.9 MB of window with an 8 MB ring, and six
+        // of that slice's matches read 8 MB too early without this (the p15
+        // stage check byte caught it: status 105).
+        if (window_cap != 0u && (uint64_t)offs_from_start + need <= (uint64_t)window_len) {
+            const uint64_t limit = (uint64_t)window_len - need;
+            if (offs_from_start <= limit) {
+                const uint64_t k = (limit - (uint64_t)offs_from_start) / (uint64_t)window_cap;
+                offs_from_start = (uint32_t)((uint64_t)offs_from_start + k * (uint64_t)window_cap);
+            }
+        }
         if ((uint64_t)offs_from_start + need > (uint64_t)window_len) {
             BWT_FAIL("param15: window offset %u + %llu exceeds window %zu\n",
                      offs_from_start, (unsigned long long)need, window_len);
@@ -1186,6 +1202,11 @@ bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
             return false;
         }
         const uint8_t* src = window_base + offs_from_start;
+        static const bool watch_p15 = (NZ_ENV("NZ_WATCH_P15") != nullptr);
+        if (watch_p15)
+            std::fprintf(stderr, "[p15m] out_at=%ld len=%u need=%llu src_off=%u window=%zu\n",
+                         (long)(out - out_org), matchlen, (unsigned long long)need,
+                         offs_from_start, window_len);
         for (uint32_t i = 0; i != (uint32_t)need; i++) out[i] = src[i];
         out += (uint32_t)need;
         in += 4;

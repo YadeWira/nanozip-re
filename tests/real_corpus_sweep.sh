@@ -34,7 +34,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NATIVE="${RECON_ROOT}/bin/nz_recon"
+NATIVE="${NZ_RECON:-${RECON_ROOT}/bin/nz_recon}"   # NZ_RECON pins a frozen copy: never
+# rebuild bin/nz_recon while a sweep runs, or its verdicts mix two binaries.
 LEGACY="${RECON_ROOT}/../linux32/nz"
 [[ -n "${NZ_LEGACY_ORACLE:-}" ]] && LEGACY="${NZ_LEGACY_ORACLE}"
 CORPUS="${NZ_REAL_CORPUS:-/tmp/nzre_work/realcorpus}"

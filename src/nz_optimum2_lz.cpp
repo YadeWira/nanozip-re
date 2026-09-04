@@ -1209,6 +1209,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
 }
 
 
+std::uint32_t NzOptimum2LzDecoder::WindowCapacity() const { return ring_.capacity; }
+
 void NzOptimum2LzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
     // Transcription of FUN_080b9180(ppRing, src, len) -- how the ORIGINAL pushes
     // bytes that did NOT come out of the LZ engine (stored blocks, post-filter
