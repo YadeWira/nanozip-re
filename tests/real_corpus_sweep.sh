@@ -117,7 +117,23 @@ for fix in "${FIXTURES[@]}"; do
     (cd "$nd" && NZ_TRACE_CONSTRUCTS=1 timeout "$TMO" "$NATIVE" x -y -fo -v "$arc") >"$nerr" 2>&1
     record_constructs "$rel" "$m" "$nerr"
     if [[ -z "$(find "$od" -type f | head -1)" ]]; then
-      M_SKIP[$m]=$((M_SKIP[$m]+1)); record "$rel" "$m" SKIP "legacy x wrote nothing"; continue
+      # The oracle could not extract its own archive -- the 32-bit original runs
+      # out of address space on the large fixtures this sweep is for. The source
+      # file is just as good a reference, since that is what it compressed, so
+      # compare against it instead of dropping the pair.
+      src_ok=0
+      if [[ "$DIRMODE" == "1" ]]; then
+        diff -rq "$fix" "$nd/$(basename "$fix")" >/dev/null 2>&1 && src_ok=1
+      else
+        nfile=$(find "$nd" -type f | head -1)
+        [[ -n "$nfile" ]] && cmp -s "$fix" "$nfile" && src_ok=1
+      fi
+      if [[ $src_ok -eq 1 ]]; then
+        M_PASS[$m]=$((M_PASS[$m]+1)); record "$rel" "$m" PASS "vs source (the original could not extract)"
+      else
+        M_SKIP[$m]=$((M_SKIP[$m]+1)); record "$rel" "$m" SKIP "legacy x wrote nothing"
+      fi
+      continue
     fi
     if [[ "$DIRMODE" == "1" ]]; then
       same=0

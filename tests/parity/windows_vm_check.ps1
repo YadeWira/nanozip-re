@@ -35,7 +35,7 @@ function State($d) {
      "$rel $($_.Length) $($_.Attributes) $((Get-FileHash $_.FullName -Algorithm SHA256).Hash.Substring(0,16))"
   }) -join "`n"
 }
-$pass = 0; $fail = 0
+$pass = 0; $fail = 0; $timing = 0
 foreach ($spec in @("n:-cn","c:-cc","d:-cd","Du:-cD","f:-cf","Fu:-cF","o:-co","Ou:-cO")) {
   $tag, $opt = $spec.Split(":")
   Push-Location src
@@ -57,17 +57,27 @@ foreach ($spec in @("n:-cn","c:-cc","d:-cd","Du:-cD","f:-cf","Fu:-cF","o:-co","O
     }
   }
   # console: l and t
+  # STDOUT only: the banner and the host line go to stderr, and PowerShell
+  # interleaves a merged stream in its own order, which is not a difference in
+  # the program's output.
   function Clean($s) { ($s -split "`r?`n" | Where-Object { $_ -notmatch "MHz|Win32|Win64|IO-|in [0-9]" }) -join "`n" }
   foreach ($cmd in @("l","t")) {
-    $a = Clean ((& $orig $cmd "w_$tag.nz" 2>&1) | Out-String)
+    $a = Clean ((& $orig $cmd "w_$tag.nz" 2>$null) | Out-String)
     foreach ($who in @($ours32, $ours64)) {
-      $b = Clean ((& $who $cmd "w_$tag.nz" 2>&1) | Out-String)
+      $b = Clean ((& $who $cmd "w_$tag.nz" 2>$null) | Out-String)
       if ($a -eq $b) { $pass++ } else {
-        "FAIL ${tag} console $cmd ($(Split-Path -Leaf $who)):"; $fail++
-        Compare-Object ($a -split "`n") ($b -split "`n") | Select-Object -First 4 |
-          ForEach-Object { "    $($_.SideIndicator) $($_.InputObject)" }
+        # A difference only in the progress figures is the documented timing
+        # item: how many "<N> MB" ticks fit on the status line depends on how
+        # many whole seconds the decode crosses.
+        $real = Compare-Object ($a -split "`n") ($b -split "`n") |
+                Where-Object { $_.InputObject -notmatch "MB    |^\s*$" }
+        if (-not $real) { $timing++; "timing ${tag} console $cmd ($(Split-Path -Leaf $who))" }
+        else {
+          "FAIL ${tag} console $cmd ($(Split-Path -Leaf $who)):"; $fail++
+          $real | Select-Object -First 4 | ForEach-Object { "    $($_.SideIndicator) $($_.InputObject)" }
+        }
       }
     }
   }
 }
-"vmcheck: $pass checks passed, $fail failed"
+"vmcheck: $pass checks passed, $timing timing-only, $fail failed"
