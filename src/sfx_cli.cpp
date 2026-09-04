@@ -220,7 +220,15 @@ CliOptions ParseCli(int argc, char** argv) {
     }
 
     if (out.command == Command::kW32c) {
-        if (!plain.empty()) { out.archive_path = plain.front(); plain.erase(plain.begin()); }
+        // The original validates the archive name for `w32c` like any other
+        // command ("Error: Archive name missing..."); only the self-extractor
+        // build itself is missing here.
+        if (plain.empty()) {
+            out.show_usage = true;
+            out.error = "archive name missing";
+            return out;
+        }
+        out.archive_path = plain.front(); plain.erase(plain.begin());
         out.positional = plain;
         return out;
     }

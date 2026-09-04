@@ -676,7 +676,9 @@ bool CollectRawFiles(
         std::error_code ec;
         const fs::file_status st = fs::status(input, ec);
         if (ec || st.type() == fs::file_type::not_found) {
-            warnings->push_back("missing input: " + arg);
+            // The original's own wording, printed without the port's
+            // "Warning: " prefix (measured: `nz a new.nz nope.txt`).
+            warnings->push_back("No files found with " + arg);
             continue;
         }
 
@@ -717,7 +719,7 @@ bool CollectRawFiles(
     }
 
     if (out_files->empty()) {
-        *error = "no usable input files";
+        *error = "Nothing to do (no files found).";
         return false;
     }
     return true;
@@ -1345,6 +1347,19 @@ struct LegacyCnContext {
     // With decode_failed: the streams all decoded cleanly but the output came
     // out short -- reported as "Unexpected end of file." rather than a code.
     bool decode_eof = false;
+    // The file ends before the decoder can start: the record framing itself is
+    // cut, or the first data record carries fewer bytes than the codec's first
+    // block header. The original's reader reports that as "Unexpected end of
+    // file." and never creates a compressor, so no "Compressor #k" line either.
+    // Measured over m_<codec>.nz truncated byte by byte around the first data
+    // record: every codec reports it while the record header is incomplete, and
+    // -cc/-co/-cO also with 1-4 payload bytes (their block header is 5).
+    bool eof_before_decode = false;
+    // A data record's header was read (its payload may be cut). The original
+    // creates the decompressor object then, and that is what prints
+    // "Compressor #k"; an archive cut before its first data record never gets
+    // one. Measured on m_<codec>.nz cut byte by byte around that record.
+    bool saw_data_record = true;
     // The original's status for the failure (ERROR_CODES.md): printed plain when
     // a record follows the failing one, as code<<8|slot when it was the last.
     std::uint32_t decode_code = 0;
@@ -1388,6 +1403,13 @@ void AdoptDecodeError(LegacyCnContext& ctx) {
     nzr::derr::Clear();
 }
 
+// A line from the source collector: the ones that reproduce the original's own
+// wording go out verbatim, the port's extra diagnostics keep "Warning: ".
+inline void PrintCollectorLine(std::ostream& os, const std::string& w) {
+    if (w.rfind("No files found with ", 0) == 0) os << w << '\n';
+    else os << "Warning: " << w << '\n';
+}
+
 // The original's corruption report (ERROR_CODES.md). Returns the exit status:
 // 2 for the "Archive corrupted" lines (main maps it to 0 unless NZ_STRICT_EXIT),
 // 255 for the fatal "Internal error" path, which the original exits with (-1)
@@ -1398,7 +1420,7 @@ int PrintCorruptLine(std::ostream& os, const LegacyCnContext& c) {
         return 255;
     }
     ClearStatusLine(os);
-    if (c.decode_eof) { os << "Archive corrupted. Unexpected end of file.\n"; return 2; }
+    if (c.decode_eof || c.eof_before_decode) { os << "Archive corrupted. Unexpected end of file.\n"; return 2; }
     std::uint32_t code;
     if (c.decode_code == 0u) code = c.truncated_input ? 25600u : 100u;
     else code = c.decode_at_last_record ? ((c.decode_code << 8) | static_cast<std::uint32_t>(c.decode_slot & 0xffu)) : c.decode_code;
@@ -4363,6 +4385,12 @@ bool TryParseLegacyCnArchive(
     // split across parallel streams and has no whole-file checksum.
     std::map<std::string, std::set<unsigned>> path_streams;
     bool truncated_input = false;
+    // The record framing itself ran off the end of the file, or the first data
+    // record is shorter than the codec's first block header: the original never
+    // gets a decoder started and its reader reports "Unexpected end of file."
+    bool eof_before_decode = false;
+    // A data record whose header is complete (its payload may be cut off).
+    bool saw_data_record = false;
 
     // No record-count cap: a 2.29 GB -cf container carries 16 streams x ~144 records
     // (2300+), and an earlier cap of 1024 made the walker stop half-way, so the
@@ -4372,17 +4400,20 @@ bool TryParseLegacyCnArchive(
     for (std::size_t guard = 0; guard <= bytes.size() && pos < bytes.size(); ++guard) {
         const std::size_t record_begin = pos;
         std::uint64_t r64 = 0u;
-        if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) break;
+        if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) {
+            truncated_input = eof_before_decode = true;
+            break;
+        }
         auto r = static_cast<std::uint32_t>(r64);
         unsigned ctype   = r & 0x0fu;
         unsigned cstream = 0u;
         std::size_t csize = static_cast<std::size_t>(r >> 4u);
 
         if (ctype == 15u) {
-            if (pos >= bytes.size()) break;
+            if (pos >= bytes.size()) { truncated_input = eof_before_decode = true; break; }
             unsigned ext = static_cast<unsigned>(bytes[pos++]);
             if (ext >= 0xf8u) {
-                if (pos >= bytes.size()) break;
+                if (pos >= bytes.size()) { truncated_input = eof_before_decode = true; break; }
                 ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[pos++]) + 248u;
             }
             ctype   = ext & 0x0fu;
@@ -4390,9 +4421,23 @@ bool TryParseLegacyCnArchive(
             if (cstream == 0u) ctype += 15u;
         }
 
+        if (ctype == 0u && found_codec) saw_data_record = true;
+
         if (pos + csize > bytes.size()) {
             truncated_input = true;
             psink::MarkTruncated();
+            // Nothing ever reached the decoder: the cut is in a metadata record
+            // (or in a data record the codec cannot even start on), so the
+            // failure comes from the reader and is "Unexpected end of file."
+            // Measured over m_<codec>.nz cut byte by byte: with the first data
+            // record's header whole, -cn/-cd/-cD/-cf/-cF already report their own
+            // status, while -cc/-co/-cO still need the 5 bytes of a block header.
+            const bool cut_in_data = (ctype == 0u && cstream == 0u && found_codec);
+            if (!found_first_data &&
+                (!cut_in_data ||
+                 ((method_p0 == 5u || method_p0 == 6u || method_p0 == 7u) &&
+                  bytes.size() - pos < 5u)))
+                eof_before_decode = true;
             // The original hands the decoder whatever bytes of the cut-off data
             // record exist (its reports on truncated archives -- 4096, 1024, 1536,
             // the lzhds assertion -- come from decoding that stub), so keep it.
@@ -6687,6 +6732,8 @@ bool TryParseLegacyCnArchive(
                      (int)native_store_payload, (int)native_literal_payload);
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
+    ctx.eof_before_decode = eof_before_decode;
+    ctx.saw_data_record = saw_data_record || has_parallel_streams;
     {
         std::size_t acc = 0;
         for (const auto& dr : data_records) { acc += dr.second - dr.first; ctx.payload_record_ends.push_back(acc); }
@@ -8967,6 +9014,9 @@ void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOp
     // rest follow as they start (the progress engine prints them). For a single
     // container the one worker is always running by then.
     const bool parallel = !ctx.parallel_p1.empty();
+    // Cut before the first data record: the original never creates a
+    // decompressor, so no line at all.
+    if (!ctx.saw_data_record) return;
     for (std::size_t k = 0; k < n; ++k) {
         if (parallel && !progress::SlotStarted(k, progress::E())) continue;
         const std::string line = FormatCompressorLine(ctx, k, verbose, test_mode);
@@ -10002,16 +10052,13 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
 
     const bool need_checksums = (options.checksum != ChecksumMode::kNone);
     if (!BuildSourceList(options, &sources, &warnings, &error, need_checksums)) {
-        for (const std::string& w : warnings) {
-            os << "Warning: " << w << '\n';
-        }
-        os << "Error: " << error << '\n';
+        for (const std::string& w : warnings) PrintCollectorLine(os, w);
+        if (error.rfind("Nothing to do", 0) == 0) os << error << '\n';
+        else os << "Error: " << error << '\n';
         return 1;
     }
 
-    for (const std::string& w : warnings) {
-        os << "Warning: " << w << '\n';
-    }
+    for (const std::string& w : warnings) PrintCollectorLine(os, w);
 
     if (native_legacy_stream) {
         std::ostringstream native_log;
@@ -10135,16 +10182,13 @@ int RunSimulate(const CliOptions& options, std::ostream& os) {
     std::string error;
 
     if (!BuildSourceList(options, &sources, &warnings, &error, false)) {
-        for (const std::string& w : warnings) {
-            os << "Warning: " << w << '\n';
-        }
-        os << "Error: " << error << '\n';
+        for (const std::string& w : warnings) PrintCollectorLine(os, w);
+        if (error.rfind("Nothing to do", 0) == 0) os << error << '\n';
+        else os << "Error: " << error << '\n';
         return 1;
     }
 
-    for (const std::string& w : warnings) {
-        os << "Warning: " << w << '\n';
-    }
+    for (const std::string& w : warnings) PrintCollectorLine(os, w);
 
     if (native_legacy_stream) {
         std::ostringstream native_log;
