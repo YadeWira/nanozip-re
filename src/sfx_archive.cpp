@@ -1359,6 +1359,7 @@ struct LegacyCnContext {
     // disk (or verified, for `t`); the extractor only reports.
     bool sink_handled = false;
     std::size_t sink_failed_entries = 0;
+    bool sink_plain_code = false;   // the failing stream had another record ahead
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -1383,7 +1384,7 @@ void AdoptDecodeError(LegacyCnContext& ctx) {
         while (idx + 1u < ctx.payload_record_ends.size() && e.input_pos >= ctx.payload_record_ends[idx]) ++idx;
         last = (idx + 1u == ctx.payload_record_ends.size()) && !ctx.records_after_data;
     }
-    ctx.decode_at_last_record = last;
+    ctx.decode_at_last_record = last && !ctx.sink_plain_code;
     nzr::derr::Clear();
 }
 
@@ -1703,6 +1704,13 @@ struct Stream {
     std::size_t entered_group = 0;    // groups < this had their first file created
     bool entered_any = false;
     bool cut = false;                 // its last data record was cut off by the end of the archive
+    // Where the stream's LAST data record starts, in the same byte space the
+    // decoder consumes. The driver reports a status PLAIN when a later record
+    // step of the same slot notices it, and shifted (status<<8|slot) when the
+    // failing record was the last one or the input ended -- so a failure before
+    // this offset is the plain case. 0 = unknown, which keeps the shifted form.
+    std::uint64_t last_record_start = 0;
+    bool have_last_record = false;
 };
 enum class Policy { kProduced, kGroup, kStore };
 // What a worker of each codec reports when its stream ends early without a
@@ -1746,6 +1754,7 @@ struct Engine {
     std::size_t unsafe = 0;
     std::size_t cannot = 0;
     bool stream_failed = false;
+    bool plain_code = false;          // report the status without the slot (see Stream::last_record_start)
     bool truncated = false;           // the archive itself is cut short
 };
 inline Engine& E() { static Engine e; return e; }
@@ -1755,7 +1764,7 @@ inline void Configure(const CliOptions& opt, bool test_mode, std::ostream& os, c
     Engine& e = E();
     std::lock_guard<std::mutex> lk(e.mu);
     e.configured = !SafeMode();
-    e.published = e.committed = e.stream_failed = e.truncated = false;
+    e.published = e.committed = e.stream_failed = e.plain_code = e.truncated = false;
     e.opt = &opt; e.test_mode = test_mode; e.os = &os; e.root = root;
     e.entries = nullptr; e.streams.clear(); e.files.clear();
     e.yes_to_all = opt.yes_to_all; e.mismatches = e.unsafe = e.cannot = 0;
@@ -1902,6 +1911,16 @@ inline void MismatchLine(Engine& e, const Slice& sl, std::uint32_t got) {
 }
 
 // A worker starts stream k: the first file of its first group is created.
+// The offset, in the byte space this stream's decoder consumes, where its last
+// data record starts. A failure before it is the plainly-reported case.
+inline void SetLastRecordStart(std::size_t k, std::uint64_t off) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    e.streams[k].last_record_start = off;
+    e.streams[k].have_last_record = true;
+}
+
 inline void StreamBegin(std::size_t k) {
     Engine& e = E();
     std::unique_lock<std::mutex> lk(e.mu);
@@ -1936,6 +1955,10 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     }
     if (!ok) {
         e.stream_failed = true;
+        // A failure with another record of this stream still ahead is the one
+        // the driver reports plainly.
+        const nzr::derr::State& st = nzr::derr::Current();
+        if (s.have_last_record && st.has_pos && st.input_pos < s.last_record_start) e.plain_code = true;
         if (nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u) {
             std::uint32_t code = 100u;
             if (clean_end) {
@@ -2005,7 +2028,7 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
 }
 
-struct Outcome { bool committed = false; bool stream_failed = false; std::size_t mismatches = 0; std::size_t failed_entries = 0; };
+struct Outcome { bool committed = false; bool stream_failed = false; bool plain_code = false; std::size_t mismatches = 0; std::size_t failed_entries = 0; };
 
 // Close everything, apply the timestamps, report.
 inline Outcome Finish() {
@@ -2027,7 +2050,7 @@ inline Outcome Finish() {
             if (en.has_win_attr) SetExtractedWinAttributes(f.path, en.win_attr);
         }
     }
-    o.committed = e.committed; o.stream_failed = e.stream_failed;
+    o.committed = e.committed; o.stream_failed = e.stream_failed; o.plain_code = e.plain_code;
     o.mismatches = e.mismatches; o.failed_entries = e.mismatches + e.unsafe + e.cannot;
     e.published = false;   // one container per run
     return o;
@@ -5551,7 +5574,10 @@ bool TryParseLegacyCnArchive(
                             slice_done[idx].store(true, std::memory_order_relaxed);
                             return true;
                         });
-                        if (!all_ok && !use_sink) {
+                        // `assembled` is empty when the sink took the container (and stays
+                        // empty if the sink then declined to publish), so check the buffer,
+                        // not the intent.
+                        if (!all_ok && !assembled.empty()) {
                             // The buffer is uninitialised: give the slices that did not
                             // complete the zeros the zero-filled vector used to hold.
                             for (std::size_t q = 0; q < plist.size(); ++q)
@@ -6027,12 +6053,15 @@ bool TryParseLegacyCnArchive(
                             sub.cm_window_size = cm_window_size;
                             sub.total_data_size = st.osz;
                             std::vector<unsigned char> subdata;
+                            std::uint64_t last_rec = 0;
                             for (const auto& c : st.chunks) {
+                                last_rec = subdata.size();
                                 WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
                                 subdata.insert(subdata.end(),
                                                bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
                                                bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                             }
+                            if (use_sink && st.chunks.size() > 1u) psink::SetLastRecordStart(idx, last_rec);
                             sub.data = std::move(subdata);
                             std::vector<unsigned char> slice;
                             std::string sub_err;
@@ -6226,7 +6255,14 @@ bool TryParseLegacyCnArchive(
                             std::vector<unsigned char> slice;
                             slice.reserve(static_cast<std::size_t>(s.osz));
                             bool sok = true;
-                            if (use_sink) psink::StreamBegin(idx);
+                            if (use_sink) {
+                                psink::StreamBegin(idx);
+                                if (s.chunks.size() > 1u) {
+                                    std::uint64_t off = 0;
+                                    for (std::size_t q = 0; q + 1u < s.chunks.size(); ++q) off += s.chunks[q].second;
+                                    psink::SetLastRecordStart(idx, off);
+                                }
+                            }
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
                                 sok = decode_seq(bytes.data(), c.first, c.first + c.second, s.osz, &slice);
@@ -6642,6 +6678,7 @@ bool TryParseLegacyCnArchive(
         ctx.sink_handled = true;
         ctx.sink_failed_entries = so.failed_entries;
         ctx.decode_failed = so.stream_failed;
+        ctx.sink_plain_code = so.plain_code;
         if (!native_store_payload) native_literal_payload = true;
     }
     if (NZ_ENV("NZ_TRACE_PARSTREAM"))
