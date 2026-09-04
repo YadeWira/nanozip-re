@@ -107,5 +107,8 @@ int main(int argc, char** argv) {
         std::getline(std::cin, line);
     }
     if (rc == 2 && std::getenv("NZ_SAFE") != nullptr) return 2;
+    // The original's fatal "Internal error" path exits with -1 (255) -- the one
+    // status it does not launder to 0 (quirk 1). Reproduced as is.
+    if (rc == 255) return 255;
     return finish(rc);
 }

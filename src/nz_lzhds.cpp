@@ -8,6 +8,7 @@
 // code). Validated byte-exact against 3 real GDB-captured chunks (see the
 // session's research artifacts) before this C++ transcription.
 #include "nz_env.h"
+#include "nz_decode_error.h"
 #include "nz_lzhds.h"
 #include <cstdio>
 #include <cstdlib>
@@ -508,6 +509,11 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
         // FUN_080982e0's own `uVar10 = uVar8-3; uVar13 = iVar11+4+
         // (0x3fff<uVar10)+(0x3ff<uVar10)+(0x7fffff<uVar10)`).
         if (offset == 0u || offset > ring_size) return 0u;
+        // FUN_080982e0 copies the whole match and then asserts that it fitted
+        // (`if (remaining < mlen) FUN_08048370(0x143f7ac)`): "Internal error:
+        // 21231532!" and exit(-1). The copy is clamped here for memory safety;
+        // the assertion is reported the same way.
+        if (mlen > out_size - pos) nzr::derr::Fatal(0x143f7acu);
         std::uint32_t mcopy = (mlen < out_size - pos) ? mlen : (out_size - pos);
         // The source pointer is resolved ONCE, at the match start -- wrapped by
         // the capacity only if pos - offset is negative -- and the copy then

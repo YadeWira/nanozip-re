@@ -1,5 +1,6 @@
 #include "nz_env.h"
 #include "nz_trace.h"
+#include "nz_decode_error.h"
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #endif
@@ -1228,12 +1229,60 @@ struct LegacyCnContext {
     // With decode_failed: the streams all decoded cleanly but the output came
     // out short -- reported as "Unexpected end of file." rather than a code.
     bool decode_eof = false;
+    // The original's status for the failure (ERROR_CODES.md): printed plain when
+    // a record follows the failing one, as code<<8|slot when it was the last.
+    std::uint32_t decode_code = 0;
+    std::uint32_t decode_fatal_id = 0;
+    std::size_t decode_slot = 0;
+    bool decode_at_last_record = false;
+    // Data records in payload (spliced) space: cumulative end offsets, and
+    // whether any record follows the last data record in the file.
+    std::vector<std::size_t> payload_record_ends;
+    bool records_after_data = false;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
     std::uint64_t total_data_size = 0;
     ByteBuffer data;
 };
+
+// Copies the thread's recorded decode error (nz_decode_error.h) into the context
+// and decides how the original would print it: plain when a record follows the
+// failing one, code<<8|slot when the failing record was the archive's last (or
+// the input ended). The failing record is found from the input offset the
+// decoder recorded, in payload (spliced data record) space.
+void AdoptDecodeError(LegacyCnContext& ctx) {
+    const nzr::derr::State& e = nzr::derr::Current();
+    ctx.decode_code = e.code;
+    ctx.decode_fatal_id = e.fatal_id;
+    ctx.decode_slot = e.parallel ? e.slot : 0u;
+    bool last = ctx.truncated_input || e.parallel;   // a worker stream's status is always reported at the end
+    if (!e.parallel && e.has_pos && !ctx.payload_record_ends.empty()) {
+        std::size_t idx = 0;
+        while (idx + 1u < ctx.payload_record_ends.size() && e.input_pos >= ctx.payload_record_ends[idx]) ++idx;
+        last = (idx + 1u == ctx.payload_record_ends.size()) && !ctx.records_after_data;
+    }
+    ctx.decode_at_last_record = last;
+    nzr::derr::Clear();
+}
+
+// The original's corruption report (ERROR_CODES.md). Returns the exit status:
+// 2 for the "Archive corrupted" lines (main maps it to 0 unless NZ_STRICT_EXIT),
+// 255 for the fatal "Internal error" path, which the original exits with (-1)
+// and whose line comes after a newline, without clearing the status line.
+int PrintCorruptLine(std::ostream& os, const LegacyCnContext& c) {
+    if (c.decode_fatal_id != 0u) {
+        os << "\nInternal error: " << c.decode_fatal_id << "! Please report this to sami (at) nanozip.net.\n";
+        return 255;
+    }
+    ClearStatusLine(os);
+    if (c.decode_eof) { os << "Archive corrupted. Unexpected end of file.\n"; return 2; }
+    std::uint32_t code;
+    if (c.decode_code == 0u) code = c.truncated_input ? 25600u : 100u;
+    else code = c.decode_at_last_record ? ((c.decode_code << 8) | static_cast<std::uint32_t>(c.decode_slot & 0xffu)) : c.decode_code;
+    os << "Archive corrupted. Error decoding (code " << code << ")\n";
+    return 2;
+}
 
 // ---------------------------------------------------------------------------
 // Progress engine: the original's status line as decompiled (FUN_0804b740 /
@@ -2021,12 +2070,29 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     const std::size_t threads = std::min<std::size_t>(DecodeThreadCount(), n);
     std::atomic<bool> ok{true};
     std::atomic<bool> oom{false};
+    // The original reports the FIRST slot (lowest index) that holds an error
+    // status, as status<<8 | slot. Each worker's decoders record their status in
+    // the thread-local channel; collect the lowest slot's and hand it to the
+    // calling thread when the batch is over.
+    std::mutex fail_mu;
+    bool have_fail = false; std::size_t fail_slot = 0; nzr::derr::State fail_state;
+    const auto record_failure = [&](std::size_t i) {
+        std::lock_guard<std::mutex> lk(fail_mu);
+        if (!have_fail || i < fail_slot) { have_fail = true; fail_slot = i; fail_state = nzr::derr::Current(); }
+        nzr::derr::Clear();
+    };
+    const auto publish_failure = [&]() {
+        if (!have_fail) return;
+        nzr::derr::t_state = fail_state; nzr::derr::t_state.parallel = true; nzr::derr::t_state.slot = fail_slot;
+        if (nzr::derr::t_state.code == 0u && nzr::derr::t_state.fatal_id == 0u) nzr::derr::t_state.code = 100u;
+    };
     if (threads <= 1u) {
         for (std::size_t i = 0; i < n && ok; ++i) {
             progress::SlotScope slot(i);
-            if (!fn(i)) ok = false;
+            if (!fn(i)) { ok = false; record_failure(i); }
             else progress::StreamDone(i);
         }
+        publish_failure();
         return ok;
     }
     std::atomic<std::size_t> next{0};
@@ -2036,7 +2102,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
             if (i >= n || !ok) return;
             try {
                 progress::SlotScope slot(i);
-                if (!fn(i)) ok = false;
+                if (!fn(i)) { ok = false; record_failure(i); }
                 else progress::StreamDone(i);
             } catch (const std::bad_alloc&) {
                 oom = true; ok = false;
@@ -2971,9 +3037,15 @@ bool DecodeLzpfMember(
     // fresh zeroed vector that is then copied -- two passes over the output
     // saved. With it, `verify` takes (const unsigned char*, std::size_t) and
     // *out is left empty on success.
-    unsigned char* direct_out = nullptr) {
+    unsigned char* direct_out = nullptr,
+    // The archive was cut inside this member: decode the bytes that exist, as
+    // the original does (its truncation reports come from that stub decode).
+    bool allow_truncated = false) {
     progress::Scope pscope;
-    if (first_block_pos + first_stream_len > bytes.size()) return false;
+    if (first_block_pos + first_stream_len > bytes.size()) {
+        if (!allow_truncated || first_block_pos >= bytes.size()) return false;
+        first_stream_len = bytes.size() - first_block_pos;
+    }
     // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
     // header fields) plus the decline point — the fastest way to tell whether a
     // failing member even reaches the stereo prefilter path.
@@ -3097,7 +3169,7 @@ bool DecodeLzpfMember(
         lzpf_img.Configure(0x00u, 16u, 16u, true);
         while (total_written < total) {
             if (input_pos >= stream_data_end) {
-                if (input_pos != stream_data_end) { decode_ok = false; break; }
+                if (input_pos != stream_data_end) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 member_done = total_written;
                 // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
                 // + width) before the next stream tag.
@@ -3113,16 +3185,19 @@ bool DecodeLzpfMember(
                 }
                 std::uint64_t next_tag = 0;
                 if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
-                    (next_tag & 0x0fu) != 0u) { decode_ok = false; break; }
-                const std::uint64_t next_bytes = next_tag >> 4u;
+                    (next_tag & 0x0fu) != 0u) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                std::uint64_t next_bytes = next_tag >> 4u;
+                if (next_bytes != 0u && allow_truncated &&
+                    next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos))
+                    next_bytes = static_cast<std::uint64_t>(bytes.size() - input_pos);
                 if (next_bytes == 0u ||
                     next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos)) {
-                    decode_ok = false; break;
+                    nzr::derr::SetAt(2u, input_pos); decode_ok = false; break;
                 }
                 stream_data_end = input_pos + static_cast<std::size_t>(next_bytes);
             }
             std::uint32_t uvar9 = 0;
-            if (!decode_lzpf_header(input_pos, uvar9)) { decode_ok = false; break; }
+            if (!decode_lzpf_header(input_pos, uvar9)) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
             const bool mode_prefilter = ((uvar9 & 7u) == 4u);
             const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
             const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
@@ -3143,8 +3218,8 @@ bool DecodeLzpfMember(
                 const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;   // 1 = image block
                 std::uint64_t block_out_size = uvar9 >> 4u;
                 if (block_out_size == 0u) block_out_size = 0x8000u;
-                if (block_out_size > 0x8001u) { decode_ok = false; break; }
-                if (total_written + block_out_size > total) { decode_ok = false; break; }
+                if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
+                if (total_written + block_out_size > total) { nzr::derr::SetAt(3u, input_pos); decode_ok = false; break; }
                 const std::size_t block_start_in_window = window_cursor;
                 const std::size_t avail_in = stream_data_end - input_pos;
                 const std::uint8_t pf_hdr = bytes[input_pos];
@@ -3175,7 +3250,7 @@ bool DecodeLzpfMember(
                             sw, en, wq, pf_consumed);
                 }
                 ++blk_idx;
-                if (pf_consumed == 0) { decode_ok = false; break; }
+                if (pf_consumed == 0) { nzr::derr::SetAt(5u, input_pos); decode_ok = false; break; }
                 input_pos += pf_consumed;
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 std::memcpy(decoded + total_written, window + block_start_in_window,
@@ -3209,7 +3284,7 @@ bool DecodeLzpfMember(
                 progress::Add(block_out_size);
                 continue;
             }
-            if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { decode_ok = false; break; }
+            if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { nzr::derr::SetAt(5u, input_pos); decode_ok = false; break; }
             if (trace_lzpf) {
                 fprintf(stderr, "[lzpf] blk#%zu %s uvar9=%u out=%llu\n", blk_idx,
                         mode_literal ? "lit" : (mode_lz77_side ? "lz-side" : "lz-raw"),
@@ -3237,8 +3312,8 @@ bool DecodeLzpfMember(
             pf_lms_ch2.Init();
             std::uint64_t block_out_size = uvar9 >> 3u;
             if (block_out_size == 0u) block_out_size = 0x8000u;
-            if (block_out_size > 0x8001u) { decode_ok = false; break; }
-            if (total_written + block_out_size > total) { decode_ok = false; break; }
+            if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
+            if (total_written + block_out_size > total) { nzr::derr::SetAt(3u, input_pos); decode_ok = false; break; }
             // Exe un-transform (uvar9 bit 2). The real dispatcher
             // FUN_08097570 does, for every NON-prefilter block:
             //     if ((uVar9 & 4) != 0)
@@ -3264,7 +3339,9 @@ bool DecodeLzpfMember(
                                 static_cast<std::uint32_t>(out_off + 4u));
             };
             if (mode_literal) {
-                if (input_pos + block_out_size > stream_data_end) { decode_ok = false; break; }
+                // A block that consumes more input than its stream holds is the
+                // original's status 6 (FUN_08097e20, checked after the block).
+                if (input_pos + block_out_size > stream_data_end) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
                 const std::size_t block_start_in_window = window_cursor;
                 std::memcpy(window + block_start_in_window, bytes.data() + input_pos,
                             static_cast<std::size_t>(block_out_size));
@@ -3317,7 +3394,7 @@ bool DecodeLzpfMember(
             std::size_t* raw_consumed_ptr = nullptr;
             std::size_t raw_consumed = 0;
             if (mode_lz77_side) {
-                if (input_pos + 2u > stream_data_end) { decode_ok = false; break; }
+                if (input_pos + 2u > stream_data_end) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
                 const std::uint16_t side_count =
                     static_cast<std::uint16_t>(bytes[input_pos]) |
                     (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
@@ -3327,7 +3404,7 @@ bool DecodeLzpfMember(
                 const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
                     bytes.data() + input_pos, arith_size,
                     bytecode.data(), side_count, /*max_len=*/12);
-                if (consumed == 0 || consumed > arith_size) { decode_ok = false; break; }
+                if (consumed == 0 || consumed > arith_size) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
                 input_pos += consumed;
                 bc_ptr = bytecode.data();
                 bc_len = side_count;
@@ -3347,9 +3424,12 @@ bool DecodeLzpfMember(
                       bc_ptr, bc_len, window, window_capacity,
                       &window_cursor, static_cast<std::size_t>(block_out_size),
                       hash_table.data(), &last_lz_dest, raw_consumed_ptr);
-            if (!dispatch_ok) { decode_ok = false; break; }
+            if (!dispatch_ok) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
             if (mode_lz77_raw) input_pos += raw_consumed;
-            if (window_cursor != block_start_in_window + block_out_size) { decode_ok = false; break; }
+            // The original does not check that the LZ77 block filled its slot; on
+            // garbage it copies the slot out and moves to the next header, which is
+            // where its report comes from. Same here (the slot is bounded).
+            window_cursor = block_start_in_window + block_out_size;
             std::memcpy(decoded + total_written, window + block_start_in_window,
                         static_cast<std::size_t>(block_out_size));
             apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
@@ -3574,7 +3654,15 @@ bool TryParseLegacyCnArchive(
             if (cstream == 0u) ctype += 15u;
         }
 
-        if (pos + csize > bytes.size()) { truncated_input = true; break; }
+        if (pos + csize > bytes.size()) {
+            truncated_input = true;
+            // The original hands the decoder whatever bytes of the cut-off data
+            // record exist (its reports on truncated archives -- 4096, 1024, 1536,
+            // the lzhds assertion -- come from decoding that stub), so keep it.
+            if (ctype == 0u && cstream == 0u && found_codec && pos < bytes.size())
+                data_records.push_back({record_begin, bytes.size()});
+            break;
+        }
         const bool is_main = (cstream == 0u);
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] @%zu ctype=%u cstream=%u csize=%zu codec=%d table=%d\n",
@@ -5361,7 +5449,7 @@ bool TryParseLegacyCnArchive(
                     if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
                                          total_data_size, is_variant_b, method_p1,
                                          /*derived_cap_only=*/checksum_mode == ChecksumMode::kNone,
-                                         member_verify, &member_out)) {
+                                         member_verify, &member_out, nullptr, truncated_input)) {
                         native_literal_payload = true;
                         literal_data_offset = 0u;
                         literal_data_size = member_out.size();
@@ -5371,6 +5459,8 @@ bool TryParseLegacyCnArchive(
                         // The members completed before the failing one (see
                         // DecodeLzpfMember): written the way the original does.
                         partial_prefix = std::move(member_out);
+                        if (!use_splice && nzr::derr::t_state.has_pos && nzr::derr::t_state.input_pos >= payload_start)
+                            nzr::derr::t_state.input_pos -= payload_start;   // archive offset -> payload space
                     }
                 }
 
@@ -5586,6 +5676,12 @@ bool TryParseLegacyCnArchive(
     }
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
+    {
+        std::size_t acc = 0;
+        for (const auto& dr : data_records) { acc += dr.second - dr.first; ctx.payload_record_ends.push_back(acc); }
+        ctx.records_after_data = !data_records.empty() && data_records.back().second < bytes.size();
+    }
+    if (ctx.decode_failed) AdoptDecodeError(ctx);
     // Every native_literal_payload path above went through validate_decoded_candidate
     // (or the partial fallback, whose verdicts are in entry_checksum_ok).
     ctx.checksums_verified = native_literal_payload && checksum_verification_supported && !ctx.decode_failed;
@@ -5861,8 +5957,14 @@ static bool TryDecodeLegacyLzhd(
             if (!ok) break;
         }
         if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
-        const std::uint64_t stream_bytes = stream_tag >> 4u;
-        if (stream_bytes == 0u || stream_bytes > raw_len - pos) { ok = false; break; }
+        std::uint64_t stream_bytes = stream_tag >> 4u;
+        if (stream_bytes == 0u) { ok = false; break; }
+        bool cut_stream = false;
+        if (stream_bytes > raw_len - pos) {
+            if (!legacy.truncated_input) { ok = false; break; }
+            stream_bytes = raw_len - pos;   // the cut-off last record: decode what exists, as the original does
+            cut_stream = true;
+        }
 
         const std::uint8_t* block_in  = raw + pos;
         const std::uint32_t block_in_size = static_cast<std::uint32_t>(stream_bytes);
@@ -5883,8 +5985,14 @@ static bool TryDecodeLegacyLzhd(
             fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);
         }
-        if (produced == 0u) { ok = false; break; }
+        if (produced == 0u) { nzr::derr::SetAt(16u, static_cast<std::size_t>(block_in - raw)); ok = false; break; }   // header read past the stream end: -0x10
         if (!nzr::cd::NzCdLastStreamClean()) {
+            // A chunk that failed inside a cut-off stream: nz_lzhd's header reader
+            // runs out of input first (-0x10) whatever the chunk decoder noticed.
+            // (nz_lzhds behaves differently there -- it reaches its reconstruct
+            // assertion on the garbage -- and is not modelled.)
+            if (cut_stream && !is_lzhds) { nzr::derr::Clear(); nzr::derr::SetAt(16u, static_cast<std::size_t>(block_in - raw)); }
+            else nzr::derr::SetAt(5u, static_cast<std::size_t>(block_in - raw));
             // The stream stopped on a malformed chunk: the original reports the
             // error here (code 5) and has flushed only the streams before it.
             if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
@@ -6036,7 +6144,10 @@ static bool TryDecodeLegacyCm(
             chunk_type = r & 0x0fu;
             if ((r >> 4) == 0u) chunk_type += 15u;
         }
-        if (chunk_size > raw_len - pos) { ok = false; break; }
+        if (chunk_size > raw_len - pos) {
+            if (!legacy.truncated_input) { ok = false; break; }
+            chunk_size = static_cast<std::uint32_t>(raw_len - pos);   // cut-off last record (see the parser)
+        }
         if (chunk_type != 0u) {
             // Metadata chunk between data chunks. One of these can be the entry's
             // CHECKSUM: it is a type-5 record, and it does NOT have to sit in the
@@ -6127,7 +6238,7 @@ static bool TryDecodeLegacyCm(
                     fprintf(stderr, "[TDCC] audio Decode(payload_size=%u out_size=%u) -> %d\n",
                             payload_size, alt_out_size, aok ? 1 : 0);
                 }
-                if (!aok) { ok = false; break; }
+                if (!aok) { nzr::derr::SetAt(16u, pos); ok = false; break; }
                 // NOTE: the reference does not feed audio output through the CM
                 // model. Our stored-block path does feed it (an empirically
                 // established deviation -- see the long comment below), so if a
@@ -6150,7 +6261,7 @@ static bool TryDecodeLegacyCm(
                 fprintf(stderr, "[TDCC] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
                         payload_size, alt_out_size, iused);
             }
-            if (iused == 0u) { ok = false; break; }
+            if (iused == 0u) { nzr::derr::SetAt(2u, pos); ok = false; break; }
             out_data->insert(out_data->end(), work3.begin(), work3.end());
             progress::Add(work3.size());
             continue;
@@ -6183,9 +6294,17 @@ static bool TryDecodeLegacyCm(
         std::string stg;
         std::size_t stage_idx = 0;
         bool stage_bad = false;
+        std::uint32_t stage_bad_code = 100u;
+        // The original checks each stage the moment it is computed and stops
+        // there; ours defers the verdict to the block end (the LIFO index needs
+        // the stage count). So when a sub-decoder fails on a block whose earlier
+        // stage already mismatched, the original had reported THAT stage first.
+        const auto fail_code = [&](std::uint32_t own) { return stage_bad ? stage_bad_code : own; };
         const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
             const unsigned got = StageCheck255(p, n);
-            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got) stage_bad = true;
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got && !stage_bad) {
+                stage_bad = true; stage_bad_code = nzr::derr::StageCode(nm);
+            }
             ++stage_idx;
             if (!trace_stg) return;
             char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
@@ -6506,7 +6625,7 @@ static bool TryDecodeLegacyCm(
         }
 
         stg_report();
-        if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
+        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         progress::Add(cur_size);
         }
@@ -6521,6 +6640,7 @@ static bool TryDecodeLegacyCm(
     }
     if (!ok) {
         // Completed blocks stay in out_data (see TryDecodeLegacyOptimum).
+        nzr::derr::Set(100u);   // anything not classified above is the payload stage check of the original
         if (out_error_message) *out_error_message = "cm: malformed block stream";
         return false;
     }
@@ -6718,7 +6838,7 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
             }
             if (audio_out_size == 0u) continue;
-            if (audio_out_size > total_size_hint - out_data->size()) { ok = false; break; }
+            if (audio_out_size > total_size_hint - out_data->size()) { nzr::derr::SetAt(14u, pos); ok = false; break; }
             if (decr_param == 3u) {
                 // Image block (FUN_080a9ca0 on the codec's image object; the
                 // community reference wrongly treats this shape as CM-only and
@@ -6731,7 +6851,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
                             payload_size, audio_out_size, iused);
                 }
-                if (iused == 0u) { ok = false; break; }
+                if (iused == 0u) { nzr::derr::SetAt(2u, pos); ok = false; break; }
                 out_data->insert(out_data->end(), ibuf.begin(), ibuf.end());
                 progress::Add(ibuf.size());
                 continue;
@@ -6750,7 +6870,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] audio Decode(payload_size=%u out_size=%u) -> %d\n",
                         payload_size, audio_out_size, aok ? 1 : 0);
             }
-            if (!aok) { ok = false; break; }
+            if (!aok) { nzr::derr::SetAt(16u, pos); ok = false; break; }
             out_data->insert(out_data->end(), abuf.begin(), abuf.end());
                 progress::Add(abuf.size());
             continue;
@@ -6786,9 +6906,17 @@ static bool DecodeOptimumBlockSequence(
         // unmodelled stage (the exe filter?) can never fail a good archive.
         std::size_t stage_idx = 0;
         bool stage_bad = false;
+        std::uint32_t stage_bad_code = 100u;
+        // The original checks each stage the moment it is computed and stops
+        // there; ours defers the verdict to the block end (the LIFO index needs
+        // the stage count). So when a sub-decoder fails on a block whose earlier
+        // stage already mismatched, the original had reported THAT stage first.
+        const auto fail_code = [&](std::uint32_t own) { return stage_bad ? stage_bad_code : own; };
         const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
             const unsigned got = StageCheck255(p, n);
-            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got) stage_bad = true;
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got && !stage_bad) {
+                stage_bad = true; stage_bad_code = nzr::derr::StageCode(nm);
+            }
             ++stage_idx;
             if (!trace_stg) return;
             char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
@@ -6963,7 +7091,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] BWT DecodeInput(payload_size=%u out_size=%u) -> %d\n",
                             payload_size, out_size, bdi_ok ? 1 : 0);
                 }
-                if (!bdi_ok) { ok = false; break; }
+                if (!bdi_ok) { nzr::derr::SetAt(fail_code(3u), pos); ok = false; break; }
                 cur_size = out_size;
                 stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
             }
@@ -6972,7 +7100,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
                         cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
             }
-            if (!bwt_ok) { ok = false; break; }
+            if (!bwt_ok) { nzr::derr::SetAt(fail_code(103u), pos); ok = false; break; }
             stgmark("bwt", work.data(), cur_size);
 
             // params 14/15 run here: after the inverse BWT, before the shared
@@ -6993,7 +7121,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
                             param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
                 }
-                if (!p14ok || n14 == 0u) { ok = false; break; }
+                if (!p14ok || n14 == 0u) { nzr::derr::SetAt(fail_code(5u), pos); ok = false; break; }
                 t14.resize(n14); work.swap(t14); cur_size = n14;
                 stgmark("p14", work.data(), cur_size);
             }
@@ -7250,7 +7378,7 @@ static bool DecodeOptimumBlockSequence(
                     tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, dece_param, hx.c_str(), stg.c_str(),
                     stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
         }
-        if (stage_idx == staged.size() && stage_bad) { ok = false; break; }
+        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         progress::Add(cur_size);
         nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
@@ -7398,6 +7526,7 @@ static bool TryDecodeLegacyOptimum(
         // has written exactly those by the time it reports the error.
         if (out_data->size() > static_cast<std::size_t>(legacy.total_data_size))
             out_data->resize(static_cast<std::size_t>(legacy.total_data_size));
+        nzr::derr::Set(100u);
         if (out_error_message) *out_error_message = "optimum: decode failed";
         return false;
     }
@@ -7938,6 +8067,7 @@ int RunLegacyCnExtractOrTest(
             bridged.entry_checksum_ok.clear();
             bridged.decode_failed = true;
             bridged.decode_eof = (lzhd_decode_error == "lzhd: unexpected end of file");
+            AdoptDecodeError(bridged);
             bridged.data = std::move(*partial);
             return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
         }
@@ -8100,11 +8230,7 @@ int RunLegacyCnExtractOrTest(
         // Measured: no footer, just the error line (code 100; 25600 when the
         // archive is cut short -- the original has more codes, see
         // docs/ORIGINAL_QUIRKS.md).
-        ClearStatusLine(os);
-        if (legacy.decode_eof) os << "Archive corrupted. Unexpected end of file.\n";
-        else os << "Archive corrupted. Error decoding (code "
-                << (legacy.truncated_input ? 25600 : 100) << ")\n";
-        return 2;
+        return PrintCorruptLine(os, legacy);
     }
     // The original prints its normal footer after a checksum mismatch; so do we.
     // Status 2 marks the damage; main() maps it to the original's 0 unless
@@ -9061,14 +9187,13 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
 
                 // Measured: an undecodable payload is "Archive corrupted. Error
                 // decoding (code 100)"; one cut off before its end is code 25600.
-                ClearStatusLine(os);
-                os << "Archive corrupted. Error decoding (code "
-                   << (legacy_cn.truncated_input ? 25600 : 100) << ")\n";
+                AdoptDecodeError(legacy_cn);
+                const int corrupt_rc = PrintCorruptLine(os, legacy_cn);
                 if (NativeTrace()) {
                     os << "[native] no native decoder accepted this stream; payload mode: "
                        << LegacyPayloadModeLabel(legacy_cn.payload_mode) << '\n';
                 }
-                return 2;   // status 2: damaged / undecodable content
+                return corrupt_rc;   // 2: damaged / undecodable content; 255: the original's fatal path
             }
 
         }

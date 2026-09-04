@@ -1,6 +1,7 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
 #include "nz_env.h"
+#include "nz_decode_error.h"
 #include "nz_trace.h"
 #include <cstdio>
 #include <cstdlib>
@@ -411,7 +412,7 @@ static const unsigned char g_kCdModelLen[64] = {
     24,24,25,25,26,26,27,27,28,28,29,29,30,30,31,31,
 };
 // FUN_080b1dc0: bounded LEB-ish varint over a byte cursor (limit bounds byte count).
-struct CdRd { const std::uint8_t* cur; const std::uint8_t* end; };
+struct CdRd { const std::uint8_t* cur; const std::uint8_t* end; bool overrun = false; };
 // Bytes still readable. NEVER compute this as `(std::size_t)(r.end - r.cur)`:
 // several advances below are driven by a length read out of the stream, and once
 // cur passes end that subtraction underflows to ~2^64, after which the next
@@ -428,6 +429,7 @@ static bool CdSkip(CdRd& r, std::uint32_t n) {
     return true;
 }
 static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
+    if (r.cur >= r.end) r.overrun = true;
     std::uint8_t b = (r.cur < r.end) ? *r.cur++ : 0;
     if (limit < 0x101u) return b;
     std::uint32_t acc = 0, sh = 0;
@@ -435,6 +437,7 @@ static std::uint32_t CdReadVar(CdRd& r, std::uint32_t limit) {
         if (!(b & 0x80u)) return (static_cast<std::uint32_t>(b & 0x7fu) << sh) | acc;
         acc |= static_cast<std::uint32_t>(b & 0x7fu) << sh; sh += 7;
         limit = ((limit & 0x7fu) ? 1u : 0u) + (limit >> 7);
+        if (r.cur >= r.end) r.overrun = true;
         b = (r.cur < r.end) ? *r.cur++ : 0;
         if (limit < 0x101u) return (static_cast<std::uint32_t>(b) << sh) | acc;
     }
@@ -793,6 +796,11 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         std::fprintf(stderr, "[CD] hdr: chunk=0x%x flags=0x%x out_size=%u pure_lit=%d is_lzhds=%d\n",
                      chunk, flags, out_size, (int)pure_literal, (int)is_lzhds);
     }
+    if (r.overrun) {   // the header reader ran past the stream: the original's -0x10
+        CD_FAIL("chunk header runs past the stream end\n");
+        nzr::derr::SetAt(16u, *block_pos);
+        return 0;
+    }
     if (out_size == 0) return 0;
     // out_size <= 0x8001 always (the size field is a 0x80010-limited varint, the
     // delta a 0x8001-limited one) and fits the 64 KB ring. A corrupt header can
@@ -801,6 +809,10 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // 2 MB archive). The original stops with "Internal error".
     if (out_size > 0x8001u) {
         CD_FAIL("chunk out_size %u exceeds the 0x8001 maximum\n", out_size);
+        // The original has no such bound: it runs on and trips its "output beyond
+        // the total" checks (-13 LZ / -10 CM / -11 prefilter) or, on a match that
+        // outruns the chunk, its assertion 21231532 (lzhds). Report the first.
+        nzr::derr::SetAt(is_cm_chunk ? 10u : (is_pf_chunk ? 11u : 13u), *block_pos);
         return 0;
     }
     // The ring write base RESETS to 0 when this chunk would not fit before the ring
@@ -1112,6 +1124,10 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     // 18 s per chunk, fuzz 2026-09-03) -- the per-entry work-budget invariant.
     if (litsum > out_size || summlen > out_size + 0x1000000u) {
         CD_FAIL("token list asks for %u literals / %u match bytes on a %u-byte chunk\n", litsum, summlen, out_size);
+        // The original runs the reconstruction anyway; nz_lzhds' asserts on a
+        // match that outruns the chunk ("Internal error: 21231532!", exit -1),
+        // nz_lzhd's clamps and the token loop then fails (-5).
+        if (is_lzhds) nzr::derr::Fatal(0x143f7acu); else nzr::derr::SetAt(5u, *block_pos);
         return 0;
     }
     std::uint32_t total_lit = litsum;
@@ -1195,6 +1211,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
     *recon_advance = base + out_size;
     if (flags & 8u) {   // text pipeline: param14 / line-RLE / CRLF / word-dict
         std::uint32_t n = NzCdTextPipeline(slice.data(), out_size, out, out_cap, text_param);
+        if (n == 0u) nzr::derr::SetAt(6u, *block_pos);   // FUN_080a3c90 returned 0 -> -6
         return n;
     }
     std::uint32_t n;
@@ -1287,6 +1304,9 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
         if (n == 0 || pos <= prev) {
             CD_FAIL("stream stop: n=%u pos=%zu prev=%zu block_len=%zu written=%u/%u\n",
                     n, pos, prev, block_len, written, out_cap);
+            // A chunk that could not be decoded: the token loop of the original
+            // exits with -5 unless a more specific status was recorded above.
+            nzr::derr::SetAt(5u, prev);
             break;   // malformed / no progress
         }
         written += n;
