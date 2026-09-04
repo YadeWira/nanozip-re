@@ -95,11 +95,22 @@ with 0, 2^1 … 2^31, 0.
 
 ## How these were measured
 
-Two harnesses drive the original and nanozip-re through identical invocations and compare
-stdout, stderr, exit status and the tree of written files (mode, timestamp, size, path):
-`matrix.sh` (36 command/format cases) and `matrix2.sh` (78 switch cases), plus
-`corrupt_compare_all.sh` (one flipped byte at five offsets and a truncation, on a five-file archive
-of every codec, 48 cases; `x`, `l` and `t`, trees and report lines compared), and `matrix3.sh` (77 cases on hand-built trees: empty files, links,
-odd names, modes, extreme mtimes, hostile paths, `-o`/`-x`/`-sp` corners, time zones and
-locales). They live with the project's private tooling and are described in the wiki's
-Reverse-Engineering-Notes.
+Every item above comes from driving the original and nanozip-re through identical invocations and
+comparing stdout, stderr, exit status and the tree of written files (contents, mode, timestamp, size,
+path). The harnesses now live in the repository, under `tests/`, so a clean clone reproduces the
+numbers; `tests/parity/make_fixtures.sh` builds their archives with the original rather than shipping
+them.
+
+| harness | what it drives |
+|---|---|
+| `tests/parity/matrix.sh`, `matrix2.sh`, `matrix3.sh` | 182 command, switch and shape cases: hand-built trees, empty files, links, odd names, modes, extreme timestamps, hostile paths, `-o`/`-x`/`-sp` corners, time zones and locales. `compare.sh` scores them, separating the status-line writes from real differences |
+| `tests/parity/pty_prompt.py` | the overwrite prompt through a real pty, key by key |
+| `tests/parity/corrupt_compare_all.sh` | one flipped byte at five offsets and a truncation, on a multi-file archive of every codec: 48 cases, `x`, `l` and `t`, trees and report lines |
+| `tests/parity/corrupt_compare_parallel.sh` | the same for parallel containers, single- and multi-file: 112 cases |
+| `tests/sweep_dirs.sh` | directory trees with symlinks, unreadable files and setuid/sticky modes, every codec plus `-fo` |
+| `tests/sfx_exe.sh` | self-extracting `.exe` archives of every codec |
+| `tests/windows_original.sh`, `tests/parity/windows_vm_check.ps1` | archives made by the **Windows** original, through wine and on a real Windows machine |
+| `tests/env_switches.sh` | the environment switches this port adds |
+
+The reverse-engineering side (GDB scripts, Ghidra passes, the per-stage dumps) is described in the
+wiki's Reverse-Engineering-Notes.
