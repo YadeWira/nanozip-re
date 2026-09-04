@@ -449,94 +449,17 @@ class AudioBitcountDecoderB {
 };
 
 // ---------------------------------------------------------------------------
-// GDB GROUND TRUTH, 2026-09-01 -- what the real binary actually does for a
-// `decr_param == 2` block, and why this AudioPred transcription only agrees with
-// it under `-cO`.
-//
-// HISTORICAL INVESTIGATION RECORD (2026-09-01). The audio path is fully ported
-// and byte-exact for -co, -cO and -cc (suite 88/88, 85d046e): every "NOT ported" /
-// "unported" below describes the state at the time and was resolved -- the -co
-// bit-count class (FUN_0809bdc0) is SetBitcountVariantB, FUN_080958d0 is the
-// extra -co/-cc predictor stage, FUN_08096160 the -cO inter-channel stage. Kept
-// because the measurement method and the refuted hypotheses are still useful.
-//
-// Captured against `linux32/nz` on the three archives in ~/.cache/nzre_aud by
-// watchpointing the residual array the real decoder hands to its reconstruction
-// call (`FUN_080a50c0`, 3rd argument), then watching one element of it to get the
-// sequence of stages that write it:
-//
-//   -cO :  FUN_0809bbf0  ->  FUN_08095d90  ->  FUN_08096160
-//   -co :  FUN_0809bbf0  ->  FUN_080958d0  ->  FUN_08095d90  ->  FUN_08096e20
-//   (-cc takes the -co shape)
-//
-// So the audio path is NOT a separate algorithm family: it is assembled from the
-// SAME primitives as the lzpf prefilter, three of which this tree already has
-// byte-exact --
-//   FUN_0809bbf0 = nzr::lzpf::DecodeResidualsStereo  (in-tree, and its comment
-//                  calls it speculative/never-the-real-path -- true for lzpf,
-//                  FALSE for audio: this is its real caller)
-//   FUN_08095d90 = nzr::lzpf::LpcPredictor / PrefilterPlane
-//   FUN_08096e20 = nzr::lzpf::LmsObject (the LMS)
-// -- plus two that are NOT ported: FUN_080958d0 (an extra predictor stage that
-// only -co/-cc run) and FUN_08096160 (-cO's inter-channel stage, where -co/-cc
-// use the LMS instead).
-//
-// Measured consequences, so nobody re-derives them:
-//   * The residual array handed to the reconstruction is BYTE-IDENTICAL across
-//     -co, -cO and -cc (md5 7d4ca807c2b0fdcc6f57ac92291a82f9, 32000 int32).
-//   * This port reproduces it byte-exactly for -cO (0 diffs) and gets it wrong
-//     for -co (from element 0) and -cc (from element 2). The reconstruction
-//     stage is therefore fine; the defect is entirely in residual production.
-//   * The real decoder writes resid[0] exactly ONCE, so its predictor stages do
-//     not touch the first element.
-//
-// REFUTED here, do not retry: reading the small header the reconstruction call
-// receives (`01 01 02 02 2c 00 00 00 ...`, where [4..7] is header_bytes = 44 and
-// [2]/[3] drive FUN_080a50c0's branch) as the six predictor-enable flags -- no
-// bit offset in -120..+120 reproduces it and forcing it does not match; and
-// re-routing the payload straight into DecodePrefilterStream (best of 64 offsets
-// x orders x nstages x mono/stereo left 63725 of 64044 bytes wrong).
-//
-// fresh capture. NZOPT_DUMP_AUDCOUNTS dumps the per-sample bit-count array where
-// FUN_0809bbf0 receives it, NZOPT_DUMP_AUDPOST the residuals where it returns, and
-// NZOPT_DUMP_AUDPLANE=<prefix> one file per FUN_08095d90 call. Those three split the
-// pipeline at exactly the points the GDB captures in ~/.cache/nzre_tools/audio_gdb/
-// were taken, so each half can be checked independently.
-//
-// SECOND ROUND OF GROUND TRUTH (2026-09-01). The two remaining codecs fail for two
-// DIFFERENT reasons, and both are now localised:
-//
-// -co: its BIT-COUNT DECODER IS A DIFFERENT CLASS, and it is unported. The two
-//   per-channel decoders are reached through a vtable at obj+0x38700/+0x38704, and
-//   the vtable pointer differs per codec:
-//        -cO, -cc :  vtable 0x0813c848, decode = FUN_0809c070
-//        -co      :  vtable 0x0813c860, decode = FUN_0809bdc0
-//   The AudioBitcountDecoder below is a transcription of FUN_0809c070 -- which is why
-//   -cO's and -cc's bit-count arrays come out BYTE-EXACT and -co's is garbage from
-//   element 0 (near-constant ~26 where the real values range 0..45). Per
-//   work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md, vtable 0x0813c860 is
-//   a Fenwick-tree/frequency-count coder whose slot0 (FUN_080bd760) is its
-//   build/rebalance routine; FUN_0809bdc0 has never been read line by line and there
-//   is no decompile for it. Porting it is what -co needs.
-//
-// -cc: FIXED. Its bit-counts and post-residual-decode array were already byte-exact,
-//   so the defect was downstream, and it turned out to be TWO hardcoded per-codec
-//   parameters -- see SetPlaneOrders and AudioStereoDecoder::Configure below. Every
-//   configurable constant in this decoder is a per-CODEC value and this file had
-//   -cO's baked in throughout, which is the whole reason -cO was byte-exact and
-//   nothing else was.
-//   Refuted along the way, with per-stage evidence (the earlier attempt could only
-//   test end to end): switching RunSmall to UpdateBig's magnitude-shift-then-re-sign
-//   convention breaks a stage that was exact, and so does flipping its factor-update
-//   polarity. Both conventions in this file are correct as written -- the real
-//   assembly at 0x08095ca0 confirms `sar` on the signed sum and `delta > 0 ->
-//   psubw`. Do not retry either.
-// ---------------------------------------------------------------------------
-
-// LinearPredictor: sign-LMS over a 512-stride dual history (samples in the low
-// half, log-magnitudes in the high half). hist_[3072] is exactly sized for the
-// wrap target &hist_[2560 - order] plus the +512 stride, for order <= 512.
-// Orders are fixed by AudioPred's constructor (0x60 and 8), never from input.
+// The audio path (decr_param == 2) is fully ported and byte-exact for -co, -cO
+// and -cc. Getting there took three separate findings, kept here in one
+// paragraph because each is a rule the code below depends on rather than a
+// historical note: the -co bit-count decoder is a whole second CLASS
+// (FUN_0809bdc0, SetBitcountVariantB) and not a parameter of the -cO one;
+// FUN_080958d0 is an extra predictor stage that only -co and -cc run;
+// FUN_08096160 is the inter-channel stage only -cO runs. The measurement
+// recipe that produced them -- GDB on the real binary, one stage at a time,
+// with the object's own state as the oracle -- is written up in
+// ~/.cache/nzre_tools/audio_gdb/ together with the captured ground truth and
+// the hypotheses it refuted.
 // ---------------------------------------------------------------------------
 static inline int32_t Clamp16(int32_t v) {
     return ((int16_t)v != v) ? ((v >> 31) ^ 0x7fff) : v;

@@ -1,169 +1,78 @@
-# NanoZip RE Workflow (CLI reconstruction)
+# NanoZip RE workflow (CLI reconstruction)
 
-Cutoff date: 2026-04-03
+Rewritten 2026-09-04. The original version of this page described a decoder that could still fall
+back to an "extract bridge" or a "gdb bridge" -- a real `nz` consulted at runtime -- and measured
+itself in percentages of methods that avoided them. None of that exists any more: no code path looks
+for or runs an original binary, every codec decodes natively, and the measurements are byte-exactness
+counts instead. What follows is how the work is actually done now.
 
 ## Operational goal
 
-Reconstruct `l/t/x/a/s` of NanoZip 0.09a without SFX, prioritizing:
+Reconstruct NanoZip 0.09a's `l`, `t`, `x` (and later `a`, `s`, `w32c`) byte for byte, in this order:
 
-1. real usage compatibility (`l/t/x` working on legacy archives);
-2. format traceability (header, table, metadata, payload);
-3. progressive replacement of compat/bridges with pure C++ decode.
+1. **Decode**, one engine at a time, byte-exact against the original on real archives.
+2. **Console**, byte-identical: the same lines, the same order, the same figures.
+3. **Encode**, once the decode is complete: an archive this port writes must be the archive the
+   original writes.
 
-## Percentage definitions
+## How a claim is measured
 
-- `usage_real_percent`:
-  - percentage of `-c*` methods that pass `l/t/x` with correct output;
-  - includes bridge/compat paths when activated.
-- `native_only_percent`:
-  - percentage of `-c*` methods that pass `l/t/x` without emitting `[compat]`;
-  - may still use the `extract bridge` or `gdb bridge`.
-- `native_pure_percent` (recommended manual measurement):
-  - same criterion as above, but with bridges disabled:
-  - `NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`.
-- `encode_real_percent`:
-  - percentage of `-c*` methods where `a/s` followed by `t/x` of the produced archive passes correctly.
-- `encode_native_no_compat_percent`:
-  - percentage of `-c*` methods where `a/s` does not emit `[compat]`.
-- `encode_native_no_compat_bridge_percent`:
-  - percentage of `-c*` methods where `a/s` emits neither `[compat]` nor `[bridge]`.
+The original at `work/linux32/nz` is the oracle for everything (the 64-bit build of 2011 segfaults on
+a current kernel, so it is not usable). A statement about behaviour is worth making only if a harness
+reproduces it:
+
+- `tests/native_only_v2.sh` -- 12 synthetic fixtures x 8 codecs, byte-diffed. 96/96.
+- `tests/multifile_v2.sh` -- multi-file trees and listings over 12 selectors x 9 shapes. 144 + 72.
+- `tests/real_corpus_sweep.sh` -- real files from a local corpus, compressed by the original under
+  every codec and decoded by both. Resumable, shardable; `NZ_RECON` pins a frozen binary so a rebuild
+  cannot mix two binaries into one verdict.
+- `tests/sfx_exe.sh`, `tests/sweep_dirs.sh`, `tests/env_switches.sh` -- self-extractors, directory
+  trees with symlinks and odd modes, the environment switches.
+- `tests/parity/` -- the console matrices, the pty prompt driver and the damaged-archive comparisons,
+  with a fixture builder that makes its archives with the original.
+- `~/.cache/nzre_tools/release_verify_pkg/check.sh` -- 71 archives / 183 hashes, run against all four
+  release binaries (the Windows pair on a real Windows machine).
+
+Anything a harness cannot reach is stated as such, in
+[docs/ORIGINAL_QUIRKS.md](ORIGINAL_QUIRKS.md) or on the wiki's Component-Status page.
 
 ## Tools used
 
 - RE/inspection:
   - `rizin/radare2`, `gdb` (batch), `xxd`, `strace`, `rg`.
-- Behavior validation:
-  - `work/linux64/nz`, `work/linux32/nz` as oracle.
+- Behaviour validation:
+  - `work/linux32/nz` as the oracle (`work/linux64/nz` segfaults on a current kernel).
 - Reconstruction:
   - `cmake`, `g++`.
 
-## Base flow (standard iteration)
+## Base flow (one iteration)
 
-1. Build the reconstructed binary.
-2. Measure the coverage baseline (`coverage_matrix.sh`).
-3. Re-run the baseline with bridges disabled to measure pure progress.
-4. Take a `.nz` sample and extract its internal stream to form format hypotheses.
-5. Implement the subcase in C++ parser/decode (always conservative).
-6. Run regression:
-   - `l/t/x` on the test corpus;
-   - `cmp` of extracted files vs originals;
-   - full coverage matrix.
-7. Document the finding and leave a concrete next step.
+1. Build (`cmake --build build -j8`), then run the suites above -- never rebuild while a sweep runs.
+2. Pick a failing archive and reduce it: which codec, which block, which stage. The per-block check
+   bytes name the stage; `NZOPT_TRACE_TDO`, `NZOPT_TRACE_STG`, `NZOPT_TRACE_BWT`, `NZOPT_TRACE_LZPF`
+   and the `NZOPT_DUMP_*` variables dump the buffers around it.
+3. Get the original's answer for the same bytes: extract with it and compare at the offset the trace
+   names, or read the value out of the running binary with GDB (`~/.cache/nzre_tools/cli_parity/`
+   holds the scripts: breakpoint helpers, hardware watchpoints on a worker's status word, golden
+   vectors).
+4. Fix, re-run every suite, and add a fixture so the case cannot regress silently.
+5. Write the finding down: a comment where the code needs it, a quirk entry if the original is at
+   fault, a Changelog row, and a memory note for the next session.
 
-## Reference commands
+## Environment switches (this port's, not the original's)
 
-Build:
+| variable | effect |
+|---|---|
+| `NZ_SAFE=1` | on a damaged archive write only entries whose checksum verifies |
+| `NZ_STRICT_EXIT=1` | exit 2 on a damaged archive instead of the original's 0 |
+| `NZ_THREADS=n` | cap the worker threads of a parallel container (`-t<n>` does the same) |
+| `NZ_TRACE_CONSTRUCTS=1` | print each distinct format construct met, once |
+| `NZ_VERBOSE_NATIVE=1` | say why an engine declined |
 
-```bash
-cd work/reconstruccion
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release -j
-cp build-release/nz_recon bin/nz_recon
-cp build-release/nz_sfx_recon bin/nz_sfx_recon
-```
+## Tools
 
-Normal coverage:
-
-```bash
-cd work/reconstruccion
-./tests/coverage_matrix.sh
-```
-
-Coverage without bridges (purity):
-
-```bash
-cd work/reconstruccion
-NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1 ./tests/coverage_matrix.sh
-```
-
-Legacy stream dump:
-
-```bash
-cd work/reconstruccion
-./tests/legacy_stream_dump.py /path/to/archive.nz
-```
-
-`-co/-cO` runtime path trace in the legacy backend:
-
-```bash
-cd work/reconstruccion
-./tests/legacy_optimum_trace_path.sh /path/to/archive.nz
-```
-
-Runtime path matrix vs native purity (sample batch):
-
-```bash
-cd work/reconstruccion
-./tests/legacy_optimum_path_matrix.py '/tmp/nz_co_grid/*.nz' '/tmp/nz_co_pairs/*.nz'
-```
-
-## Legacy decode paths (real order)
-
-For `t/x` of legacy archives:
-
-1. native header + table + metadata parser;
-2. if the payload is not native:
-   - `extract bridge` (uses the legacy backend in a temp dir, no ptrace);
-   - then `gdb bridge` (if available);
-3. if both fail:
-   - `[compat]` fallback to the legacy backend.
-
-## `a/s` compression paths (real state)
-
-- `-cn`: native C++ compression/writing.
-- legacy methods (`-cf/-cF/-cd/-cD/-co/-cO/-cc`):
-  - by default: native `native-first` writer with RE wrappers:
-    - `cf/cF`: `literal-only`;
-    - `cd/cD`: `literal-wrapper` (`[varint][0x00][raw]`);
-    - `co/cO`: BWT wrapper (`[u32 size][bwt_last][u24 primary]`, 32 KiB limit in native writer);
-    - `cc`: `raw-wrapper` (`[u32 size][raw]`).
-  - if the native writer fails and the bridge is enabled: fallback to the legacy backend (marked `[bridge]`, without the prior `[compat]` marker);
-  - `NZ_DISABLE_COMPRESS_BRIDGE=1`: disables the bridge fallback and forces strictly native output (error if the wrapper does not apply).
-  - supports `-h*` (with `-hf -> Fletcher32` mapping in the legacy header).
-
-## Operational environment variables
-
-- `NZ_LEGACY_BACKEND`:
-  - path to the `nz` backend (file or containing directory).
-- `NZ_LEGACY_BRIDGE_BACKEND`:
-  - path to the linux32 backend for the `gdb bridge`.
-- `NZ_DISABLE_EXTRACT_BRIDGE`:
-  - disables the extract bridge.
-- `NZ_DISABLE_GDB_BRIDGE`:
-  - disables the gdb/ptrace bridge.
-- `NZ_DISABLE_COMPRESS_BRIDGE`:
-  - disables the `a/s` compression bridge fallback for legacy methods and forces strictly native output.
-
-## Current state per `-c` method
-
-- `cn`: pure native.
-- `cd/cD`: pure native in the observed literal-only subcase; native RE wrapper writer available.
-- `cc`:
-  - pure native in the `literal-wrapper` subcase (`[u32 size][raw][trailer]`);
-  - native `raw-wrapper` writer available;
-  - real compressed streams still require bridge/compat.
-- `cf/cF`: pure literal-only; native literal writer available; real compressed streams still pending.
-- `co/cO`:
-  - native BWT-wrapper decoder observed on small samples;
-  - native `raw-wrapper` subcase decoder observed on incompressible entries;
-  - native BWT-wrapper writer available (32 KiB limit);
-  - general real compressed streams still pending (bridge/compat).
-
-## Implementation principle
-
-Always validate subcases with strong structural checks:
-
-1. coherent stream layout (`stream_tag`, lengths, limits);
-2. expected total size (`total_data_size`);
-3. per-entry consistency (never read out of range);
-4. safe fallback to bridge/compat when the checks do not hold.
-
-## Immediate backlog
-
-1. Port the real `cf/cF` compressed path (RE core `0x08097570/0x08097e20`).
-2. Complete the pure `co/cO` decoder for the general real compressed streams still pending:
-   - prefilter `0x0809a250` on the `0x080aa850 -> 0x0809a250 -> 0x0809d370` path;
-   - alternate repetitive path `0x080aa850 -> 0x080acaf0 -> 0x080ace10 -> 0x080accd0`.
-   - note: the direct BWT path `0x080aa850 -> 0x0809d370` already has native coverage on observed wrappers (including `primary` in trailer16@+5).
-3. Extend the pure `cc` decoder to real compressed streams.
-4. Complete the multi-file legacy metadata parser (timestamps/permissions/checksum per entry).
+- Reverse engineering: Ghidra headless (`work/ghidra_scripts/DecompAt.java`, `Xrefs.java`,
+  `AllFuncs.java`), `objdump`, `gdb` in batch mode, `strace`, `xxd`.
+- Performance: `perf` with the per-function mapping in `~/.cache/nzre_tools/perf/`.
+- Fuzzing: `~/.cache/nzre_tools/fuzz/fuzz.sh` (ASan + UBSan over mutated archives; exit 255 is the
+  original's reproduced `Internal error` path, not a crash).

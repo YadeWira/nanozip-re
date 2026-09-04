@@ -6518,7 +6518,7 @@ bool TryParseLegacyCnArchive(
 
     // Zero-byte payload fast path: every compressor serialises an empty file
     // identically (no data bytes), so we can satisfy the request natively
-    // without falling through to the bridge (which segfaults in the legacy
+    // without declining (the legacy binary segfaults on this shape, see
     // backend on some builds when asked to decompress nothing).
     if (!native_store_payload && !native_literal_payload && total_data_size == 0u) {
         native_literal_payload = true;
@@ -6646,7 +6646,7 @@ bool TryParseLegacyCnArchive(
         //  - 0x3b p0=6 (-cO, nz_optimum2) -> TryDecodeLegacyOptimum, backed by
         //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
         //    (historical note: parallel-container -cO and decr_param==0 BWT were once unported; both are native now)
-        //    bridge (see nz_optimum2_lz.h for scope).
+        //    (see nz_optimum2_lz.h for the engine's scope).
         if (!spliced_data.empty()) {
             ctx.data = std::move(spliced_data);
         } else {
@@ -6885,7 +6885,7 @@ static bool TryDecodeLegacyLzhd(
         // chunks into the contiguous output. Handles pure-LZ -cd (recon output ==
         // file). Blocks whose chunks carry a tt08/param14/CM/BWT post-filter
         // produce fewer bytes here; the size-mismatch check below rejects them so
-        // they fall back to the bridge until those stages are wired.
+        // they decline until those stages are wired.
         const std::uint32_t block_cap = static_cast<std::uint32_t>(total_out - written);
         std::uint32_t produced = nzr::cd::NzCdDecodeStream(
             block_in, block_in_size, window_base + written, block_cap,
@@ -6943,7 +6943,7 @@ static bool TryDecodeLegacyLzhd(
     // Verify the decoded output against the archive's stored per-file checksum(s).
     // The native -cd ring model is byte-exact for the common case but has a residual
     // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
-    // mismatch here makes the caller fall through to the bridge so the user still
+    // mismatch here makes the caller decline, so the user still
     // gets byte-exact output (no silent corruption, no double-decode of correct
     // files), and turns NZ_NO_BRIDGE native-only into a provable correctness signal.
     // Skipped only when the archive carries no usable checksum.
@@ -7577,15 +7577,14 @@ static bool TryDecodeLegacyCm(
     }
 
     // TryDecodeLegacyOptimum gates: a stored per-file checksum mismatch means
-    // "decline and let the caller fall back to the bridge", never "emit it
+    // "decline and let the caller try another engine", never "emit it
     // anyway".
     //
     // This gate was missing until a real-world corpus sweep found the hole it
-    // left. The caller's own CM handling cross-checks native output against a
-    // bridge decode, but ONLY when a bridge is actually available -- with
-    // NZ_NO_BRIDGE=1 (or simply no legacy binary present, which is this
-    // project's whole goal) it took `cm_native_ok` at face value and emitted
-    // whatever this function returned. Sweeping 56 real files x 8 methods
+    // left. Back when a legacy binary could still be consulted, the caller's CM
+    // handling cross-checked native output against it -- but only when one was
+    // actually reachable, which for a user never is, and then it took
+    // `cm_native_ok` at face value and emitted whatever this function returned. Sweeping 56 real files x 8 methods
     // surfaced one archive (a ~10 MB game-data blob under -cc) where this
     // function returns true with 394113 wrong bytes, so the extractor wrote a
     // silently corrupt file instead of declining. Output size alone is not a
@@ -7668,7 +7667,7 @@ static bool TryDecodeLegacyCm(
 // stream) and threaded across every decr_param==1 block in this stream's
 // sequence, matching the real binary's per-stream-persistent ring/adaptive-
 // table state. Parallel-container -cO (flag 0x0f) remains out of scope and
-// is declined here so it keeps routing to the bridge (parallel-container
+// is declined here (parallel-container
 // -co IS handled, but by a separate code path in TryParseLegacyCnArchive, not
 // this function -- see its own comments). decr_param==0 (BWT) blocks are also
 // not yet ported (either engine) and decline.
@@ -7676,7 +7675,7 @@ static bool TryDecodeLegacyCm(
 // Safety: every candidate is checksum-gated below (mirroring -cd/-cD/-cc's
 // own self-verify pattern) before being trusted by the caller; any mismatch,
 // malformed framing, or DecodeBlock-reported inconsistency cleanly declines
-// (returns false) so RunLegacyCnExtractOrTest falls through to the bridge --
+// (returns false) so RunLegacyCnExtractOrTest tries the next engine --
 // never a partial/corrupt native result.
 // Decode a sequence of -co (nz_optimum1) block records occupying
 // [blocks_begin, blocks_end) within `raw` -- NO leading stream_tag (callers
@@ -8472,8 +8471,8 @@ static bool TryDecodeLegacyOptimum(
     }
 
     // Checksum self-verify (mirrors TryDecodeLegacyLzhd's own gate above): a
-    // stored per-file checksum mismatch means "decline, let the caller fall
-    // back to the bridge" rather than "trust it anyway".
+    // stored per-file checksum mismatch means "decline, let the caller try
+    // another engine" rather than "trust it anyway".
     //
     // History: an earlier pass through this session found a live,
     // reproducible bug in the literal 4-context mixer's ctxC seed formula
