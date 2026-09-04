@@ -11,6 +11,7 @@ ignored by the binary.
 |---|---|
 | `native_only_v2.sh` | 12 synthetic fixtures × 8 codecs, byte-diffed against the original; includes a hand-built BWT-with-entropy-layer case. Headline: 96/96. |
 | `multifile_v2.sh` | Multi-file archives: whole-tree compare (contents, mode, mtime) over 12 compressor selectors × 9 shapes, metadata switches (`-nt -np -nm -hn -hc -hC`), 72 `l` listings. Pins the metadata record layout. 144 + 72. |
+| `sfx_exe.sh` | Self-extracting archives: the original's `w32c` builds one `.exe` per codec (PE stub + archive), and `l`/`t`/`x` are compared against it. 8/8 byte-exact. |
 | `real_corpus_sweep.sh` | Real-world files: every file in `$NZ_REAL_CORPUS` compressed by the original under all 8 codecs and decoded by both. Resumable (`NZ_RESULTS_TSV`), shardable (`NZ_SHARD=i/N`), directory fixtures (`NZ_DIR_MODE=1`), per-call `NZ_TIMEOUT`. Collects `[construct]` lines (see below). |
 | `stress_matrix.sh` | 5 consecutive runs × 8 codecs over single/multi/multi-block shapes: a non-determinism tripwire. |
 | `smoke_suite.sh` | CLI basics (no args, unknown command/switch), file errors, extraction metadata smoke. |

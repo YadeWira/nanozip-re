@@ -59,6 +59,7 @@
 #include <unistd.h>
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <utime.h>
 #endif
 #endif
@@ -1172,6 +1173,87 @@ enum class LegacyPayloadMode {
 // before the decode can begin; on a 2.3 GB archive that alone was half a second
 // of the critical path, and every page was then faulted in a second time by the
 // workers.
+
+// A read-only view of the archive bytes. The parser and every decoder only ever
+// read them, so they can look at a memory MAPPING of the file instead of a heap
+// copy: on a 2 GB archive that is 2 GB of anonymous memory turned into
+// reclaimable page cache (the original streams its input, quirk 23).
+class ByteView {
+public:
+    ByteView() = default;
+    ByteView(const unsigned char* p, std::size_t n) : p_(p), n_(n) {}
+    ByteView(const std::vector<unsigned char>& v) : p_(v.data()), n_(v.size()) {}   // NOLINT: implicit by design
+    const unsigned char* data() const { return p_; }
+    std::size_t size() const { return n_; }
+    bool empty() const { return n_ == 0u; }
+    const unsigned char* begin() const { return p_; }
+    const unsigned char* end() const { return p_ + n_; }
+    unsigned char operator[](std::size_t i) const { return p_[i]; }
+    ByteView subview(std::size_t off) const { return off <= n_ ? ByteView(p_ + off, n_ - off) : ByteView(); }
+private:
+    const unsigned char* p_ = nullptr;
+    std::size_t n_ = 0;
+};
+
+// The archive file, mapped read-only where the platform allows it and read into
+// a vector otherwise (Windows, and any mmap failure).
+class ArchiveBytes {
+public:
+    ~ArchiveBytes() { Close(); }
+    ArchiveBytes() = default;
+    ArchiveBytes(const ArchiveBytes&) = delete;
+    ArchiveBytes& operator=(const ArchiveBytes&) = delete;
+    bool Open(const std::string& path) {
+        Close();
+#if !defined(_WIN32)
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st{};
+            if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                const std::size_t n = static_cast<std::size_t>(st.st_size);
+                void* m = ::mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    ::close(fd);
+                    map_ = static_cast<const unsigned char*>(m);
+                    map_n_ = n;
+                    return true;
+                }
+            }
+            ::close(fd);
+        }
+#endif
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return false;
+        input.seekg(0, std::ios::end);
+        const std::streamoff len = input.tellg();
+        input.seekg(0, std::ios::beg);
+        if (len > 0) {
+            vec_.resize(static_cast<std::size_t>(len));
+            input.read(reinterpret_cast<char*>(vec_.data()), len);
+            if (!input) vec_.resize(static_cast<std::size_t>(input.gcount()));
+        }
+        return true;
+    }
+    void Close() {
+#if !defined(_WIN32)
+        if (map_ != nullptr) { ::munmap(const_cast<unsigned char*>(map_), map_n_); map_ = nullptr; map_n_ = 0; }
+#endif
+        vec_.clear();
+        vec_.shrink_to_fit();
+    }
+    // `off` drops a self-extractor's PE stub without moving a byte.
+    ByteView View(std::size_t off = 0u) const {
+        const unsigned char* p = map_ != nullptr ? map_ : vec_.data();
+        const std::size_t n = map_ != nullptr ? map_n_ : vec_.size();
+        return off <= n ? ByteView(p + off, n - off) : ByteView();
+    }
+    bool mapped() const { return map_ != nullptr; }
+private:
+    const unsigned char* map_ = nullptr;
+    std::size_t map_n_ = 0;
+    std::vector<unsigned char> vec_;
+};
+
 class ByteBuffer {
 public:
     ByteBuffer() = default;
@@ -2016,7 +2098,7 @@ std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data
 }
 
 bool ReadLegacyVarint(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t* io_pos,
     std::size_t end,
     std::uint64_t* out_value) {
@@ -2105,7 +2187,7 @@ std::uint32_t ReadU32LE(const unsigned char* p);
 // is written, so callers fall back to the older per-shape heuristics and, more
 // importantly, no half-parsed checksum can be mistaken for a real one.
 bool ApplyLegacyAttributeRecords(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     const std::vector<std::array<std::size_t, 4>>& records,  // {stream, type, begin, end}
     const std::map<unsigned, std::vector<std::size_t>>& stream_named,
     const std::set<std::string>& split_paths,
@@ -2324,7 +2406,7 @@ static std::uint32_t LegacyCdRingUnitsFromP1(std::uint8_t p1) {
 // Detected by the record right after the version chunk being an extended one.
 // Returns false when the archive is not parallel or the record walk breaks.
 bool ParseLegacyParallelStreams(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::map<unsigned, LegacyParallelStream>* out_streams,
     // A store (-cn) copies whatever bytes of a cut record exist (measured: the
     // slice checksum is computed over stub + zero padding); the compressed
@@ -2565,7 +2647,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
 
 template <class DecodeStreamFn>
 bool AssembleParallelMultiFile(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     const std::map<unsigned, LegacyParallelStream>& streams,
     const std::vector<LegacyCnEntry>& entries,
     std::uint64_t total,
@@ -2686,7 +2768,7 @@ bool AssembleParallelMultiFile(
 
 // Concatenate a stream's data-record payloads into one buffer.
 inline std::vector<unsigned char> ConcatParallelChunks(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
     std::vector<unsigned char> in;
     for (const auto& c : chunks) {
@@ -2703,7 +2785,7 @@ inline std::vector<unsigned char> ConcatParallelChunks(
 // slice is checked against its own checksum, so a wrong layout cannot produce
 // output.
 bool TryAssembleParallelStore(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::uint64_t total_size,
     std::vector<unsigned char>* out,
     const std::vector<LegacyCnEntry>* entries = nullptr) {
@@ -2787,7 +2869,7 @@ bool TryAssembleParallelStore(
 // *out holds the concatenated raw payload (exactly `total` bytes) and the walk
 // consumes the buffer up to EOF, which makes the starting offset unambiguous.
 bool TryAssembleStoredBlocks(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t first_prefix,
     std::uint64_t total,
     std::size_t trailer_bytes,
@@ -2841,7 +2923,7 @@ bool TryAssembleStoredBlocks(
 }
 
 bool ReadLegacyTableSpan(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t* io_pos,
     std::uint64_t* out_span) {
     if (io_pos == nullptr || out_span == nullptr || *io_pos >= bytes.size()) {
@@ -2878,7 +2960,7 @@ bool IsLikelyLegacyPathByte(unsigned char c) {
 }
 
 bool LooksLikeLegacyFilenameTable(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t table_start,
     std::size_t table_end) {
     if (table_start >= table_end || table_end > bytes.size()) {
@@ -2913,7 +2995,7 @@ bool LooksLikeLegacyFilenameTable(
 }
 
 bool ReadLegacyTableSpanFlexible(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t* io_pos,
     std::uint64_t* out_span) {
     if (io_pos == nullptr || out_span == nullptr || *io_pos >= bytes.size()) {
@@ -3539,7 +3621,7 @@ const char* LegacyPayloadModeLabel(LegacyPayloadMode mode) {
 // shared core behind both single-stream and parallel-container lzpf decode.
 template <typename Verify>
 bool DecodeLzpfMember(
-    const std::vector<unsigned char>& bytes,
+    const ByteView& bytes,
     std::size_t first_block_pos,
     std::size_t first_stream_len,
     std::uint64_t total,
@@ -4075,19 +4157,16 @@ bool TryParseLegacyCnArchive(
         return false;
     }
 
-    // Sized read: istreambuf_iterator pulls one byte at a time through the
-    // stream buffer and regrows the vector -- seconds of CPU on a 1.7 GB archive.
-    std::vector<unsigned char> bytes;
-    {
-        input.seekg(0, std::ios::end);
-        const std::streamoff len = input.tellg();
-        input.seekg(0, std::ios::beg);
-        if (len > 0) {
-            bytes.resize(static_cast<std::size_t>(len));
-            input.read(reinterpret_cast<char*>(bytes.data()), len);
-            if (!input) bytes.resize(static_cast<std::size_t>(input.gcount()));
-        }
+    // The archive is mapped, not copied (see ArchiveBytes): the parse and every
+    // decoder only read it, and a 2 GB archive would otherwise be 2 GB of
+    // anonymous memory.
+    input.close();
+    ArchiveBytes archive;
+    if (!archive.Open(archive_path)) {
+        if (out_error_message != nullptr) *out_error_message = "Cannot open archive!";
+        return false;
     }
+    ByteView bytes = archive.View();
     StageMark("archive read");
     // A self-extracting archive (`w32c`) is a Windows PE stub with the archive
     // appended; the original opens those by seeking past the image (FUN_080b0e50),
@@ -4096,7 +4175,7 @@ bool TryParseLegacyCnArchive(
     if (bytes.size() > 0x40u && bytes[0] == 'M' && bytes[1] == 'Z') {
         const std::size_t off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? bytes.size() : 4096u);
         if (NZ_ENV("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
-        if (off > 1u && off < bytes.size()) bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(off));
+        if (off > 1u && off < bytes.size()) bytes = bytes.subview(off);
     }
     if (bytes.size() < 24u) {
         if (out_error_message != nullptr) {
@@ -5289,7 +5368,7 @@ bool TryParseLegacyCnArchive(
                                     payload.insert(payload.end(), bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
                                                    bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                             }
-                            const std::vector<unsigned char>& pin = in_place ? bytes : payload;
+                            const ByteView pin = in_place ? bytes : ByteView(payload);
                             const std::size_t pbeg = in_place ? s.chunks.front().first : 0u;
                             const std::size_t plen_in = in_place ? s.chunks.front().second : payload.size();
                             const std::size_t pend = in_place ? pbeg + plen_in : 0u;
@@ -5715,7 +5794,7 @@ bool TryParseLegacyCnArchive(
                                     const bool one = (chunks.size() == 1u);
                                     const std::vector<unsigned char> in = one ? std::vector<unsigned char>() : ConcatParallelChunks(bytes, chunks);
                                     if (!one && in.empty()) return false;
-                                    const std::vector<unsigned char>& pin = one ? bytes : in;
+                                    const ByteView pin = one ? bytes : ByteView(in);
                                     const std::size_t pbeg = one ? chunks.front().first : 0u;
                                     const std::size_t plen_in = one ? chunks.front().second : in.size();
                                     const bool sinking = psink::Available() || psink::Committed();
@@ -6120,8 +6199,7 @@ bool TryParseLegacyCnArchive(
                     // payload_start IS data_records[0].first, so the same parse
                     // applies to the spliced buffer from its own start.
                     const bool use_splice = !spliced_data.empty();
-                    const std::vector<unsigned char>& chain_src =
-                        use_splice ? spliced_data : bytes;
+                    const ByteView chain_src = use_splice ? ByteView(spliced_data) : bytes;
                     const std::size_t chain_sp = use_splice ? (sp - payload_start) : sp;
                     // With no checksum stored (-hn / -nm) there is nothing to
                     // adjudicate between capacity candidates, so use only the

@@ -38,7 +38,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
-| Release package, 63 archives (incl. single- and multi-file parallel containers of every codec), all four binaries | 159/159 hashes |
+| Release package, 71 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 183/183 hashes |
 | Console matrices (36 + 78 + 77 cases, pty prompt harness) | identical except progress-redraw timing, the order of `Compressor` lines of parallel workers, and the encode commands |
 | Damaged archives, 8 codecs × 6 corruptions (`x`, `l`, `t`) | 42/48 identical trees; the `Archive corrupted` / `Internal error` report identical in 38/48 (`l`: 47/48); the rest are the original's crashes and uninitialised memory ([quirks 26, 27](docs/ORIGINAL_QUIRKS.md)) and four `-cf`/`-cF` garbage divergences |
 | Damaged **parallel** containers, 8 codecs × 7 corruptions, single- and multi-file (`x`) | 104/112 identical trees (holes, short files, files created and left empty exactly where the original's workers leave them, [quirk 41](docs/ORIGINAL_QUIRKS.md)); report line identical in 96/112, the rest being `-cd`/`-cD` and `-cO` detection differences, one segfault of the original and the plain-vs-shifted code of four early failures |
@@ -47,7 +47,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 
 Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
 it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
-machine. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
+machine. The archive itself is mapped, not copied into the heap. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
 [Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity),
 [Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status),
 [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
