@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 namespace {
 
@@ -588,6 +590,159 @@ struct BwtUnpackInput {
 // have over-allocated by 4*data_size + 3. That coupling is not worth
 // replicating: this port owns its scratch buffers, so a caller only has to
 // provide the block's own bytes.
+// The inverse BWT walk is one dependent chain of random accesses -- a cache
+// miss per output byte on a large block. The original (FUN_0809d370 for blocks
+// of 0x40000 bytes and more, walker FUN_0809d160) breaks it into many chains:
+// pick K start indices, walk each until it meets another chain's start, then
+// stitch the pieces in cycle order from the primary index. The pieces are the
+// same bytes in the same order, so the output is identical; the win is that K
+// independent misses are in flight instead of one. Its start-detection trick is
+// kept: a chain's start index has the chain's id in its low byte, so "is this
+// index a start" is one L1 lookup (starts[idx & 0xff] == idx); the primary index
+// takes the chain slot its own low byte selects. The byte for a position comes
+// from the 256-entry cumulative count table (largest c with C[c] <= pos), as in
+// the original, so no second random access is needed.
+namespace {
+
+constexpr uint32_t kBwtChainThreshold = 0x40000u;   // the original's cut-over
+constexpr uint32_t kBwtChains = 128u;               // walked round-robin, split over threads
+std::atomic<unsigned> g_bwt_threads{0};             // 0 = decide from the hardware
+constexpr uint32_t kBwtPage = 1u << 16;             // scratch page per piece
+
+inline uint32_t BwtSymOf(const uint32_t* C, uint32_t pos) {
+    uint32_t s = 0;
+    for (uint32_t k = 128; k; k >>= 1) if (pos >= C[s + k]) s += k;
+    return s;
+}
+
+struct BwtChain {
+    uint32_t start = 0, idx = 0, next_start = 0, len = 0;
+    std::vector<uint32_t> pages;   // page indices into the scratch pool
+    uint32_t page_fill = kBwtPage; // bytes used in the last page (full = need a new one)
+    bool done = false;
+};
+
+bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
+                          const uint32_t* C, const std::vector<uint32_t>& table) {
+    // Chain k starts at a spaced index whose low byte is k; the primary index
+    // replaces the chain its low byte selects (or is added as one more chain).
+    uint32_t nchains = kBwtChains;
+    std::vector<BwtChain> chains(nchains + 1u);
+    uint32_t starts[256];
+    int16_t chain_of[256];
+    for (uint32_t i = 0; i < 256u; ++i) { starts[i] = 0xffffffffu; chain_of[i] = -1; }
+    const uint32_t step = n / nchains;
+    for (uint32_t k = 0; k < nchains; ++k) {
+        uint32_t s = ((k * step) & 0xffffff00u) | k;
+        if (s >= n) s = k;   // n >= 0x40000 here, so k < n always
+        chains[k].start = s; starts[k] = s; chain_of[k] = (int16_t)k;
+    }
+    const uint32_t plow = bwt_pos & 0xffu;
+    uint32_t primary;
+    if (plow < nchains) { chains[plow].start = bwt_pos; starts[plow] = bwt_pos; primary = plow; }
+    else { primary = nchains; chains[primary].start = bwt_pos; starts[plow] = bwt_pos; chain_of[plow] = (int16_t)primary; ++nchains; }
+    chains.resize(nchains);
+    // Two chains can only collide if a spaced start equals the primary index;
+    // that slot was replaced above, and low bytes are distinct by construction.
+
+    // Scratch pool: every byte lands in exactly one page, plus one partial page
+    // per chain.
+    const uint64_t npages = (uint64_t)((n + kBwtPage - 1u) / kBwtPage) + nchains;
+    std::vector<uint8_t> pool((size_t)npages * kBwtPage);
+    for (uint32_t k = 0; k < nchains; ++k) chains[k].idx = chains[k].start;
+
+    // The chains are independent: split them over threads, each walking its
+    // subset round-robin (one step of every live chain per round, so the
+    // independent loads overlap). Pages come from a shared counter; every chain
+    // writes only its own pages.
+    unsigned nthreads = g_bwt_threads.load(std::memory_order_relaxed);
+    if (nthreads == 0u) nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0u) nthreads = 1u;
+    if (nthreads > 16u) nthreads = 16u;
+    if (nthreads > nchains / 8u) nthreads = nchains / 8u;
+    if (nthreads == 0u) nthreads = 1u;
+    std::atomic<uint32_t> next_page_atomic{0};
+    std::atomic<bool> walk_ok{true};
+    auto walk = [&](uint32_t first, uint32_t last) {
+        std::vector<uint32_t> active;
+        for (uint32_t k = first; k < last; ++k) active.push_back(k);
+        uint64_t steps = 0;
+        while (!active.empty()) {
+            for (size_t a = 0; a < active.size();) {
+                BwtChain& c = chains[active[a]];
+                const uint32_t pos = c.idx;
+                const uint32_t sym = BwtSymOf(C, pos);
+                const uint32_t nxt = table[pos];
+                ++steps;
+                if (c.page_fill == kBwtPage) { c.pages.push_back(next_page_atomic.fetch_add(1u)); c.page_fill = 0; }
+                pool[(size_t)c.pages.back() * kBwtPage + c.page_fill++] = (uint8_t)sym;
+                ++c.len;
+                if (starts[nxt & 0xffu] == nxt) {
+                    c.next_start = nxt; c.done = true;
+                    active[a] = active.back(); active.pop_back();
+                } else {
+                    c.idx = nxt; ++a;
+                }
+            }
+            // Chains never overlap (two on one cycle stop at each other's start,
+            // chains on different cycles never meet), so a valid permutation takes
+            // at most n steps in all; a corrupt one is not a permutation and
+            // would walk forever.
+            if (steps > (uint64_t)n) { walk_ok = false; return; }
+        }
+    };
+    if (nthreads <= 1u) {
+        walk(0u, nchains);
+    } else {
+        std::vector<std::thread> pool_threads;
+        const uint32_t per = (nchains + nthreads - 1u) / nthreads;
+        for (unsigned t = 0; t < nthreads; ++t) {
+            const uint32_t first = t * per, last = std::min(nchains, first + per);
+            if (first >= last) break;
+            pool_threads.emplace_back(walk, first, last);
+        }
+        for (auto& th : pool_threads) th.join();
+    }
+    if (!walk_ok) {
+        BWT_FAIL("chain walk did not terminate: corrupt permutation\n");
+        return false;
+    }
+
+    // Stitch from the primary index, following each piece to the chain that
+    // starts where it ended, until n bytes are out. A periodic block has a
+    // permutation of several cycles: the plain walk then repeats the primary's
+    // cycle, and so does this (the same chain comes round again). The pieces
+    // must end exactly at n and the last link must lead back to the primary
+    // index -- the plain walk's "ends where it began" check.
+    uint64_t total = 0;
+    uint32_t cur = primary;
+    uint8_t* out = data;
+    while (total < n) {
+        const BwtChain& c = chains[cur];
+        if (c.len == 0u || total + c.len > n) { BWT_FAIL("chain stitch: piece does not fit\n"); return false; }
+        uint32_t left = c.len;
+        for (size_t p = 0; p < c.pages.size() && left; ++p) {
+            const uint32_t take = left < kBwtPage ? left : kBwtPage;
+            std::memcpy(out, pool.data() + (size_t)c.pages[p] * kBwtPage, take);
+            out += take; left -= take;
+        }
+        total += c.len;
+        const int16_t nk = chain_of[c.next_start & 0xffu];
+        if (nk < 0 || chains[(uint32_t)nk].start != c.next_start) { BWT_FAIL("chain stitch: bad link\n"); return false; }
+        cur = (uint32_t)nk;
+    }
+    if (total != n || cur != primary) {
+        BWT_FAIL("chain stitch: total %llu of %u, back at primary: %d\n",
+                 (unsigned long long)total, n, (int)(cur == primary));
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+void NzBwtSetThreadCount(unsigned n) { g_bwt_threads.store(n, std::memory_order_relaxed); }
+
 bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     if (data_size == 0u) return true;
     // The reference reads table[bwt_pos] unchecked on the first iteration; a
@@ -597,22 +752,28 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     uint32_t byte_count[256];
     std::memset(byte_count, 0, sizeof(byte_count));
     for (uint32_t i = 0; i != data_size; ++i) byte_count[data[i]]++;
+    uint32_t C[257];   // C[c] = first sorted position of symbol c
     uint32_t sum = 0;
     for (uint32_t i = 0; i != 256u; ++i) {
         const uint32_t t = byte_count[i];
-        byte_count[i] = sum;
+        C[i] = sum; byte_count[i] = sum;
         sum += t;
     }
+    C[256] = sum;
 
-    std::vector<uint8_t> source(data, data + data_size);
     std::vector<uint32_t> table(data_size);
-    for (uint32_t i = 0; i != data_size; ++i) table[byte_count[source[i]]++] = i;
+    for (uint32_t i = 0; i != data_size; ++i) table[byte_count[data[i]]++] = i;
 
+    if (data_size >= kBwtChainThreshold)
+        return BwtUntransformChains(data, data_size, bwt_pos, C, table);
+
+    // Small block: the plain single-chain walk; the byte at a position is its
+    // symbol in the sorted column (largest c with C[c] <= pos), which equals
+    // the BWT byte the reference reads through the table.
     const uint32_t start = bwt_pos;
     for (uint32_t i = 0; i != data_size; ++i) {
-        const uint32_t v = table[bwt_pos];
-        data[i] = source[v];
-        bwt_pos = v;
+        data[i] = (uint8_t)BwtSymOf(C, bwt_pos);
+        bwt_pos = table[bwt_pos];
     }
     // A genuine BWT is one cycle of length data_size, so the walk ends where it
     // began. Corrupt input (a flipped byte changes the symbol counts) breaks the

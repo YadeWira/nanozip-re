@@ -26,6 +26,8 @@
 // untouched) when bwt_pos is out of range for this block, rather than reading
 // out of bounds the way the reference does.
 bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos);
+// Threads used by the inverse BWT walk on large blocks (0 = hardware default).
+void NzBwtSetThreadCount(unsigned n);
 
 // Decodes the param6 == 1 entropy layer that wraps the BWT output (reference
 // BwtDecodeInput). `payload`/`payload_size` are the block's raw payload,

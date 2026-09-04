@@ -8887,7 +8887,7 @@ static std::string LegacyOpenFailureMessage(ArchiveOpenError open_error, const s
     return legacy_error.empty() ? error : legacy_error;
 }
 
-void SetDecodeThreads(unsigned n) { g_decode_threads = n; }
+void SetDecodeThreads(unsigned n) { g_decode_threads = n; NzBwtSetThreadCount(n); }
 
 int RunList(const CliOptions& options, std::ostream& os) {
     ArchiveContext context;
