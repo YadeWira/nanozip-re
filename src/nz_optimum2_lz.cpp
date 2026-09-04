@@ -1,4 +1,15 @@
 #include "nz_env.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+// The NZO2_*/NZOPT2_* trace and dump switches sit on the per-bit path of the -cO
+// core. They are compiled in only with -DNZOPT_DEBUG; by default every test
+// folds to a constant and disappears.
+#ifdef NZOPT_DEBUG
+#define O2_DBG_ENV(name) NZ_ENV(name)
+#else
+#define O2_DBG_ENV(name) static_cast<const char*>(nullptr)
+#endif
 #include <cstdio>
 #include <cstdlib>
 // Native linux32 `-cO` (nz_optimum2) LZ/CM engine. See include/nz_optimum2_lz.h
@@ -350,7 +361,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                                        std::uint8_t* out, std::uint32_t out_size) {
     if (out_size == 0) return true;
 
-    if (const char* dp = NZ_ENV("NZO2_DUMP_MEM")) {
+    if (const char* dp = O2_DBG_ENV("NZO2_DUMP_MEM")) {
         // Model memory at block entry. mem_ mirrors the real decoder object's own
         // layout (every cell offset in this file is an absolute offset into it), so
         // a GDB dump of the real object at the same point diffs directly against
@@ -417,11 +428,29 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         std::int32_t in7 = Stretch(state7);
 
         int wRowOff = 0x90 + static_cast<int>(((ctx6s >> 6) & 3u) + (ctxC >> 8) * 4u) * 0x10;
+        // The original's mixer (FUN_080a5d90 at 0x080a6727) is MMX: two pmaddwd
+        // over the eight int16 weights and stretched inputs, paddd, movd. Same in
+        // SSE2; the int32 partial sums wrap identically in any order.
+        std::int32_t dot;
+#if defined(__SSE2__)
+        const __m128i wv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mem + wRowOff));
+        const __m128i iv = _mm_set_epi16(static_cast<short>(in7), static_cast<short>(in6),
+                                         static_cast<short>(in5), static_cast<short>(in4),
+                                         static_cast<short>(in3), static_cast<short>(in2),
+                                         static_cast<short>(in1), static_cast<short>(in0));
+        {
+            __m128i acc = _mm_madd_epi16(wv, iv);
+            acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 8));
+            acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 4));
+            dot = _mm_cvtsi128_si32(acc);
+        }
+#else
         std::int32_t w[8];
         for (int i = 0; i < 8; i++) w[i] = static_cast<std::int16_t>(Rd16(mem, wRowOff + i * 2));
         std::int32_t inputs[8] = {in0, in1, in2, in3, in4, in5, in6, in7};
-        std::int32_t dot = 0;
+        dot = 0;
         for (int i = 0; i < 8; i++) dot += w[i] * inputs[i];
+#endif
 
         std::int32_t sq = (dot >> 16) + 0x800;
         std::uint32_t sqU = (sq < 0) ? 0u : static_cast<std::uint32_t>(sq);
@@ -430,7 +459,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         // bit exactly where the coder sits near a decision boundary and nowhere
         // else, which is what this file does. So the suspect is a branch that
         // almost never fires. Count each and record where it first does.
-        static const char* const rb = NZ_ENV("NZO2_RAREBRANCH");
+        static const char* const rb = O2_DBG_ENV("NZO2_RAREBRANCH");
         if (rb != nullptr) {
             static long n_neg = 0, n_clamp = 0, n_pfix = 0, n_tot = 0;
             static std::uint32_t first_neg = 0, first_clamp = 0;
@@ -439,11 +468,11 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
             if (sqU >= 0xfffu) {
                 if (!n_clamp) first_clamp = g_rare_pos;
                 ++n_clamp;
-                if (NZ_ENV("NZO2_RAREBRANCH_EVERY"))
+                if (O2_DBG_ENV("NZO2_RAREBRANCH_EVERY"))
                     std::fprintf(stderr, "[RARE] CLAMP #%ld at pos=%u sq=%d dot=%d\n",
                                  n_clamp, g_rare_pos, sq, dot);
             }
-            if (n_tot % 2000000 == 0 || NZ_ENV("NZO2_RAREBRANCH_EVERY")) {
+            if (n_tot % 2000000 == 0 || O2_DBG_ENV("NZO2_RAREBRANCH_EVERY")) {
                 std::fprintf(stderr, "[RARE] bits=%ld sq<0=%ld (first pos %u) sq>=0xfff=%ld (first pos %u)\n",
                              n_tot, n_neg, first_neg, n_clamp, first_clamp);
             }
@@ -466,7 +495,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         // NZO2_DUMP_AT_MIX=<mixbit>:<path> -- dump the whole model area at one
         // exact literal-mixer bit, so it can be diffed against a GDB dump of
         // the real object taken at the matching A#/B# breakpoint hit.
-        static const char* const da = NZ_ENV("NZO2_DUMP_AT_MIX");
+#ifdef NZOPT_DEBUG
+        static const char* const da = O2_DBG_ENV("NZO2_DUMP_AT_MIX");
         if (da != nullptr) {
             long want = std::atol(da);
             const char* colon = std::strchr(da, ':');
@@ -476,36 +506,50 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 std::fprintf(stderr, "[O2] mem dump at MIX #%ld -> %s\n", want, colon + 1);
             }
         }
+#endif
+#ifdef NZOPT_DEBUG
         const std::uint32_t rclo_ = rc.lo, rchi_ = rc.hi, rccode_ = rc.code;
+#endif
         std::uint32_t bit = rc.DecodeBit(pFinal);
-        static const char* const mixfrom_ = NZ_ENV("NZO2_MIXFROM");
+#ifdef NZOPT_DEBUG
+        static const char* const mixfrom_ = O2_DBG_ENV("NZO2_MIXFROM");
         static const long mixfrom = mixfrom_ ? atol(mixfrom_) : -1;
-        static const long mixto = NZ_ENV("NZO2_MIXTO") ? atol(NZ_ENV("NZO2_MIXTO")) : (mixfrom + 8);
-        static const bool trace_mix = NZ_ENV("NZOPT2_TRACE_MIX") != nullptr;
+        static const long mixto = O2_DBG_ENV("NZO2_MIXTO") ? atol(O2_DBG_ENV("NZO2_MIXTO")) : (mixfrom + 8);
+        static const bool trace_mix = O2_DBG_ENV("NZOPT2_TRACE_MIX") != nullptr;
         if (trace_mix || (mixfrom >= 0 && g_mixbits >= mixfrom && g_mixbits <= mixto))
             fprintf(stderr, "  MIX #%ld ctxP=%#x ctx2=%#x ctx1p=%u ctx3=%#x ctx6s=%u ctx7s=%u ctxC=%u confByte=%u apmOff=%#x apmNear=%#x apmLo=%u apmHi=%u interp=%u in=[%d,%d,%d,%d,%d,%d,%d,%d] w=[%d,%d,%d,%d,%d,%d,%d,%d] wRowOff=%#x sqMin=%u apmSeed=%u mixedP=%u pFinal=%u bit=%u rclo=%#x rchi=%#x rccode=%#x critprob=%u\n",
-            g_mixbits, ctxP, ctx2, ctx1p, ctx3, ctx6s, ctx7s, ctxC, confByte, apmOff, apmNear, apmLo, apmHi, interp, in0,in1,in2,in3,in4,in5,in6,in7, w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7], wRowOff, sqMin, apmSeed, mixedP, pFinal, bit, rclo_, rchi_, rccode_,
+            g_mixbits, ctxP, ctx2, ctx1p, ctx3, ctx6s, ctx7s, ctxC, confByte, apmOff, apmNear, apmLo, apmHi, interp, in0,in1,in2,in3,in4,in5,in6,in7, Rd16(mem, wRowOff), Rd16(mem, wRowOff+2), Rd16(mem, wRowOff+4), Rd16(mem, wRowOff+6), Rd16(mem, wRowOff+8), Rd16(mem, wRowOff+10), Rd16(mem, wRowOff+12), Rd16(mem, wRowOff+14), wRowOff, sqMin, apmSeed, mixedP, pFinal, bit, rclo_, rchi_, rccode_,
             (unsigned)(((rchi_ - rclo_) >> 12) ? ((rccode_ - rclo_) / ((rchi_ - rclo_) >> 12)) : 0u));
 
+#endif
         Wr16(mem, apmNear,
              static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1003eu - apmOld) >> 6) + apmOld));
         std::int32_t err = static_cast<std::int32_t>(bit * 0xfffu) - static_cast<std::int32_t>(pFinal);
+        // w[i] += clamp16(((in[i] * err * 16) >> 16 + 1) >> 1): the original's
+        // pmulhw / psraw / paddsw sequence. |in| < 2^12 and |err| < 2^12, so the
+        // product fits 32 bits and (p * 16) >> 16 == p >> 12 exactly.
+#if defined(__SSE2__)
+        {
+            const __m128i ev = _mm_set1_epi16(static_cast<short>(err));
+            const __m128i lo = _mm_mullo_epi16(iv, ev), hi = _mm_mulhi_epi16(iv, ev);
+            __m128i p0 = _mm_unpacklo_epi16(lo, hi), p1 = _mm_unpackhi_epi16(lo, hi);   // 8 x int32 products
+            const __m128i one = _mm_set1_epi32(1);
+            p0 = _mm_srai_epi32(_mm_add_epi32(_mm_srai_epi32(p0, 12), one), 1);
+            p1 = _mm_srai_epi32(_mm_add_epi32(_mm_srai_epi32(p1, 12), one), 1);
+            const __m128i delta = _mm_packs_epi32(p0, p1);     // |delta| <= 2^11, exact
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(mem + wRowOff), _mm_adds_epi16(wv, delta));
+        }
+#else
         for (int i = 0; i < 8; i++) {
             std::int64_t t1 = (static_cast<std::int64_t>(inputs[i]) * err * 16) >> 16;
             std::int64_t delta = (t1 + 1) >> 1;
             std::int64_t nv = delta + w[i];
-            if (NZ_ENV("NZO2_RAREBRANCH") && (nv < -32768 || nv > 32767)) {
-                static long n_wclamp = 0;
-                ++n_wclamp;
-                if (NZ_ENV("NZO2_RAREBRANCH_EVERY"))
-                    std::fprintf(stderr, "[RARE] WCLAMP #%ld at pos=%u w[%d] nv=%lld\n",
-                                 n_wclamp, g_rare_pos, i, (long long)nv);
-            }
             std::int16_t clamped = (nv < -32768) ? static_cast<std::int16_t>(-32768)
                                   : (nv > 32767)  ? static_cast<std::int16_t>(32767)
                                                    : static_cast<std::int16_t>(nv);
             Wr16(mem, wRowOff + i * 2, static_cast<std::uint16_t>(clamped));
         }
+#endif
 
         std::uint32_t upd8 = bit * 0x100u;
         Wr8(mem, 0x208a0 + static_cast<int>(ctx7s),
@@ -637,7 +681,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
     while (local_74 < out_size) {
         std::uint32_t chunk_size = std::min(out_size - local_74, 0x8000u);
         std::uint32_t headroom = ring_.EnsureHeadroom(chunk_size);
-        if (NZ_ENV("NZO2_TRACE_CHUNK"))
+        if (O2_DBG_ENV("NZO2_TRACE_CHUNK"))
             std::fprintf(stderr, "[O2] chunk: produced=%u chunk_size=%u cursor=%u capacity=%u -> headroom=%u%s\n",
                          local_74, chunk_size, ring_.cursor, ring_.capacity, headroom,
                          headroom == 0 ? "  *** LZP RESET" : "");
@@ -662,7 +706,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
             // with tens of thousands of byte-exact bytes on either side.
             std::memset(mem + 0x1042c00, 0, 0x40000u);
         }
-        if (const char* dp = NZ_ENV("NZO2_DUMP_CHUNK")) {
+        if (const char* dp = O2_DBG_ENV("NZO2_DUMP_CHUNK")) {
             // Model memory at the start of each 0x8000 chunk, so a divergence that
             // appears WITHIN a block can be bracketed. Pair with a GDB hardware
             // watchpoint on the real output buffer at the same byte offset, which
@@ -809,7 +853,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1001e - apm2Old) >> 5) + apm2Old));
 
                 g_rare_pos = local_54;
-                if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "pos=%u mixbits=%ld dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, g_mixbits, bit, mixedP, rc.lo, rc.hi, rc.code);
+                if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "pos=%u mixbits=%ld dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, g_mixbits, bit, mixedP, rc.lo, rc.hi, rc.code);
                 if (bit != 0) break;  // literal: fall through to mixer below
 
                 // ===================== MATCH DECODE =====================
@@ -908,10 +952,10 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 }
                 std::uint32_t length = local_a4v + 2u;
 
-                if (local_94 < length) { if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@length pos=%u local_94=%u length=%u\n", local_54, local_94, length); failed = true; break; }
+                if (local_94 < length) { if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@length pos=%u local_94=%u length=%u\n", local_54, local_94, length); failed = true; break; }
 
                 if (slot_group == 0) {
-                    if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "  entering slot-tree: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
+                    if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "  entering slot-tree: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
                     std::uint32_t length_code = std::min<std::uint32_t>(local_a4v, 15u);
                     std::uint8_t lengthBucket = nzr::optimum::OptimumDat081724d0()[length_code];
                     std::uint32_t rowBias = static_cast<std::uint32_t>(lengthBucket) << 5;
@@ -932,7 +976,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                             (prob1 + 2u +
                              (((static_cast<std::uint32_t>(cell2hi) + 1u + static_cast<std::uint32_t>(cell2lo)) >> 5) * 3u)) >> 2;
                         std::uint32_t bit2 = rc.DecodeBit(combined + ((combined < 0x800u) ? 1u : 0u));
-                        if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "    slotbit[%d] treepos_before=%u cell1Off=%#x cell1=%u prob1=%u iVar26u=%u cell2lo=%u cell2hi=%u combined=%u bit=%u\n",
+                        if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "    slotbit[%d] treepos_before=%u cell1Off=%#x cell1=%u prob1=%u iVar26u=%u cell2lo=%u cell2hi=%u combined=%u bit=%u\n",
                                                               i, treepos, cell1Off, cell1, prob1, iVar26u, cell2lo, cell2hi, combined, bit2);
 
                         std::uint32_t upd1 = static_cast<std::uint32_t>(
@@ -949,7 +993,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         slotAcc = bit2 + slotAcc * 2u;
                     }
                     std::uint32_t slot = slotAcc ^ 0x1fu;
-                    if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "  slotAcc=%u slot=%u lengthBucket=%u rowBias=%u\n", slotAcc, slot, lengthBucket, rowBias);
+                    if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "  slotAcc=%u slot=%u lengthBucket=%u rowBias=%u\n", slotAcc, slot, lengthBucket, rowBias);
 
                     std::uint32_t acc = (slot != 0u) ? 1u : 0u;
                     {
@@ -1015,12 +1059,12 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                     }
 
                     if (ring_.capacity <= acc) {
-                        if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@distance pos=%u acc=%u capacity=%u\n", local_54, acc, ring_.capacity);
+                        if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@distance pos=%u acc=%u capacity=%u\n", local_54, acc, ring_.capacity);
                         // Copy out whatever this chunk decoded before giving up:
                         // the boundary between right and wrong bytes is the only
                         // thing that localises a model divergence, and a chunk
                         // that copies nothing hides it entirely.
-                        if (const char* cp = NZ_ENV("NZO2_DUMP_PARTIAL")) {
+                        if (const char* cp = O2_DBG_ENV("NZO2_DUMP_PARTIAL")) {
                             FILE* pf = fopen(cp, "wb");
                             if (pf) {
                                 fwrite(base + chunk_start, 1,
@@ -1040,7 +1084,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 }
 
                 std::uint32_t distance = rep[0] + 1u;
-                if (NZ_ENV("NZOPT2_TRACE")) fprintf(stderr, "MATCH pos=%u length=%u distance=%u slot_group=%u rep=[%u,%u,%u,%u]\n", local_54, length, distance, slot_group, rep[0], rep[1], rep[2], rep[3]);
+                if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "MATCH pos=%u length=%u distance=%u slot_group=%u rep=[%u,%u,%u,%u]\n", local_54, length, distance, slot_group, rep[0], rep[1], rep[2], rep[3]);
                 local_81 = static_cast<std::uint8_t>(local_81 * 2);
 
                 std::uint32_t srcStart = local_54 - distance;
@@ -1053,7 +1097,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 if (underflow && ring_.scrolled_once) {
                     static bool done = false;
                     if (!done) {
-                        if (const char* up = NZ_ENV("NZO2_DUMP_UNDERFLOW")) {
+                        if (const char* up = O2_DBG_ENV("NZO2_DUMP_UNDERFLOW")) {
                             done = true;
                             char rp[512];
                             std::snprintf(rp, sizeof(rp), "%s.ring", up);
@@ -1120,7 +1164,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                     Wr16(mem, 0x103ae12, static_cast<std::uint16_t>(ctxC_idx));
                 }
 
-                if (NZ_ENV("NZOPT2_TRACE_SETUP")) fprintf(stderr, "SETUP pos=%u am2=%#x local_a4=%#x ctxP_off=%#x ctx1_pos=%u ctx2_off=%#x ctx3_off=%#x predRep0=%#x predLzp=%#x local_9c=%u ctx6_seed=%u ctx7_seed=%u local_81=%#x\n",
+                if (O2_DBG_ENV("NZOPT2_TRACE_SETUP")) fprintf(stderr, "SETUP pos=%u am2=%#x local_a4=%#x ctxP_off=%#x ctx1_pos=%u ctx2_off=%#x ctx3_off=%#x predRep0=%#x predLzp=%#x local_9c=%u ctx6_seed=%u ctx7_seed=%u local_81=%#x\n",
                     local_54, am2, local_a4, ctxP_off, ctx1_pos, ctx2_off, ctx3_off, predRep0, predLzp, local_9c, ctx6_seed, ctx7_seed, local_81);
                 std::uint32_t byteAcc = 0;
                 std::uint32_t bitsLeft = 4;
@@ -1144,7 +1188,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 }
 
                 local_a4 = byteAcc;
-                if (NZ_ENV("NZOPT2_TRACE_LIT")) fprintf(stderr, "LIT pos=%u byte=%#x (%c)\n", local_54, byteAcc, (byteAcc>=32&&byteAcc<127)?(char)byteAcc:'.');
+                if (O2_DBG_ENV("NZOPT2_TRACE_LIT")) fprintf(stderr, "LIT pos=%u byte=%#x (%c)\n", local_54, byteAcc, (byteAcc>=32&&byteAcc<127)?(char)byteAcc:'.');
                 base[local_54] = static_cast<std::uint8_t>(byteAcc);
                 local_54 += 1;
                 local_94 -= 1;
