@@ -16,7 +16,9 @@
 #include "nz_bwt.h"
 #include "nz_audio.h"
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <type_traits>
 #include <thread>
 #include <iterator>
 #include "nz_exefilter.h"
@@ -1154,6 +1156,44 @@ enum class LegacyPayloadMode {
     kCompressed
 };
 
+// The decoded output. Either a std::vector moved in from a producer (no copy),
+// or an UNINITIALISED heap array for producers that fill every byte themselves
+// -- the parallel containers, whose slices are proven to tile the output before
+// any worker starts. std::vector<unsigned char>(n) zeroes n bytes on ONE thread
+// before the decode can begin; on a 2.3 GB archive that alone was half a second
+// of the critical path, and every page was then faulted in a second time by the
+// workers.
+class ByteBuffer {
+public:
+    ByteBuffer() = default;
+    ByteBuffer(std::vector<unsigned char>&& v) : vec_(std::move(v)) {}   // NOLINT: implicit by design
+    ByteBuffer& operator=(std::vector<unsigned char>&& v) { raw_.reset(); raw_n_ = 0; vec_ = std::move(v); return *this; }
+    ByteBuffer(ByteBuffer&&) = default;
+    ByteBuffer& operator=(ByteBuffer&&) = default;
+    ByteBuffer(const ByteBuffer& o) { *this = o; }
+    ByteBuffer& operator=(const ByteBuffer& o) {
+        if (this != &o) { raw_.reset(); raw_n_ = 0; vec_.assign(o.data(), o.data() + o.size()); }
+        return *this;
+    }
+    static ByteBuffer Uninitialized(std::size_t n) {
+        ByteBuffer b;
+        if (n) { b.raw_.reset(new unsigned char[n]); b.raw_n_ = n; }
+        return b;
+    }
+    unsigned char* data() { return raw_ ? raw_.get() : vec_.data(); }
+    const unsigned char* data() const { return raw_ ? raw_.get() : vec_.data(); }
+    std::size_t size() const { return raw_ ? raw_n_ : vec_.size(); }
+    bool empty() const { return size() == 0u; }
+    void clear() { raw_.reset(); raw_n_ = 0; vec_.clear(); }
+    template <class It> void assign(It a, It b) { raw_.reset(); raw_n_ = 0; vec_.assign(a, b); }
+    const unsigned char* begin() const { return data(); }
+    const unsigned char* end() const { return data() + size(); }
+private:
+    std::vector<unsigned char> vec_;
+    std::unique_ptr<unsigned char[]> raw_;
+    std::size_t raw_n_ = 0;
+};
+
 struct LegacyCnContext {
     std::string archive_path;
     ChecksumMode checksum_mode = ChecksumMode::kNone;
@@ -1192,7 +1232,7 @@ struct LegacyCnContext {
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
     std::uint64_t total_data_size = 0;
-    std::vector<unsigned char> data;
+    ByteBuffer data;
 };
 
 // ---------------------------------------------------------------------------
@@ -2925,7 +2965,13 @@ bool DecodeLzpfMember(
     unsigned method_p1,
     bool derived_cap_only,
     Verify&& verify,
-    std::vector<unsigned char>* out) {
+    std::vector<unsigned char>* out,
+    // Optional: decode straight into this caller-owned buffer of `total` bytes
+    // (a parallel container's slice of the assembled output) instead of into a
+    // fresh zeroed vector that is then copied -- two passes over the output
+    // saved. With it, `verify` takes (const unsigned char*, std::size_t) and
+    // *out is left empty on success.
+    unsigned char* direct_out = nullptr) {
     progress::Scope pscope;
     if (first_block_pos + first_stream_len > bytes.size()) return false;
     // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
@@ -3012,7 +3058,18 @@ bool DecodeLzpfMember(
         std::vector<std::uint8_t> window_alloc(
             window_left_pad + window_capacity + window_tail_slack, 0);
         std::uint8_t* const window = window_alloc.data() + window_left_pad;
-        std::vector<unsigned char> decoded(static_cast<std::size_t>(total), 0);
+        std::vector<unsigned char> decoded_store;
+        unsigned char* decoded = direct_out;
+        if (decoded == nullptr) {
+            decoded_store.assign(static_cast<std::size_t>(total), 0);
+            decoded = decoded_store.data();
+        }
+        auto run_verify = [&]() -> bool {
+            if constexpr (std::is_invocable_v<Verify, const unsigned char*, std::size_t>)
+                return verify(static_cast<const unsigned char*>(decoded), static_cast<std::size_t>(total));
+            else
+                return verify(decoded_store);
+        };
         std::vector<std::int32_t> hash_table(
             is_variant_b ? std::size_t{0x1000000u} : std::size_t{8192u}, std::int32_t{3});
         std::vector<std::uint8_t> byte_buffer_b(
@@ -3121,7 +3178,7 @@ bool DecodeLzpfMember(
                 if (pf_consumed == 0) { decode_ok = false; break; }
                 input_pos += pf_consumed;
                 window_cursor += static_cast<std::size_t>(block_out_size);
-                std::memcpy(decoded.data() + total_written, window + block_start_in_window,
+                std::memcpy(decoded + total_written, window + block_start_in_window,
                             static_cast<std::size_t>(block_out_size));
                 // Backfill hash_table for the prefilter block's window bytes.
                 // The real dispatcher FUN_08097570 calls FUN_080b6d90 at the end
@@ -3203,7 +3260,7 @@ bool DecodeLzpfMember(
             // this branch.
             auto apply_exe_filter = [&](std::size_t out_off, std::size_t n) {
                 if ((uvar9 & 4u) == 0u) return;
-                nzr::cd::NzCdExeUnfilter(decoded.data() + out_off, static_cast<std::uint32_t>(n),
+                nzr::cd::NzCdExeUnfilter(decoded + out_off, static_cast<std::uint32_t>(n),
                                 static_cast<std::uint32_t>(out_off + 4u));
             };
             if (mode_literal) {
@@ -3211,7 +3268,7 @@ bool DecodeLzpfMember(
                 const std::size_t block_start_in_window = window_cursor;
                 std::memcpy(window + block_start_in_window, bytes.data() + input_pos,
                             static_cast<std::size_t>(block_out_size));
-                std::memcpy(decoded.data() + total_written, bytes.data() + input_pos,
+                std::memcpy(decoded + total_written, bytes.data() + input_pos,
                             static_cast<std::size_t>(block_out_size));
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 // Backfill hash_table for the literal bytes just written
@@ -3293,7 +3350,7 @@ bool DecodeLzpfMember(
             if (!dispatch_ok) { decode_ok = false; break; }
             if (mode_lz77_raw) input_pos += raw_consumed;
             if (window_cursor != block_start_in_window + block_out_size) { decode_ok = false; break; }
-            std::memcpy(decoded.data() + total_written, window + block_start_in_window,
+            std::memcpy(decoded + total_written, window + block_start_in_window,
                         static_cast<std::size_t>(block_out_size));
             apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
             total_written += static_cast<std::size_t>(block_out_size);
@@ -3304,22 +3361,23 @@ bool DecodeLzpfMember(
                 char path[512];
                 snprintf(path, sizeof(path), "%s.cap%zu", dp, window_capacity);
                 if (FILE* fp = fopen(path, "wb")) {
-                    fwrite(decoded.data(), 1, total_written, fp);
+                    fwrite(decoded, 1, total_written, fp);
                     fclose(fp);
                 }
             }
             fprintf(stderr, "[lzpf] cap=%zu blocks=%zu ok=%d written=%zu/%llu verify=%d\n",
                     window_capacity, blk_idx, (int)decode_ok, total_written,
                     (unsigned long long)total,
-                    (decode_ok && total_written == total) ? (int)verify(decoded) : -1);
+                    (decode_ok && total_written == total) ? (int)run_verify() : -1);
         }
         if (first_candidate) {
             first_candidate = false;
             if (member_done > 0 && member_done < total)
-                first_prefix.assign(decoded.begin(), decoded.begin() + static_cast<std::ptrdiff_t>(member_done));
+                first_prefix.assign(decoded, decoded + member_done);
         }
-        if (decode_ok && total_written == total && verify(decoded)) {
-            *out = std::move(decoded);
+        if (decode_ok && total_written == total && run_verify()) {
+            if (direct_out != nullptr) { if (out != nullptr) out->clear(); }
+            else *out = std::move(decoded_store);
             pscope.Commit();
             return true;
         }
@@ -4294,7 +4352,7 @@ bool TryParseLegacyCnArchive(
     std::size_t literal_data_offset = 0;
     std::size_t literal_data_size = 0;
     bool literal_data_owned = false;
-    std::vector<unsigned char> literal_data_buffer;
+    ByteBuffer literal_data_buffer;
     const auto validate_literal_candidate = [&](std::size_t offset) -> bool {
         if (offset > bytes.size()) {
             return false;
@@ -4337,34 +4395,37 @@ bool TryParseLegacyCnArchive(
 
         return true;
     };
-    const auto validate_decoded_candidate = [&](const std::vector<unsigned char>& candidate) -> bool {
-        if (candidate.size() != static_cast<std::size_t>(total_data_size))
+    const auto validate_decoded_candidate_p = [&](const unsigned char* cdata, std::size_t csize) -> bool {
+        if (csize != static_cast<std::size_t>(total_data_size))
             return false;
         std::size_t cursor = 0;
         for (const LegacyCnEntry& e : entries) {
-            if (e.size > static_cast<std::uint64_t>(candidate.size() - cursor))
+            if (e.size > static_cast<std::uint64_t>(csize - cursor))
                 return false;
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (e.has_checksum && checksum_verification_supported) {
-                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, candidate.data() + cursor, n);
+                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, cdata + cursor, n);
                 if (got != e.checksum)
                     return false;
             }
             cursor += n;
         }
-        return cursor == candidate.size();
+        return cursor == csize;
+    };
+    const auto validate_decoded_candidate = [&](const std::vector<unsigned char>& candidate) -> bool {
+        return validate_decoded_candidate_p(candidate.data(), candidate.size());
     };
     // Option (c) for damaged archives: a candidate whose decode completed (sizes
     // add up) but whose per-entry checksums do not all match is kept as a
     // fallback; if no fully verified candidate turns up, it is adopted and the
     // extractor writes the good entries and reports the bad ones. Always returns
     // false so the adopting branch is skipped at the call site.
-    std::vector<unsigned char> partial_candidate;
+    ByteBuffer partial_candidate;
     std::vector<std::uint8_t> partial_ok;
     // A decode that failed part-way: the output of the members completed before
     // the failure. Adopted with ctx.decode_failed when nothing better turns up.
     std::vector<unsigned char> partial_prefix;
-    const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
+    const auto record_partial_b = [&](ByteBuffer& candidate) -> bool {
         if (!partial_candidate.empty() || candidate.size() != static_cast<std::size_t>(total_data_size)) return false;
         std::vector<std::uint8_t> ok; std::size_t bad = 0;
         if (CheckEntries(entries, checksum_mode, checksum_verification_supported, candidate.data(), candidate.size(), &ok, &bad) && bad > 0) {
@@ -4372,6 +4433,13 @@ bool TryParseLegacyCnArchive(
             partial_ok = std::move(ok);
         }
         return false;
+    };
+    const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
+        ByteBuffer b(std::move(candidate));
+        const bool r = record_partial_b(b);
+        if (!partial_candidate.empty() && partial_candidate.data() == b.data()) return r;  // moved
+        candidate.assign(b.data(), b.data() + b.size());   // give it back
+        return r;
     };
 
     // A multi-block archive interleaves the next block's table/mtime/perm/
@@ -4517,8 +4585,9 @@ bool TryParseLegacyCnArchive(
                             }
                             p += csz;
                         }
-                        std::vector<unsigned char> assembled(
-                            static_cast<std::size_t>(total_data_size), 0);
+                        ByteBuffer assembled = ByteBuffer::Uninitialized(static_cast<std::size_t>(total_data_size));
+                        std::vector<std::atomic<bool>> slice_done(ps.size());
+                        for (auto& d : slice_done) d.store(false, std::memory_order_relaxed);
                         bool all_ok = parse_ok && !ps.empty();
                         std::vector<PStream*> plist;
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
@@ -4541,21 +4610,28 @@ bool TryParseLegacyCnArchive(
                                                bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                             const ChecksumMode cm = s.cmode;
                             const std::uint32_t cv = s.cval;
-                            auto slice_verify = [&](const std::vector<unsigned char>& dec) -> bool {
-                                return ComputeBufferChecksum(cm, dec.data(), dec.size()) == cv;
+                            auto slice_verify = [&](const unsigned char* dec, std::size_t n) -> bool {
+                                return ComputeBufferChecksum(cm, dec, n) == cv;
                             };
-                            std::vector<unsigned char> slice;
+                            // Straight into this stream's slice (DisjointCover proved the
+                            // slices tile the output before any thread started).
+                            if (static_cast<std::uint64_t>(s.ooff) + s.osz > assembled.size()) return false;
+                            std::vector<unsigned char> unused;
                             if (!DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
-                                                  is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &slice)) {
-                                return false;
-                            }
-                            if (slice.size() != s.osz) return false;
-                            std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
-                                        slice.data(), slice.size());
+                                                  is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &unused,
+                                                  assembled.data() + static_cast<std::size_t>(s.ooff))) return false;
+                            slice_done[idx].store(true, std::memory_order_relaxed);
                             return true;
                         });
+                        if (!all_ok) {
+                            // The buffer is uninitialised: give the slices that did not
+                            // complete the zeros the zero-filled vector used to hold.
+                            for (std::size_t q = 0; q < plist.size(); ++q)
+                                if (!slice_done[q].load(std::memory_order_relaxed))
+                                    std::memset(assembled.data() + static_cast<std::size_t>(plist[q]->ooff), 0, plist[q]->osz);
+                        }
                         StageMark("streams decoded");
-                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                        if (all_ok && (validate_decoded_candidate_p(assembled.data(), assembled.size()) || record_partial_b(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4807,14 +4883,14 @@ bool TryParseLegacyCnArchive(
                                     sub.cm_b_bits = cm_b_bits;
                                     sub.cm_window_size = cm_window_size;
                                     sub.total_data_size = out_size;
+                                    std::vector<unsigned char> subdata;
                                     for (const auto& c : chunks) {
-                                        WriteLegacyVarint(
-                                            static_cast<std::uint64_t>(c.second) << 4u, &sub.data);
-                                        sub.data.insert(
-                                            sub.data.end(),
-                                            bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                            bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                        WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
+                                        subdata.insert(subdata.end(),
+                                                       bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                                       bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                                     }
+                                    sub.data = std::move(subdata);
                                     std::string err;
                                     return TryDecodeLegacyCm(sub, dst, &err);
                                 },
@@ -4956,13 +5032,14 @@ bool TryParseLegacyCnArchive(
                             sub.cm_b_bits = cm_b_bits;
                             sub.cm_window_size = cm_window_size;
                             sub.total_data_size = st.osz;
+                            std::vector<unsigned char> subdata;
                             for (const auto& c : st.chunks) {
-                                WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &sub.data);
-                                sub.data.insert(
-                                    sub.data.end(),
-                                    bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                    bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
+                                subdata.insert(subdata.end(),
+                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                             }
+                            sub.data = std::move(subdata);
                             std::vector<unsigned char> slice;
                             std::string sub_err;
                             if (!TryDecodeLegacyCm(sub, &slice, &sub_err) ||
