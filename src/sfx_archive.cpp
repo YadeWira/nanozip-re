@@ -50,6 +50,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1243,6 +1247,10 @@ struct LegacyCnContext {
     // whether any record follows the last data record in the file.
     std::vector<std::size_t> payload_record_ends;
     bool records_after_data = false;
+    // A parallel container written by the sink (psink): the files are already on
+    // disk (or verified, for `t`); the extractor only reports.
+    bool sink_handled = false;
+    std::size_t sink_failed_entries = 0;
     LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
     std::vector<LegacyCnEntry> entries;
     std::uint64_t data_offset = 0;
@@ -1257,6 +1265,7 @@ struct LegacyCnContext {
 // decoder recorded, in payload (spliced data record) space.
 void AdoptDecodeError(LegacyCnContext& ctx) {
     const nzr::derr::State& e = nzr::derr::Current();
+    if (e.code == 0xfffffffeu) { ctx.decode_eof = true; ctx.decode_code = 0u; ctx.decode_slot = e.parallel ? e.slot : 0u; ctx.decode_at_last_record = true; nzr::derr::Clear(); return; }
     ctx.decode_code = e.code;
     ctx.decode_fatal_id = e.fatal_id;
     ctx.decode_slot = e.parallel ? e.slot : 0u;
@@ -1537,6 +1546,383 @@ struct SlotScope {
 };
 
 }  // namespace progress
+
+// ---------------------------------------------------------------------------
+// Parallel-container output sink: the original's writer model for -pN archives,
+// measured on 91 damaged single- and multi-file parallel containers (2026-09-04,
+// ~/.cache/nzre_tools/cli_parity/corrupt_compare_parallel.sh):
+//  * every WORKER writes its own stream straight into the output files at
+//    absolute offsets (strace: one open O_CREAT|O_TRUNC, then one open O_WRONLY
+//    per other worker) -- a stream that fails leaves a HOLE of zeros, or a short
+//    file when it was the last slot;
+//  * the CM family flushes per codec block, lzpf per member segment, -cd/-cD
+//    per file group (a table's files; 1 MB quanta inside a group) -- a status
+//    failure keeps NOTHING of the unit in flight, a clean-but-short stream
+//    flushes what it produced;
+//  * a group's FIRST file is created (empty) when the worker starts the group,
+//    the group's later files when bytes reach them; groups after a failure are
+//    never started; the other workers carry on;
+//  * slice checksums (one per table entry) are verified when the slice is out
+//    and a mismatch prints "Checksum mismatch [stored computed]: <file>", then
+//    the footer; a status error prints "Archive corrupted. Error decoding (code
+//    status<<8|slot)" and no footer.
+// `t` runs the same sink without touching the disk. NZ_SAFE keeps the old
+// assemble-then-verify path (verified bytes only).
+std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size);
+bool SafeMode();
+
+namespace psink {
+
+// The clean-but-short stream end: no status, "Unexpected end of file".
+constexpr std::uint32_t kCleanEndCode = 0xfffffffeu;
+
+struct Slice {
+    std::size_t entry = 0;            // index into the archive's entries
+    std::uint64_t file_off = 0;       // where it sits inside its file
+    std::uint64_t len = 0;
+    std::uint64_t spos = 0;           // where it starts inside the stream's output
+    ChecksumMode cmode = ChecksumMode::kNone;
+    std::uint32_t cval = 0;
+    bool has_cksum = false;
+    std::size_t group = 0;            // table group inside the stream
+    bool checked = false;
+};
+struct Stream {
+    std::vector<Slice> slices;        // in stream order
+    std::uint64_t total = 0;
+    std::vector<std::uint64_t> group_start;   // stream position where each group starts
+    std::uint64_t flushed = 0;        // bytes of the stream already on disk
+    std::size_t entered_group = 0;    // groups < this had their first file created
+    bool entered_any = false;
+    bool cut = false;                 // its last data record was cut off by the end of the archive
+};
+enum class Policy { kProduced, kGroup, kStore };
+// What a worker of each codec reports when its stream ends early without a
+// status of its own (measured on cut and flipped -p4 containers):
+//   stream cut mid-group:      -cc/-co nothing ("Unexpected end of file"), -cO 100,
+//                              lzpf 2, -cd/-cD 4
+//   a group announced but no data record left for it (cut before it): CM family
+//                              100, lzpf 4, -cD 1
+//   not cut, decoder just stopped short: CM family 100, lzpf nothing, -cd 4
+enum class Family { kCm, kCo, kCO, kLzpf, kCd, kStore };
+
+struct FileState {
+    bool selected = false;
+    bool write_it = false;            // after the overwrite prompt / unsafe path
+    bool decided = false;             // prompt asked / path judged
+    bool created = false;
+    bool cannot_write = false;
+    fs::path path;
+    std::string display;              // as the original names it: relative unless -o gave a root
+    int fd = -1;
+    std::mutex io;
+};
+
+struct Engine {
+    std::mutex mu;                    // state (files, streams, counters)
+    bool configured = false;          // RunExtractOrTest set the options
+    bool published = false;           // a parallel container handed its layout
+    bool committed = false;           // something was created/written: the outcome is final
+    const CliOptions* opt = nullptr;
+    bool test_mode = false;
+    std::ostream* os = nullptr;
+    fs::path root;
+    const std::vector<LegacyCnEntry>* entries = nullptr;
+    std::vector<Stream> streams;
+    Policy policy = Policy::kProduced;
+    Family family = Family::kCm;
+    std::uint64_t quantum = 0;        // -cd: 1 MB flush quanta inside a group
+    std::vector<std::unique_ptr<FileState>> files;
+    bool yes_to_all = false;
+    std::size_t mismatches = 0;
+    std::size_t unsafe = 0;
+    std::size_t cannot = 0;
+    bool stream_failed = false;
+    bool truncated = false;           // the archive itself is cut short
+};
+inline Engine& E() { static Engine e; return e; }
+inline void MarkTruncated() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); e.truncated = true; }
+
+inline void Configure(const CliOptions& opt, bool test_mode, std::ostream& os, const fs::path& root) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.configured = !SafeMode();
+    e.published = e.committed = e.stream_failed = e.truncated = false;
+    e.opt = &opt; e.test_mode = test_mode; e.os = &os; e.root = root;
+    e.entries = nullptr; e.streams.clear(); e.files.clear();
+    e.yes_to_all = opt.yes_to_all; e.mismatches = e.unsafe = e.cannot = 0;
+}
+inline void Reset() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.configured = e.published = e.committed = false;
+    e.entries = nullptr; e.streams.clear(); e.files.clear();
+}
+// Available to a parallel path of the parser: configured and not yet used.
+inline bool Available() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.configured && !e.published; }
+inline bool Committed() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.committed; }
+
+// The parser hands over the layout: streams in worker order, each a list of
+// slices (entry, offset in file, length, checksum) in stream order with their
+// table group. Returns false (and stays inactive) on an inconsistent layout.
+inline bool Publish(const std::vector<LegacyCnEntry>& entries, std::vector<Stream> streams,
+                    Policy policy, std::uint64_t quantum, Family family) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.configured || e.published) return false;
+    for (Stream& s : streams) {
+        std::uint64_t pos = 0; std::size_t g = static_cast<std::size_t>(-1);
+        s.group_start.clear();
+        for (Slice& sl : s.slices) {
+            if (sl.entry >= entries.size()) return false;
+            if (sl.group != g) { g = sl.group; s.group_start.push_back(pos); }
+            sl.spos = pos; pos += sl.len;
+        }
+        s.total = pos; s.flushed = 0; s.entered_group = 0; s.entered_any = false;
+    }
+    e.entries = &entries; e.streams = std::move(streams); e.policy = policy; e.quantum = quantum; e.family = family;
+    e.files.clear();
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto f = std::make_unique<FileState>();
+        const LegacyCnEntry& en = entries[i];
+        f->selected = MatchesAnyPattern(en.path, e.opt->positional) && !IsExcluded(en.path, e.opt->exclude_patterns);
+        e.files.push_back(std::move(f));
+    }
+    e.published = true;
+    return true;
+}
+
+// Under e.mu. Decide the file's path and, when needed, ask the overwrite
+// question (std::cin is read with the lock dropped; the timer keeps drawing).
+inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex>& lk) {
+    FileState& f = *e.files[idx];
+    if (f.decided) return;
+    f.decided = true;
+    const LegacyCnEntry& en = (*e.entries)[idx];
+    if (e.test_mode || !f.selected) { f.write_it = false; return; }
+    fs::path safe_rel = e.opt->strip_paths ? fs::path(SanitizeExtractPath(en.path)).filename()
+                                           : SanitizeExtractPath(en.path);
+    if (e.opt->forceout) safe_rel = fs::path(e.opt->positional.empty() ? std::string("*") : e.opt->positional.front());
+    if (safe_rel.empty()) {
+        std::cerr << "Skipping unsafe path in archive: " << en.path << '\n';
+        ++e.unsafe; f.write_it = false; return;
+    }
+    f.path = e.root / safe_rel;
+    f.display = e.opt->output_path.empty() ? safe_rel.string() : f.path.string();
+    f.write_it = true;
+    std::error_code ec;
+    if (!e.yes_to_all && fs::exists(f.path, ec)) {
+        for (;;) {
+            {
+                progress::Engine& pe = progress::E();
+                std::lock_guard<std::mutex> plk(pe.mu);
+                ClearStatusLine(*e.os);
+                *e.os << '\r' << "Overwrite " << en.path << " (Yes/No/Always)? ";
+                e.os->flush();
+            }
+            std::string answer;
+            lk.unlock();
+            const bool got = static_cast<bool>(std::getline(std::cin, answer));
+            lk.lock();
+            if (!got) { f.write_it = false; break; }
+            const char k = answer.empty() ? '\0' : answer[0];
+            if (k == 'y') break;
+            if (k == 'n') { f.write_it = false; break; }
+            if (k == 'a') { e.yes_to_all = true; break; }
+        }
+    }
+}
+
+// Under e.mu: create the file (the original opens it when a worker's cursor
+// enters it). A failure prints "Cannot write: <path>" once.
+inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex>& lk) {
+    FileState& f = *e.files[idx];
+    DecideLocked(e, idx, lk);
+    if (f.created) return;
+    f.created = true;
+    e.committed = true;
+    const LegacyCnEntry& en = (*e.entries)[idx];
+    progress::FileStart(en.path);
+    if (!f.write_it) return;
+    if (f.path.has_parent_path()) MakeDirs0700(f.path.parent_path());
+#if defined(_WIN32)
+    f.fd = ::_open(f.path.string().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    f.fd = ::open(f.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                  static_cast<mode_t>((en.has_permissions ? en.permissions : 0600u) & 07777u));
+    if (f.fd >= 0 && e.opt->restore_ownership && en.has_owner)
+        (void)::fchown(f.fd, static_cast<uid_t>(en.uid), static_cast<gid_t>(en.gid));
+#endif
+    if (f.fd < 0) {
+        f.cannot_write = true; ++e.cannot;
+        progress::Engine& pe = progress::E();
+        std::lock_guard<std::mutex> plk(pe.mu);
+        *e.os << '\n' << "Cannot write: " << f.display << '\n';
+    }
+}
+
+// Positional write, outside e.mu (per-file lock; workers of a split file share
+// the descriptor).
+inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
+    if (f.fd < 0 || n == 0u) return;
+    std::lock_guard<std::mutex> lk(f.io);
+#if defined(_WIN32)
+    if (::_lseeki64(f.fd, static_cast<long long>(off), SEEK_SET) < 0) return;
+    while (n > 0u) {
+        const unsigned piece = static_cast<unsigned>(std::min<std::size_t>(n, std::size_t{1} << 28));
+        const int w = ::_write(f.fd, p, piece);
+        if (w <= 0) return;
+        p += w; n -= static_cast<std::size_t>(w); 
+    }
+#else
+    while (n > 0u) {
+        const ssize_t w = ::pwrite(f.fd, p, n, static_cast<off_t>(off));
+        if (w <= 0) return;
+        p += w; n -= static_cast<std::size_t>(w); off += static_cast<std::uint64_t>(w);
+    }
+#endif
+}
+
+inline void MismatchLine(Engine& e, const Slice& sl, std::uint32_t got) {
+    progress::Engine& pe = progress::E();
+    std::lock_guard<std::mutex> plk(pe.mu);
+    ClearStatusLine(*e.os);
+    *e.os << "Checksum mismatch [" << FormatChecksum(sl.cmode, sl.cval) << ' '
+          << FormatChecksum(sl.cmode, got) << "]: " << (*e.entries)[sl.entry].path << '\n';
+}
+
+// A worker starts stream k: the first file of its first group is created.
+inline void StreamBegin(std::size_t k) {
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (!s.slices.empty() && !s.entered_any) { s.entered_any = true; s.entered_group = 1; CreateLocked(e, s.slices.front().entry, lk); }
+}
+
+// A worker ends stream k. `buf` holds its output (produced bytes valid), `ok` =
+// the stream decoded completely (the slice checksums may still disagree),
+// `clean_end` = it stopped early without a status. Flushes per policy, creates
+// the files the cursor reached, verifies the slices that are out.
+inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t produced, bool ok, bool clean_end,
+                      // Store policy: bytes that actually arrived (the rest of `produced` is
+                      // zero padding the original writes anyway); the slice checksums are
+                      // computed over these.
+                      std::uint64_t received = ~std::uint64_t{0}) {
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (produced > s.total) produced = s.total;
+    if (received > produced) received = produced;
+    std::uint64_t flush_to = produced;
+    if (!ok && !clean_end && e.policy == Policy::kGroup) {
+        // The group in flight is lost; earlier groups (and whole quanta of this
+        // one) are out.
+        std::uint64_t gstart = 0;
+        for (std::uint64_t gs : s.group_start) if (gs <= produced) gstart = gs;
+        flush_to = gstart;
+        if (e.quantum != 0u && produced > gstart) flush_to = gstart + ((produced - gstart) / e.quantum) * e.quantum;
+    }
+    if (!ok) {
+        e.stream_failed = true;
+        if (nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u) {
+            std::uint32_t code = 100u;
+            if (clean_end) {
+                const bool no_data_group = s.group_start.size() > 1u && produced <= s.group_start.back();
+                const bool cut = s.cut || e.truncated;
+                if (cut && no_data_group)
+                    code = (e.family == Family::kLzpf) ? 4u : (e.family == Family::kCd) ? 1u : 100u;
+                else if (cut)
+                    code = (e.family == Family::kCm || e.family == Family::kCo) ? kCleanEndCode
+                         : (e.family == Family::kCO) ? 100u : (e.family == Family::kLzpf) ? 2u : 4u;
+                else
+                    code = (e.family == Family::kLzpf) ? kCleanEndCode : (e.family == Family::kCd) ? 4u : 100u;
+            }
+            nzr::derr::Set(code);
+        }
+    }
+    const bool trace = NZ_ENV("NZ_TRACE_SINK") != nullptr;
+    if (trace) std::fprintf(stderr, "[sink] stream %zu produced=%llu ok=%d clean=%d flush_to=%llu code=%u\n", k,
+                            (unsigned long long)produced, (int)ok, (int)clean_end, (unsigned long long)flush_to, nzr::derr::Current().code);
+    // Files the flushed bytes reach, then the group the cursor stands in.
+    struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
+    std::vector<Piece> pieces;
+    std::vector<std::pair<const Slice*, std::uint32_t>> bad;
+    for (Slice& sl : s.slices) {
+        const std::uint64_t a = std::max(sl.spos, s.flushed);
+        const std::uint64_t b = std::min(sl.spos + sl.len, flush_to);
+        if (sl.len == 0u) continue;
+        if (a >= b) continue;
+        CreateLocked(e, sl.entry, lk);
+        FileState& f = *e.files[sl.entry];
+        if (f.write_it && f.fd >= 0)
+            pieces.push_back({&f, sl.file_off + (a - sl.spos), buf + a, static_cast<std::size_t>(b - a)});
+        // A stored slice is checked over whatever arrived (a cut one over 0 bytes:
+        // the original prints "ffffffff" for those).
+        const bool store_check = (e.policy == Policy::kStore) && !sl.checked;
+        if (!sl.checked && (flush_to >= sl.spos + sl.len || store_check)) {
+            sl.checked = true;
+            if (sl.has_cksum && e.opt->checksum != ChecksumMode::kNone) {
+                // Store: a slice with any byte received is checked whole (stub + zero
+                // padding); one with no record at all over nothing ("ffffffff").
+                const std::size_t avail = (store_check && received <= sl.spos) ? std::size_t{0} : static_cast<std::size_t>(sl.len);
+                const std::uint32_t got = ComputeBufferChecksum(sl.cmode, buf + sl.spos, avail);
+                if (trace) std::fprintf(stderr, "[sink]   slice entry=%zu off=%llu len=%llu stored=%08x got=%08x\n", sl.entry,
+                                        (unsigned long long)sl.file_off, (unsigned long long)sl.len, sl.cval, got);
+                if (got != sl.cval) { ++e.mismatches; bad.emplace_back(&sl, got); }
+            } else if (trace) std::fprintf(stderr, "[sink]   slice entry=%zu unchecked has=%d\n", sl.entry, (int)sl.has_cksum);
+        }
+    }
+    s.flushed = std::max(s.flushed, flush_to);
+    // The group the cursor is in (or starts) when the stream ends short: its
+    // first file exists, empty, as the original leaves it.
+    if (!ok && produced < s.total) {
+        std::size_t g = 0;
+        for (std::size_t i = 0; i < s.group_start.size(); ++i) if (s.group_start[i] <= produced) g = i;
+        for (std::size_t i = s.entered_group; i <= g; ++i) {
+            for (const Slice& sl : s.slices) if (sl.group == i) { CreateLocked(e, sl.entry, lk); break; }
+        }
+        s.entered_group = std::max(s.entered_group, g + 1u);
+        // Empty files inside the flushed range exist too.
+    }
+    for (const Slice& sl : s.slices)
+        if (sl.len == 0u && sl.spos <= flush_to && (ok || sl.spos < produced || sl.spos == 0u)) CreateLocked(e, sl.entry, lk);
+    e.committed = e.committed || !pieces.empty();
+    std::vector<std::pair<const Slice*, std::uint32_t>> bad_copy = bad;
+    lk.unlock();
+    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
+    for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
+}
+
+struct Outcome { bool committed = false; bool stream_failed = false; std::size_t mismatches = 0; std::size_t failed_entries = 0; };
+
+// Close everything, apply the timestamps, report.
+inline Outcome Finish() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    Outcome o;
+    if (!e.published) return o;
+    for (std::size_t i = 0; i < e.files.size(); ++i) {
+        FileState& f = *e.files[i];
+        if (f.fd >= 0) {
+#if defined(_WIN32)
+            ::_close(f.fd);
+#else
+            ::close(f.fd);
+#endif
+            f.fd = -1;
+            const LegacyCnEntry& en = (*e.entries)[i];
+            if (en.has_mtime) (void)SetExtractedMtime(f.path, en.mtime_unix);
+        }
+    }
+    o.committed = e.committed; o.stream_failed = e.stream_failed;
+    o.mismatches = e.mismatches; o.failed_entries = e.mismatches + e.unsafe + e.cannot;
+    e.published = false;   // one container per run
+    return o;
+}
+
+}  // namespace psink
 
 constexpr int kLegacyNeedCompat = -100;
 
@@ -1888,6 +2274,7 @@ struct LegacyParallelSlice {
     std::uint32_t cval = 0;
     bool hasoff = false;
     bool has_cksum = false;
+    std::size_t table = 0;   // which filename table of the stream introduced it (its flush group)
 };
 
 // One stream of a parallel (-pN) container.
@@ -1909,6 +2296,8 @@ struct LegacyParallelStream {
     std::uint8_t p0 = 0, p1 = 0;
     bool hasparams = false;
     std::size_t last_table_first = 0;     // index in `slices` of the latest table's first entry
+    std::size_t table_count = 0;          // filename tables seen so far
+    bool cut = false;                     // its last data record was cut off by the end of the file
 };
 
 // The -cd/-cD LZ ring, in 64 KB units, from the codec record's p1 byte:
@@ -1936,7 +2325,11 @@ static std::uint32_t LegacyCdRingUnitsFromP1(std::uint8_t p1) {
 // Returns false when the archive is not parallel or the record walk breaks.
 bool ParseLegacyParallelStreams(
     const std::vector<unsigned char>& bytes,
-    std::map<unsigned, LegacyParallelStream>* out_streams) {
+    std::map<unsigned, LegacyParallelStream>* out_streams,
+    // A store (-cn) copies whatever bytes of a cut record exist (measured: the
+    // slice checksum is computed over stub + zero padding); the compressed
+    // codecs never see a cut record.
+    bool keep_cut_chunk = false) {
     if (out_streams == nullptr) return false;
     out_streams->clear();
 
@@ -1967,7 +2360,11 @@ bool ParseLegacyParallelStreams(
             sid = ext >> 4u;
             if (sid == 0u) ct += 15u;
         }
-        if (csz > bytes.size() - p) return false;
+        bool cut_rec = false;
+        if (csz > bytes.size() - p) {
+            if (ct != 0u || p >= bytes.size()) return false;
+            csz = bytes.size() - p; cut_rec = true;   // cut data record: dropped, the stream ends short
+        }
         LegacyParallelStream& st = (*out_streams)[sid];
         if (ct == 1u && csz >= 2u) {
             // A filename TABLE: (size varint, name\0) pairs, one per file the
@@ -1984,8 +2381,9 @@ bool ParseLegacyParallelStreams(
                                               bytes.begin() + static_cast<std::ptrdiff_t>(p + csz),
                                               static_cast<unsigned char>(0));
                 if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(p + csz)) break;
-                if (first) { st.osz = v; st.hassz = true; st.last_table_first = st.slices.size(); first = false; }
+                if (first) { st.osz = v; st.hassz = true; st.last_table_first = st.slices.size(); first = false; ++st.table_count; }
                 LegacyParallelSlice sl;
+                sl.table = st.table_count - 1u;
                 sl.path.assign(reinterpret_cast<const char*>(bytes.data() + tp),
                                static_cast<std::size_t>(
                                    std::distance(bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it)));
@@ -2036,7 +2434,8 @@ bool ParseLegacyParallelStreams(
                     : ReadU32LE(bytes.data() + p);
             }
         } else if (ct == 0u && csz > 0u) {
-            st.chunks.emplace_back(p, csz);
+            if (!cut_rec || keep_cut_chunk) st.chunks.emplace_back(p, csz);
+            if (cut_rec) st.cut = true;
         }
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[PAR] rec sid=%u ct=%u csz=%zu at %zu\n", sid, ct, csz, p);
@@ -2130,7 +2529,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
         if (nzr::derr::t_state.code == 0u && nzr::derr::t_state.fatal_id == 0u) nzr::derr::t_state.code = 100u;
     };
     if (threads <= 1u) {
-        for (std::size_t i = 0; i < n && ok; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {   // every stream runs, as the original's workers do after a failure
             progress::SlotScope slot(i);
             progress::SlotStarted(i);
             if (!fn(i)) { ok = false; record_failure(i); }
@@ -2143,7 +2542,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     auto worker = [&]() {
         for (;;) {
             const std::size_t i = next.fetch_add(1u);
-            if (i >= n || !ok) return;
+            if (i >= n) return;
             try {
                 progress::SlotScope slot(i);
                 progress::SlotStarted(i);
@@ -2160,6 +2559,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     worker();
     for (auto& th : pool) th.join();
     if (oom) throw std::bad_alloc();
+    publish_failure();
     return ok;
 }
 
@@ -2170,7 +2570,12 @@ bool AssembleParallelMultiFile(
     const std::vector<LegacyCnEntry>& entries,
     std::uint64_t total,
     DecodeStreamFn&& decode_stream,
-    std::vector<unsigned char>* out) {
+    std::vector<unsigned char>* out,
+    // Parallel sink: write each stream as it completes instead of assembling.
+    bool use_sink = false,
+    psink::Policy policy = psink::Policy::kProduced,
+    std::uint64_t quantum = 0u,
+    psink::Family family = psink::Family::kCm) {
     if (out == nullptr || entries.size() < 2u || total == 0u ||
         total > (static_cast<std::uint64_t>(1) << 40)) {
         return false;
@@ -2185,7 +2590,6 @@ bool AssembleParallelMultiFile(
     }
     if (acc != total) return false;
 
-    std::vector<unsigned char> assembled(static_cast<std::size_t>(total), 0);
     // Validate every stream and prove the slices tile the output before any
     // thread runs; then decode the streams concurrently, each writing its own
     // disjoint slices.
@@ -2194,7 +2598,7 @@ bool AssembleParallelMultiFile(
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     for (const auto& kv : streams) {
         const LegacyParallelStream& st = kv.second;
-        if (st.chunks.empty() || st.slices.empty()) continue;
+        if ((st.chunks.empty() && !st.cut) || st.slices.empty()) continue;
         std::uint64_t stream_out = 0;
         for (const LegacyParallelSlice& sl : st.slices) {
             if (sl.osz == 0u) continue;   // an empty file: nothing to decode or place
@@ -2211,10 +2615,42 @@ bool AssembleParallelMultiFile(
         outs.push_back(stream_out);
     }
     if (!DisjointCover(ranges, total)) return false;
+    if (use_sink) {
+        std::map<std::string, std::size_t> eidx;
+        for (std::size_t i = 0; i < entries.size(); ++i) eidx.emplace(entries[i].path, i);
+        std::vector<psink::Stream> streams;
+        for (const LegacyParallelStream* st : list) {
+            psink::Stream ps;
+            for (const LegacyParallelSlice& sl : st->slices) {
+                psink::Slice x;
+                x.entry = eidx.find(sl.path)->second; x.file_off = sl.ooff; x.len = sl.osz;
+                x.cmode = sl.cmode; x.cval = sl.cval; x.has_cksum = sl.has_cksum; x.group = sl.table;
+                ps.slices.push_back(x);
+            }
+            ps.cut = st->cut;
+            streams.push_back(std::move(ps));
+        }
+        use_sink = psink::Publish(entries, std::move(streams), policy, quantum, family);
+    }
+    std::vector<unsigned char> assembled_store;
+    if (!use_sink) assembled_store.assign(static_cast<std::size_t>(total), 0);
 
     const bool all = ParallelForEach(list.size(), [&](std::size_t idx) -> bool {
         const LegacyParallelStream& st = *list[idx];
         const std::uint64_t stream_out = outs[idx];
+        if (use_sink) {
+            psink::StreamBegin(idx);
+            const auto accept_all = [](const std::vector<unsigned char>&) { return true; };
+            std::vector<unsigned char> decoded;
+            bool okd = decode_stream(st.chunks, stream_out, accept_all, &decoded);
+            if (decoded.size() > stream_out) decoded.resize(static_cast<std::size_t>(stream_out));
+            std::uint64_t received = decoded.size();
+            if (policy == psink::Policy::kStore) decoded.resize(static_cast<std::size_t>(stream_out));   // zero-padded, as the original writes it
+            else okd = okd && decoded.size() == stream_out;
+            const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+            psink::StreamEnd(idx, decoded.data(), decoded.size(), okd, clean, received);
+            return okd;
+        }
         const auto accept = [&](const std::vector<unsigned char>& dec) -> bool {
             if (dec.size() != stream_out) return false;
             std::uint64_t cur = 0;
@@ -2235,15 +2671,16 @@ bool AssembleParallelMultiFile(
         for (const LegacyParallelSlice& sl : st.slices) {
             if (sl.osz == 0u) continue;
             const std::uint64_t file_base = base.find(sl.path)->second;
-            std::memcpy(assembled.data() + static_cast<std::size_t>(file_base + sl.ooff),
+            std::memcpy(assembled_store.data() + static_cast<std::size_t>(file_base + sl.ooff),
                         decoded.data() + static_cast<std::size_t>(cursor),
                         static_cast<std::size_t>(sl.osz));
             cursor += sl.osz;
         }
         return true;
     });
+    if (use_sink) return psink::Committed();
     if (!all) return false;
-    *out = std::move(assembled);
+    *out = std::move(assembled_store);
     return true;
 }
 
@@ -2268,13 +2705,43 @@ inline std::vector<unsigned char> ConcatParallelChunks(
 bool TryAssembleParallelStore(
     const std::vector<unsigned char>& bytes,
     std::uint64_t total_size,
-    std::vector<unsigned char>* out) {
-    if (out == nullptr || total_size == 0u ||
-        total_size > static_cast<std::uint64_t>(bytes.size())) {
-        return false;
-    }
+    std::vector<unsigned char>* out,
+    const std::vector<LegacyCnEntry>* entries = nullptr) {
+    if (out == nullptr || total_size == 0u) return false;
     std::map<unsigned, LegacyParallelStream> streams;
-    if (!ParseLegacyParallelStreams(bytes, &streams)) return false;
+    if (!ParseLegacyParallelStreams(bytes, &streams, /*keep_cut_chunk=*/true)) return false;
+    if (entries != nullptr && entries->size() == 1u && psink::Available()) {
+        // Sink: each raw slice goes straight out; a bad slice is written and
+        // reported like the original does ("Checksum mismatch [...]: file").
+        std::vector<const LegacyParallelStream*> list;
+        std::vector<psink::Stream> pstreams;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto& kv : streams) {
+            const LegacyParallelStream& st = kv.second;
+            if (st.chunks.empty() && !st.cut) continue;
+            if (!st.hasoff || !st.hassz || st.ooff > total_size || st.osz > total_size - st.ooff) return false;
+            psink::Stream ps; psink::Slice sl;
+            sl.entry = 0u; sl.file_off = st.ooff; sl.len = st.osz; sl.cmode = st.cmode; sl.cval = st.cval;
+            sl.has_cksum = (st.cmode != ChecksumMode::kNone); sl.group = 0u;
+            ps.slices.push_back(sl); pstreams.push_back(std::move(ps));
+            list.push_back(&st); ranges.emplace_back(st.ooff, st.osz);
+        }
+        if (list.empty() || !DisjointCover(ranges, total_size)) return false;
+        if (!psink::Publish(*entries, std::move(pstreams), psink::Policy::kStore, 0u, psink::Family::kStore)) return false;
+        for (std::size_t idx = 0; idx < list.size(); ++idx) {
+            const LegacyParallelStream& st = *list[idx];
+            progress::SlotScope slot(idx);
+            psink::StreamBegin(idx);
+            std::vector<unsigned char> slice = ConcatParallelChunks(bytes, st.chunks);
+            const std::uint64_t received = std::min<std::uint64_t>(slice.size(), st.osz);
+            slice.resize(static_cast<std::size_t>(st.osz));   // a cut slice is written zero-padded to its size
+            progress::Add(received);
+            // A short (cut) slice is not an error for a store: the slice goes out whole
+            // and its checksum is reported over the bytes that arrived.
+            psink::StreamEnd(idx, slice.data(), slice.size(), true, false, received);
+        }
+        return psink::Committed();
+    }
 
     std::vector<unsigned char> assembled(static_cast<std::size_t>(total_size), 0);
     std::uint64_t covered = 0;
@@ -3089,7 +3556,14 @@ bool DecodeLzpfMember(
     unsigned char* direct_out = nullptr,
     // The archive was cut inside this member: decode the bytes that exist, as
     // the original does (its truncation reports come from that stub decode).
-    bool allow_truncated = false) {
+    bool allow_truncated = false,
+    // Bytes of whole members (segments) completed by the first candidate: what
+    // the original has flushed when a later segment fails.
+    std::size_t* out_member_done = nullptr,
+    // Parallel-container stream: the original's worker clamps a block that
+    // overshoots its slice or reads past its record and carries on; the report
+    // then comes from the next block header (4, 2), not from the overrun (6, 3).
+    bool lenient = false) {
     progress::Scope pscope;
     if (first_block_pos + first_stream_len > bytes.size()) {
         if (!allow_truncated || first_block_pos >= bytes.size()) return false;
@@ -3233,6 +3707,7 @@ bool DecodeLzpfMember(
                     input_pos += 1u + tw;
                 }
                 std::uint64_t next_tag = 0;
+                if (lenient && input_pos >= bytes.size()) { decode_ok = false; break; }   // input simply ran out: the sink reports the codec's short-end status
                 if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
                     (next_tag & 0x0fu) != 0u) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 std::uint64_t next_bytes = next_tag >> 4u;
@@ -3268,7 +3743,10 @@ bool DecodeLzpfMember(
                 std::uint64_t block_out_size = uvar9 >> 4u;
                 if (block_out_size == 0u) block_out_size = 0x8000u;
                 if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
-                if (total_written + block_out_size > total) { nzr::derr::SetAt(3u, input_pos); decode_ok = false; break; }
+                if (total_written + block_out_size > total) {
+                    // lenient (parallel worker): the original reports this as 2, not 3.
+                    nzr::derr::SetAt(lenient ? 2u : 3u, input_pos); decode_ok = false; break;
+                }
                 const std::size_t block_start_in_window = window_cursor;
                 const std::size_t avail_in = stream_data_end - input_pos;
                 const std::uint8_t pf_hdr = bytes[input_pos];
@@ -3362,7 +3840,9 @@ bool DecodeLzpfMember(
             std::uint64_t block_out_size = uvar9 >> 3u;
             if (block_out_size == 0u) block_out_size = 0x8000u;
             if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
-            if (total_written + block_out_size > total) { nzr::derr::SetAt(3u, input_pos); decode_ok = false; break; }
+            if (total_written + block_out_size > total) {
+                nzr::derr::SetAt(lenient ? 2u : 3u, input_pos); decode_ok = false; break;   // see above
+            }
             // Exe un-transform (uvar9 bit 2). The real dispatcher
             // FUN_08097570 does, for every NON-prefilter block:
             //     if ((uVar9 & 4) != 0)
@@ -3390,12 +3870,14 @@ bool DecodeLzpfMember(
             if (mode_literal) {
                 // A block that consumes more input than its stream holds is the
                 // original's status 6 (FUN_08097e20, checked after the block).
-                if (input_pos + block_out_size > stream_data_end) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                std::size_t lit_avail = static_cast<std::size_t>(block_out_size);
+                if (input_pos + block_out_size > stream_data_end) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    lit_avail = stream_data_end - input_pos;   // the rest of the block stays as it is
+                }
                 const std::size_t block_start_in_window = window_cursor;
-                std::memcpy(window + block_start_in_window, bytes.data() + input_pos,
-                            static_cast<std::size_t>(block_out_size));
-                std::memcpy(decoded + total_written, bytes.data() + input_pos,
-                            static_cast<std::size_t>(block_out_size));
+                std::memcpy(window + block_start_in_window, bytes.data() + input_pos, lit_avail);
+                std::memcpy(decoded + total_written, bytes.data() + input_pos, lit_avail);
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 // Backfill hash_table for the literal bytes just written
                 // (legacy FUN_080b6d90 / FUN_080b6cf0, called after every
@@ -3430,7 +3912,7 @@ bool DecodeLzpfMember(
                     }
                 }
                 apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
-                input_pos += static_cast<std::size_t>(block_out_size);
+                input_pos += lit_avail;
                 total_written += static_cast<std::size_t>(block_out_size);
                 progress::Add(block_out_size);
                 continue;
@@ -3443,7 +3925,11 @@ bool DecodeLzpfMember(
             std::size_t* raw_consumed_ptr = nullptr;
             std::size_t raw_consumed = 0;
             if (mode_lz77_side) {
-                if (input_pos + 2u > stream_data_end) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                if (input_pos + 2u > stream_data_end) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    input_pos = stream_data_end;   // no side stream left: the next header read reports
+                    continue;
+                }
                 const std::uint16_t side_count =
                     static_cast<std::uint16_t>(bytes[input_pos]) |
                     (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
@@ -3453,8 +3939,12 @@ bool DecodeLzpfMember(
                 const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
                     bytes.data() + input_pos, arith_size,
                     bytecode.data(), side_count, /*max_len=*/12);
-                if (consumed == 0 || consumed > arith_size) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
-                input_pos += consumed;
+                if (consumed == 0 || consumed > arith_size) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    input_pos += arith_size;   // clamp to the record; the bytecode decoded so far is used
+                } else {
+                    input_pos += consumed;
+                }
                 bc_ptr = bytecode.data();
                 bc_len = side_count;
             } else {  // mode_lz77_raw
@@ -3473,7 +3963,8 @@ bool DecodeLzpfMember(
                       bc_ptr, bc_len, window, window_capacity,
                       &window_cursor, static_cast<std::size_t>(block_out_size),
                       hash_table.data(), &last_lz_dest, raw_consumed_ptr);
-            if (!dispatch_ok) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+            if (!dispatch_ok && !lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+            // lenient: the original's dispatcher copies bounded garbage and moves on.
             if (mode_lz77_raw) input_pos += raw_consumed;
             // The original does not check that the LZ77 block filled its slot; on
             // garbage it copies the slot out and moves to the next header, which is
@@ -3501,7 +3992,8 @@ bool DecodeLzpfMember(
         }
         if (first_candidate) {
             first_candidate = false;
-            if (member_done > 0 && member_done < total)
+            if (out_member_done != nullptr) *out_member_done = member_done;
+            if (member_done > 0 && member_done < total && direct_out == nullptr)
                 first_prefix.assign(decoded, decoded + member_done);
         }
         if (decode_ok && total_written == total && run_verify()) {
@@ -3705,6 +4197,7 @@ bool TryParseLegacyCnArchive(
 
         if (pos + csize > bytes.size()) {
             truncated_input = true;
+            psink::MarkTruncated();
             // The original hands the decoder whatever bytes of the cut-off data
             // record exist (its reports on truncated archives -- 4096, 1024, 1536,
             // the lzhds assertion -- come from decoding that stub), so keep it.
@@ -4189,7 +4682,7 @@ bool TryParseLegacyCnArchive(
             // Parallel store holding several files: the slices are raw, so
             // "decoding" a stream is copying its concatenated chunks.
             std::map<unsigned, LegacyParallelStream> pstreams;
-            if (ParseLegacyParallelStreams(bytes, &pstreams) &&
+            if (ParseLegacyParallelStreams(bytes, &pstreams, /*keep_cut_chunk=*/true) &&
                 AssembleParallelMultiFile(
                     bytes, pstreams, entries, total_data_size,
                     [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
@@ -4197,9 +4690,10 @@ bool TryParseLegacyCnArchive(
                         const std::function<bool(const std::vector<unsigned char>&)>&,
                         std::vector<unsigned char>* dst) {
                         *dst = ConcatParallelChunks(bytes, chunks);
-                        return dst->size() == out_size;
+                        if (dst->size() > out_size) dst->resize(static_cast<std::size_t>(out_size));
+                        return psink::Available() || psink::Committed() || dst->size() == out_size;
                     },
-                    &store_blocks_buffer)) {
+                    &store_blocks_buffer, psink::Available(), psink::Policy::kStore, 0u, psink::Family::kStore)) {
                 store_multiblock = true;
                 metadata_end = table_end;
                 payload_start = table_end;
@@ -4207,7 +4701,7 @@ bool TryParseLegacyCnArchive(
             }
         }
         if (!prefix_found && entries.size() == 1u &&  // see the offset note below
-            TryAssembleParallelStore(bytes, total_data_size, &store_blocks_buffer)) {
+            TryAssembleParallelStore(bytes, total_data_size, &store_blocks_buffer, &entries)) {
             // Parallel (-pN) store: the slices are raw and scattered between the
             // per-stream record sets, so neither the tail scan nor the block
             // chain finds them. Every slice was checksum-verified.
@@ -4571,6 +5065,36 @@ bool TryParseLegacyCnArchive(
         }
         return false;
     };
+    // Parallel sink (psink): hand a single-file container's streams over. Each
+    // stream is one slice of entry 0 at its output offset.
+    const auto publish_single = [&](const auto& list) -> bool {
+        std::vector<psink::Stream> streams;
+        for (const auto* st : list) {
+            psink::Stream ps;
+            psink::Slice sl;
+            sl.entry = 0u; sl.file_off = st->ooff; sl.len = st->osz;
+            sl.cmode = st->cmode; sl.cval = st->cval; sl.has_cksum = (st->cmode != ChecksumMode::kNone);
+            sl.group = 0u;
+            ps.slices.push_back(sl);
+            ps.cut = st->cut;
+            streams.push_back(std::move(ps));
+        }
+        const psink::Family fam =
+            (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) ? psink::Family::kLzpf :
+            (method == 0x2bu) ? psink::Family::kCd :
+            (method == 0x3bu && method_p0 == 5u) ? psink::Family::kCo :
+            (method == 0x3bu) ? psink::Family::kCO : psink::Family::kCm;
+        const psink::Policy pol = (fam == psink::Family::kCd) ? psink::Policy::kGroup : psink::Policy::kProduced;
+        return psink::Publish(entries, std::move(streams), pol, (fam == psink::Family::kCd) ? std::uint64_t{0x100000u} : 0u, fam);
+    };
+    // The sink wrote (or, for `t`, verified) the container: nothing to assemble.
+    const auto sink_adopt = [&]() -> bool {
+        if (!psink::Committed()) return false;
+        native_literal_payload = true;
+        literal_data_offset = 0u; literal_data_size = 0u; literal_data_owned = true;
+        literal_data_buffer.clear();
+        return true;
+    };
     const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
         ByteBuffer b(std::move(candidate));
         const bool r = record_partial_b(b);
@@ -4665,6 +5189,7 @@ bool TryParseLegacyCnArchive(
                             // stream); they form one logical lzpf stream and are
                             // concatenated before decode.
                             std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
                             std::uint32_t cval = 0;
@@ -4690,7 +5215,15 @@ bool TryParseLegacyCnArchive(
                                 sid = ext >> 4u;
                                 if (sid == 0u) ct += 15u;
                             }
-                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
                             PStream& s = ps[sid];
                             if (ct == 1u && csz >= 2u) {
                                 std::size_t tp = p; std::uint64_t v = 0;
@@ -4718,11 +5251,12 @@ bool TryParseLegacyCnArchive(
                                 s.cval = static_cast<std::uint32_t>(bytes[p]) |
                                          (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
                             } else if (ct == 0u && csz > 0u) {
-                                s.chunks.emplace_back(p, csz);
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
                             }
                             p += csz;
                         }
-                        ByteBuffer assembled = ByteBuffer::Uninitialized(static_cast<std::size_t>(total_data_size));
+                        bool use_sink = psink::Available();
+                        ByteBuffer assembled = use_sink ? ByteBuffer() : ByteBuffer::Uninitialized(static_cast<std::size_t>(total_data_size));
                         std::vector<std::atomic<bool>> slice_done(ps.size());
                         for (auto& d : slice_done) d.store(false, std::memory_order_relaxed);
                         bool all_ok = parse_ok && !ps.empty();
@@ -4730,12 +5264,13 @@ bool TryParseLegacyCnArchive(
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
                         for (auto& kv : ps) {
                             PStream& s = kv.second;
-                            if (s.chunks.empty()) continue;
+                            if (s.chunks.empty() && !s.cut) continue;
                             if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
                         StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PStream& s = *plist[idx];
                             std::vector<unsigned char> payload;
@@ -4750,17 +5285,32 @@ bool TryParseLegacyCnArchive(
                             auto slice_verify = [&](const unsigned char* dec, std::size_t n) -> bool {
                                 return ComputeBufferChecksum(cm, dec, n) == cv;
                             };
+                            std::vector<unsigned char> unused;
+                            if (use_sink) {
+                                // The original knows its dictionary capacity and verifies
+                                // nothing while decoding: one candidate, the sink checks the
+                                // slice and writes whatever came out.
+                                std::vector<unsigned char> sbuf(static_cast<std::size_t>(s.osz));
+                                psink::StreamBegin(idx);
+                                std::size_t mdone = 0;
+                                const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
+                                const bool okd = DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
+                                                                  is_variant_b, method_p1, /*derived_cap_only=*/true, accept_all, &unused,
+                                                                  sbuf.data(), false, &mdone, /*lenient=*/true);
+                                psink::StreamEnd(idx, sbuf.data(), okd ? s.osz : mdone, okd,
+                                                 !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                return okd;
+                            }
                             // Straight into this stream's slice (DisjointCover proved the
                             // slices tile the output before any thread started).
                             if (static_cast<std::uint64_t>(s.ooff) + s.osz > assembled.size()) return false;
-                            std::vector<unsigned char> unused;
                             if (!DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
                                                   is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &unused,
                                                   assembled.data() + static_cast<std::size_t>(s.ooff))) return false;
                             slice_done[idx].store(true, std::memory_order_relaxed);
                             return true;
                         });
-                        if (!all_ok) {
+                        if (!all_ok && !use_sink) {
                             // The buffer is uninitialised: give the slices that did not
                             // complete the zeros the zero-filled vector used to hold.
                             for (std::size_t q = 0; q < plist.size(); ++q)
@@ -4768,7 +5318,8 @@ bool TryParseLegacyCnArchive(
                                     std::memset(assembled.data() + static_cast<std::size_t>(plist[q]->ooff), 0, plist[q]->osz);
                         }
                         StageMark("streams decoded");
-                        if (all_ok && (validate_decoded_candidate_p(assembled.data(), assembled.size()) || record_partial_b(assembled))) {
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate_p(assembled.data(), assembled.size()) || record_partial_b(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -4822,6 +5373,7 @@ bool TryParseLegacyCnArchive(
                             // Each entry is one raw nz_cd block: (offset, size)
                             // into `bytes`, decoded in order into the slice.
                             std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
                             std::uint32_t cval = 0;
@@ -4848,7 +5400,15 @@ bool TryParseLegacyCnArchive(
                                 sid = ext >> 4u;
                                 if (sid == 0u) ct += 15u;
                             }
-                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
                             PCdStream& s = ps[sid];
                             if (ct == 1u && csz >= 2u) {
                                 std::size_t tp = p; std::uint64_t v = 0;
@@ -4879,24 +5439,26 @@ bool TryParseLegacyCnArchive(
                                 s.cval = static_cast<std::uint32_t>(bytes[p]) |
                                          (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
                             } else if (ct == 0u && csz > 0u) {
-                                s.chunks.emplace_back(p, csz);
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
                             }
                             p += csz;
                         }
+                        bool use_sink = psink::Available();
                         std::vector<unsigned char> assembled(
-                            static_cast<std::size_t>(total_data_size), 0);
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
                         bool all_ok = parse_ok && !ps.empty();
                         static constexpr std::size_t kCdWindowPad = 16u;
                         std::vector<PCdStream*> plist;
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
                         for (auto& kv : ps) {
                             PCdStream& s = kv.second;
-                            if (s.chunks.empty()) continue;
+                            if (s.chunks.empty() && !s.cut) continue;
                             if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
                         StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PCdStream& s = *plist[idx];
                             const std::size_t slice_total = static_cast<std::size_t>(s.osz);
@@ -4926,6 +5488,7 @@ bool TryParseLegacyCnArchive(
                             // of a worker stream had nothing to decode into).
                             nzr::lzpf::PrefilterContext s_pf; s_pf.Configure(s_is_lzhds ? 32u : 8u, 3u);
                             nzr::lzpf::LmsObject s_lms1{}, s_lms2{}; s_lms1.Init(); s_lms2.Init();
+                            if (use_sink) psink::StreamBegin(idx);
                             for (const auto& c : s.chunks) {
                                 if (pwritten >= slice_total) break;
                                 const std::uint8_t* blk_in = bytes.data() + c.first;
@@ -4937,9 +5500,21 @@ bool TryParseLegacyCnArchive(
                                     static_cast<std::uint32_t>(pwritten),
                                     s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index,
                                     &s_pf, &s_lms1, &s_lms2, &s_img);
-                                if (produced == 0u) return false;
+                                if (produced == 0u) {
+                                    if (use_sink) psink::StreamEnd(idx, slice_window, pwritten, false,
+                                                                   nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                    return false;
+                                }
                                 pwritten += produced;
                                 progress::Add(produced);
+                            }
+                            if (use_sink) {
+                                // Ran out of chunks before the slice was full: the sink reports
+                                // the codec's short-end status.
+                                const bool okd = pwritten == slice_total;
+                                psink::StreamEnd(idx, slice_window, pwritten, okd,
+                                                 !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                return okd;
                             }
                             if (pwritten != slice_total) return false;
                             if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) return false;
@@ -4948,7 +5523,8 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -5031,7 +5607,7 @@ bool TryParseLegacyCnArchive(
                                     std::string err;
                                     return TryDecodeLegacyCm(sub, dst, &err);
                                 },
-                                &assembled);
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kCm);
                         } else if (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) {
                             // Each type-0 chunk IS one delimited nz_cd block, so
                             // they are decoded one at a time threading a ring
@@ -5078,13 +5654,14 @@ bool TryParseLegacyCnArchive(
                                             static_cast<std::uint32_t>(written),
                                             s_is_lzhds, ctx_ptr, &ctx_index,
                                             &s_pf, &s_lms1, &s_lms2, &s_img);
-                                        if (produced == 0u) return false;
+                                        if (produced == 0u) { dst->resize(written); return false; }
                                         written += produced;
-        progress::Add(produced);
+                                        progress::Add(produced);
                                     }
+                                    if (written != out_size) dst->resize(written);
                                     return written == out_size;
                                 },
-                                &assembled);
+                                &assembled, psink::Available(), psink::Policy::kGroup, std::uint64_t{0x100000u}, psink::Family::kCd);
                         } else if (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u)) {
                             const std::uint32_t wcap =
                                 nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
@@ -5108,10 +5685,12 @@ bool TryParseLegacyCnArchive(
                                                                           out_size, dec, aud, img, exe, raw_stream, dst);
                                     }
                                     nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
-                                    return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                      out_size, dec, aud, img, exe, raw_stream, dst);
+                                    const bool r = DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
+                                                                              out_size, dec, aud, img, exe, raw_stream, dst);
+                                    return r;
                                 },
-                                &assembled);
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u,
+                                method_p0 == 5u ? psink::Family::kCo : psink::Family::kCO);
                         } else if (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) {
                             const bool vb = (method_p0 == 2u);
                             got = AssembleParallelMultiFile(
@@ -5123,14 +5702,19 @@ bool TryParseLegacyCnArchive(
                                     const std::vector<unsigned char> in =
                                         ConcatParallelChunks(bytes, chunks);
                                     if (in.empty()) return false;
-                                    return DecodeLzpfMember(in, 0u, in.size(), out_size, vb,
-                                                            method_p1, /*derived_cap_only=*/false,
-                                                            accept, dst);
+                                    const bool sinking = psink::Available() || psink::Committed();
+                                    std::size_t mdone = 0;
+                                    const bool okd = DecodeLzpfMember(in, 0u, in.size(), out_size, vb,
+                                                                      method_p1, /*derived_cap_only=*/sinking,
+                                                                      accept, dst, nullptr, false, &mdone, /*lenient=*/sinking);
+                                    if (!okd && sinking) dst->resize(mdone);   // completed members only
+                                    return okd;
                                 },
-                                &assembled);
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kLzpf);
                         }
                         StageMark("streams decoded");
-                        if (got && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                        if (sink_adopt()) {
+                        } else if (got && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -5145,20 +5729,22 @@ bool TryParseLegacyCnArchive(
                     entries.size() == 1u) {  // see the offset note above
                     std::map<unsigned, LegacyParallelStream> pstreams;
                     if (ParseLegacyParallelStreams(bytes, &pstreams) && pstreams.size() > 1u) {
+                        bool use_sink = psink::Available();
                         std::vector<unsigned char> assembled(
-                            static_cast<std::size_t>(total_data_size), 0);
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
                         bool all_ok = true;
                         std::vector<const LegacyParallelStream*> plist;
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
                         for (const auto& kv : pstreams) {
                             const LegacyParallelStream& st = kv.second;
-                            if (st.chunks.empty()) continue;
+                            if (st.chunks.empty() && !st.cut) continue;
                             if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone ||
                                 st.ooff > total_data_size ||
                                 st.osz > total_data_size - st.ooff) { all_ok = false; break; }
                             plist.push_back(&st); pranges.emplace_back(st.ooff, st.osz);
                         }
                         StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             const LegacyParallelStream& st = *plist[idx];
                             LegacyCnContext sub;
@@ -5179,6 +5765,14 @@ bool TryParseLegacyCnArchive(
                             sub.data = std::move(subdata);
                             std::vector<unsigned char> slice;
                             std::string sub_err;
+                            if (use_sink) {
+                                psink::StreamBegin(idx);
+                                const bool okd = TryDecodeLegacyCm(sub, &slice, &sub_err) && slice.size() == st.osz;
+                                if (slice.size() > st.osz) slice.resize(static_cast<std::size_t>(st.osz));
+                                const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+                                psink::StreamEnd(idx, slice.data(), slice.size(), okd, clean);
+                                return okd;
+                            }
                             if (!TryDecodeLegacyCm(sub, &slice, &sub_err) ||
                                 slice.size() != st.osz ||
                                 ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) {
@@ -5189,7 +5783,8 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -5226,6 +5821,7 @@ bool TryParseLegacyCnArchive(
                             // but concatenated in order if a stream is ever
                             // split across more than one type-0 chunk.
                             std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
                             std::uint32_t cval = 0;
@@ -5251,7 +5847,15 @@ bool TryParseLegacyCnArchive(
                                 sid = ext >> 4u;
                                 if (sid == 0u) ct += 15u;
                             }
-                            if (p + csz > bytes.size()) { parse_ok = false; break; }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
                             POptStream& s = ps[sid];
                             if (ct == 1u && csz >= 2u) {
                                 std::size_t tp = p; std::uint64_t v = 0;
@@ -5279,7 +5883,7 @@ bool TryParseLegacyCnArchive(
                                 s.cval = static_cast<std::uint32_t>(bytes[p]) |
                                          (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
                             } else if (ct == 0u && csz > 0u) {
-                                s.chunks.emplace_back(p, csz);
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
                             }
                             p += csz;
                         }
@@ -5316,19 +5920,21 @@ bool TryParseLegacyCnArchive(
                                 return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, sraw, out);
                             };
                         }
+                        bool use_sink = psink::Available();
                         std::vector<unsigned char> assembled(
-                            static_cast<std::size_t>(total_data_size), 0);
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
                         bool all_ok = parse_ok && !ps.empty() && popt_window_capacity != 0u;
                         std::vector<POptStream*> plist;
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
                         for (auto& kv : ps) {
                             POptStream& s = kv.second;
-                            if (s.chunks.empty()) continue;
+                            if (s.chunks.empty() && !s.cut) continue;
                             if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
                         StageMark("records walked"); if (all_ok && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
                         // One worker stream per thread (see ParallelForEach); every stream
                         // writes its own disjoint slice of `assembled`.
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
@@ -5336,6 +5942,7 @@ bool TryParseLegacyCnArchive(
                             std::vector<unsigned char> slice;
                             slice.reserve(static_cast<std::size_t>(s.osz));
                             bool sok = true;
+                            if (use_sink) psink::StreamBegin(idx);
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
                                 sok = decode_seq(bytes.data(), c.first, c.first + c.second, s.osz, &slice);
@@ -5350,6 +5957,13 @@ bool TryParseLegacyCnArchive(
                                                   bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
                                 sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &slice);
                             }
+                            if (use_sink) {
+                                const bool okd = sok && slice.size() == s.osz;
+                                if (slice.size() > s.osz) slice.resize(static_cast<std::size_t>(s.osz));
+                                const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+                                psink::StreamEnd(idx, slice.data(), slice.size(), okd, clean);
+                                return okd;
+                            }
                             if (!sok || slice.size() != s.osz) return false;
                             if (ComputeBufferChecksum(s.cmode, slice.data(), slice.size()) != s.cval) return false;
                             std::memcpy(assembled.data() + static_cast<std::size_t>(s.ooff),
@@ -5357,7 +5971,8 @@ bool TryParseLegacyCnArchive(
                             return true;
                         });
                         StageMark("streams decoded");
-                        if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
                             StageMark("validated");
                             native_literal_payload = true;
                             literal_data_offset = 0u;
@@ -5722,6 +6337,15 @@ bool TryParseLegacyCnArchive(
         literal_data_owned = true;
         literal_data_buffer = std::move(partial_prefix);
         ctx.decode_failed = true;
+    }
+    if (psink::Committed()) {
+        // The sink wrote the container while the streams decoded; the extractor
+        // only reports (footer, or the original's corruption line).
+        const psink::Outcome so = psink::Finish();
+        ctx.sink_handled = true;
+        ctx.sink_failed_entries = so.failed_entries;
+        ctx.decode_failed = so.stream_failed;
+        if (!native_store_payload) native_literal_payload = true;
     }
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
@@ -8008,6 +8632,11 @@ int RunLegacyCnExtractOrTest(
     // Start of the whole command (decode included): the footer's "in N s" is the
     // original's total, not just the copy-out that follows a finished decode.
     std::chrono::steady_clock::time_point run_start) {
+    if (legacy.sink_handled) {
+        if (legacy.decode_failed) return PrintCorruptLine(os, legacy);
+        PrintDecodeFooter(os, legacy.total_data_size, ElapsedSince(run_start));
+        return legacy.sink_failed_entries == 0u ? 0 : 2;
+    }
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
@@ -8272,7 +8901,7 @@ int RunLegacyCnExtractOrTest(
                                         (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L)) {
                     // Measured: "Cannot write: <path>" on a fresh line, per file, and
                     // the run goes on to the footer.
-                    os << '\n' << "Cannot write: " << out_path.string() << '\n';
+                    os << '\n' << "Cannot write: " << (options.output_path.empty() ? safe_rel.string() : out_path.string()) << '\n';
                     ++failed;
                     bytes_ok += e.size;
                     progress.Advance(e.size);
@@ -9234,6 +9863,9 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             // Parts of the decode run inside the parser, so the header printer is
             // registered with the progress engine and fired by the first progress
             // tick (from the parser's snapshot) or explicitly after the parse.
+            psink::Configure(options, test_mode, os,
+                             options.output_path.empty() ? fs::current_path() : fs::path(options.output_path));
+            struct SinkEnd { ~SinkEnd() { psink::Reset(); } } sink_end;
             progress::Begin(&os, [&](std::ostream& o) {
                 const LegacyCnContext& c = parsed ? legacy_cn : progress::Snapshot();
                 progress::SetCompressorLine([&](std::size_t k) {
