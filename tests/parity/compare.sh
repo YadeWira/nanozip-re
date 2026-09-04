@@ -19,11 +19,19 @@ norm() {
            -e 's/[0-9]+ (B|KB|MB|GB)([ |]|$)/<SIZE>\2/g' \
            -e 's/\/tmp\/[A-Za-z0-9_.]+/<DIR>/g'
 }
-# A case whose only differing lines are progress figures or the IO-out clause is
-# counted as "timing": how many "<N> MB" figures fit on the status line depends on
-# how many whole seconds the decode crosses, and the original's footer adds an
-# IO-out figure for the copy-out it overlaps with the decode. Both are documented
-# as not reproduced (docs/ORIGINAL_QUIRKS.md).
+# The status line is rewritten in place: every such write ends in backspaces, and
+# the clear that precedes one is a run of spaces. How many of them a run emits
+# depends on how many whole seconds the decode crosses, and the original's footer
+# adds an IO-out clause for the copy-out it overlaps with the decode -- all of it
+# documented as not reproduced. Dropping exactly those lines leaves the messages,
+# which is what a comparison should be about.
+msgs() {
+  # The matrices already normalise their own timings, so match the clause, not
+  # its placeholders: keep "IO-in: ...." and drop the "IO-out: ..." the original
+  # adds for the copy-out it overlaps with the decode.
+  norm "$1" | grep -v $'\010' | grep -vE '^ *$' | sed -E 's/^(IO-in:[^.]*\.).*/\1/'
+}
+
 same=0; timing=0; diffs=0
 for c in "$OUT"/*/; do
   c=${c%/}; [ -d "$c/orig" ] || continue
@@ -32,8 +40,7 @@ for c in "$OUT"/*/; do
     [ -f "$c/orig/$f" ] || continue
     if ! diff -q <(norm "$c/orig/$f") <(norm "$c/ours/$f") >/dev/null; then
       bad="$bad $f"
-      if diff <(norm "$c/orig/$f") <(norm "$c/ours/$f") | grep -E '^[<>]' |
-         grep -qvE '<SIZE>|IO-out|^[<>] *$'; then only_timing=0; fi
+      if ! diff -q <(msgs "$c/orig/$f") <(msgs "$c/ours/$f") >/dev/null; then only_timing=0; fi
     fi
   done
   if [ -z "$bad" ]; then same=$((same+1))
