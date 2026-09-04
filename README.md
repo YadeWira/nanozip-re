@@ -41,7 +41,8 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Release package, 47 archives, all four binaries | 95/95 hashes |
 | Console matrices (36 + 77 + 77 cases, pty prompt harness) | identical except progress-redraw timing and the encode commands |
 | Damaged archives, 8 codecs × 6 corruptions | 42/48 identical trees |
-| Fuzzing, ASan + UBSan, 1228 corrupt and non-archive inputs (`~/.cache/nzre_tools/fuzz/fuzz.sh`) | 1228/1228 clean, worst case 4.9 s |
+| Fuzzing, ASan + UBSan, 1228 corrupt and non-archive inputs (`~/.cache/nzre_tools/fuzz/fuzz.sh`) | 1228/1228 clean, worst case 4.8 s |
+| Decode speed vs the original, 137 MB mixed tar × 6 codecs and a 2.29 GB archive ([Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance)) | faster on `-co`, `-cd`, `-cf` and the 2.29 GB test; 1.07× on `-cO`, 1.16× `-cc`, 1.3× `-cD` |
 
 Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
 it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
@@ -51,8 +52,8 @@ machine. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/
 [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
 
 **Not there yet:** encode (`a`, `s`) and self-extractor creation (`w32c`). Known limits: the
-`IO-out` footer figure and the progress redraw count are timing-dependent; the 32-bit builds hold the
-decoded stream in memory; format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image
+`IO-out` footer figure and the progress redraw count are timing-dependent; the output is assembled in
+memory and written after the decode (the 32-bit builds cannot decode archives above 2 GB); format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image
 predictor modes other than 2) are ported but unexercised.
 
 ## Usage
