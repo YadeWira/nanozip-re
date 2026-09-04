@@ -3563,26 +3563,30 @@ bool DecodeLzpfMember(
     // Parallel-container stream: the original's worker clamps a block that
     // overshoots its slice or reads past its record and carries on; the report
     // then comes from the next block header (4, 2), not from the overrun (6, 3).
-    bool lenient = false) {
+    bool lenient = false,
+    // Where this member's input ends inside `bytes` (0 = the whole buffer): lets a
+    // parallel worker decode its record in place instead of copying it out.
+    std::size_t input_end = 0u) {
+    const std::size_t in_end = (input_end != 0u && input_end <= bytes.size()) ? input_end : bytes.size();
     progress::Scope pscope;
-    if (first_block_pos + first_stream_len > bytes.size()) {
-        if (!allow_truncated || first_block_pos >= bytes.size()) return false;
-        first_stream_len = bytes.size() - first_block_pos;
+    if (first_block_pos + first_stream_len > in_end) {
+        if (!allow_truncated || first_block_pos >= in_end) return false;
+        first_stream_len = in_end - first_block_pos;
     }
     // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
     // header fields) plus the decline point — the fastest way to tell whether a
     // failing member even reaches the stereo prefilter path.
     const bool trace_lzpf = (NZ_ENV("NZOPT_TRACE_LZPF") != nullptr);
     auto decode_lzpf_header = [&](std::size_t& pos, std::uint32_t& out_uvar9) -> bool {
-        if (pos >= bytes.size()) return false;
+        if (pos >= in_end) return false;
         std::uint8_t b0 = bytes[pos++];
         std::uint32_t v = static_cast<std::uint32_t>(b0) ^ (b0 & 0x80u);
         if ((b0 & 0x80u) != 0u) {
-            if (pos >= bytes.size()) return false;
+            if (pos >= in_end) return false;
             std::uint8_t b1 = bytes[pos++];
             v = (static_cast<std::uint32_t>(b1) ^ (b1 & 0x80u)) * 0x80u + 0x80u + v;
             if ((b1 & 0x80u) != 0u) {
-                if (pos >= bytes.size()) return false;
+                if (pos >= in_end) return false;
                 std::uint8_t b2 = bytes[pos++];
                 v = static_cast<std::uint32_t>(b2) * 0x4000u + 0x4000u + v;
             }
@@ -3696,26 +3700,26 @@ bool DecodeLzpfMember(
                 member_done = total_written;
                 // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
                 // + width) before the next stream tag.
-                while (input_pos < bytes.size()) {
+                while (input_pos < in_end) {
                     const std::uint8_t tb = bytes[input_pos];
                     std::size_t tw;
                     if      (tb == 0x45u) tw = 4u;
                     else if (tb == 0x47u) tw = 4u;
                     else if (tb == 0x26u) tw = 2u;
                     else break;
-                    if (input_pos + 1u + tw > bytes.size()) break;
+                    if (input_pos + 1u + tw > in_end) break;
                     input_pos += 1u + tw;
                 }
                 std::uint64_t next_tag = 0;
-                if (lenient && input_pos >= bytes.size()) { decode_ok = false; break; }   // input simply ran out: the sink reports the codec's short-end status
-                if (!ReadLegacyVarint(bytes, &input_pos, bytes.size(), &next_tag) ||
+                if (lenient && input_pos >= in_end) { decode_ok = false; break; }   // input simply ran out: the sink reports the codec's short-end status
+                if (!ReadLegacyVarint(bytes, &input_pos, in_end, &next_tag) ||
                     (next_tag & 0x0fu) != 0u) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 std::uint64_t next_bytes = next_tag >> 4u;
                 if (next_bytes != 0u && allow_truncated &&
-                    next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos))
-                    next_bytes = static_cast<std::uint64_t>(bytes.size() - input_pos);
+                    next_bytes > static_cast<std::uint64_t>(in_end - input_pos))
+                    next_bytes = static_cast<std::uint64_t>(in_end - input_pos);
                 if (next_bytes == 0u ||
-                    next_bytes > static_cast<std::uint64_t>(bytes.size() - input_pos)) {
+                    next_bytes > static_cast<std::uint64_t>(in_end - input_pos)) {
                     nzr::derr::SetAt(2u, input_pos); decode_ok = false; break;
                 }
                 stream_data_end = input_pos + static_cast<std::size_t>(next_bytes);
@@ -5273,13 +5277,22 @@ bool TryParseLegacyCnArchive(
                         if (use_sink) { use_sink = all_ok && publish_single(plist); if (!use_sink && assembled.empty()) all_ok = false; }
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PStream& s = *plist[idx];
+                            // One record (the usual case) is decoded in place; several are
+                            // concatenated first.
                             std::vector<unsigned char> payload;
                             std::size_t plen = 0;
                             for (const auto& c : s.chunks) plen += c.second;
-                            payload.reserve(plen);
-                            for (const auto& c : s.chunks)
-                                payload.insert(payload.end(), bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                            const bool in_place = (s.chunks.size() == 1u);
+                            if (!in_place) {
+                                payload.reserve(plen);
+                                for (const auto& c : s.chunks)
+                                    payload.insert(payload.end(), bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                                   bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                            }
+                            const std::vector<unsigned char>& pin = in_place ? bytes : payload;
+                            const std::size_t pbeg = in_place ? s.chunks.front().first : 0u;
+                            const std::size_t plen_in = in_place ? s.chunks.front().second : payload.size();
+                            const std::size_t pend = in_place ? pbeg + plen_in : 0u;
                             const ChecksumMode cm = s.cmode;
                             const std::uint32_t cv = s.cval;
                             auto slice_verify = [&](const unsigned char* dec, std::size_t n) -> bool {
@@ -5294,9 +5307,9 @@ bool TryParseLegacyCnArchive(
                                 psink::StreamBegin(idx);
                                 std::size_t mdone = 0;
                                 const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
-                                const bool okd = DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
+                                const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
                                                                   is_variant_b, method_p1, /*derived_cap_only=*/true, accept_all, &unused,
-                                                                  sbuf.data(), false, &mdone, /*lenient=*/true);
+                                                                  sbuf.data(), false, &mdone, /*lenient=*/true, pend);
                                 psink::StreamEnd(idx, sbuf.data(), okd ? s.osz : mdone, okd,
                                                  !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
                                 return okd;
@@ -5304,9 +5317,9 @@ bool TryParseLegacyCnArchive(
                             // Straight into this stream's slice (DisjointCover proved the
                             // slices tile the output before any thread started).
                             if (static_cast<std::uint64_t>(s.ooff) + s.osz > assembled.size()) return false;
-                            if (!DecodeLzpfMember(payload, 0u, payload.size(), s.osz,
+                            if (!DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
                                                   is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &unused,
-                                                  assembled.data() + static_cast<std::size_t>(s.ooff))) return false;
+                                                  assembled.data() + static_cast<std::size_t>(s.ooff), false, nullptr, false, pend)) return false;
                             slice_done[idx].store(true, std::memory_order_relaxed);
                             return true;
                         });
@@ -5699,14 +5712,18 @@ bool TryParseLegacyCnArchive(
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>& accept,
                                     std::vector<unsigned char>* dst) {
-                                    const std::vector<unsigned char> in =
-                                        ConcatParallelChunks(bytes, chunks);
-                                    if (in.empty()) return false;
+                                    const bool one = (chunks.size() == 1u);
+                                    const std::vector<unsigned char> in = one ? std::vector<unsigned char>() : ConcatParallelChunks(bytes, chunks);
+                                    if (!one && in.empty()) return false;
+                                    const std::vector<unsigned char>& pin = one ? bytes : in;
+                                    const std::size_t pbeg = one ? chunks.front().first : 0u;
+                                    const std::size_t plen_in = one ? chunks.front().second : in.size();
                                     const bool sinking = psink::Available() || psink::Committed();
                                     std::size_t mdone = 0;
-                                    const bool okd = DecodeLzpfMember(in, 0u, in.size(), out_size, vb,
+                                    const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, out_size, vb,
                                                                       method_p1, /*derived_cap_only=*/sinking,
-                                                                      accept, dst, nullptr, false, &mdone, /*lenient=*/sinking);
+                                                                      accept, dst, nullptr, false, &mdone, /*lenient=*/sinking,
+                                                                      one ? pbeg + plen_in : 0u);
                                     if (!okd && sinking) dst->resize(mdone);   // completed members only
                                     return okd;
                                 },
