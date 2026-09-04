@@ -81,7 +81,7 @@ as in the original). Environment variables, all optional:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Produces `bin/nz_recon`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -Iinclude -static -pthread -o nz_recon src/*.cpp` (and the mingw-w64 equivalents for Windows).
+Produces `bin/nz_recon`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -Iinclude -static -pthread -o nz_recon src/*.cpp` (and the mingw-w64 equivalents for Windows). The 32-bit builds add `-m32 -msse2`: the SSE2 paths (audio predictor, `-cO` mixer) are compiled only when the target has SSE2, and on a 137 MB mixed tar that is a 19 % shorter `-cO` decode for a Pentium 4-class minimum (the original needed MMX).
 
 ## Tests
 
