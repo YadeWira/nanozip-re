@@ -9025,6 +9025,9 @@ int RunList(const CliOptions& options, std::ostream& os) {
 
 int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os) {
     const auto run_start = std::chrono::steady_clock::now();
+    // The inverse BWT's own thread pool follows the same -t / NZ_THREADS / CPU
+    // count rule as the stream workers.
+    NzBwtSetThreadCount(DecodeThreadCount());
     ArchiveContext context;
     std::string error;
     const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);

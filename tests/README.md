@@ -38,6 +38,13 @@ mid-stream checksum records); the sweep aggregates them into a "constructs obser
 release can say what was exercised. `tests/gen_image_variants.py <dir>` writes BMP/PGM/PPM/PBM/TGA/
 TIFF variants that trigger the image detectors.
 
+## Speed and debug builds
+
+`tests/bench_vs_original.sh` builds a ~140 MB mixed tar from a sample collection, has the original
+compress it in the six codecs and times `t` for both binaries (the numbers on the wiki's Performance
+page). `tests/debug_build_check.sh` syntax-checks the trace/dump switches, which compile in only with
+`-DNZOPT_DEBUG` (the `-cO` model-write watch with `-DNZO2_WATCH`) and are off in every normal build.
+
 ## RE helpers
 
 `legacy_optimum_trace_path.sh`, `legacy_optimum_path_matrix.py`, `legacy_stream_dump.py`,
