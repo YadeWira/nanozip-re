@@ -793,7 +793,16 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         std::fprintf(stderr, "[CD] hdr: chunk=0x%x flags=0x%x out_size=%u pure_lit=%d is_lzhds=%d\n",
                      chunk, flags, out_size, (int)pure_literal, (int)is_lzhds);
     }
-    if (out_size == 0) return 0;     // out_size <= 0x8001 always fits the 64 KB ring
+    if (out_size == 0) return 0;
+    // out_size <= 0x8001 always (the size field is a 0x80010-limited varint, the
+    // delta a 0x8001-limited one) and fits the 64 KB ring. A corrupt header can
+    // still spell out gigabytes -- CdReadVar does not clamp -- and a decoder that
+    // believes it allocates and Huffman-decodes that much garbage (fuzz: 8 s on a
+    // 2 MB archive). The original stops with "Internal error".
+    if (out_size > 0x8001u) {
+        CD_FAIL("chunk out_size %u exceeds the 0x8001 maximum\n", out_size);
+        return 0;
+    }
     // The ring write base RESETS to 0 when this chunk would not fit before the ring
     // end (verified vs the binary's obj+0x980: f18 chunk2 53707+26661 > 65536 -> base
     // 0; all chunks that fit keep advancing). Cross-chunk matches still wrap (& mask).
@@ -1000,6 +1009,9 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         } else {
             acount = out_n;
         }
+        // A column's arith payload cannot exceed the chunk it feeds; a corrupt
+        // count would otherwise size the buffer and the Huffman loop by garbage.
+        if (acount > 0x10000u) { overran = true; r.cur = r.end; return std::vector<std::uint8_t>(); }
         std::vector<std::uint8_t> ar(acount + 64, 0);
         if (arith) {
             const std::size_t col_avail = CdAvail(r);
