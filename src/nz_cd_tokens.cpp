@@ -10,6 +10,7 @@
 #include "nz_cd_texttransform_dict.h"   // &8 bit 0x8 word-dictionary transform
 #include "nz_lzhds.h"     // -cD (nz_lzhds) literal model
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -589,8 +590,22 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
     nz_trace::Construct("cd_tt_param=0x%x", param);
     const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x40u | 0x1u;
     if (param & ~kSupported) do { CD_FAIL("text pipeline: unsupported bits 0x%x (param=0x%x)\n", param & ~kSupported, param); return 0; } while (0);
-    std::vector<std::uint8_t> sa(out_cap + 64, 0), sb(out_cap + 64, 0);
+    // Double buffers sized by the remaining output (a stage may expand up to
+    // out_cap). Allocating and zeroing them per chunk cost 2 x the whole file per
+    // 32 KB text chunk (89 % of a -cd decode). They persist per thread instead,
+    // and the bytes a stage wrote are zeroed again afterwards, so every call still
+    // sees all-zero buffers exactly as before.
+    static thread_local std::vector<std::uint8_t> sa, sb;
+    if (sa.size() < static_cast<std::size_t>(out_cap) + 64u) { sa.assign(static_cast<std::size_t>(out_cap) + 64u, 0u); }
+    if (sb.size() < static_cast<std::size_t>(out_cap) + 64u) { sb.assign(static_cast<std::size_t>(out_cap) + 64u, 0u); }
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
+    std::uint32_t dirty[2] = {0u, 0u};   // bytes to re-zero in each buffer on exit
+    struct Rezero {
+        std::uint8_t** b; std::uint32_t* d; std::uint32_t cap;
+        ~Rezero() {
+            for (int i = 0; i < 2; ++i) if (d[i]) std::memset(b[i], 0, std::min<std::size_t>(cap + 64u, static_cast<std::size_t>(d[i]) + 64u));
+        }
+    } rezero{bufs, dirty, out_cap};
     const std::uint8_t* cur = src;
     std::uint32_t n = size; int bi = 0;
     // Stage order as FUN_080a3c90 dispatches them (GDB-confirmed on a param14 +
@@ -608,6 +623,7 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
             case 0x01u: m = NzCdCrlf(cur, n, bufs[bi], out_cap); break;
             default: return 0;
         }
+        dirty[bi] = std::max(dirty[bi], m ? m : out_cap);   // a failed stage may have written anywhere
         if (!m) return 0;
         if (const char* dd = NZ_ENV("NZOPT_DUMP_CD_TT")) {   // per-stage outputs of this pipeline call
             static thread_local unsigned call_no = 0; static thread_local unsigned st = 0;
