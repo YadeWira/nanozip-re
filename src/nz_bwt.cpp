@@ -877,14 +877,47 @@ bool NzBwtDecodeInput(const uint8_t* payload, uint32_t payload_size,
         if (in_bytes[i]) std::memcpy(offsets[i], cur_src, in_bytes[i]);
     }
 
-    for (uint32_t i = 0; i != 256u; ++i) {
-        if (out_bytes[i] == 0u) continue;
-        if (stored_raw[i]) continue;   // already sitting in place, verbatim
+    // Each bucket is decoded by its own unpacker in its own scratch region, so
+    // the buckets are independent; the original (FUN_0809a890 under FUN_0809d370's
+    // thread group) decodes them in parallel on large blocks and so does this.
+    auto decode_bucket = [&](uint32_t i) -> bool {
         BwtUnpackInput unpacker;
         if (unpacker.BwtUnpackMain(offsets[i], in_bytes[i], out_bytes[i]) != out_bytes[i]) {
             BWT_FAIL("bucket %u failed (in=%u out=%u)\n", i, in_bytes[i], out_bytes[i]);
             return false;
         }
+        return true;
+    };
+    unsigned nthreads = 1u;
+    if (out_size >= kBwtChainThreshold) {
+        nthreads = g_bwt_threads.load(std::memory_order_relaxed);
+        if (nthreads == 0u) nthreads = std::thread::hardware_concurrency();
+        if (nthreads == 0u) nthreads = 1u;
+        if (nthreads > 16u) nthreads = 16u;
+    }
+    if (nthreads <= 1u) {
+        for (uint32_t i = 0; i != 256u; ++i) {
+            if (out_bytes[i] == 0u || stored_raw[i]) continue;   // raw: already in place
+            if (!decode_bucket(i)) return false;
+        }
+    } else {
+        // Largest buckets first so the tail of the schedule is short.
+        std::vector<uint32_t> order;
+        for (uint32_t i = 0; i != 256u; ++i) if (out_bytes[i] != 0u && !stored_raw[i]) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return out_bytes[a] > out_bytes[b]; });
+        std::atomic<size_t> next{0};
+        std::atomic<bool> ok{true};
+        auto worker = [&]() {
+            for (;;) {
+                const size_t k = next.fetch_add(1u);
+                if (k >= order.size() || !ok.load(std::memory_order_relaxed)) return;
+                if (!decode_bucket(order[k])) ok = false;
+            }
+        };
+        std::vector<std::thread> threads;
+        for (unsigned t = 0; t < nthreads && t < order.size(); ++t) threads.emplace_back(worker);
+        for (auto& th : threads) th.join();
+        if (!ok) return false;
     }
 
     uint8_t* dst = out;
