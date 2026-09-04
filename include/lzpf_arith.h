@@ -178,6 +178,17 @@ struct BitReader {
 // Backs the legacy DAT_081b42f0 lookup table referenced by every bit-reader call.
 std::uint32_t Mask(unsigned n);
 
+// The original's run-length / length-code base table, DAT_081b4380. It lives in
+// .bss and the loop at 0x080c0320 fills it with
+//     table[0] = 0; for (i = 1; i != 33; ++i) table[i] = (i <= 31) ? (1u << i) : 0;
+// i.e. 33 entries: 0, 2^1 .. 2^31, 0. Its readers index it with a lookahead
+// count (FUN_080a41d0), a halved length code (FUN_080aa070) or a code minus
+// 0xe0 (FUN_0809baa0), so the accessor takes the index as it stands.
+inline std::uint32_t RunLengthBase(std::uint32_t index) {
+    if (index == 0u || index > 31u) return 0u;
+    return 1u << index;
+}
+
 // Initialise a fresh reader pointing at [data, data+size). Caller owns the buffer.
 void Init(BitReader& r, const std::uint8_t* data, std::size_t size);
 

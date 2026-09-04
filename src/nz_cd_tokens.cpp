@@ -581,17 +581,33 @@ std::uint32_t NzCdCrlf(const std::uint8_t* src, std::uint32_t insz,
 }
 }  // namespace
 
-// &8 text pipeline (FUN_080a3c90): a param bitmask selects an ordered sequence of text
-// transforms applied with double-buffering. Supported bits: 0x80 param14, 0x8 word
-// dictionary (NzCdDict; reorder_ascii=true for -cd, type!=7), 0x20 line-RLE
-// (FUN_080a2f20), 0x1 CRLF EOL (FUN_080a19b0), applied in that dispatch order (the
-// reference order is 0x80,0x10,0x8,0x4,0x2,0x20,0x40,0x1). Any other bit set means a
-// transform not yet ported (0x10 tt16-num, 0x4 html, 0x2 insert-LF) -> return 0 so the
-// caller bridges. Every text stage EXPANDS, so each intermediate <= the final output.
+// &8 text pipeline: a param bitmask selects an ordered sequence of text transforms
+// applied with double-buffering. The dispatcher FUN_080a3c90 was decompiled
+// (2026-09-04) and its order is exactly 0x80, 0x10, 0x08, 0x04, 0x02, 0x20, 0x40,
+// 0x01 -- the order below. Which bits it can pass on, and what each needs:
+//   0x80 param14      FUN_080a0ff0, no side data
+//   0x10 tt16-num     FUN_080a3340(obj+0x1c, ...) -- the ORIGINAL returns 0 (declines)
+//                     when that side object is null, and a -cd chunk header has no
+//                     field for the tt16 arith side stream, so it cannot occur here
+//   0x08 dictionary   FUN_080a0a00, preceded by the optional ASCII reorder (obj+0x22)
+//   0x04 html         FUN_080a1190 over a 2237-byte LOCAL state (FUN_080b7c00): no
+//                     side stream, so it IS wireable -- done below, with the same
+//                     transform the CM family exercises on hundreds of corpus files
+//   0x02 insert-LF    FUN_080a3520(obj, ...) -- reads the tt2 side stream off the
+//                     object, which a -cd chunk likewise cannot carry
+//   0x20 line-RLE     FUN_080a2f20 with the byte 10
+//   0x40 chess        FUN_080a3000
+//   0x01 CRLF EOL     FUN_080a19b0
+// MEASURED: over the 3037-file stratified sweep (24 272 decodes) the -cd pipeline
+// param only ever took 0x01, 0x08, 0x09, 0x20, 0x21, 0x28, 0x29, 0x40, 0x41, 0x88,
+// 0x89, 0xc8, 0xc9 -- never 0x10, 0x04 or 0x02; and a file that makes -cc/-co set
+// tt=0x14 (tt16 + html) makes -cd use no text transform at all, so its detector is
+// the more conservative one. Every text stage EXPANDS, so each intermediate <= the
+// final output.
 std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
                                std::uint8_t* out, std::uint32_t out_cap, std::uint32_t param) {
     nz_trace::Construct("cd_tt_param=0x%x", param);
-    const std::uint32_t kSupported = 0x80u | 0x8u | 0x20u | 0x40u | 0x1u;
+    const std::uint32_t kSupported = 0x80u | 0x8u | 0x4u | 0x20u | 0x40u | 0x1u;
     if (param & ~kSupported) do { CD_FAIL("text pipeline: unsupported bits 0x%x (param=0x%x)\n", param & ~kSupported, param); return 0; } while (0);
     // Double buffers sized by the remaining output (a stage may expand up to
     // out_cap). Allocating and zeroing them per chunk cost 2 x the whole file per
@@ -611,9 +627,9 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
     } rezero{bufs, dirty, out_cap};
     const std::uint8_t* cur = src;
     std::uint32_t n = size; int bi = 0;
-    // Stage order as FUN_080a3c90 dispatches them (GDB-confirmed on a param14 +
-    // dict + chess chunk: param14 -> dict -> chess).
-    static const std::string order_env = "80,08,20,40,01";
+    // Stage order as FUN_080a3c90 dispatches them (decompiled; also GDB-confirmed on
+    // a param14 + dict + chess chunk: param14 -> dict -> chess).
+    static const std::string order_env = "80,08,04,20,40,01";
     for (std::size_t p0 = 0; p0 < order_env.size(); p0 += 3) {
         const unsigned bit = static_cast<unsigned>(std::strtoul(order_env.c_str() + p0, nullptr, 16));
         if (!(param & bit)) continue;
@@ -621,6 +637,7 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
         switch (bit) {
             case 0x80u: m = NzCdParam14(cur, n, bufs[bi], out_cap); break;
             case 0x08u: m = NzCdDict(cur, n, bufs[bi], out_cap, false); break;
+            case 0x04u: m = ::NzTextTransformHtml(cur, n, bufs[bi], out_cap); break;
             case 0x20u: m = NzCdLineRle(cur, n, bufs[bi], out_cap); break;
             case 0x40u: m = ::NzTextTransform6(cur, n, bufs[bi], out_cap); break;
             case 0x01u: m = NzCdCrlf(cur, n, bufs[bi], out_cap); break;

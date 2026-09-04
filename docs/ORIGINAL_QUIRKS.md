@@ -60,6 +60,22 @@ switches. The verdict column says what nanozip-re does today.
 
 ## Things that are *not* defects but surprise people
 
+**Format corners no encoder emits** (checked 2026-09-04, so a decoder that declines them is not
+incomplete): the text-transform dispatcher understands one bit more than the seven the CM family
+uses — 0x80, which means "apply param14" — but the CM block header has its own param14 flag and
+across 9 255 CM blocks of the 3037-file sweep bit 0x80 never appeared while that flag was set 1 272
+times. In `-cd`/`-cD` the same dispatcher can in principle also run the tt16-number (0x10) and
+insert-linefeed (0x02) transforms, but both read a dedicated arithmetic side stream off the codec
+object — the original itself returns "decline" for 0x10 when that side object is null — and a `-cd`
+chunk header has no field to carry one; over the whole sweep the `-cd` text parameter only ever took
+values built from 0x80, 0x40, 0x20, 0x08 and 0x01, and a file that makes `-cc`/`-co` select tt16 +
+html makes `-cd` apply no text transform at all. The BWT's rank-delta prefix saturates at 31 bits,
+which would need a single bucket above a gigabyte: on a 221 MB text input at `-m256m` and at `-m2g`
+(the largest memory the original accepts) the biggest bucket is 440 054 bytes and the biggest prefix
+18 bits, and the bucket size does not grow with the memory budget. The run-length base table the
+prefix indexes is not a mystery either: it sits in `.bss` and the loop at 0x080c0320 fills 33 words
+with 0, 2^1 … 2^31, 0.
+
 - **Compression is not reproducible byte-for-byte across thread counts**: the same input
   compressed with `-p1` and with the default gives different archives (different stream
   splits). Decoding either is fine.

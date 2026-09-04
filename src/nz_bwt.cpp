@@ -1,6 +1,7 @@
 // nz_bwt.cpp — NanoZip decr_param == 0 ("BWT") block decoding, ported from the
 // community reference decoder (nzdec_v0 NZ.cpp). Faithful reimplementation.
 #include "nz_env.h"
+#include "nz_trace.h"
 #include "nz_bwt.h"
 
 #include <algorithm>
@@ -441,6 +442,9 @@ struct BwtUnpackInput {
                         if (!aa_flag || ++ik == 31u) break;
                     }
 
+                    // The unary prefix length: its tail is what a rank delta above
+                    // 2^30 would need (see the note below), so record the large ones.
+                    if (ik >= 20u) nz_trace::Construct("bwt_rank_ik=%u", ik);
                     uint16_t* b_ptr = &model_b_[ik * 16u + hash2];
                     const bool b_flag = adec.Read(*b_ptr);
                     *b_ptr = (uint16_t)(*b_ptr +
@@ -452,18 +456,23 @@ struct BwtUnpackInput {
 
                     // upper_bits is a rank delta that gets added to a C[] entry,
                     // so it can never legitimately exceed this bucket's output
-                    // size. It does exceed it when ik saturates at 31: the
-                    // shift by ik-1 then yields ~3.2e9. The reference computes
-                    // `numbits = max(ik, 1)` at exactly this point and never
-                    // uses it, which suggests its large-ik path is incomplete
-                    // rather than that this port mis-transcribed it -- the
-                    // reference is already known to get some -co/-cO edges
-                    // wrong. Pinning down what the real binary does here needs
-                    // GDB against linux32/nz, so decline at the true cause
-                    // instead of letting a garbage C[] entry surface later as a
-                    // confusing num_rle underflow.
+                    // size. Reaching ik = 31 (the unary prefix saturates there)
+                    // would mean a delta above 2^30, i.e. a single BWT bucket
+                    // over a gigabyte. MEASURED (2026-09-04) that the encoder
+                    // does not go anywhere near it: over every -co/-cO archive
+                    // in the verification package plus a 221 MB text input
+                    // compressed at -m256m and at -m2g (the largest memory the
+                    // original accepts), the biggest bucket is 440 054 bytes
+                    // and the biggest ik is 18 -- and the bucket size does not
+                    // grow with -m, so it is the codec's own bucket split that
+                    // bounds it, not the memory budget. A 32-bit encoder could
+                    // not hold such a block anyway (the BWT needs several bytes
+                    // of suffix array per symbol). So this is an unreachable
+                    // corner of the format rather than a gap in the port, and
+                    // declining here keeps a garbage C[] entry from surfacing
+                    // later as a confusing num_rle underflow.
                     if (upper_bits > out_size) {
-                        BWT_FAIL("decode: rank delta %u > out_size %u (ik=%u, reference large-ik path incomplete)\n",
+                        BWT_FAIL("decode: rank delta %u > out_size %u (ik=%u, no encoder emits this)\n",
                                  upper_bits, out_size, ik);
                         return 7;
                     }

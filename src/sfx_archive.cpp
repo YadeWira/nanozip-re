@@ -3732,7 +3732,8 @@ bool DecodeLzpfMember(
     // member, so those files are on disk when it reports the error.
     std::vector<unsigned char> first_prefix;
     bool first_candidate = true;
-    for (const std::size_t window_capacity : cap_candidates) {
+    for (std::size_t cap_idx = 0; cap_idx < cap_candidates.size(); ++cap_idx) {
+        const std::size_t window_capacity = cap_candidates[cap_idx];
         pscope.Restart();
         std::size_t member_done = 0;
         std::size_t stream_data_end = first_block_pos + first_stream_len;
@@ -4083,6 +4084,12 @@ bool DecodeLzpfMember(
                 first_prefix.assign(decoded, decoded + member_done);
         }
         if (decode_ok && total_written == total && run_verify()) {
+            // Which dictionary capacity actually decoded: candidate 0 is the value
+            // DERIVED from the codec record's p1 byte, 1..4 are the legacy guesses
+            // kept as a fallback. If a corpus sweep never reports a candidate above
+            // 0, the guesses can go (see the note next to cap_candidates).
+            nz_trace::Construct("lzpf_cap candidate=%zu of=%zu p1=%u variant=%c",
+                                cap_idx, cap_candidates.size(), method_p1, is_variant_b ? 'B' : 'A');
             if (direct_out != nullptr) { if (out != nullptr) out->clear(); }
             else *out = std::move(decoded_store);
             pscope.Commit();
@@ -4777,6 +4784,7 @@ bool TryParseLegacyCnArchive(
                         return psink::Available() || psink::Committed() || dst->size() == out_size;
                     },
                     &store_blocks_buffer, psink::Available(), psink::Policy::kStore, 0u, psink::Family::kStore)) {
+                nz_trace::Construct("store_assembly=parallel_multifile");
                 store_multiblock = true;
                 metadata_end = table_end;
                 payload_start = table_end;
@@ -4792,6 +4800,7 @@ bool TryParseLegacyCnArchive(
             metadata_end = table_end;
             payload_start = table_end;
             prefix_found = true;
+            nz_trace::Construct("store_assembly=parallel_single");
         }
         if (!prefix_found) {
             // Multi-block store: walk [varint len<<4|0][raw][checksum trailer]
@@ -4810,6 +4819,7 @@ bool TryParseLegacyCnArchive(
             for (std::size_t s = table_end; s <= scan_end; ++s) {
                 if (TryAssembleStoredBlocks(bytes, s, total_data_size,
                                             store_trailer_bytes, &store_blocks_buffer)) {
+                    nz_trace::Construct("store_assembly=block_chain trailer=%zu", store_trailer_bytes);
                     store_multiblock = true;
                     metadata_end = s;
                     payload_start = s;
@@ -6433,6 +6443,19 @@ bool TryParseLegacyCnArchive(
         literal_data_buffer = std::move(partial_prefix);
         ctx.decode_failed = true;
     }
+    {
+        // The container's shape, so a sweep can say which of them were exercised
+        // (the encode phase has to write all of these back).
+        std::size_t nstreams = 0;
+        if (has_parallel_streams) {
+            std::map<unsigned, LegacyParallelStream> shape;
+            if (ParseLegacyParallelStreams(bytes, &shape)) nstreams = shape.size();
+        }
+        nz_trace::Construct("container %s codec=0x%02x/%u streams=%zu files=%s",
+                            has_parallel_streams ? "parallel" : "single",
+                            method, method_p0, nstreams,
+                            entries.size() == 1u ? "1" : "many");
+    }
     if (psink::Committed()) {
         // The sink wrote the container while the streams decoded; the extractor
         // only reports (footer, or the original's corruption line).
@@ -7268,6 +7291,13 @@ static bool TryDecodeLegacyCm(
                         cur_size, tt_flags, tp);
             }
         }
+        // The text-transform dispatcher FUN_080a3c90 knows one more bit than the
+        // seven below: 0x80 = param14 (FUN_080a0ff0). The CM family requests
+        // param14 through its OWN block-header flag instead (the p14 field this
+        // block already applies), and over 9 255 CM-family blocks of the 3037-file
+        // sweep tt never had bit 0x80 set (the largest value seen is 0x43) while
+        // p14 was set 1 272 times. So this decline covers a bit the encoder
+        // expresses elsewhere, not a gap in the port.
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining);
@@ -8030,6 +8060,13 @@ static bool DecodeOptimumBlockSequence(
                         cur_size, tt_flags, tp);
             }
         }
+        // The text-transform dispatcher FUN_080a3c90 knows one more bit than the
+        // seven below: 0x80 = param14 (FUN_080a0ff0). The CM family requests
+        // param14 through its OWN block-header flag instead (the p14 field this
+        // block already applies), and over 9 255 CM-family blocks of the 3037-file
+        // sweep tt never had bit 0x80 set (the largest value seen is 0x43) while
+        // p14 was set 1 272 times. So this decline covers a bit the encoder
+        // expresses elsewhere, not a gap in the port.
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));

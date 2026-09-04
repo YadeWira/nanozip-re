@@ -54,6 +54,8 @@ add_executable(test_lzpf_arith
     # nz_cd_tokens' text pipeline calls the shared tt 0x40 transform, which
     # lives in its own dependency-free unit for exactly this reason
     src/nz_tt_chess.cpp
+    # ... and the tt 0x04 html transform, which the -cd pipeline dispatches too
+    src/nz_text_transform.cpp
     # nz_cd_tokens' 0xf sub-chunk runs the image model (nz_audio.cpp), whose
     # bit-count model is seeded from nz_cm's shared LUT
     src/nz_audio.cpp

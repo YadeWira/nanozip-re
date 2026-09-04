@@ -950,8 +950,23 @@ void TestCdDecodeBlockMultiText() {
            "CD full file decode matches original (multi-chunk text, 45600 B, ring recon-advance+reset)");
 }
 
+// DAT_081b4380, the run-length / length-code base table. It lives in .bss and
+// the loop at 0x080c0320 fills it with 33 entries: 0, 2^1 .. 2^31, 0. An earlier
+// note approximated it as 2^L - 2, which is right only at index 0.
+void TestRunLengthBase() {
+    Expect(nzr::lzpf::RunLengthBase(0) == 0u, "RunLengthBase(0)");
+    bool all = true;
+    for (std::uint32_t i = 1; i <= 31; ++i) {
+        if (nzr::lzpf::RunLengthBase(i) != (1u << i)) all = false;
+    }
+    Expect(all, "RunLengthBase(1..31) == 2^i");
+    Expect(nzr::lzpf::RunLengthBase(32) == 0u, "RunLengthBase(32)");
+    Expect(nzr::lzpf::RunLengthBase(33) == 0u, "RunLengthBase(past the end)");
+}
+
 int main() {
     TestMaskTable();
+    TestRunLengthBase();
     TestCounterInit();
     TestFixedSequences();
     TestStraddle();
