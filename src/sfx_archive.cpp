@@ -17,6 +17,7 @@
 #include "nz_bwt.h"
 #include "nz_audio.h"
 #include <atomic>
+#include <cpuid.h>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -551,9 +552,9 @@ fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
 // original does not.  An archive with no permission record (which is also what
 // -np and an all-0600 input produce) uses the original's own default of 0600.
 bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
-                        std::uint32_t mode) {
+                        std::uint32_t mode, long owner_uid = -1, long owner_gid = -1) {
 #if defined(_WIN32)
-    (void)mode;
+    (void)mode; (void)owner_uid; (void)owner_gid;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     // Never hand the CRT a single write above 2 GB: msvcrt's _write() takes an
@@ -576,6 +577,10 @@ bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::si
     if (fd < 0) {
         return false;
     }
+    // -fo: the original calls fchown on the open descriptor with the stored
+    // user/group and ignores the result (measured: fchown32(fd, uid, gid), then
+    // utime; nothing printed when it fails for a non-root user).
+    if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
     std::size_t written = 0;
     while (written < n) {
         const ssize_t w = ::write(fd, data + written, n - written);
@@ -1318,6 +1323,9 @@ struct Engine {
     bool have_snapshot = false;
     bool parallel = false;
     std::array<std::atomic<std::uint64_t>, kMaxSlots> done{};
+    std::array<std::atomic<bool>, kMaxSlots> started{};    // worker began (SlotStarted)
+    std::array<bool, kMaxSlots> announced{};               // its "Compressor #k" line is out
+    std::function<std::string(std::size_t)> compressor_line;   // set by the header registration
     std::atomic<std::uint64_t> total{0};
     std::string name, shown_name;
     bool worker_gate = false, writer_gate = false;
@@ -1377,6 +1385,8 @@ inline void Begin(std::ostream* os, std::function<void(std::ostream&)> header) {
     e.os = os; e.header = std::move(header); e.header_done = false;
     e.have_snapshot = false; e.parallel = false;
     for (auto& d : e.done) d.store(0u, std::memory_order_relaxed);
+    for (auto& d : e.started) d.store(false, std::memory_order_relaxed);
+    e.announced.fill(false); e.compressor_line = nullptr;
     e.total.store(0u, std::memory_order_relaxed);
     e.name.clear(); e.shown_name.clear();
     e.worker_gate = e.writer_gate = false;
@@ -1384,8 +1394,19 @@ inline void Begin(std::ostream* os, std::function<void(std::ostream&)> header) {
 inline void End() {
     Engine& e = E();
     std::lock_guard<std::mutex> lk(e.mu);
-    e.os = nullptr; e.header = nullptr;
+    e.os = nullptr; e.header = nullptr; e.compressor_line = nullptr;
 }
+// A worker took slot k (ParallelForEach). The original prints each worker's
+// "Compressor #k" line when that worker first ticks; the ones already running
+// when the header goes out appear in the header write itself.
+inline void SlotStarted(std::size_t k) {
+    Engine& e = E();
+    if (e.os == nullptr || k >= kMaxSlots) return;
+    e.started[k].store(true, std::memory_order_relaxed);
+}
+inline bool SlotStarted(std::size_t k, const Engine& e) { return k < kMaxSlots && e.started[k].load(std::memory_order_relaxed); }
+inline void MarkAnnounced(std::size_t k) { Engine& e = E(); if (k < kMaxSlots) e.announced[k] = true; }
+inline void SetCompressorLine(std::function<std::string(std::size_t)> f) { E().compressor_line = std::move(f); }
 inline bool Active() { return E().os != nullptr; }
 
 // The parser publishes what the header needs before any decode it runs itself.
@@ -1448,6 +1469,16 @@ inline void Add(std::uint64_t n) {
     const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
     const bool first_of_stream0 = slot == 0u && e.done[0].load(std::memory_order_relaxed) == 0u;
     std::lock_guard<std::mutex> lk(e.mu);
+    EnsureHeaderLocked(e);
+    if (slot < kMaxSlots && !e.announced[slot] && e.compressor_line) {
+        // This worker's line was not in the header: clear the status line, print
+        // it, and redraw the name (the original's writer re-ticks right after).
+        e.announced[slot] = true;
+        ClearStatusLine(*e.os);
+        const std::string line = e.compressor_line(slot);
+        e.os->write(line.data(), static_cast<std::streamsize>(line.size()));
+        if (!e.shown_name.empty()) { ClearStatusLine(*e.os); WriteFieldLocked(e, Name40(e.shown_name) + " ", FieldsLocked(e)); }
+    }
     if (first_of_stream0 && e.parallel) WriterStartLocked(e);
     e.done[slot].fetch_add(n, std::memory_order_relaxed);
     e.total.fetch_add(n, std::memory_order_relaxed);
@@ -2089,6 +2120,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     if (threads <= 1u) {
         for (std::size_t i = 0; i < n && ok; ++i) {
             progress::SlotScope slot(i);
+            progress::SlotStarted(i);
             if (!fn(i)) { ok = false; record_failure(i); }
             else progress::StreamDone(i);
         }
@@ -2102,6 +2134,7 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
             if (i >= n || !ok) return;
             try {
                 progress::SlotScope slot(i);
+                progress::SlotStarted(i);
                 if (!fn(i)) { ok = false; record_failure(i); }
                 else progress::StreamDone(i);
             } catch (const std::bad_alloc&) {
@@ -7848,6 +7881,19 @@ void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t o
     os << buf << '\n';
 }
 
+// "Compressor #k: <name> [<N> MB]\n" for worker k, the memory figure from that
+// worker's own window byte (rounding is the original's ((bytes >> 19) + 1) >> 1);
+// under -v the IO buffer split (no read-ahead, 1 MB write-behind for `t`, 4 for `x`).
+std::string FormatCompressorLine(const LegacyCnContext& ctx, std::size_t k, bool verbose, bool test_mode) {
+    const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
+    const std::uint8_t p1 = (ctx.parallel_p1.empty() || k >= ctx.parallel_p1.size()) ? ctx.legacy_method_p1 : ctx.parallel_p1[k];
+    const std::uint64_t bytes = LegacyEngineWorkingSetP1(ctx, p1);
+    std::string line = "Compressor #" + std::to_string(k) + ": " + label + " [" + std::to_string(((bytes >> 19) + 1u) >> 1) + " MB]";
+    if (verbose) line += std::string(" IO-buffers: 0+") + (test_mode ? "1" : "4") + " MB.";
+    line += '\n';
+    return line;
+}
+
 void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOptions& options, bool test_mode) {
     const bool verbose = options.verbose;
     os << "Archive: " << ctx.archive_path << '\n';
@@ -7863,23 +7909,23 @@ void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOp
     else if (options.read_buffer_bytes)  os << ", IO-read-buffer: " << mb(options.read_buffer_bytes) << " MB";
     else if (options.write_buffer_bytes) os << ", IO-write-buffer: " << mb(options.write_buffer_bytes) << " MB";
     os << '\n';
-    const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
     // Rounding is the original's ((bytes >> 19) + 1) >> 1. Under -v it appends its
     // IO buffer split: no read-ahead, a 1 MB write-behind for `t`, 4 MB for `x`.
     // A parallel container gets one line per worker (the original emits them in
     // thread-scheduling order; this port uses stream order), each sized from
     // that worker's own window byte.
     const std::size_t n = ctx.parallel_p1.empty() ? 1u : ctx.parallel_p1.size();
+    // The original prints a worker's line the first time that worker ticks, so
+    // the header carries only the workers already running when it goes out; the
+    // rest follow as they start (the progress engine prints them). For a single
+    // container the one worker is always running by then.
+    const bool parallel = !ctx.parallel_p1.empty();
     for (std::size_t k = 0; k < n; ++k) {
-        // (This used to copy the whole context -- including the decoded data --
-        // once per worker line: 16 x 2.3 GB of memcpy, 16 of the 23 seconds the
-        // 2.29 GB archive took.)
-        const std::uint8_t p1 = ctx.parallel_p1.empty() ? ctx.legacy_method_p1 : ctx.parallel_p1[k];
-        const std::uint64_t bytes = LegacyEngineWorkingSetP1(ctx, p1);
+        if (parallel && !progress::SlotStarted(k, progress::E())) continue;
+        const std::string line = FormatCompressorLine(ctx, k, verbose, test_mode);
         ClearStatusLine(os);
-        os << "Compressor #" << k << ": " << label << " [" << (((bytes >> 19) + 1u) >> 1) << " MB]";
-        if (verbose) os << " IO-buffers: 0+" << (test_mode ? 1 : 4) << " MB.";
-        os << '\n';
+        os.write(line.data(), static_cast<std::streamsize>(line.size()));
+        progress::MarkAnnounced(k);
     }
 }
 
@@ -8205,7 +8251,9 @@ int RunLegacyCnExtractOrTest(
                     MakeDirs0700(out_path.parent_path());
                 }
                 if (!WriteExtractedFile(out_path, ptr, n,
-                                        e.has_permissions ? e.permissions : 0600u)) {
+                                        e.has_permissions ? e.permissions : 0600u,
+                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.uid) : -1L,
+                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L)) {
                     // Measured: "Cannot write: <path>" on a fresh line, per file, and
                     // the run goes on to the footer.
                     os << '\n' << "Cannot write: " << out_path.string() << '\n';
@@ -9172,6 +9220,10 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             // tick (from the parser's snapshot) or explicitly after the parse.
             progress::Begin(&os, [&](std::ostream& o) {
                 const LegacyCnContext& c = parsed ? legacy_cn : progress::Snapshot();
+                progress::SetCompressorLine([&](std::size_t k) {
+                    const LegacyCnContext& cc = parsed ? legacy_cn : progress::Snapshot();
+                    return FormatCompressorLine(cc, k, options.verbose, test_mode);
+                });
                 PrintDecodeHeader(o, c, options, test_mode);
                 progress::HeaderPrinted(!c.parallel_p1.empty(),
                                         c.entries.empty() ? std::string() : c.entries.front().path);
@@ -9325,16 +9377,35 @@ int RunInfo(std::ostream& os) {
     // to its low nibble and the bracketed value is the EXTENDED FAMILY (0 for
     // family 6), not the extended model.
     // (the host summary line is already on screen: PrintBanner emits it)
-    const std::string vendor   = ParseProcValue("/proc/cpuinfo", "vendor_id\t:");
-    const std::string family_s = ParseProcValue("/proc/cpuinfo", "cpu family\t:");
-    const std::string model_s  = ParseProcValue("/proc/cpuinfo", "model\t\t:");
-    const std::string step_s   = ParseProcValue("/proc/cpuinfo", "stepping\t:");
-    const std::string flags    = ParseProcValue("/proc/cpuinfo", "flags\t\t:");
-
-    const unsigned family = family_s.empty() ? 0u : (unsigned)strtoul(family_s.c_str(), nullptr, 10);
-    const unsigned model  = model_s.empty()  ? 0u : (unsigned)strtoul(model_s.c_str(), nullptr, 10);
-    const unsigned step   = step_s.empty()   ? 0u : (unsigned)strtoul(step_s.c_str(), nullptr, 10);
-    const unsigned ext_family = (family >= 15u) ? (family - 15u) : 0u;
+    // The original reads all of this with CPUID, not /proc (measured: identical
+    // output with /proc/cpuinfo unreadable), so do the same: vendor from leaf 0,
+    // the raw family/model/stepping nibbles and the feature bits from leaf 1,
+    // 3DNow! from extended leaf 0x80000001.
+    std::string vendor; unsigned family = 0, model = 0, step = 0, ext_family = 0; std::string flags;
+    {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (__get_cpuid(0u, &a, &b, &c, &d)) {
+            char v[13]; std::memcpy(v, &b, 4); std::memcpy(v + 4, &d, 4); std::memcpy(v + 8, &c, 4); v[12] = 0; vendor = v;
+        }
+        if (__get_cpuid(1u, &a, &b, &c, &d)) {
+            step = a & 0xfu; model = (a >> 4) & 0xfu; family = (a >> 8) & 0xfu; ext_family = (a >> 20) & 0xffu;
+            if (d & (1u << 23)) flags += " mmx";
+            if (d & (1u << 25)) flags += " sse";
+            if (d & (1u << 26)) flags += " sse2";
+            if (c & (1u << 0))  flags += " pni";
+            if (c & (1u << 9))  flags += " ssse3";
+            if (c & (1u << 19)) flags += " sse4_1";
+            if (c & (1u << 20)) flags += " sse4_2";
+            if (d & (1u << 28)) flags += " ht";
+        }
+        unsigned ea = 0, eb = 0, ec = 0, ed = 0;
+        if (__get_cpuid(0x80000000u, &ea, &eb, &ec, &ed) && ea >= 0x80000001u &&
+            __get_cpuid(0x80000001u, &ea, &eb, &ec, &ed)) {
+            if (ed & (1u << 31)) flags += " 3dnow";
+            if (ed & (1u << 30)) flags += " 3dnowext";
+        }
+        flags += ' ';
+    }
 
     char idbuf[256];
     snprintf(idbuf, sizeof(idbuf),
@@ -9347,6 +9418,7 @@ int RunInfo(std::ostream& os) {
     static const struct { const char* flag; const char* shown; } kFeat[] = {
         {"mmx", "MMX"}, {"sse", "SSE1"}, {"sse2", "SSE2"}, {"pni", "SSE3"},
         {"ssse3", "SSSE3"}, {"sse4_1", "SSE41"}, {"sse4_2", "SSE42"},
+        {"3dnow", "3DNow!"}, {"3dnowext", "3DNow!+"},
         {"ht", "Hyper-Threading"},
     };
     std::string feat;

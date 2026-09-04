@@ -8,9 +8,11 @@
 #include <cstring>
 #include <fstream>
 #include <x86intrin.h>
+#include <cpuid.h>
 #if defined(_WIN32)
 #include <windows.h>
-#include <cpuid.h>
+#else
+#include <unistd.h>
 #endif
 #include <ctime>
 
@@ -323,11 +325,9 @@ unsigned MeasuredMhz(const std::string& cpuinfo_mhz) {
     return cpuinfo_mhz.empty() ? 0u : (unsigned)std::strtod(cpuinfo_mhz.c_str(), nullptr);
 }
 
-#if defined(_WIN32)
-// /proc does not exist here, so the same three facts come from CPUID and the
-// Win32 API. Without this the banner every command prints reads
-// "unknown CPU|... MHz|#0|0/0 MB", which looks like a broken build.
-std::string WinCpuBrand() {
+// The brand string from CPUID leaves 0x80000002-4 -- what the original prints,
+// on every platform (Windows has no /proc; Linux may hide /proc/cpuinfo).
+std::string CpuidBrand() {
     unsigned regs[4] = {0, 0, 0, 0};
     if (!__get_cpuid(0x80000000u, &regs[0], &regs[1], &regs[2], &regs[3]) ||
         regs[0] < 0x80000004u) {
@@ -347,6 +347,8 @@ std::string WinCpuBrand() {
     if (first == std::string::npos) return std::string();
     return out.substr(first, out.find_last_not_of(' ') - first + 1u);
 }
+
+#if defined(_WIN32)
 
 // Physical cores and logical processors, so the "+HT" suffix means the same
 // thing it does on the Linux build.
@@ -416,7 +418,7 @@ std::string HostSummaryLine() {
         avail_mb = ms.ullAvailPhys / (1024ull * 1024ull);
         total_mb = ms.ullTotalPhys / (1024ull * 1024ull);
     }
-    const std::string brand = WinCpuBrand();
+    const std::string brand = CpuidBrand();
     char wbuf[512];
     std::snprintf(wbuf, sizeof(wbuf), "%s|%u MHz|#%u%s|%llu/%llu MB",
                   brand.empty() ? "unknown CPU" : brand.c_str(),
@@ -465,11 +467,23 @@ std::string HostSummaryLine() {
         if (!a.empty()) avail_kb = std::strtoull(a.c_str(), nullptr, 10);
     }
 
+    // The original takes these from CPUID and the CPU count from the kernel,
+    // not from /proc/cpuinfo (measured: identical line with the file unreadable).
+    std::string brand = model;
+    bool ht_flag = ht;
+    if (brand.empty()) brand = CpuidBrand();
+    if (logical == 0u) {
+        const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+        logical = n > 0 ? static_cast<unsigned>(n) : 1u;
+        if (logical > 32u) logical = 32u;
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (__get_cpuid(1u, &a, &b, &c, &d)) ht_flag = (d & (1u << 28)) != 0u;
+    }
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%s|%u MHz|#%u%s|%llu/%llu MB",
-                  model.empty() ? "unknown CPU" : model.c_str(),
+                  brand.empty() ? "unknown CPU" : brand.c_str(),
                   MeasuredMhz(mhz),
-                  logical, ht ? "+HT" : "",
+                  logical, ht_flag ? "+HT" : "",
                   static_cast<unsigned long long>((avail_kb + 512u) / 1024u),
                   static_cast<unsigned long long>((total_kb + 512u) / 1024u));
     return std::string(buf);
