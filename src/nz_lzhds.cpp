@@ -249,12 +249,19 @@ std::uint32_t EmitPredictorSymbol(std::uint8_t* ctx_table, std::uint32_t ctx, st
 namespace {
 int g_call_index = -1;
 long g_trace_want = -2;
-bool TraceOn() {
+// Called per decoded symbol: the common case must be one predictable branch on
+// a resolved flag (the out-of-line version with its lazy init was 4 % of a -cD
+// decode).
+bool TraceOnSlow() {
     if (g_trace_want == -2) {
         const char* e = NZ_ENV("NZOPT_TRACE_LZHDS");
         g_trace_want = (e == nullptr) ? -1 : ((*e == 'a') ? -3 : std::atol(e));
     }
     return g_trace_want == -3 || (g_trace_want >= 0 && g_call_index == (int)g_trace_want);
+}
+inline bool TraceOn() {
+    if (__builtin_expect(g_trace_want == -1, 1)) return false;
+    return TraceOnSlow();
 }
 }  // namespace
 
