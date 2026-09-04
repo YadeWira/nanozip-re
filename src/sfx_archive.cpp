@@ -1292,6 +1292,7 @@ struct LegacyCnContext {
     std::uint8_t legacy_method = 0;
     std::uint8_t legacy_method_p0 = 0;
     std::uint8_t legacy_method_p1 = 0;
+    std::uint8_t legacy_method_p2 = 0;   // the block-size byte-float (memory figure)
     // CM decoder params (method==0x4b, p0==7): extracted from the two extra
     // bytes that precede the filename table span in -cc archives.
     int cm_a_bits = 28;
@@ -4242,7 +4243,7 @@ bool TryParseLegacyCnArchive(
     // the sum across all streams.  We scan all chunks to accumulate totals.
     ChecksumMode checksum_mode = ChecksumMode::kNone;
     bool checksum_verification_supported = true;
-    unsigned char method = 0u, method_p0 = 0u, method_p1 = 0u;
+    unsigned char method = 0u, method_p0 = 0u, method_p1 = 0u, method_p2 = 0u;
     int cm_a_bits = 28, cm_b_bits = 25;
     std::uint32_t cm_window_size = 1024u * 1024u;
     std::size_t table_start = 0u, table_end = 0u;
@@ -4307,6 +4308,17 @@ bool TryParseLegacyCnArchive(
             // the lzhds assertion -- come from decoding that stub), so keep it.
             if (ctype == 0u && cstream == 0u && found_codec && pos < bytes.size())
                 data_records.push_back({record_begin, bytes.size()});
+            // A filename table cut off by the end of the file: the original
+            // reads the names that fit and then reports the truncation the way
+            // it reports any other one ("Archive corrupted. Unexpected end of
+            // file." after printing the first entry's name), so take the table
+            // as far as it goes instead of rejecting the archive.
+            if (ctype == 1u && cstream == 0u && found_codec && !found_table && pos < bytes.size()) {
+                table_start = pos;
+                table_end = bytes.size();
+                found_table = true;
+                all_tables.push_back({0u, pos, bytes.size()});
+            }
             break;
         }
         const bool is_main = (cstream == 0u);
@@ -4347,6 +4359,15 @@ bool TryParseLegacyCnArchive(
             method    = static_cast<unsigned char>((csize << 4u) | 11u);
             method_p0 = bytes[pos];
             method_p1 = (csize >= 2u) ? bytes[pos + 1u] : 0u;
+            // The THIRD byte is the block size the compressor settled on (the
+            // same mantissa/exponent byte-float as the window). It is what the
+            // "[N MB]" figure on the Compressor line is computed from -- the
+            // original sizes its primary buffer by the block, not the window --
+            // so an archive made with an explicit -m prints a smaller figure
+            // than its window alone would suggest. Measured on -co archives of
+            // one 3 MB input at -m8m/-m24m/-m32m/-m48m: 13/16/20/25 MB, exactly
+            // f(window from p1, primary = max(block from p2, 1 MB)).
+            method_p2 = (csize >= 3u) ? bytes[pos + 2u] : 0u;
             // CM (p0=7, size>=4): payload[2]=B (unused), payload[3]=CD.
             if (method == 0x4bu && method_p0 == 7u && csize >= 4u) {
                 const unsigned char cd_byte = bytes[pos + 3u];
@@ -4469,6 +4490,9 @@ bool TryParseLegacyCnArchive(
                                       bytes.begin() + static_cast<std::ptrdiff_t>(table_end),
                                       static_cast<unsigned char>(0));
         if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(table_end)) {
+            // The table itself was cut off: keep the entries that are complete
+            // (the original does, and then reports the truncation).
+            if (truncated_input && !entries.empty()) break;
             if (out_error_message != nullptr) {
                 *out_error_message = "Data corrupted while reading headers!";
             }
@@ -4513,7 +4537,10 @@ bool TryParseLegacyCnArchive(
         entries.push_back(std::move(e));
     }
 
-    if (p != table_end) {
+    // A table cut off by the end of the file stops at its last whole entry, so
+    // the cursor does not reach table_end -- that is the shape the original
+    // lists and then reports as "Unexpected end of file", not a rejection.
+    if (p != table_end && !(truncated_input && !entries.empty())) {
         if (out_error_message != nullptr) {
             *out_error_message = "Data corrupted while reading headers!";
         }
@@ -5259,6 +5286,7 @@ bool TryParseLegacyCnArchive(
         snap.legacy_method = method;
         snap.legacy_method_p0 = method_p0;
         snap.legacy_method_p1 = method_p1;
+        snap.legacy_method_p2 = method_p2;
         snap.cm_a_bits = cm_a_bits;
         snap.cm_b_bits = cm_b_bits;
         snap.cm_window_size = cm_window_size;
@@ -6507,6 +6535,7 @@ bool TryParseLegacyCnArchive(
     ctx.legacy_method = method;
     ctx.legacy_method_p0 = method_p0;
     ctx.legacy_method_p1 = method_p1;
+    ctx.legacy_method_p2 = method_p2;
     ctx.cm_a_bits = cm_a_bits;
     ctx.cm_b_bits = cm_b_bits;
     ctx.cm_window_size = cm_window_size;
@@ -8687,7 +8716,24 @@ struct DecodeProgress {
 //   0x3f700 + 0x1000 + 0x80000, -cc 0x8b600 + 0x1000, -cO 0x118f240 alone.
 std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W) {
     const std::uint64_t MB = 1048576ull;
-    const std::uint64_t P = (c.legacy_method_p0 == 7u) ? MB : (W > MB ? W : MB);
+    // P is the object's primary buffer. For -cc it is a fixed 1 MB; for
+    // -co/-cO it follows the BLOCK size the compressor chose, which the codec
+    // record carries in its third byte (the same byte-float as the window).
+    // Older archives (and any record without that byte) fall back to the
+    // window, which is what the default -m produces anyway.
+    std::uint64_t P = MB;
+    if (c.legacy_method_p0 != 7u) {
+        std::uint64_t block = 0;
+        if (c.legacy_method_p2 != 0u) {
+            const unsigned xp = static_cast<unsigned>(c.legacy_method_p2) + 1u;
+            unsigned m = xp & 0x0fu;
+            const unsigned sh = xp >> 4u;
+            if (sh) m = (m + 16u) << (sh - 1u);
+            block = static_cast<std::uint64_t>(m) << 16u;
+        }
+        const std::uint64_t base = block != 0u ? block : W;
+        P = base > MB ? base : MB;
+    }
     std::uint64_t f88b0 = 2775628ull;
     if (P > MB) f88b0 += ((P - MB) * 69ull + 640ull) / 1280ull;
     std::uint64_t core = W + 0x1008abull + 5ull * P + ((0x100000ull + P / 32ull + 1ull) >> 1)
@@ -8845,6 +8891,7 @@ LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
     r.legacy_method = c.legacy_method;
     r.legacy_method_p0 = c.legacy_method_p0;
     r.legacy_method_p1 = c.legacy_method_p1;
+    r.legacy_method_p2 = c.legacy_method_p2;
     r.cm_a_bits = c.cm_a_bits;
     r.cm_b_bits = c.cm_b_bits;
     r.cm_window_size = c.cm_window_size;
