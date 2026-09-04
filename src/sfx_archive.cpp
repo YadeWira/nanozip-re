@@ -2846,6 +2846,19 @@ bool AssembleParallelMultiFile(
         const std::uint64_t stream_out = outs[idx];
         if (use_sink) {
             psink::StreamBegin(idx);
+            // Where this stream's LAST data record starts in the byte space its
+            // decoder consumes (the chunks are fed concatenated): a failure
+            // before it is the one the driver reports plainly. The single-file
+            // parallel paths do the same; without it a multi-file container
+            // printed status<<8|slot where the original prints the status.
+            // A clean end (no status of its own) stays SHIFTED even when it
+            // produced nothing: pmf_o 0.50/0.60 and pmf_Ou 0.60 report
+            // status<<8|slot there, so only a recorded input position decides.
+            if (st.chunks.size() > 1u) {
+                std::uint64_t off = 0;
+                for (std::size_t q = 0; q + 1u < st.chunks.size(); ++q) off += st.chunks[q].second;
+                psink::SetLastRecordStart(idx, off);
+            }
             const auto accept_all = [](const std::vector<unsigned char>&) { return true; };
             std::vector<unsigned char> decoded;
             bool okd = decode_stream(st.chunks, stream_out, accept_all, &decoded);
