@@ -28,7 +28,13 @@ case "$cmd" in
   run)
     W=${1:?workdir}; out=${2:-$W/bench_results.txt}; : > "$out"
     for c in o O c d D f; do for who in orig ours; do bin=$NZ; [ $who = ours ] && bin=$OURS
-      s=$(date +%s.%N); "$bin" t "$W/mix_$c.nz" >/dev/null 2>&1; e=$(date +%s.%N)
-      echo "-c$c $who $(echo "$e - $s" | bc -l | cut -c1-6) s" | tee -a "$out"; done; done ;;
+      s=$(date +%s.%N); log=$("$bin" t "$W/mix_$c.nz" 2>&1 | tr '\r' '\n'); e=$(date +%s.%N)
+      # A time is only a time if the decode completed: a run that stopped with a
+      # corruption report measured a prefix (the -co rows of 2026-09-03 did exactly
+      # that, unnoticed, until the stored-block model reset made the decode finish).
+      verdict=""; echo "$log" | grep -qE "Archive corrupted|Checksum mismatch|Internal error" && verdict=" FAIL($(echo "$log" | grep -oE "code [0-9]+|mismatch|Internal error" | head -1))"
+      echo "$log" | grep -q "Decompressed" || verdict="${verdict:- FAIL(no footer)}"
+      echo "-c$c $who $(echo "$e - $s" | bc -l | cut -c1-6) s$verdict" | tee -a "$out"; done; done
+    grep -q FAIL "$out" && echo "bench: some rows FAILED -- their times are not comparable" ;;
   *) sed -n 2,8p "$0"; exit 1 ;;
 esac
