@@ -215,5 +215,9 @@ void EncodeBlock(State& st, const std::uint8_t* block, std::size_t len, std::siz
 
 // FUN_08059dd0: the block's randomness score (0..~255).
 std::uint32_t Score(const std::uint8_t* p, std::uint32_t len);
+// FUN_080c0430 / FUN_080c0540 (forward): the exe metric and the in-place E8/E9 filter,
+// shared with the -cd compressor.
+std::uint32_t ExeMetric(const std::uint8_t* p, std::uint32_t n);
+void ExeFilterForward(std::uint8_t* p, std::uint32_t n, std::uint64_t pos);
 
 }  // namespace nzr::lzpf_enc

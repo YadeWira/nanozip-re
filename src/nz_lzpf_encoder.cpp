@@ -757,7 +757,7 @@ static inline std::uint8_t ExeClass(std::uint8_t b) {
 
 // FUN_080c0430: how many E8/E9 displacements (with a 00/FF top byte) point at
 // one of the last four targets seen -- repeated call targets mean real code.
-static std::uint32_t ExeMetric(const std::uint8_t* p, std::uint32_t n) {
+std::uint32_t ExeMetric(const std::uint8_t* p, std::uint32_t n) {
     if (n < 10u) return 0u;
     std::uint32_t count = 0;
     // the last four targets: pbVar6, pbVar7, local_18, local_14 of the decompile;
@@ -789,7 +789,7 @@ static std::uint32_t ExeMetric(const std::uint8_t* p, std::uint32_t n) {
 
 // FUN_080c0540 with param_5 = 0: the forward filter, in place. `pos` is the
 // running position counter (State::exe_pos) of the block's first byte.
-static void ExeFilterForward(std::uint8_t* p, std::uint32_t n, std::uint64_t pos) {
+void ExeFilterForward(std::uint8_t* p, std::uint32_t n, std::uint64_t pos) {
     if (n < 10u) return;
     const std::uint8_t* const end = p + (n - 6u);
     std::uint8_t* q = p;

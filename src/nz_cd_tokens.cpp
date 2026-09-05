@@ -411,6 +411,7 @@ static const unsigned char g_kCdModelLen[64] = {
     16,16,17,17,18,18,19,19,20,20,21,21,22,22,23,23,
     24,24,25,25,26,26,27,27,28,28,29,29,30,30,31,31,
 };
+
 // FUN_080b1dc0: bounded LEB-ish varint over a byte cursor (limit bounds byte count).
 struct CdRd { const std::uint8_t* cur; const std::uint8_t* end; bool overrun = false; };
 // Bytes still readable. NEVER compute this as `(std::size_t)(r.end - r.cur)`:
@@ -1370,3 +1371,9 @@ std::uint32_t NzCdDecodeBlock(const std::uint8_t* block, std::size_t block_len,
 
 }  // namespace cd
 }  // namespace nzr
+
+const unsigned char* nzr::cd::NzCdModelTable(int field) {
+    return field == 0 ? g_kCdModelLit : field == 1 ? g_kCdModelOff : g_kCdModelLen;
+}
+
+const unsigned char* nzr::cd::NzCdParam14ClassTable() { return kClassTable; }

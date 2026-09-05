@@ -43,6 +43,12 @@ std::uint32_t NzCdReconstruct(const std::uint32_t* tokens, std::uint32_t num_tok
 // nbits==0 the value is `b`, else `value = (extra | ((idx - model[slot]) << nbits)
 // + base) + threshold` with `base = (slot>>1==0)?0:(1<<(slot>>1))` and `extra` =
 // `nbits` bits read MSB-first from the shared byte-swapped bitstream.
+// The per-field {baseoff, nbits} model arrays (0 = lit_run, 1 = offset, 2 = length),
+// shared with the compressor (FUN_0808aff0 indexes them by 2 * bit length).
+const unsigned char* NzCdModelTable(int field);
+// The 256-byte character class table of FUN_080b7600 (param14's), shared with the compressor.
+const unsigned char* NzCdParam14ClassTable();
+
 struct NzCdField {
     const std::uint8_t* slot_tbl;   // idx -> slot
     const std::uint8_t* model;      // slot -> {baseoff @[slot], nbits @[slot+1]}

@@ -25,6 +25,7 @@
 #include "nz_exefilter.h"
 #include "nz_texttransform_num.h"
 #include "nz_lzpf_encoder.h"
+#include "nz_lzhd_encoder.h"
 
 #include <algorithm>
 #include <array>
@@ -10754,12 +10755,21 @@ struct EncodeStatus {
 struct EncodeCodec {
     unsigned p0 = 0;
     std::unique_ptr<nzr::lzpf_enc::State> lz;
-    const char* Label() const { return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : "nz_lzpf_large"; }
+    std::unique_ptr<nzr::lzhd_enc::State> cd;
+    const char* Label() const { return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large" : p0 == 3u ? "nz_lzhd" : "nz_lzhds"; }
     // FUN_0805a110: the working set the Compressor line reports -- the window, the
     // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
     // 2 MB analysis object; the store has just its window.
-    std::uint64_t MemoryBytes(std::uint64_t window) const {
+    std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
         if (p0 == 0u) return window;
+        if (p0 >= 3u) {
+            // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
+            // object (FUN_0805d590: window, the finder table, one 0xe0080 token
+            // buffer per thread -- FUN_0805ed90 allocates DAT_08183620 + 1 of them,
+            // the thread count being kept zero-based -- and 0x30000 per finder)
+            const std::uint64_t finder = nzr::lzhd_enc::FinderTableBytes(static_cast<std::uint32_t>(window));
+            return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + window + finder + 0xe0080ull * threads + 0x30000ull;
+        }
         return window + (p0 == 2u ? 0x4000000ull : 0x208000ull) + 0x200000ull + 0x210000ull;
     }
 };
@@ -10779,7 +10789,7 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
     if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
     for (unsigned k = 0; k < workers; ++k) {
         ClearStatusLine(os);
-        os << "Compressor #" << k << ": " << codec.Label() << " [" << mb(codec.MemoryBytes(window)) << " MB]";
+        os << "Compressor #" << k << ": " << codec.Label() << " [" << mb(codec.MemoryBytes(window, threads)) << " MB]";
         if (options.verbose && threads > 1u) os << " IO-buffer: " << mb(rbuf / workers) << " MB.";
         os << '\n';
     }
@@ -10824,12 +10834,13 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
             WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
         }
-        const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
+        const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
         const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
         WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
-    if (codec.p0 != 0u && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
+    if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
+    if (codec.p0 >= 3u && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window)); }
     // The pieces of this range, in the order the reader meets them, then the
     // original's list order: slices prepended, whole files appended. Ghosts (-x
     // matches, unreadable files) take their bytes in the split but store none.
@@ -10906,12 +10917,23 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     // before a 65536-byte one share theirs). Each chunk is one DATA record of
     // 32 KB blocks; the store's unit is its window.
     const bool chunked = codec.p0 != 0u;
+    // FUN_0805b020 reads 1 MB pieces with a 64 KB file-boundary rule; FUN_08065a40 (lzhd) with 16 KB
+    const std::uint64_t piece_bound = codec.p0 >= 3u ? 0x4000u : 0x10000u;
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
+        const std::size_t met_start = cur_met;   // the reader's first entry of this piece
         const std::uint64_t want = std::min<std::uint64_t>(chunked ? 0x100000u : window, total - written);
         while (block.size() < want && cur_met < met.size()) {
-            if (chunked && cur_off == 0u && !block.empty() &&
-                (block.size() >= 0x10000u || (cur_met < met.size() && met[cur_met].len > 0x10000u))) break;
+            if (chunked && cur_off == 0u && !block.empty()) {
+                // the reader decides at a file boundary looking at the next NON-EMPTY
+                // file: zero-length entries between a piece and a piece-breaking file
+                // travel with the next piece's table (oracle cd_multi: `... tiny empty blk3.bin`)
+                std::size_t nx = cur_met;
+                while (nx < met.size() && met[nx].len == 0u) ++nx;
+                const std::uint64_t next_len = (nx < met.size()) ? met[nx].len : 0u;
+                const std::uint64_t last_len = (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
+                if (last_len >= piece_bound || next_len > piece_bound) break;
+            }
             pass_empty();
             if (cur_met >= met.size()) break;
             const LegacyStreamPiece& pc = met[cur_met];
@@ -10931,12 +10953,33 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             cur_off += n;
             if (cur_off == pc.len) { piece_ck[piece_of[cur_met]] = ck.Final(); ++cur_met; cur_off = 0; }
         }
-        pass_empty();
+        if (!chunked) pass_empty();
+        else if (cur_off == 0u) {
+            // FUN_08065a40 / FUN_0805b020: at a file boundary the reader stops when
+            // the file just read is `bound` bytes or more, or the next non-empty file
+            // is larger than `bound`; otherwise the zero-length entries that follow
+            // join this piece. After a stop they open the next piece (even one with
+            // no data at all). Measured on the original with 22 combinations.
+            std::size_t nx = cur_met;
+            while (nx < met.size() && met[nx].len == 0u) ++nx;
+            const std::uint64_t next_len = (nx < met.size()) ? met[nx].len : 0u;
+            const std::uint64_t last_len = (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
+            if (!(last_len >= piece_bound || next_len > piece_bound)) pass_empty();
+        }
         const std::uint64_t block_end = written + block.size();
         // pieces that start in this block (list order), and those that end in it
         std::size_t a_from = pieces.size(), a_to = 0, c_from = pieces.size(), c_to = 0;
+        // which entries this piece's table announces: the store goes by position (a
+        // zero-length file at a block's end belongs to it); the compressing codecs'
+        // reader hands over exactly the entries it consumed for the piece
+        std::size_t consumed_lo = pieces.size(), consumed_hi = 0;
+        if (chunked) for (std::size_t m = met_start; m < cur_met + (cur_off != 0u ? 1u : 0u) && m < met.size(); ++m) {   // (a file cut by the piece boundary is announced where it starts)
+            if (piece_of[m] == static_cast<std::size_t>(-1)) continue;
+            consumed_lo = std::min(consumed_lo, piece_of[m]); consumed_hi = std::max(consumed_hi, piece_of[m] + 1u);
+        }
         for (std::size_t k = 0; k < pieces.size(); ++k) {
-            const bool starts = !announced[k] && (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && cur_met > 0u));
+            const bool starts = !announced[k] && (chunked ? (consumed_lo <= k && k < consumed_hi)
+                                                          : (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && cur_met > 0u)));
             if (starts) { announced[k] = true; a_from = std::min(a_from, k); a_to = std::max(a_to, k + 1u); }
             const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= block_end;
             if (ends) { summed[k] = true; c_from = std::min(c_from, k); c_to = std::max(c_to, k + 1u); }
@@ -10948,11 +10991,15 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         if (chunked) {
             // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
             // 4-byte alignment matters to the side stream's overflow check only)
-            std::size_t off = 0;
-            while (off < block.size()) {
-                const std::size_t n = std::min<std::size_t>(0x8000u, block.size() - off);
-                nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u, off == 0u);
-                off += n;
+            if (codec.p0 >= 3u) {
+                nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
+            } else {
+                std::size_t off = 0;
+                while (off < block.size()) {
+                    const std::size_t n = std::min<std::size_t>(0x8000u, block.size() - off);
+                    nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u, off == 0u);
+                    off += n;
+                }
             }
         }
         const std::vector<unsigned char>& data = chunked ? payload : block;
@@ -10961,6 +11008,23 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         written = block_end;
         status.BlockDone(os, stream, block.size());
         if (total == 0u) break;
+    }
+    if (chunked && cur_met < met.size()) {
+        // the entries left are zero-length (or ghosts) after a boundary stop: the
+        // reader hands them over as one more piece -- its table, metadata and an
+        // empty DATA record (FUN_08065a40 on `b.bin empty`)
+        const std::size_t m0 = cur_met;
+        pass_empty();
+        std::size_t a_from = pieces.size(), a_to = 0;
+        for (std::size_t m = m0; m < cur_met; ++m) {
+            if (piece_of[m] == static_cast<std::size_t>(-1)) continue;
+            a_from = std::min(a_from, piece_of[m]); a_to = std::max(a_to, piece_of[m] + 1u);
+            announced[piece_of[m]] = true; summed[piece_of[m]] = true;
+        }
+        if (a_from > a_to) a_from = a_to;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, a_from, a_to, ckmode, options);
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, 0u);
+        out.insert(out.end(), hdr.begin(), hdr.end());
     }
     return true;
 }
@@ -11123,6 +11187,7 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kNone) return RunAddStoreContainer(options, std::move(found), os, add_start, 0u);
     if (options.compressor == Compressor::kLzpf) return RunAddStoreContainer(options, std::move(found), os, add_start, 1u);
     if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
+    if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
     // The other codecs still go through the stub writer (uncompressed bytes in
     // legacy framing, one file table): give it the original's file list.
     {

@@ -23,3 +23,11 @@ std::uint32_t NzCdDict(const std::uint8_t* in, std::uint32_t in_size,
 
 }  // namespace cd
 }  // namespace nzr
+
+namespace nzr { namespace cd {
+const unsigned char* NzCdCharacterTraits0();
+std::uint32_t NzCdDictBucketIndex(unsigned char c_e60, unsigned char c_a60);
+const std::uint16_t* NzCdDictBucketStarts();
+struct NzCdDictRef { const std::uint16_t* big_initial; const std::uint32_t* big_lo; const std::uint32_t* big_hi; const std::uint16_t* mid_initial; const std::uint32_t* mid; const std::uint32_t* ultrasmall; };
+void NzCdDictRefArrays(NzCdDictRef* r);
+} }

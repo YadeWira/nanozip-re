@@ -5489,3 +5489,39 @@ std::uint32_t NzCdDict(const std::uint8_t* in, std::uint32_t in_size,
 
 }  // namespace cd
 }  // namespace nzr
+
+// ---- shared with the compressor (nz_lzhd_text.cpp) ----
+const unsigned char* nzr::cd::NzCdCharacterTraits0() { return kCharacterTraits_0; }
+// FUN_080b7020: the two per-byte tables of the dictionary's two-letter bucket
+// hash -- 27 * (c - 0x60) for a lower-case first letter, c - 0x60 for a
+// lower-case second letter, 0 otherwise.
+std::uint32_t nzr::cd::NzCdDictBucketIndex(unsigned char c_e60, unsigned char c_a60) {
+    const bool le = (kCharacterTraits_0[c_e60] & 0x20u) != 0u, la = (kCharacterTraits_0[c_a60] & 0x20u) != 0u;
+    return (le ? static_cast<std::uint32_t>(c_e60) - 0x60u : 0u) + (la ? 27u * (static_cast<std::uint32_t>(c_a60) - 0x60u) : 0u);
+}
+// FUN_080b7680's cumulative bucket table (DAT_08189880), rebuilt from the word
+// list: entry i = words in buckets below i + ..., shifted one up as the original
+// memcpy does, so entry[i+1] - entry[i] is bucket i's size.
+const std::uint16_t* nzr::cd::NzCdDictBucketStarts() {
+    static std::uint16_t table[0x2dc];
+    static bool built = false;
+    if (!built) {
+        std::uint16_t counts[0x2dc]; std::memset(counts, 0, sizeof(counts));
+        for (int i = 0; i < 16384; ++i) {
+            const std::uint32_t c0 = (kCharDictBig_Initial[i] >> 8) & 0xffu, c1 = kCharDictBig_Initial[i] & 0xffu;
+            const std::uint32_t b = NzCdDictBucketIndex(static_cast<unsigned char>(c1), static_cast<unsigned char>(c0)) + 1u;
+            if (b < 0x2dc) ++counts[b];
+        }
+        std::uint32_t acc = 0;
+        for (int i = 0; i < 0x2da; ++i) { table[i] = static_cast<std::uint16_t>(acc); acc += counts[i]; }
+        table[0x2da] = static_cast<std::uint16_t>(acc);
+        // the original writes cumulative[i] for i < 0x2da then shifts the array by one short
+        for (int i = 0; i < 0x2d9; ++i) table[i] = table[i + 1];
+        built = true;
+    }
+    return table;
+}
+void nzr::cd::NzCdDictRefArrays(NzCdDictRef* r) {
+    r->big_initial = kCharDictBig_Initial; r->big_lo = kCharDictBig_Lo; r->big_hi = kCharDictBig_Hi;
+    r->mid_initial = kCharDictMid_Initial; r->mid = kCharDictMid; r->ultrasmall = kCharacterDictUltrasmall;
+}
