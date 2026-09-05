@@ -46,9 +46,12 @@ open(f'{d}/p12.bin','wb').write(bytes(random.randrange(256) for _ in range(12000
 open(f'{d}/p6.bin','wb').write(bytes(random.randrange(256) for _ in range(600000)))
 open(f'{d}/p3.dat','wb').write(bytes(random.randrange(256) for _ in range(300000)))
 open(f'{d}/p2.txt','w').write('parallel text line\n' * 5000)
+# an executable and a text+random mix for the compressing codecs
+import shutil; shutil.copy('/usr/bin/ls', f'{d}/exe.bin')
+open(f'{d}/mix.bin','wb').write((('lorem ipsum dolor sit amet ' * 40 + '\n') * 900).encode() + bytes(random.randrange(256) for _ in range(700000)))
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
 open(f'{d}/unread.bin','wb').write(bytes(5000)); os.utime(f'{d}/unread.bin', (1200000000, 1200000000)); os.chmod(f'{d}/unread.bin', 0)
-for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt']:
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
@@ -108,8 +111,31 @@ CASES=(
   "cn_p2_et|-cn -p2 -t1 -sn|empty tiny"
   "cn_p2_te|-cn -p2 -t1 -sn|tiny empty"
   "cn_p3_hn_one|-cn -p3 -t1 -hn|tiny"
-  "cf_one|-cf|a.txt"
-  "cF_one|-cF|a.txt"
+  # lzpf (-cf/-cF): under -t1 -- the original's reader runs ahead of its compressor on
+  # other thread counts and the metadata lands wherever the race left it
+  "cf_one|-cf -t1|a.txt"
+  "cF_one|-cF -t1|a.txt"
+  "cf_three|-cf -t1|a.txt b.bin empty"
+  "cF_three|-cF -t1|a.txt b.bin empty"
+  "cf_tree|-cf -t1 -r|sub"
+  "cf_big|-cf -t1|big.bin a.txt"
+  "cF_big|-cF -t1|big.bin a.txt"
+  "cf_p12|-cf -t1|p12.bin p6.bin p2.txt"
+  "cf_sn|-cf -t1 -sn|tiny a.txt sub/c.dat b.bin empty"
+  "cf_hn|-cf -t1 -hn|a.txt b.bin"
+  "cf_hc|-cf -t1 -hc|a.txt b.bin empty"
+  "cf_bound|-cf -t1 -sn|blk1.bin blk2.bin blk3.bin one.bin"
+  "cf_round|-cf -t1 -sn|r98304.bin r98303.bin tiny"
+  "cf_p2|-cf -p2 -t1|p12.bin b.bin a.txt"
+  "cF_p2|-cF -p2 -t1|p12.bin b.bin a.txt"
+  "cf_p3|-cf -p3 -t1|p12.bin p6.bin p3.dat p2.txt"
+  "cf_p2_one|-cf -p2 -t1|tiny"
+  "cf_x|-cf -t1 -r -xb.bin|a.txt b.bin sub"
+  "cf_dotdir|-cf -t1 -r|."
+  "cf_exe|-cf -t1|exe.bin"
+  "cF_exe|-cF -t1|exe.bin"
+  "cf_mix|-cf -t1|mix.bin"
+  "cf_default|-cf|a.txt b.bin"
   "cd_one|-cd|a.txt"
   "cD_one|-cD|a.txt"
   "co_one|-co|a.txt"

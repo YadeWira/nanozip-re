@@ -11,6 +11,7 @@ set(RECON_SOURCES
     src/sfx_archive.cpp
     src/linux32_cm_map.cpp
     src/lzpf_arith.cpp
+    src/nz_lzpf_encoder.cpp
     src/nz_cm.cpp
     src/nz_cd_tokens.cpp
     src/nz_cd_texttransform_dict.cpp

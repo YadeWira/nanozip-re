@@ -24,6 +24,7 @@
 #include <iterator>
 #include "nz_exefilter.h"
 #include "nz_texttransform_num.h"
+#include "nz_lzpf_encoder.h"
 
 #include <algorithm>
 #include <array>
@@ -5686,7 +5687,8 @@ bool TryParseLegacyCnArchive(
                             // archive HAS checksums; `-hn` writes none at all, and the
                             // original decodes such a container like any other, so the
                             // gate follows the archive's mode, not the slice's.
-                            if (!s.hasoff || !s.hassz ||
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
                                 (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
@@ -5911,7 +5913,8 @@ bool TryParseLegacyCnArchive(
                             // archive HAS checksums; `-hn` writes none at all, and the
                             // original decodes such a container like any other, so the
                             // gate follows the archive's mode, not the slice's.
-                            if (!s.hasoff || !s.hassz ||
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
                                 (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
@@ -6222,7 +6225,8 @@ bool TryParseLegacyCnArchive(
                             // archive HAS checksums; `-hn` writes none at all, and the
                             // original decodes such a container like any other, so the
                             // gate follows the archive's mode, not the slice's.
-                            if (!st.hasoff || !st.hassz ||
+                            if (!st.hassz ||   // no offset record = the whole file, offset 0
+                                
                                 (st.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 st.ooff > total_data_size ||
                                 st.osz > total_data_size - st.ooff) { all_ok = false; break; }
@@ -6440,7 +6444,8 @@ bool TryParseLegacyCnArchive(
                             // archive HAS checksums; `-hn` writes none at all, and the
                             // original decodes such a container like any other, so the
                             // gate follows the archive's mode, not the slice's.
-                            if (!s.hasoff || !s.hassz ||
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
                                 (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
@@ -10731,7 +10736,22 @@ struct EncodeStatus {
 // IO-buffer). A -pN above T is preceded by the warning line. One Compressor
 // line per worker, "[M MB]" from that worker's window, -v adding its share of
 // the read buffer (R/N, half-up MB).
-void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window) {
+// What a worker stream compresses with. p0 0 = store; 1/2 = lzpf (-cf/-cF), whose
+// state (window, hash tables) lives in `lz` and is created per stream.
+struct EncodeCodec {
+    unsigned p0 = 0;
+    std::unique_ptr<nzr::lzpf_enc::State> lz;
+    const char* Label() const { return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : "nz_lzpf_large"; }
+    // FUN_0805a110: the working set the Compressor line reports -- the window, the
+    // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
+    // 2 MB analysis object; the store has just its window.
+    std::uint64_t MemoryBytes(std::uint64_t window) const {
+        if (p0 == 0u) return window;
+        return window + (p0 == 2u ? 0x4000000ull : 0x208000ull) + 0x200000ull + 0x210000ull;
+    }
+};
+
+void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window, const EncodeCodec& codec) {
     const unsigned host = HostThreadCount();
     unsigned threads = host;
     if (options.threads > 0u && options.threads < host) threads = options.threads;
@@ -10746,7 +10766,7 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
     if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
     for (unsigned k = 0; k < workers; ++k) {
         ClearStatusLine(os);
-        os << "Compressor #" << k << ": none [" << mb(window) << " MB]";
+        os << "Compressor #" << k << ": " << codec.Label() << " [" << mb(codec.MemoryBytes(window)) << " MB]";
         if (options.verbose && threads > 1u) os << " IO-buffer: " << mb(rbuf / workers) << " MB.";
         os << '\n';
     }
@@ -10784,7 +10804,7 @@ void PrintStoreEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint6
 bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
                             const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
                             std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
-                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms) {
+                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec) {
     if (with_header) {
         std::vector<unsigned char> hdr;
         if (ckmode != ChecksumMode::kNone) {
@@ -10792,10 +10812,11 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
         }
         const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
-        const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
-        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec, codec + 2);
+        const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
+    if (codec.p0 != 0u && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
     // The pieces of this range, in the order the reader meets them, then the
     // original's list order: slices prepended, whole files appended. Ghosts (-x
     // matches, unreadable files) take their bytes in the split but store none.
@@ -10865,10 +10886,19 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             ++cur_met; cur_off = 0;
         }
     };
+    // The compressing codecs read the stream in CHUNKS (FUN_0805b020's reader call
+    // with max 1 MB, min 64 KB): at a file boundary the read stops once 64 KB are in
+    // hand, and a file LARGER than 64 KB is never appended to a started chunk (a
+    // 12000-byte file before a 300000-byte one is a chunk of its own; small files
+    // before a 65536-byte one share theirs). Each chunk is one DATA record of
+    // 32 KB blocks; the store's unit is its window.
+    const bool chunked = codec.p0 != 0u;
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
-        const std::uint64_t want = std::min<std::uint64_t>(window, total - written);
+        const std::uint64_t want = std::min<std::uint64_t>(chunked ? 0x100000u : window, total - written);
         while (block.size() < want && cur_met < met.size()) {
+            if (chunked && cur_off == 0u && !block.empty() &&
+                (block.size() >= 0x10000u || (cur_met < met.size() && met[cur_met].len > 0x10000u))) break;
             pass_empty();
             if (cur_met >= met.size()) break;
             const LegacyStreamPiece& pc = met[cur_met];
@@ -10901,8 +10931,20 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         if (a_from > a_to) a_from = a_to;
         if (c_from > c_to) c_from = c_to;
         LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, c_from, c_to, ckmode, options);
-        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, block.size());
-        out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), block.begin(), block.end());
+        std::vector<unsigned char> payload;
+        if (chunked) {
+            // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
+            // 4-byte alignment matters to the side stream's overflow check only)
+            std::size_t off = 0;
+            while (off < block.size()) {
+                const std::size_t n = std::min<std::size_t>(0x8000u, block.size() - off);
+                nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u);
+                off += n;
+            }
+        }
+        const std::vector<unsigned char>& data = chunked ? payload : block;
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
+        out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), data.begin(), data.end());
         written = block_end;
         status.BlockDone(os, stream, block.size());
         if (total == 0u) break;
@@ -10917,7 +10959,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
 // original's interleaving scheduler-dependent (measured: three runs, three
 // different archives), so this order is what we always write.
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
-                         const std::chrono::steady_clock::time_point& add_start) {
+                         const std::chrono::steady_clock::time_point& add_start, unsigned p0) {
     // Ghosts count here (the split and the window are sized before anything is
     // opened), but not in what the footer reports as compressed.
     std::uint64_t total = 0, stored = 0;
@@ -10935,7 +10977,11 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
-    PrintStoreEncodeHeader(os, options, workers, window);
+    EncodeCodec header_codec; header_codec.p0 = p0;
+    PrintStoreEncodeHeader(os, options, workers, window, header_codec);
+    // one codec state per worker stream (the original's workers own their windows)
+    std::vector<EncodeCodec> codecs(workers);
+    for (EncodeCodec& c : codecs) c.p0 = p0;
     EncodeStatus status(workers);
     std::uint64_t read_ms = 0, write_ms = 0;
     const auto timed_write = [&](const std::vector<unsigned char>& v) {
@@ -10960,7 +11006,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
     if (workers == 1u) {
         std::vector<unsigned char> body;
-        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms)) return 1;
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0])) return 1;
         timed_write(body);
     } else {
         std::vector<unsigned char> body;
@@ -10968,7 +11014,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         {
             const auto r = range_of(workers - 1u);
             std::vector<unsigned char> h;
-            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms)) return 1;
+            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms, codecs[workers - 1u])) return 1;
             // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
             std::vector<unsigned char> hdr_only;
             if (ckmode != ChecksumMode::kNone) {
@@ -10976,8 +11022,8 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
                 WriteLegacyRecordHeader(&hdr_only, kind_type, workers - 1u, 0u);
             }
             const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
-            const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
-            WriteLegacyRecordHeader(&hdr_only, 11u, workers - 1u, 2u); hdr_only.insert(hdr_only.end(), codec, codec + 2);
+            const unsigned char codec_rec[2] = {static_cast<unsigned char>(p0), static_cast<unsigned char>(p1)};
+            WriteLegacyRecordHeader(&hdr_only, 11u, workers - 1u, 2u); hdr_only.insert(hdr_only.end(), codec_rec, codec_rec + 2);
             timed_write(hdr_only);
         }
         for (unsigned k = 1u; k < workers; ++k) {
@@ -10987,19 +11033,19 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             // block -- table, stamps, checksums, an empty DATA -- comes AFTER
             // every header, worker 0's included (measured with -p2 and -p3).
             if (k == workers - 1u && total == 0u) continue;
-            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms)) return 1;
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k])) return 1;
             timed_write(body);
         }
         {
             const auto r = range_of(0u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms)) return 1;
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0])) return 1;
             timed_write(body);
         }
         if (total == 0u) {
             const auto r = range_of(workers - 1u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms)) return 1;
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u])) return 1;
             timed_write(body);
         }
     }
@@ -11034,9 +11080,9 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     const auto add_start = std::chrono::steady_clock::now();
     std::vector<EncodeSource> found = CollectEncodeSources(options, os);
     if (found.empty()) { os << "Nothing to do (no files found).\n"; return 1; }
-    if (options.compressor == Compressor::kNone) {
-        return RunAddStoreContainer(options, std::move(found), os, add_start);
-    }
+    if (options.compressor == Compressor::kNone) return RunAddStoreContainer(options, std::move(found), os, add_start, 0u);
+    if (options.compressor == Compressor::kLzpf) return RunAddStoreContainer(options, std::move(found), os, add_start, 1u);
+    if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
     // The other codecs still go through the stub writer (uncompressed bytes in
     // legacy framing, one file table): give it the original's file list.
     {
