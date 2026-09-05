@@ -433,6 +433,8 @@ struct LmsObject {
 // dot products are widened to i32 via pmaddwd. Shift applied to dot result.
 void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residuals,
                           std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2);
+std::int32_t LmsPredictSample(LmsObject& o, std::int32_t x);           // FUN_080beaa0
+void LmsUpdateSample(LmsObject& o, std::int32_t sample, std::int32_t residual);   // FUN_080beae0
 
 // Decode one prefilter block of up to 65536 output bytes. Mirrors FUN_080a5330.
 // `input`/`input_size`: compressed bytes starting immediately after the outer

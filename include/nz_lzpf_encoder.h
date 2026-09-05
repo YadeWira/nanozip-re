@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "lzpf_arith.h"
 
 namespace nzr::lzpf_enc {
 
@@ -54,8 +55,15 @@ struct LpcPlane {
 // and 1 of order01 (4 for -cf, 8 for -cF), the rest 8; one stage; no LMS.
 struct AudioModel {
     LpcPlane plane[6];
-    void Configure(std::uint32_t order01) { plane[0].Configure(order01); plane[1].Configure(order01); for (int i = 2; i < 6; ++i) plane[i].Configure(8u); }
-    void ResetAll() { for (auto& p : plane) p.Reset(); }   // FUN_080b1950
+    std::uint32_t flags = 0;      // obj[0]: 0 for lzpf, 0x10 for lzhd (the inter-channel LMS variant)
+    std::uint32_t nstages = 1;    // obj[1]: 1 for lzpf, 3 for lzhd
+    nzr::lzpf::LmsObject lms[2];  // obj+0xf8d0 / +0x2070 further: the two channels' LMS state
+    void Configure(std::uint32_t order01, std::uint32_t fl = 0u, std::uint32_t nst = 1u) {
+        flags = fl; nstages = nst;
+        plane[0].Configure(order01); plane[1].Configure(order01); for (int i = 2; i < 6; ++i) plane[i].Configure(8u);
+        lms[0].Init(); lms[1].Init();
+    }
+    void ResetAll() { for (auto& p : plane) p.Reset(); lms[0].Init(); lms[1].Init(); }   // FUN_080b1950
 };
 
 // FUN_080899d0's 0x28-byte struct: what the image detector found.
@@ -80,10 +88,18 @@ struct ImageEncModel {
     std::uint32_t col = 0;             // obj+0x52918 (u16): pixels of the row a block ended inside
     std::uint8_t align = 0, nch = 1, grp = 1, bps = 1, endian = 0;   // obj+0x52921/22/23/24/25
     std::vector<std::uint32_t> stack_tbl;
+    std::uint32_t flags = 0;                  // obj+0x52940: 0 for lzpf, 2 (LMS planes) for lzhd
+    nzr::lzpf::LpcBigPredictor plane[5];      // obj+0x10 + k*0x1c10 (FUN_080bddc0 planes), used when flags & 2
     ImageEncModel() : ring1(0x8003u, 0), stack_tbl(65543u, 0) {}
+    void Configure(std::uint32_t fl, std::uint32_t order03, std::uint32_t order4) {   // FUN_08089a70 -> FUN_080b5f50
+        flags = fl;
+        for (int k = 0; k < 4; ++k) { plane[k].order = order03; plane[k].Reset(); }
+        plane[4].order = order4; plane[4].Reset();
+    }
     void Reset() {                      // FUN_080b6170
         width = 1; col = 0; rows_done = 0; height = 0; align = 0; grp = 1; nch = 1; bps = 1; endian = 0;
         r1 = 0; std::fill(ring1.begin(), ring1.end(), 0);
+        if (flags & 2u) for (auto& p : plane) p.Reset();
     }
 };
 

@@ -268,7 +268,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
                     b == static_cast<std::uint8_t>(c >> 24u) || b == static_cast<std::uint8_t>(c >> 16u)) sym = 0u;
                 cache[ctx] = (c << 8u) | b;
                 ++hist_a[sym];
-                ++hist_b[static_cast<std::uint8_t>(b - s[k - grp])];
+                ++hist_b[static_cast<std::uint8_t>(b - block[k])];   // s[k - grp] with a signed offset
             }
             std::uint8_t lens[256], codes[256];
             std::uint32_t cost_a = 0, cost_b = 0;
@@ -284,7 +284,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
                     const std::uint8_t b = s[k];
                     const std::uint32_t x1 = h1 ^ b; h1 = x1 << 8u;
                     const std::uint32_t i1 = (x1 & 0x1fffu) >> 3u, b1 = b & 7u;
-                    const std::uint32_t x2 = h2 ^ static_cast<std::uint8_t>(b - s[k - grp]); h2 = x2 << 8u;
+                    const std::uint32_t x2 = h2 ^ static_cast<std::uint8_t>(b - block[k]); h2 = x2 << 8u;
                     const std::uint32_t i2 = ((x2 & 0x1fffu) + 0x2000u) >> 3u, b2 = x2 & 7u;
                     nov1 += ((bitmap[i1] >> b1) + 1u) & 1u; bitmap[i1] |= static_cast<std::uint8_t>(1u << b1);
                     nov2 += ((bitmap[i2] >> b2) + 1u) & 1u; bitmap[i2] |= static_cast<std::uint8_t>(1u << b2);
@@ -326,6 +326,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
     w.Put(2u, 3u);   // mode 2
     w.Put(0u, 1u);   // no plane shifts
     w.Put(0u, 1u);   // no cascade shifts
+    for (auto& pl : m.plane) pl.shift = 0x0fu;   // the object's plane_shift_ bytes (0x52936...), never changed
 
     // ---- the pixel loop ----
     const std::uint32_t per_ch = (aligned / nch) / bps;
@@ -343,6 +344,9 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
         } else {
             ++m.rows_done;
             m.col = (width == run) ? 0u : run;
+            if (m.flags & 2u) for (auto& pl : m.plane) {   // FUN_080bdb20: the planes' windows restart per row
+                pl.ring_off = 0x1000; std::memset(pl.area + 0x1000, 0, pl.order * 2u); std::memset(pl.area + 0x1400, 0, pl.order * 2u); pl.pred = 0;
+            }
         }
         {
             const std::uint32_t ai = (m.r1 - stride) & 0x7fffu;
@@ -351,6 +355,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
         done += run;
         for (; run != 0u; --run, ++pix) {
             const std::uint32_t ai = (m.r1 - stride) & 0x7fffu;
+            std::int32_t d[4] = {0, 0, 0, 0};
             for (std::uint32_t c = 0; c < nch; ++c) {
                 const std::uint32_t above = static_cast<std::uint16_t>(ring[ai + c]);
                 const std::uint32_t pred = static_cast<std::uint32_t>(static_cast<std::int32_t>(left[c] + 1u + above) >> 1);
@@ -358,8 +363,17 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
                 if (bps == 1u) { v = *sp++; }
                 else { v = endian ? (static_cast<std::uint32_t>(sp[0]) | (static_cast<std::uint32_t>(sp[1]) << 8u))
                                   : ((static_cast<std::uint32_t>(sp[0]) << 8u) | sp[1]); sp += 2; }
-                planes[c * per_ch + pix] = static_cast<std::int32_t>(v - pred);
+                d[c] = static_cast<std::int32_t>(v - pred);
                 left[c] = v;
+            }
+            if (m.flags & 2u) {
+                // the LMS planes: each channel's plane first, then the shared fifth
+                // plane over every channel (FUN_080bddc0 on value and residual)
+                std::int32_t r1v[4] = {0, 0, 0, 0};
+                for (std::uint32_t c = 0; c < nch; ++c) { r1v[c] = d[c] - m.plane[c].pred; std::int32_t rr = r1v[c]; m.plane[c].Run(&rr, 1u); }
+                for (std::uint32_t c = 0; c < nch; ++c) { std::int32_t r2 = r1v[c] - m.plane[4].pred; std::int32_t rr = r2; m.plane[4].Run(&rr, 1u); planes[c * per_ch + pix] = r2; }
+            } else {
+                for (std::uint32_t c = 0; c < nch; ++c) planes[c * per_ch + pix] = d[c];
             }
             for (std::uint32_t c = 0; c < nch; ++c) ring[m.r1 + c] = static_cast<std::int16_t>(left[c]);
             m.r1 = (m.r1 + nch) & 0x7fffu;

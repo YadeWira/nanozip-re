@@ -565,7 +565,152 @@ next_word:
         continue;
     }
 }
-std::uint32_t TextChessEncode(const std::uint8_t*, std::uint32_t, std::uint8_t*, std::uint32_t) { return 0u; }
+// ------------------------------------------------------------ FUN_080b8440 / FUN_080581d0
+// The chess (PGN) transform's byte classes, built exactly as the original walks
+// the byte values downwards with its two running counters.
+static const std::uint8_t* ChessTable() {
+    static std::uint8_t tbl[256];
+    static bool done = false;
+    if (!done) {
+        const std::uint8_t* t0 = Traits0();
+        std::uint32_t c = 0xff, u3 = 0xce, u5 = 0x41;
+        for (;;) {
+            const std::uint8_t digit = (t0[c] & 4u) ? 1u : 0u;
+            std::uint8_t v = digit, v1;
+            bool to555 = false, to4b4 = false;
+            if (u3 < 9u) v = digit | 0x40u;   // '1'..'9' (the assignment precedes the != 8 test)
+            if (u3 < 9u && u3 != 8u) {
+                v |= 2u;                        // '1'..'8': a rank digit too
+                if (c - 0x61u < 8u) { v |= 4u; v1 = v; if (0x41u < u5) to555 = true; else to4b4 = true; }
+                else { v1 = v; if (u5 < 0x42u) to4b4 = true; else to555 = true; }
+            } else {
+                if (c - 0x61u < 8u) { v |= 4u; v1 = v; if (0x41u < u5) to555 = true; else to4b4 = true; }
+                else { v1 = v; if (u5 < 0x42u) to4b4 = true; else to555 = true; }
+            }
+            bool store = true;
+            if (to4b4) {
+                v = v1 | 0x10u;
+                if (0x3fu < u5) to555 = true;
+                else {
+                    v = v1 | 0x30u;
+                    if (c == 0x5bu) { tbl[0x5b] = static_cast<std::uint8_t>(v1 | 0xb0u); --u3; --u5; c = 0x5a; continue; }
+                }
+            }
+            if (to555) { if (c == 0x5du) v |= 8u; else if (c == 0x5bu) v |= 0x80u; }
+            if (store) tbl[c] = v;
+            if (c == 0u) break;
+            --c; --u3; --u5;
+        }
+        done = true;
+    }
+    return tbl;
+}
+
+std::uint32_t TextChessEncode(const std::uint8_t* src, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap) {
+    if (cap < n || n < 10u) return 0u;
+    const std::uint8_t* T = ChessTable();
+    std::int32_t gain = -static_cast<std::int32_t>(std::min<std::uint32_t>(cap - n, 0x10u));
+    const std::uint8_t* slots[128];
+    for (int k = 0; k < 128; ++k) slots[k] = src;
+    std::uint32_t moves = 1, numbered = 1, expect = 1;
+    const std::uint8_t* s = src;
+    std::uint8_t* d = dst;
+    std::uint32_t rem = n;
+    for (;;) {
+        std::uint8_t* at = d;
+        const std::uint8_t c = *s;
+        const std::uint8_t* s1 = s + 1;
+        *d++ = c;
+        --rem;
+        s = s1;
+        if (rem != 0u && T[c] == 0u) continue;
+        if (rem == 0u) {
+            if (T[c] & 0x10u) { *at = 0xffu; *d = c; d = at + 2; ++gain; }
+            goto fin;
+        }
+        const std::uint8_t cls = T[c];
+        if (cls & 0x40u) {
+            // a move number: digits then '.'
+            std::uint32_t v = c - 0x30u, k = 0, ch;
+            for (;;) {
+                ch = s1[k];
+                if ((T[ch] & 1u) == 0u) break;
+                ++k; v = (ch - 0x30u) + v * 10u;
+                if (k == 10u || rem <= k) break;
+            }
+            if (ch == 0x2eu) {
+                ++moves;
+                if (v == expect) {
+                    ++numbered;
+                    rem -= k + 1u;
+                    *at = 0xfeu;
+                    if (rem == 0u) goto fin;
+                    s1 += k + 1u;
+                }
+                expect = v + 1u;
+                s = s1;
+            }
+            continue;
+        }
+        if ((cls & 4u) && (T[*s1] & 2u)) {
+            // a square: file letter + rank digit into one byte
+            *at = static_cast<std::uint8_t>((c - 0x2bu) + *s1 * 8u);
+            --gain;
+            if (rem - 1u == 0u) { d = at + 1; goto fin; }
+            s = s1 + 1; rem -= 1u;
+            continue;
+        }
+        if (cls & 0x10u) {
+            *at = 0xffu; *d = c; ++gain;
+            if (gain >= 0) return 0u;
+            d = at + 2;
+            continue;
+        }
+        if (c == 0x5bu) {
+            // a tag: two-candidate slots per (tag name letter, second char)
+            const std::uint32_t idx = (s1[1] & 3u) + ((s1[0] - 0x41u) & 0xfu) * 4u;
+            std::uint32_t code = idx * 2u;
+            const std::uint8_t* cand = slots[idx * 2u];
+            const std::uint8_t* cand2 = slots[idx * 2u + 1u];
+            slots[idx * 2u] = s1; slots[idx * 2u + 1u] = cand;
+            bool hit = false;
+            for (;;) {
+                std::uint32_t j = 0;
+                if (rem != 0u) {
+                    for (; j < rem; ++j) {
+                        if (cand[j] != s1[j]) break;
+                        if (cand[j] == 0x5du) {
+                            *at = 0xffu; *d = static_cast<std::uint8_t>(code); d = at + 2;
+                            s = s1 + j + 1u; rem -= j + 1u;
+                            if (rem == 0u) goto fin;
+                            hit = true; break;
+                        }
+                    }
+                }
+                if (hit) { expect = 1u; break; }
+                if (cand == src) break;   // (iVar11 == 0 in the original: an unset slot)
+                ++code; cand = cand2;
+                if ((code & 1u) == 0u) break;
+            }
+            if (hit) continue;
+            if (cand2 != src) {
+                // both candidates missed: the next two bytes go raw
+                *d = *s1; d = at + 2;
+                if (rem == 1u) goto fin;
+                at[2] = s1[1]; d = at + 3;
+                if (rem - 2u == 0u) goto fin;
+                s = s1 + 2; rem -= 2u;
+            }
+            continue;
+        }
+        if (c == 0x5du) { expect = 1u; }
+    }
+fin:
+    if (gain >= 0) return 0u;
+    const std::uint32_t out = static_cast<std::uint32_t>(d - dst);
+    if (out < n - n / 10u) return (moves / numbered < 3u) ? out : 0u;
+    return 0u;
+}
 
 // ------------------------------------------------------------ FUN_08059060
 std::uint32_t TextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t n, std::uint8_t*& tmp,

@@ -10588,6 +10588,7 @@ struct LegacyStreamPiece {           // one entry of a worker's list
     std::uint64_t file_off = 0;      // where this piece starts inside the file
     std::uint64_t len = 0;           // bytes stored (0 for a ghost)
     bool slice = false;              // partial file: OFF record, flag 0x10
+    std::uint64_t planned = 0;       // the reader's budget for the entry: its bytes, ghost or not
 };
 
 void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
@@ -10853,7 +10854,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         if (fe <= begin || fb >= end) continue;
         const std::uint64_t pb = std::max(fb, begin), pe = std::min(fe, end);
         if (pe <= pb) continue;
-        met.push_back({i, pb - fb, src[i].ghost ? 0u : pe - pb, (pb != fb) || (pe != fe)});
+        met.push_back({i, pb - fb, src[i].ghost ? 0u : pe - pb, (pb != fb) || (pe != fe), pe - pb});
     }
     // The worker's list IS its reading order: the stream's bytes come out in
     // list order too (measured: -p3 -t1 over 7/5/8 MB files, worker 1's data
@@ -10894,6 +10895,15 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     LegacyFileChecksum ck(ckmode);
     // Ghosts and 0-byte files at the reading cursor: the ghost is reported, the
     // empty file gets its (empty) checksum; both are passed without a read.
+    // The compressing codecs' reader (FUN_08065a40's slot-8 call, shared with lzpf)
+    // keeps a ghost's byte count as the current entry's budget after the open
+    // fails, and fills it from the files that follow -- `unread.bin(5000) b.bin`
+    // stores b.bin as 5000 + 25000 bytes in two DATA records; a second ghost met
+    // while filling adds nothing. When the budget is spent the boundary rule runs
+    // with the OPEN file as "the file just read" (measured, 27 shapes; see
+    // ORIGINAL_QUIRKS 56). The store reader has no such budget.
+    std::uint64_t ghost_budget = 0; bool budget_end = false;
+    const bool chunked = codec.p0 != 0u;
     const auto pass_empty = [&]() {
         while (cur_met < met.size() && (piece_of[cur_met] == static_cast<std::size_t>(-1) || met[cur_met].len == 0u)) {
             if (piece_of[cur_met] == static_cast<std::size_t>(-1)) {
@@ -10902,7 +10912,16 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 // its bytes count as done for the slot (a one-block store with a
                 // ghost still shows 100 %; a two-block one shows block 1 over the
                 // total WITH the ghost)
-                status.Passed(stream, src[met[cur_met].src].size);
+                // the compressing reader's slot counts REAL bytes only: when the open
+                // fails the ghost leaves the slot's total, and its budget is filled by
+                // the next files' bytes (`unread(5000) b(30000)` shows 17 % = 5000 of
+                // 30000 after the first piece; `b(30000) unread(5000) s(100)` still 82 %
+                // = 30000 of 35100, the ghost not yet met at that tick)
+                if (!chunked) status.Passed(stream, src[met[cur_met].src].size);
+                else {
+                    if (stream < status.total.size()) status.total[stream] -= std::min<std::uint64_t>(status.total[stream], met[cur_met].planned);
+                    if (ghost_budget == 0u) ghost_budget = met[cur_met].planned;
+                }
             } else {
                 status.FileStart(os, src[met[cur_met].src].display);   // an empty file is opened too
                 piece_ck[piece_of[cur_met]] = LegacyFileChecksum(ckmode).Final();
@@ -10916,7 +10935,6 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     // 12000-byte file before a 300000-byte one is a chunk of its own; small files
     // before a 65536-byte one share theirs). Each chunk is one DATA record of
     // 32 KB blocks; the store's unit is its window.
-    const bool chunked = codec.p0 != 0u;
     // FUN_0805b020 reads 1 MB pieces with a 64 KB file-boundary rule; FUN_08065a40 (lzhd) with 16 KB
     const std::uint64_t piece_bound = codec.p0 >= 3u ? 0x4000u : 0x10000u;
     while (written < total || (total == 0u && written == 0u)) {
@@ -10924,14 +10942,17 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         const std::size_t met_start = cur_met;   // the reader's first entry of this piece
         const std::uint64_t want = std::min<std::uint64_t>(chunked ? 0x100000u : window, total - written);
         while (block.size() < want && cur_met < met.size()) {
-            if (chunked && cur_off == 0u && !block.empty()) {
-                // the reader decides at a file boundary looking at the next NON-EMPTY
-                // file: zero-length entries between a piece and a piece-breaking file
-                // travel with the next piece's table (oracle cd_multi: `... tiny empty blk3.bin`)
-                std::size_t nx = cur_met;
-                while (nx < met.size() && met[nx].len == 0u) ++nx;
-                const std::uint64_t next_len = (nx < met.size()) ? met[nx].len : 0u;
-                const std::uint64_t last_len = (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
+            if (chunked && !block.empty() && ((cur_off == 0u && ghost_budget == 0u) || budget_end)) {
+                // the reader decides at an entry boundary looking at the next NON-EMPTY
+                // entry (a ghost counts with its size): zero-length entries between a
+                // piece and a piece-breaking file travel with the next piece's table
+                // (oracle cd_multi: `... tiny empty blk3.bin`). A spent ghost budget is
+                // an entry boundary too, with the open file as the one just read.
+                budget_end = false;
+                std::size_t nx = cur_met + (cur_off != 0u ? 1u : 0u);
+                while (nx < met.size() && met[nx].planned == 0u) ++nx;
+                const std::uint64_t next_len = (nx < met.size()) ? met[nx].planned : 0u;
+                const std::uint64_t last_len = (cur_off != 0u) ? met[cur_met].len : (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
                 if (last_len >= piece_bound || next_len > piece_bound) break;
             }
             pass_empty();
@@ -10943,7 +10964,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 ck = LegacyFileChecksum(ckmode);
                 status.FileStart(os, e.display);
             }
-            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size()}));
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
             const auto t_read = std::chrono::steady_clock::now();
             in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
             *read_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_read).count());
@@ -10952,7 +10973,9 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
             cur_off += n;
             if (cur_off == pc.len) { piece_ck[piece_of[cur_met]] = ck.Final(); ++cur_met; cur_off = 0; }
+            if (ghost_budget != 0u) { ghost_budget -= n; if (ghost_budget == 0u) budget_end = true; }
         }
+        budget_end = false;
         if (!chunked) pass_empty();
         else if (cur_off == 0u) {
             // FUN_08065a40 / FUN_0805b020: at a file boundary the reader stops when
@@ -10961,8 +10984,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             // join this piece. After a stop they open the next piece (even one with
             // no data at all). Measured on the original with 22 combinations.
             std::size_t nx = cur_met;
-            while (nx < met.size() && met[nx].len == 0u) ++nx;
-            const std::uint64_t next_len = (nx < met.size()) ? met[nx].len : 0u;
+            while (nx < met.size() && met[nx].planned == 0u) ++nx;
+            const std::uint64_t next_len = (nx < met.size()) ? met[nx].planned : 0u;
             const std::uint64_t last_len = (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
             if (!(last_len >= piece_bound || next_len > piece_bound)) pass_empty();
         }
@@ -11188,8 +11211,11 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kLzpf) return RunAddStoreContainer(options, std::move(found), os, add_start, 1u);
     if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
     if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
-    // The other codecs still go through the stub writer (uncompressed bytes in
-    // legacy framing, one file table): give it the original's file list.
+    // The compressors not ported yet (-cD, -co, -cO, -cc): refuse. The decode
+    // phase's stub writer labelled raw bytes with the codec's byte, an archive
+    // the original cannot decode ("code 1024" on a -cD one); nothing is better.
+    os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF or -cd.\n";
+    return 1;
     {
         std::vector<SourceFile> sources;
         for (const EncodeSource& e : found) {

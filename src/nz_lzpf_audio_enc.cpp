@@ -515,15 +515,56 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src0, std::uint3
     // the side bits
     std::vector<std::uint8_t> side(0x10000 + 16);
     BitWriter w; w.base = side.data(); w.end = side.data() + 0x10000; w.cur = side.data(); w.bitbuf = 0; w.nbits = 0;
-    if (pr.chans != 0u) w.Put(0u, 1u);   // no inter-channel LMS in this configuration (flags & 2 == 0)
-    // stage 0 (the only one): always active, shift 8
     const std::uint32_t nch = pr.chans != 0u ? 2u : 1u;
-    for (std::uint32_t j = 0; j < nch; ++j) {
-        LpcPlane& pl = m.plane[j];
-        pl.shift = 8u;
-        w.Put(1u, 1u);
-        w.Put(pl.shift - 8u, 3u);
-        pl.Forward(buf.data() + j * per, per);
+    if (pr.chans != 0u) {
+        if (m.flags & 0x10u) {
+            // FUN_08081af0: channels of comparable cost get the inter-channel LMS (G = 1)
+            std::uint32_t c1 = 100, c2 = 100;
+            for (std::uint32_t i = 0; i < per; ++i) { c1 += BitLen(AbsPlus1(buf[i])); c2 += BitLen(AbsPlus1(buf[per + i])); }
+            const std::uint32_t lo = std::min(c1, c2), hi = std::max(c1, c2);
+            if (!(lo * 7u < hi * 3u)) {
+                w.Put(1u, 1u);
+                m.lms[0].shift = 0x0cu; m.lms[1].shift = (pr.chans == 2u) ? 0x0bu : 0x0cu;   // FUN_080beb90
+                w.Put(m.lms[0].shift - 7u, 3u); w.Put(m.lms[1].shift - 7u, 3u);
+                // FUN_08054670: ch1 predicted from the previous ch2 sample, ch2 from the current ch1
+                std::int32_t prev2 = 0;
+                for (std::uint32_t i = 0; i < per; ++i) {
+                    const std::int32_t x1 = buf[i];
+                    const std::int32_t p1 = nzr::lzpf::LmsPredictSample(m.lms[0], prev2);
+                    buf[i] = x1 - p1; nzr::lzpf::LmsUpdateSample(m.lms[0], x1, x1 - p1);
+                    const std::int32_t x2 = buf[per + i];
+                    const std::int32_t p2 = nzr::lzpf::LmsPredictSample(m.lms[1], x1);
+                    buf[per + i] = x2 - p2; nzr::lzpf::LmsUpdateSample(m.lms[1], x2, x2 - p2);
+                    prev2 = x2;
+                }
+            } else { w.Put(0u, 1u); m.lms[0].Init(); m.lms[1].Init(); }   // FUN_080beb60
+        } else {
+            w.Put(0u, 1u);   // flags & 2 never set here: FUN_080be670 resets the other LMS flavour
+        }
+    }
+    // the LPC stages: stage 0 always applies; later stages only when a trial on the
+    // first samples pays (FUN_08081b70: stage 1 within 64/65, stage 2 strictly)
+    for (std::uint32_t st = 0; st < m.nstages; ++st) {
+        for (std::uint32_t j = 0; j < nch; ++j) {
+            LpcPlane& pl = m.plane[2u * st + j];
+            pl.shift = (pl.order > 8u) ? std::min<std::uint32_t>(pl.order / 20u + 12u, 15u) : 8u;   // (flags & 1) == 0
+        }
+        for (std::uint32_t j = 0; j < nch; ++j) {
+            LpcPlane& pl = m.plane[2u * st + j];
+            std::int32_t* data = buf.data() + j * per;
+            if (st == 0u) { w.Put(1u, 1u); w.Put(pl.shift - 8u, 3u); pl.Forward(data, per); continue; }
+            const std::uint32_t n2 = std::min<std::uint32_t>(per, 0x1000u);
+            const std::uint32_t p4 = (st == 1u) ? 0x40u : 1u, p5 = (st == 1u) ? 0x41u : 1u;
+            std::vector<std::int32_t> copy(data, data + n2);
+            LpcPlane trial = pl;
+            trial.Forward(copy.data(), n2);
+            std::uint32_t cf = 0, co = 0;
+            for (std::uint32_t i = 0; i < n2; ++i) { cf += BitLen(AbsPlus1(copy[i])); co += BitLen(AbsPlus1(data[i])); }
+            const bool act = cf * p4 < co * p5;
+            w.Put(act ? 1u : 0u, 1u);
+            if (act) { w.Put(pl.shift - 8u, 3u); pl.Forward(data, per); }
+            else pl.Reset();   // FUN_080bdac0
+        }
     }
     std::vector<std::uint8_t> bytes(nsmp + 16);
     ResidualEncode(buf.data(), nsmp, bytes.data(), w);

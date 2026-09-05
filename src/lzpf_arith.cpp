@@ -1774,6 +1774,11 @@ static void LmsUpdate(LmsObject& o, std::int32_t sample, std::int32_t residual) 
     LmsAdapt(o.st[1], residual);
 }
 
+// The two primitives the compressor's forward inter-channel filter (FUN_08054670)
+// needs, on the same state.
+std::int32_t LmsPredictSample(LmsObject& o, std::int32_t x) { return LmsPredict(o, x); }
+void LmsUpdateSample(LmsObject& o, std::int32_t sample, std::int32_t residual) { LmsUpdate(o, sample, residual); }
+
 // FUN_08096e20 (scalar path). Reconstructs interleaved ch1/ch2 samples in
 // place. `carry` (legacy iVar5) chains across channels: ch2 predicts from
 // ch1's just-reconstructed sample (inter-channel decorrelation), and the

@@ -90,12 +90,20 @@ tiff_gray(f'{d}/gray.tif', 160, 150, gray(160, 150, g))
 tga_rgb(f'{d}/pic.tga', 300, 220, rgb(300, 220, c))
 bmp_gray8(f'{d}/gray8.bmp', 200, 180, gray(200, 180, g))
 pgm(f'{d}/gray.pgm', 180, 160, gray(180, 160, g))
+# a CRLF text and a PGN chess file for the -cd text pipeline's CRLF and chess stages
+open(f'{d}/crlf.txt', 'wb').write(('\r\n'.join('Line %d of the report: the quick brown fox jumps over the lazy dog, again and again.' % i for i in range(600)) + '\r\n').encode())
+moves = ['e4','e5','Nf3','Nc6','Bb5','a6','Ba4','Nf6','O-O','Be7','Re1','b5','Bb3','d6','c3','O-O','h3','Nb8','d4','Nbd7']
+pgn = []
+for g in range(60):
+    pgn.append('[Event "Casual Game %d"]\n[Site "Somewhere"]\n[Date "1998.%02d.%02d"]\n[White "Player A"]\n[Black "Player B"]\n[Result "1-0"]\n\n' % (g, 1 + g % 12, 1 + g % 28))
+    pgn.append(' '.join('%d. %s %s' % (i, random.choice(moves), random.choice(moves)) for i in range(1, 40)) + ' 1-0\n\n')
+open(f'{d}/game.pgn', 'w').write(''.join(pgn))
 # an executable and a text+random mix for the compressing codecs
 import shutil; shutil.copy('/usr/bin/ls', f'{d}/exe.bin')
 open(f'{d}/mix.bin','wb').write((('lorem ipsum dolor sit amet ' * 40 + '\n') * 900).encode() + bytes(random.randrange(256) for _ in range(700000)))
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
 open(f'{d}/unread.bin','wb').write(bytes(5000)); os.utime(f'{d}/unread.bin', (1200000000, 1200000000)); os.chmod(f'{d}/unread.bin', 0)
-for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin','tone.wav','voice8.wav','raw16.pcm','gray.tif','pic.tga','gray8.bmp','gray.pgm']:
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin','tone.wav','voice8.wav','raw16.pcm','gray.tif','pic.tga','gray8.bmp','gray.pgm','crlf.txt','game.pgn']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
@@ -199,6 +207,18 @@ CASES=(
   "cd_rle|-cd -t1|r98304.bin"
   "cd_big|-cd -t1|p12.bin"
   "cd_multi|-cd -t1 -sn|b.bin sub/c.dat one.bin tiny empty blk3.bin r98303.bin"
+  "cd_text|-cd -t1|p2.txt"
+  "cd_crlf|-cd -t1|crlf.txt"
+  "cd_pgn|-cd -t1|game.pgn"
+  "cd_wav|-cd -t1|tone.wav"
+  "cd_wav8|-cd -t1|voice8.wav"
+  "cd_raw16|-cd -t1|raw16.pcm"
+  "cd_img_tif|-cd -t1|gray.tif"
+  "cd_img_tga|-cd -t1|pic.tga"
+  "cd_img_mix|-cd -t1 -sn|gray.tif a.txt pic.tga tone.wav gray.pgm"
+  "cd_media|-cd -t1 -sn|tone.wav a.txt voice8.wav raw16.pcm exe.bin mix.bin"
+  "cd_dotdir|-cd -t1 -r|."
+  "cd_default|-cd|b.bin"
   "cd_one|-cd|a.txt"
   "cD_one|-cD|a.txt"
   "co_one|-co|a.txt"

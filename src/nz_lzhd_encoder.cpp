@@ -126,6 +126,8 @@ void State::Init(std::uint32_t window) {
     tmp.assign(0x10000u + 64u, 0);
     probe_ctx = lzpf_enc::AudioProbe{};
     exe_pos = 4;
+    audio.Configure(8u, 0x10u, 3u);   // FUN_080b1600(ctx+0x40, 8, 0x10, 3, 0)
+    image.Configure(2u, 0x10u, 0x10u);   // FUN_08089a70(ctx+0x38800, 0x10, 0x10, 2)
     image.Reset();
 }
 
@@ -486,6 +488,68 @@ void WriteChunk(State& st, const std::uint8_t* lits, std::uint32_t lit_size, std
     if (flags & 2u) { PutVar(out, 0x1001u, static_cast<std::uint32_t>(rle_side.size())); out.insert(out.end(), rle_side.begin(), rle_side.end()); }
 }
 
+// ---------------------------------------------------------------- FUN_0805f030
+// The LZ cost estimate the audio decision weighs: literal bytes a quick two-byte
+// hash parse over the chunk would leave (0 when the previous chunk's match runs
+// on for more than 1024 bytes).
+static std::uint32_t LzEstimate(State& st, const std::uint8_t* p, std::uint32_t n) {
+    if (n < 0x11u) return n;
+    {
+        std::uint32_t c = st.cont, k = 0;
+        const Window& w = st.win;
+        if (c != 0u) {
+            bool inside;
+            if (c < w.size) inside = (c < w.end && w.pos <= c); else { c -= w.size; inside = (c < w.end && w.pos <= c); }
+            if (!inside) { const std::uint32_t lim = std::min(n, w.size - c); while (k < lim && w.base[w.pos + k] == w.base[c + k]) ++k; }
+        }
+        if (0x400u < k) return 0u;
+    }
+    const std::uint8_t* const skip = SkipTable();
+    const Finder& f = st.finder;
+    std::vector<const std::uint8_t*> tbl(0x2000, p);
+    const std::uint8_t* q = p + 1;
+    std::uint32_t sel = 0, remaining = n - 1u, span = n, total = 0, run = 0;
+    for (;;) {
+        std::uint8_t sk = skip[sel | (run & 0xffu)];
+        const std::uint8_t* cur = q; std::uint32_t runv = run; std::uint32_t rem = remaining;
+        for (;;) {
+            if (sk == 0u) {
+                std::uint16_t w16; std::memcpy(&w16, cur, 2);
+                const std::uint32_t h = w16 & 0x1fffu;
+                const std::uint8_t* cand = tbl[h];
+                const std::uint8_t* lim = cur + rem;
+                tbl[h] = cur;
+                std::uint32_t L = MatchLen(cur, cand, lim);
+                bool matched = 3u < L;
+                if (!matched && 3u < rem) {
+                    const std::uint32_t wv = LoadU32(cur);
+                    const std::uint32_t h2 = (wv >> 19u) ^ (wv * 0x923249u);
+                    const std::uint32_t e = f.table[(f.bmask + 3u) & h2];
+                    if (e != 0u && ((h2 >> ((32u - f.shift) & 31u)) & f.tagmask) == (f.tagmask & e)) {
+                        const std::uint8_t* cand2 = st.win.base + (e >> (f.shift & 31u));
+                        const std::uint32_t avail = static_cast<std::uint32_t>((st.win.base + st.win.size) - cand2);
+                        L = MatchLen(cand2, cur, cand2 + std::min(rem, avail));
+                        matched = 3u < L;
+                    }
+                }
+                if (matched) {
+                    total += span - rem;
+                    remaining = rem - L;
+                    if (remaining == 0u) return total;
+                    q = cur + L; run = 0; sel = 0; span = remaining;
+                    goto next;
+                }
+            }
+            if (rem == 1u) return total + span;
+            sel = 0x80u; q = cur + 1; run = runv + 1u; remaining = rem - 1u;
+            if (0x80u < run) goto next;
+            runv = run; ++cur; rem = remaining;
+            sk = skip[runv & 0xffu];
+        }
+next:;
+    }
+}
+
 // ---------------------------------------------------------------- FUN_0808fc20
 // Block-RLE detection over a window: words are read from the first 16-byte
 // boundary after `p` (an address property of the original's 64-byte-aligned
@@ -537,8 +601,11 @@ static bool ExeHeaderAt(const std::uint8_t* p, std::uint32_t n) {
 // ---------------------------------------------------------------- FUN_08064bb0
 void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vector<std::uint8_t>& out) {
     // the two 64-byte-aligned 32 KB chunk buffers (their alignment feeds the RLE detector)
-    alignas(64) static thread_local std::uint8_t bufA[0x8000 + 0x100];
-    alignas(64) static thread_local std::uint8_t bufB[0x8000 + 0x100];
+    // (the original's buffers sit 0x40 bytes into an aligned allocation; the image
+    // gate's context hash reads the two bytes before a chunk, so keep a prefix)
+    alignas(64) static thread_local std::uint8_t bufA_[0x40 + 0x8000 + 0x100];
+    alignas(64) static thread_local std::uint8_t bufB_[0x40 + 0x8000 + 0x100];
+    std::uint8_t* const bufA = bufA_ + 0x40; std::uint8_t* const bufB = bufB_ + 0x40;
     std::uint32_t off = 0;
     while (off < n) {
         const std::uint32_t len0 = std::min<std::uint32_t>(n - off, 0x8000u);
@@ -549,6 +616,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
         std::vector<std::uint8_t> rle_side;
         std::uint8_t text_param = 0;
         const bool in_span = st.probe_ctx.bytes_done < st.probe_ctx.audio_end;
+        if (std::getenv("NZ_TRACE_LZHD")) std::fprintf(stderr, "[piece] chunk off=%u len=%u in_span=%d probe{done=%u end=%u conf=%u code=%x}\n", off, len0, (int)in_span, st.probe_ctx.bytes_done, st.probe_ctx.audio_end, st.probe_ctx.conf, st.probe_ctx.code);
         if (!in_span) {
             // the analysis: probe, exe metric + filter
             lzpf_enc::AudioProbeBlock(st.probe_ctx, buf, len);
@@ -562,9 +630,10 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
         st.exe_pos += len;
         bool go_audio = false;
         if (st.probe_ctx.bytes_done < st.probe_ctx.audio_end) {
-            // inside a header's audio span
+            // inside a header's audio span: chunks under 512 bytes skip the audio
+            // block (LAB_08065218: LZ from 256 bytes, a literal below)
             st.image.Reset();
-            if (len < 0x200u) goto literal_small;
+            if (len < 0x200u) goto lz_path;
             if (flags == 0u) go_audio = true;   // LAB_08064dc0
         } else {
             // block RLE: any of up to five 0x7ff-byte windows
@@ -598,7 +667,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                     }
                 }
             }
-            if (st.probe_ctx.bytes_done < st.probe_ctx.audio_end) { st.image.Reset(); if (len < 0x200u) goto literal_small; if (flags == 0u) go_audio = true; }
+            if (st.probe_ctx.bytes_done < st.probe_ctx.audio_end) { st.image.Reset(); if (len < 0x200u) goto lz_path; if (flags == 0u) go_audio = true; }
             else {
                 if (flags == 0u) {
                     // the text pipeline (FUN_08054dc0 .. FUN_08059060)
@@ -611,22 +680,53 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                         if (const char* dp = std::getenv("NZ_DUMP_LZHD_TEXT")) { if (FILE* f = std::fopen(dp, "ab")) { std::fwrite(buf, 1, len, f); std::fclose(f); } }
                     }
                 }
-                // image (n > 0x1ff, flags == 0): TODO -- FUN_0808aac0 with the -cd profile
-                st.image.Reset();
-                if (len < 0x200u) goto literal_small;
-                if (flags == 0u) {
-                    // LAB_080651a0: the audio decision outside a span
-                    const bool dec = lzpf_enc::AudioDecide(st.probe_ctx, buf, std::min<std::uint32_t>(len, 0x400u), len);
-                    if (dec) {
-                        // (the LZ cost estimate FUN_0805f030 vs 3/4 of the chunk: TODO; assume audio)
-                        go_audio = true;
+                if (0x1ffu < len && flags == 0u) {
+                    // FUN_0808aac0: the image model, chunk `[hdr 0xf | (len+1)*16][payload]`
+                    lzpf_enc::ImageProbe ipr;
+                    lzpf_enc::ImageDetect(ipr, buf, len);
+                    std::vector<std::uint8_t> payload;
+                    const std::size_t got = lzpf_enc::ImageEncodeBlock(st.image, ipr, buf, len, payload, 0u);
+                    if (got != 0u) {
+                        PutVar(out, 0x80010u, len == 0x8000u ? 0xfu : len * 16u + 0x1fu);
+                        out.insert(out.end(), payload.begin(), payload.end());
+                        st.win.Slide(len);
+                        std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
+                        st.win.Append(buf, len);
+                        SparseAppend(st, len);
+                        std::memcpy(st.win.base + st.win.pos, &guard, 4);
+                        st.probe_ctx.bytes_done += len;
+                        off += len0;
+                        continue;
                     }
+                }
+                st.image.Reset();   // FUN_080b6170: every chunk that is not an image chunk
+                if (flags == 0u) {
+                    // LAB_080651a0: the audio decision outside a span, unless a quick
+                    // LZ parse would already keep three quarters of the bytes or less
+                    const bool dec = lzpf_enc::AudioDecide(st.probe_ctx, buf, std::min<std::uint32_t>(len, 0x400u), len);
+                    if (dec && !(LzEstimate(st, buf, len) * 4u <= len * 3u)) go_audio = true;
                 }
             }
         }
         if (go_audio) {
-            // TODO: the -cd audio block (FUN_08082d00 with the 8/0x10/3 profile); fall through to LZ for now
+            // LAB_08064dc0: the prefilter chunk `[hdr 0xc | (len+1)*16][payload]`
+            std::vector<std::uint8_t> payload;
+            const std::size_t got = lzpf_enc::AudioEncodeBlock(st.audio, buf, len, st.probe_ctx, payload, 0u);
+            if (got != 0u) {
+                PutVar(out, 0x80010u, len == 0x8000u ? 0xcu : len * 16u + 0x1cu);
+                out.insert(out.end(), payload.begin(), payload.end());
+                st.win.Slide(len);
+                std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
+                st.win.Append(buf, len);
+                SparseAppend(st, len);
+                std::memcpy(st.win.base + st.win.pos, &guard, 4);
+                st.probe_ctx.bytes_done += len;
+                off += len0;
+                continue;
+            }
+            if (0x1000u < len) st.probe_ctx = lzpf_enc::AudioProbe{};   // FUN_08080e80
         }
+lz_path:
         {
             st.probe_ctx.bytes_done += len;
             st.audio.ResetAll();
@@ -641,19 +741,6 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
             else WriteChunk(st, buf, len, len, flags, text_param, rle_side, out);
             off += len0;
             continue;
-        }
-literal_small:
-        {
-            // a tiny chunk inside an audio span: window append, literal chunk
-            st.probe_ctx.bytes_done += len;
-            st.audio.ResetAll();
-            st.win.Slide(len);
-            std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
-            st.win.Append(buf, len);
-            SparseAppend(st, len);
-            std::memcpy(st.win.base + st.win.pos, &guard, 4);
-            WriteChunk(st, buf, len, len, flags, text_param, rle_side, out);
-            off += len0;
         }
     }
 }
