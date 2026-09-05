@@ -2546,7 +2546,10 @@ bool ParseLegacyParallelStreams(
             break;
         }
     }
-    if (magic == bytes.size() || bytes[magic + 3u] != 0x0fu) return false;
+    // The record after the magic is a stream-id extension (low nibble 15) in a
+    // parallel container; comparing the WHOLE byte to 0x0f only held while a
+    // checksum record came first, so `-hn` containers were rejected here.
+    if (magic == bytes.size() || (bytes[magic + 3u] & 0x0fu) != 0x0fu) return false;
 
     std::size_t p = magic + 3u;
     for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
@@ -2781,7 +2784,10 @@ bool AssembleParallelMultiFile(
     bool use_sink = false,
     psink::Policy policy = psink::Policy::kProduced,
     std::uint64_t quantum = 0u,
-    psink::Family family = psink::Family::kCm) {
+    psink::Family family = psink::Family::kCm,
+    // `-hn` writes no checksum at all: a slice without one is then normal, not
+    // a slice whose checksum we failed to read.
+    bool require_cksum = true) {
     if (out == nullptr || entries.size() < 2u || total == 0u ||
         total > (static_cast<std::uint64_t>(1) << 40)) {
         return false;
@@ -2808,7 +2814,7 @@ bool AssembleParallelMultiFile(
         std::uint64_t stream_out = 0;
         for (const LegacyParallelSlice& sl : st.slices) {
             if (sl.osz == 0u) continue;   // an empty file: nothing to decode or place
-            if (!sl.has_cksum) return false;
+            if (require_cksum && !sl.has_cksum) return false;
             const auto it = base.find(sl.path);
             if (it == base.end()) return false;
             if (it->second + sl.ooff + sl.osz > total) return false;
@@ -4921,6 +4927,33 @@ bool TryParseLegacyCnArchive(
         ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries);
     const std::size_t run_metadata_end = first_data_record;
 
+    // Some decodes run here, at parse time; the progress engine prints the
+    // "Archive / Threads / Compressor" header lazily from this snapshot, so it
+    // has to exist before the FIRST of them -- the parallel store assembly just
+    // below is one, and without this its header came out with an empty archive
+    // name and an `unknown` compressor.
+    const auto publish_snapshot = [&]() {
+        if (!progress::Active() || entries.empty()) return;
+        LegacyCnContext snap;
+        snap.archive_path = archive_path;
+        snap.legacy_method = method;
+        snap.legacy_method_p0 = method_p0;
+        snap.legacy_method_p1 = method_p1;
+        snap.legacy_method_p2 = method_p2;
+        snap.cm_a_bits = cm_a_bits;
+        snap.cm_b_bits = cm_b_bits;
+        snap.cm_window_size = cm_window_size;
+        if (has_parallel_streams) {
+            std::map<unsigned, LegacyParallelStream> pstreams;
+            if (ParseLegacyParallelStreams(bytes, &pstreams))
+                for (const auto& kv : pstreams)
+                    snap.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
+        }
+        snap.entries.push_back(entries.front());
+        progress::Publish(snap);
+    };
+    publish_snapshot();
+
     // For stored payloads (-cn) that split across several blocks, the raw file
     // bytes are not a contiguous tail of the archive, so we assemble them here.
     bool store_multiblock = false;
@@ -4972,7 +5005,8 @@ bool TryParseLegacyCnArchive(
                         if (dst->size() > out_size) dst->resize(static_cast<std::size_t>(out_size));
                         return psink::Available() || psink::Committed() || dst->size() == out_size;
                     },
-                    &store_blocks_buffer, psink::Available(), psink::Policy::kStore, 0u, psink::Family::kStore)) {
+                    &store_blocks_buffer, psink::Available(), psink::Policy::kStore, 0u, psink::Family::kStore,
+                    checksum_mode != ChecksumMode::kNone)) {
                 nz_trace::Construct("store_assembly=parallel_multifile");
                 store_multiblock = true;
                 metadata_end = table_end;
@@ -5426,27 +5460,7 @@ bool TryParseLegacyCnArchive(
         }
     }
 
-    if (progress::Active() && !entries.empty()) {
-        // Some decodes below run here, at parse time; the progress engine prints
-        // the "Archive / Threads / Compressor" header lazily from this snapshot.
-        LegacyCnContext snap;
-        snap.archive_path = archive_path;
-        snap.legacy_method = method;
-        snap.legacy_method_p0 = method_p0;
-        snap.legacy_method_p1 = method_p1;
-        snap.legacy_method_p2 = method_p2;
-        snap.cm_a_bits = cm_a_bits;
-        snap.cm_b_bits = cm_b_bits;
-        snap.cm_window_size = cm_window_size;
-        if (has_parallel_streams) {
-            std::map<unsigned, LegacyParallelStream> pstreams;
-            if (ParseLegacyParallelStreams(bytes, &pstreams))
-                for (const auto& kv : pstreams)
-                    snap.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
-        }
-        snap.entries.push_back(entries.front());
-        progress::Publish(snap);
-    }
+    publish_snapshot();
     if (!native_store_payload && !entries.empty() && payload_start <= bytes.size()) {
                 // Parallel multi-stream container (header flag byte 0x0f, used by
                 // the multi-threaded encoder for inputs >~8 MB). The output is cut
@@ -5479,7 +5493,13 @@ bool TryParseLegacyCnArchive(
                     // multi-file one would overlap the files, and the per-entry
                     // check cannot catch it -- a file split across streams has
                     // no whole-file checksum to verify against. So decline.
-                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu &&
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
                         entries.size() == 1u) {
                         const bool is_variant_b = (method_p0 == 2u);
                         struct PStream {
@@ -5564,7 +5584,12 @@ bool TryParseLegacyCnArchive(
                         for (auto& kv : ps) {
                             PStream& s = kv.second;
                             if (s.chunks.empty() && !s.cut) continue;
-                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hasoff || !s.hassz ||
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
@@ -5692,7 +5717,13 @@ bool TryParseLegacyCnArchive(
                     // multi-file one would overlap the files, and the per-entry
                     // check cannot catch it -- a file split across streams has
                     // no whole-file checksum to verify against. So decline.
-                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu &&
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
                         entries.size() == 1u) {
                         struct PCdStream {
                             // Each entry is one raw nz_cd block: (offset, size)
@@ -5778,7 +5809,12 @@ bool TryParseLegacyCnArchive(
                         for (auto& kv : ps) {
                             PCdStream& s = kv.second;
                             if (s.chunks.empty() && !s.cut) continue;
-                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hasoff || !s.hassz ||
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
@@ -5945,7 +5981,8 @@ bool TryParseLegacyCnArchive(
                                     std::string err;
                                     return TryDecodeLegacyCm(sub, dst, &err);
                                 },
-                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kCm);
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kCm,
+                                 checksum_mode != ChecksumMode::kNone);
                         } else if (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) {
                             // Each type-0 chunk IS one delimited nz_cd block, so
                             // they are decoded one at a time threading a ring
@@ -5999,7 +6036,8 @@ bool TryParseLegacyCnArchive(
                                     if (written != out_size) dst->resize(written);
                                     return written == out_size;
                                 },
-                                &assembled, psink::Available(), psink::Policy::kGroup, std::uint64_t{0x100000u}, psink::Family::kCd);
+                                &assembled, psink::Available(), psink::Policy::kGroup, std::uint64_t{0x100000u}, psink::Family::kCd,
+                                 checksum_mode != ChecksumMode::kNone);
                         } else if (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u)) {
                             const std::uint32_t wcap =
                                 nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
@@ -6028,7 +6066,8 @@ bool TryParseLegacyCnArchive(
                                     return r;
                                 },
                                 &assembled, psink::Available(), psink::Policy::kProduced, 0u,
-                                method_p0 == 5u ? psink::Family::kCo : psink::Family::kCO);
+                                method_p0 == 5u ? psink::Family::kCo : psink::Family::kCO,
+                                 checksum_mode != ChecksumMode::kNone);
                         } else if (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) {
                             const bool vb = (method_p0 == 2u);
                             got = AssembleParallelMultiFile(
@@ -6052,7 +6091,8 @@ bool TryParseLegacyCnArchive(
                                     if (!okd && sinking) dst->resize(mdone);   // completed members only
                                     return okd;
                                 },
-                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kLzpf);
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kLzpf,
+                                 checksum_mode != ChecksumMode::kNone);
                         }
                         StageMark("streams decoded");
                         if (sink_adopt()) {
@@ -6080,7 +6120,12 @@ bool TryParseLegacyCnArchive(
                         for (const auto& kv : pstreams) {
                             const LegacyParallelStream& st = kv.second;
                             if (st.chunks.empty() && !st.cut) continue;
-                            if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone ||
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!st.hasoff || !st.hassz ||
+                                (st.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 st.ooff > total_data_size ||
                                 st.osz > total_data_size - st.ooff) { all_ok = false; break; }
                             plist.push_back(&st); pranges.emplace_back(st.ooff, st.osz);
@@ -6171,7 +6216,13 @@ bool TryParseLegacyCnArchive(
                     // multi-file one would overlap the files, and the per-entry
                     // check cannot catch it -- a file split across streams has
                     // no whole-file checksum to verify against. So decline.
-                    if (magic != bytes.size() && bytes[magic + 3u] == 0x0fu &&
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
                         entries.size() == 1u) {
                         struct POptStream {
                             // Each entry is one contiguous block-record range
@@ -6287,7 +6338,12 @@ bool TryParseLegacyCnArchive(
                         for (auto& kv : ps) {
                             POptStream& s = kv.second;
                             if (s.chunks.empty() && !s.cut) continue;
-                            if (!s.hasoff || !s.hassz || s.cmode == ChecksumMode::kNone ||
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hasoff || !s.hassz ||
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
                                 s.ooff + s.osz > total_data_size) { all_ok = false; break; }
                             plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
                         }
@@ -6875,7 +6931,12 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     // Measured: `l` lists every entry whatever file arguments follow the archive.
     for (const LegacyCnEntry& e : legacy.entries) {
         if (has_checksum) {
-            if (e.checksum_na) {
+            // A stored value of zero prints as "n/a", whatever the mode: with
+            // crc16/crc32 an empty file's checksum IS zero and the original
+            // shows n/a for it, while fletcher16 stores ffffffff for one and
+            // shows that. (A non-empty file whose crc happens to be zero gets
+            // the same treatment -- measured, not assumed.)
+            if (e.checksum_na || !e.has_checksum || e.checksum == 0u) {
                 os << "     n/a ";
             } else {
                 const std::uint32_t shown = e.has_checksum ? e.checksum : 0;
