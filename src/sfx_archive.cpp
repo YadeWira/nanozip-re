@@ -10938,7 +10938,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             std::size_t off = 0;
             while (off < block.size()) {
                 const std::size_t n = std::min<std::size_t>(0x8000u, block.size() - off);
-                nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u);
+                nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u, off == 0u);
                 off += n;
             }
         }

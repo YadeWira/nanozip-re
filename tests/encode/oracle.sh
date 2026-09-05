@@ -46,12 +46,25 @@ open(f'{d}/p12.bin','wb').write(bytes(random.randrange(256) for _ in range(12000
 open(f'{d}/p6.bin','wb').write(bytes(random.randrange(256) for _ in range(600000)))
 open(f'{d}/p3.dat','wb').write(bytes(random.randrange(256) for _ in range(300000)))
 open(f'{d}/p2.txt','w').write('parallel text line\n' * 5000)
+# audio for the lzpf prefilter: a RIFF 16-bit stereo WAV, an 8-bit mono WAV, a headerless 16-bit tone
+import math, struct
+def wav(path, ch, bits, n, gen):
+    frames = bytearray()
+    for i in range(n):
+        for c in range(ch):
+            v = gen(i, c)
+            frames += struct.pack('<h', int(v)) if bits == 16 else bytes([int(v) & 0xff])
+    hdr = b'RIFF' + struct.pack('<I', 36 + len(frames)) + b'WAVEfmt ' + struct.pack('<IHHIIHH', 16, 1, ch, 22050, 22050 * ch * bits // 8, ch * bits // 8, bits) + b'data' + struct.pack('<I', len(frames))
+    open(path, 'wb').write(hdr + frames)
+wav(f'{d}/tone.wav', 2, 16, 40000, lambda i, c: 12000 * math.sin(i * 0.031 + c) + 3000 * math.sin(i * 0.17) + random.randrange(-40, 41))
+wav(f'{d}/voice8.wav', 1, 8, 60000, lambda i, c: 128 + 60 * math.sin(i * 0.05) * math.sin(i * 0.0007) + random.randrange(-3, 4))
+open(f'{d}/raw16.pcm', 'wb').write(b''.join(struct.pack('<h', int(9000 * math.sin(i * 0.02) + random.randrange(-100, 101))) for i in range(50000)))
 # an executable and a text+random mix for the compressing codecs
 import shutil; shutil.copy('/usr/bin/ls', f'{d}/exe.bin')
 open(f'{d}/mix.bin','wb').write((('lorem ipsum dolor sit amet ' * 40 + '\n') * 900).encode() + bytes(random.randrange(256) for _ in range(700000)))
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
 open(f'{d}/unread.bin','wb').write(bytes(5000)); os.utime(f'{d}/unread.bin', (1200000000, 1200000000)); os.chmod(f'{d}/unread.bin', 0)
-for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin']:
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin','tone.wav','voice8.wav','raw16.pcm']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
@@ -136,6 +149,11 @@ CASES=(
   "cF_exe|-cF -t1|exe.bin"
   "cf_mix|-cf -t1|mix.bin"
   "cf_default|-cf|a.txt b.bin"
+  "cf_wav|-cf -t1|tone.wav"
+  "cF_wav|-cF -t1|tone.wav"
+  "cf_wav8|-cf -t1|voice8.wav"
+  "cf_raw16|-cf -t1|raw16.pcm"
+  "cf_media|-cf -t1 -sn|tone.wav a.txt voice8.wav raw16.pcm"
   "cd_one|-cd|a.txt"
   "cD_one|-cD|a.txt"
   "co_one|-co|a.txt"

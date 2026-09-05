@@ -12,6 +12,7 @@ set(RECON_SOURCES
     src/linux32_cm_map.cpp
     src/lzpf_arith.cpp
     src/nz_lzpf_encoder.cpp
+    src/nz_lzpf_audio_enc.cpp
     src/nz_cm.cpp
     src/nz_cd_tokens.cpp
     src/nz_cd_texttransform_dict.cpp

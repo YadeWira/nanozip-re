@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace nzr::lzpf_enc {
 
@@ -47,6 +49,8 @@ void State::Init(bool vb, std::size_t cap) {
     exe_pos = 4;
     literal_bytes = 0;
     audio_pending = 0;
+    probe = AudioProbe{};
+    audio.Configure(variant_b ? 8u : 4u);
 }
 
 void State::Wrap() {
@@ -426,69 +430,11 @@ std::size_t BuildCodeLengths(const std::uint32_t* hist, std::uint32_t max_len, s
 // ---------------------------------------------------------------------------
 
 // DAT_081b42f0: the mask table, [0] = 1 (!), [k] = 2^k - 1 (0x080c034f).
-static inline std::uint32_t MaskBits(std::uint32_t k) {
+std::uint32_t MaskBits(std::uint32_t k) {
     if (k == 0u) return 1u;
     if (k >= 32u) return 0xffffffffu;
     return (1u << k) - 1u;
 }
-
-// The bit writer of FUN_080b1f20 / FUN_080b2030: MSB-first, 32-bit big-endian
-// words; `cur == end` stops writing (the caller then sees the overflow).
-struct BitWriter {
-    std::uint8_t* base = nullptr;
-    std::uint8_t* end = nullptr;
-    std::uint8_t* cur = nullptr;
-    std::uint32_t bitbuf = 0;
-    std::uint32_t nbits = 0;
-
-    void Put(std::uint32_t value, std::uint32_t n) {                    // FUN_080b1f20
-        const std::uint32_t total = nbits + n;
-        if (total < 0x21u) {
-            nbits = total;
-            bitbuf = (bitbuf << (n & 31u)) | value;
-            return;
-        }
-        if (cur == end) return;
-        const std::uint32_t room = 32u - nbits;
-        const std::uint32_t keep = n - room;
-        nbits = keep;
-        const std::uint32_t word = (bitbuf << (room & 31u)) | (value >> (keep & 31u));
-        std::uint8_t* next = cur + 4;
-        bitbuf = value;
-        if (end < next) { cur = end; return; }
-        cur[0] = static_cast<std::uint8_t>(word >> 24u); cur[1] = static_cast<std::uint8_t>(word >> 16u);
-        cur[2] = static_cast<std::uint8_t>(word >> 8u);  cur[3] = static_cast<std::uint8_t>(word);
-        cur = next;
-    }
-    void PutBisect(std::uint32_t value, std::uint32_t hi) {            // FUN_080c0680
-        std::uint32_t lo = 0;
-        for (;;) {
-            std::uint32_t mid = (hi + lo) >> 1u;
-            if (mid <= lo) return;
-            for (;;) {
-                const bool up = value < mid;
-                Put(up ? 1u : 0u, 1u);
-                if (!up) { lo = mid; break; }
-                hi = mid;
-                mid = (hi + lo) >> 1u;
-                if (mid <= lo) return;
-            }
-        }
-    }
-    void Flush() {                                                       // FUN_080b2030
-        while (nbits != 0u) {
-            if (nbits < 8u) {
-                const std::uint32_t k = nbits; nbits = 0;
-                if (end <= cur) continue;
-                *cur++ = static_cast<std::uint8_t>(bitbuf << ((8u - k) & 31u));
-            } else {
-                nbits -= 8u;
-                if (end <= cur) continue;
-                *cur++ = static_cast<std::uint8_t>(bitbuf >> (nbits & 31u));
-            }
-        }
-    }
-};
 
 // FUN_0805c980: the symbols. The original writes whole big-endian words once its
 // cursor is 4-byte ALIGNED IN MEMORY and single bytes until then; the bit
@@ -721,7 +667,7 @@ static void WriteCodeLengths(BitWriter& w, const std::uint8_t* lengths, std::uin
 // FUN_080757d0. `align` = the output pointer's address modulo 4 in the original
 // (see WriteSymbols); the header and the u16 count precede this stream, so the
 // caller passes the alignment of `out`'s first byte.
-static std::size_t EncodeArithAt(const std::uint8_t* src, std::size_t n, std::uint8_t* out, std::size_t limit, std::uintptr_t align) {
+std::size_t EncodeArithAt(const std::uint8_t* src, std::size_t n, std::uint8_t* out, std::size_t limit, std::uintptr_t align) {
     if (n == 0u) return 0u;
     std::uint32_t hist[256];
     std::memset(hist, 0, sizeof(hist));
@@ -874,19 +820,81 @@ static void ExeFilterForward(std::uint8_t* p, std::uint32_t n, std::uint64_t pos
 // FUN_0805a790 without the audio and image paths (those need their own models);
 // `align` is the address modulo 4 of the first byte this block writes in the
 // original's output buffer (see WriteSymbols).
-void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_t remaining, std::vector<std::uint8_t>& out, std::uintptr_t align) {
+void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_t remaining, std::vector<std::uint8_t>& out, std::uintptr_t align, bool first_in_chunk) {
     (void)remaining;
     if (len == 0u) return;
     st.Wrap();
     std::uint8_t* const block = st.window + st.cursor;
     std::memcpy(block, src, len);
     st.cursor += len;
-    const std::uint32_t score = Score(block, static_cast<std::uint32_t>(len));
+    // The analysis job (FUN_0805b2b0), run for this block: outside a header's
+    // audio span it re-runs the format probe (which rewrites the probe struct),
+    // then, if the probe is confident and the block noisy enough, asks the
+    // prefilter decision; the exe metric comes last. Inside the span nothing runs.
+    // Two copies of the probe (FUN_0805a790): the job's, which the analysis
+    // rewrites and whose bytes_done the driver advances, and the codec's, which
+    // the prefilter encoder edits (its alignment carry). The codec's copy is
+    // REPLACED by the job's before every block, so those edits only survive into
+    // the first block of a chunk (where the job's copy is refreshed from it): a
+    // WAV's 44 header bytes come back as the "prefix" of every later block.
+    if (first_in_chunk) st.probe = st.probe_ctx;
+    std::uint32_t score = 0;
+    bool audio_decision = false;
+    std::uint32_t exe_metric = 0;
+    if (st.probe.audio_end <= st.probe.bytes_done) {
+        score = Score(src, static_cast<std::uint32_t>(len));
+        AudioProbeBlock(st.probe, src, static_cast<std::uint32_t>(len));
+        if (st.probe.audio_end <= st.probe.bytes_done) {
+            bool skip_exe = false;
+            if (st.probe.conf != 0u && 0x32u < score && st.probe.conf < score && 0x800u < len) {
+                audio_decision = AudioDecide(st.probe, src, 0x400u);
+                if (st.probe.bytes_done < st.probe.audio_end) skip_exe = true;
+            }
+            if (!skip_exe) {
+                const std::uint32_t m = static_cast<std::uint32_t>(len < 0x2000u ? len : 0x2000u);
+                exe_metric = ExeMetric(src, m) / ((m >> 12u) + 1u);
+            }
+        }
+    }
+    st.probe_ctx = st.probe;
+    st.probe.bytes_done += static_cast<std::uint32_t>(len);
     const std::size_t out_start = out.size();
     const auto literal = [&](std::uint32_t flags) {
         WriteBlockHeader(out, static_cast<std::uint32_t>(len), flags, 0u);
         out.insert(out.end(), block, block + len);
     };
+    // the prefilter block (FUN_0805a790's LAB_0805a97b, audio flavour): a literal
+    // with flags 0 when the encoder declines; sparse backfill either way, and the
+    // models are NOT reset after a prefilter block
+    const auto audio_block = [&]() {
+        std::vector<std::uint8_t> hdr;
+        WriteBlockHeader(hdr, static_cast<std::uint32_t>(len), 4u, 0u);
+        std::vector<std::uint8_t> payload;
+        const std::size_t got = AudioEncodeBlock(st.audio, block, static_cast<std::uint32_t>(len), st.probe_ctx, payload, (align + hdr.size()) & 3u);
+        if (got == 0u) {
+            literal(0u);
+            st.BackfillSparse(len);
+            st.audio.ResetAll();
+        } else {
+            out.insert(out.end(), hdr.begin(), hdr.end());
+            out.insert(out.end(), payload.begin(), payload.end());
+            st.BackfillSparse(len);
+        }
+        st.literal_bytes += len;
+        st.exe_pos += len;
+        st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
+    };
+    if (std::getenv("NZ_TRACE_LZPFENC")) {
+        const AudioProbe& q = st.probe;
+        std::fprintf(stderr, "[lzpfenc] len=%zu score=%u probe{s=%u le=%u w=%u ch=%u pfx=%u hdr=%u code=%x conf=%u lz=%u pf=%u done=%u end=%u} dec=%d exe=%u\n",
+                     len, score, q.signed_, q.le, q.width, q.chans, q.prefix, q.hdr, q.code, q.conf, q.lz_cost, q.pf_cost, q.bytes_done, q.audio_end, (int)audio_decision, exe_metric);
+    }
+    if (st.probe_ctx.bytes_done < st.probe_ctx.audio_end) { audio_block(); return; }
+    std::uint32_t flags58 = 0u;
+    if (st.probe_ctx.conf != 0u) {
+        if (score < 0x33u || score <= st.probe_ctx.conf) flags58 = 0u;
+        else if (0x800u < len && (!st.variant_b || LzCostEstimate(st, block, 0x400u) * 4u > 0xc00u)) flags58 = audio_decision ? 4u : 0u;
+    }
     // random data: no parse at all when the first 256 bytes would not shrink
     if (score > 0xe8u) {
         const std::uint32_t n = static_cast<std::uint32_t>(len < 0x100u ? len : 0x100u);
@@ -896,17 +904,16 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
             st.BackfillSparse(len);
             st.literal_bytes += len;
             st.exe_pos += len;
+            st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
+            st.audio.ResetAll();
             return;
         }
     }
-    // the exe metric of the analysis job: repeated call targets in the first 8 KB
-    std::uint32_t flags58 = 0u;
-    {
-        const std::uint32_t m = static_cast<std::uint32_t>(len < 0x2000u ? len : 0x2000u);
-        if (ExeMetric(src, m) / ((m >> 12u) + 1u) != 0u) {
-            flags58 = 4u;
-            ExeFilterForward(block, static_cast<std::uint32_t>(len), st.exe_pos);
-        }
+    if (flags58 == 4u) { audio_block(); return; }
+    // the exe metric: repeated call targets in the first 8 KB
+    if (exe_metric != 0u) {
+        flags58 = 4u;
+        ExeFilterForward(block, static_cast<std::uint32_t>(len), st.exe_pos);
     }
     std::vector<std::uint8_t> bc;
     LzParse(st, static_cast<std::size_t>(block - st.window), len, bc);
@@ -944,6 +951,8 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
     (void)out_start;
     st.literal_bytes += len;
     st.exe_pos += len;
+    st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
+    st.audio.ResetAll();   // FUN_080b6b60 after every non-prefilter block
 }
 
 }  // namespace nzr::lzpf_enc
