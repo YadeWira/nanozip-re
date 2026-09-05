@@ -248,8 +248,12 @@ std::uint32_t EmitPredictorSymbol(std::uint8_t* ctx_table, std::uint32_t ctx, st
 // This path shipped with no instrumentation at all, which is what made its
 // cross-chunk state bugs expensive to find.
 namespace {
-int g_call_index = -1;
-long g_trace_want = -2;
+// Per thread: the parallel workers each run their own stream through here, and
+// a shared counter was a data race (TSan, pf_D_D). Dump names are per thread too.
+thread_local int g_call_index = -1;
+// Per thread as well: the lazy env-var cache was written by whichever worker got
+// there first while the others read it (TSan, pf_D_D).
+thread_local long g_trace_want = -2;
 // Called per decoded symbol: the common case must be one predictable branch on
 // a resolved flag (the out-of-line version with its lazy init was 4 % of a -cD
 // decode).
