@@ -132,6 +132,9 @@ public:
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
 
+    // Cold-start the adaptive model again, keeping the window (see the -co sibling).
+    void ResetModel();
+
     // The ring's capacity. param15's absolute offsets are ring positions, so the
     // post-filter needs it to map one back to the accumulated stream.
     std::uint32_t WindowCapacity() const;

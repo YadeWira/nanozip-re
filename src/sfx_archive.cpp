@@ -7959,19 +7959,27 @@ static bool DecodeOptimumBlockSequence(
     const std::size_t stream_end = blocks_end;
     bool ok = true;
 
+    const bool trace_blocks = NZ_ENV("NZOPT_TRACE_TDO") != nullptr;
     while (pos < stream_end) {
-        if (pos + 4u > stream_end) { ok = false; break; }
+        if (pos + 4u > stream_end) {
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: no room for a block header at %zu of %zu (out=%zu)\n", pos, stream_end, out_data->size());
+            if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
+        }
         const std::uint32_t payload_size =
             static_cast<std::uint32_t>(raw[pos]) |
             (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
             (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
             (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
         pos += 4u;
-        if (payload_size > stream_end - pos) { ok = false; break; }
+        if (trace_blocks) fprintf(stderr, "[TDO] block at %zu payload_size=%u remaining=%zu out=%zu\n", pos - 4u, payload_size, stream_end - pos, out_data->size());
+        if (payload_size > stream_end - pos) {
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: payload %u runs past the stream (%zu left)\n", payload_size, stream_end - pos);
+            if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
+        }
         const std::uint8_t* payload = raw + pos;
         pos += payload_size;
 
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t decr_param = raw[pos++];
 
         // decr_param 2 (audio) and 3 use a TRUNCATED header that stops right
@@ -7985,10 +7993,10 @@ static bool DecodeOptimumBlockSequence(
             nz_trace::Construct("audio_image_block decr=%u", decr_param);
             std::uint8_t mode2_type = 0;
             if (decr_param == 2u) {
-                if (pos >= stream_end) { ok = false; break; }
+                if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 mode2_type = raw[pos++];
             }
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             const std::uint32_t audio_out_size =
                 static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
@@ -8000,7 +8008,7 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
             }
             if (audio_out_size == 0u) continue;
-            if (audio_out_size > total_size_hint - out_data->size()) { nzr::derr::SetAt(14u, pos); ok = false; break; }
+            if (audio_out_size > total_size_hint - out_data->size()) { nzr::derr::SetAt(14u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             if (decr_param == 3u) {
                 // Image block (FUN_080a9ca0 on the codec's image object; the
                 // community reference wrongly treats this shape as CM-only and
@@ -8013,7 +8021,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
                             payload_size, audio_out_size, iused);
                 }
-                if (iused == 0u) { nzr::derr::SetAt(2u, pos); ok = false; break; }
+                if (iused == 0u) { nzr::derr::SetAt(2u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 out_data->insert(out_data->end(), ibuf.begin(), ibuf.end());
                 progress::Add(ibuf.size());
                 continue;
@@ -8032,7 +8040,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] audio Decode(payload_size=%u out_size=%u) -> %d\n",
                         payload_size, audio_out_size, aok ? 1 : 0);
             }
-            if (!aok) { nzr::derr::SetAt(16u, pos); ok = false; break; }
+            if (!aok) { nzr::derr::SetAt(16u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             out_data->insert(out_data->end(), abuf.begin(), abuf.end());
                 progress::Add(abuf.size());
             continue;
@@ -8042,20 +8050,20 @@ static bool DecodeOptimumBlockSequence(
         // decr_param == 2 branch), so its state never carries across one.
         audio.Reset();
 
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t param6 = raw[pos++];
         std::uint32_t out_size = 0;
         if (param6) {
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             out_size = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
         }
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t staged_count = raw[pos++];
-        if (pos + staged_count > stream_end) { ok = false; break; }
+        if (pos + staged_count > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
         pos += staged_count;
         static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
@@ -8110,21 +8118,21 @@ static bool DecodeOptimumBlockSequence(
         };
         if (decr_param == 0u) {
             if (param6) {
-                if (pos >= stream_end) { ok = false; break; }
+                if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 bwt_param7 = raw[pos++];
             }
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             bwt_start_pos = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (pos >= stream_end) { ok = false; break; }
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             param14_flag = raw[pos++];
-            if (param14_flag && !read_u32vec(param14_data)) { ok = false; break; }
-            if (pos >= stream_end) { ok = false; break; }
+            if (param14_flag && !read_u32vec(param14_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             param15_flag = raw[pos++];
-            if (param15_flag && !read_u32vec(param15_data)) { ok = false; break; }
+            if (param15_flag && !read_u32vec(param15_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] BWT hdr: param7=%u bwt_start_pos=%u param14=%u (%zu bytes) param15=%u (%zu bytes) pos=%zu\n",
                         bwt_param7, bwt_start_pos, param14_flag, param14_data.size(),
@@ -8132,42 +8140,42 @@ static bool DecodeOptimumBlockSequence(
             }
         }
 
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t param2_flag = raw[pos++];
         std::vector<std::uint8_t> param2_data;
         if (param2_flag) {
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (pos + vlen > stream_end) { ok = false; break; }
+            if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             param2_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t param1_flag = raw[pos++];
         std::vector<std::uint8_t> param1_data;
         if (param1_flag) {
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (pos + vlen > stream_end) { ok = false; break; }
+            if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             param1_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
-        if (pos + 1u > stream_end) { ok = false; break; }
+        if (pos + 1u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         pos++;  // param16
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t tt_enabled = raw[pos++];
         std::uint8_t tt_flags = 0;
         std::vector<std::uint8_t> tt16_data, tt2_data;
         if (tt_enabled) {
-            if (pos >= stream_end) { ok = false; break; }
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tt_flags = raw[pos++];
             auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
                 if (pos >= stream_end) return false;
@@ -8180,24 +8188,24 @@ static bool DecodeOptimumBlockSequence(
                 if (pos + n > stream_end) return false;
                 dst.assign(raw + pos, raw + pos + n); pos += n; return true;
             };
-            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
-            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
+            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         }
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u tt16_data.size=%zu pos=%zu stream_end=%zu\n",
                     param2_flag, param1_flag, tt_enabled, tt_flags, tt16_data.size(), pos, stream_end);
         }
-        if (pos >= stream_end) { ok = false; break; }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         std::vector<std::uint8_t> dece_data;
         const std::uint8_t dece_param = raw[pos++];
         if (dece_param) {
-            if (pos + 4u > stream_end) { ok = false; break; }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
                 (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
                 (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
                 (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
             pos += 4u;
-            if (vlen > stream_end - pos) { ok = false; break; }
+            if (vlen > stream_end - pos) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             dece_data.assign(raw + pos, raw + pos + vlen);
             pos += vlen;
         }
@@ -8253,7 +8261,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] BWT DecodeInput(payload_size=%u out_size=%u) -> %d\n",
                             payload_size, out_size, bdi_ok ? 1 : 0);
                 }
-                if (!bdi_ok) { nzr::derr::SetAt(fail_code(3u), pos); ok = false; break; }
+                if (!bdi_ok) { nzr::derr::SetAt(fail_code(3u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 cur_size = out_size;
                 stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
             }
@@ -8262,7 +8270,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
                         cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
             }
-            if (!bwt_ok) { nzr::derr::SetAt(fail_code(103u), pos); ok = false; break; }
+            if (!bwt_ok) { nzr::derr::SetAt(fail_code(103u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             stgmark("bwt", work.data(), cur_size);
 
             // params 14/15 run here: after the inverse BWT, before the shared
@@ -8283,7 +8291,7 @@ static bool DecodeOptimumBlockSequence(
                     fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
                             param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
                 }
-                if (!p14ok || n14 == 0u) { nzr::derr::SetAt(fail_code(5u), pos); ok = false; break; }
+                if (!p14ok || n14 == 0u) { nzr::derr::SetAt(fail_code(5u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 t14.resize(n14); work.swap(t14); cur_size = n14;
                 stgmark("p14", work.data(), cur_size);
             }
@@ -8328,7 +8336,7 @@ static bool DecodeOptimumBlockSequence(
                     std::fprintf(stderr, "[P15] call=%u model=%zu in=%u window=%zu out=%u out_at=%zu ok=%d\n",
                                  call_no, param15_data.size(), cur_size, prev, n15, out_data->size(), (int)p15ok);
                 }
-                if (!p15ok || n15 == 0u) { ok = false; break; }
+                if (!p15ok || n15 == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 t15.resize(n15); work.swap(t15); cur_size = n15;
                 stgmark("p15", work.data(), cur_size);
             }
@@ -8357,6 +8365,19 @@ static bool DecodeOptimumBlockSequence(
                 work.assign(payload, payload + payload_size);
                 cur_size = payload_size;
                 dec.FeedWindow(work.data(), cur_size);
+                // ...and the adaptive model starts cold again. A stored block is
+                // the compressor giving up on a block, and it takes its model
+                // with it: the NEXT LZ block of the stream decodes from a cold
+                // state, not from what the previous LZ block adapted.
+                // Measured on a 130 MB .cab as `-co -p16`: stream 10 is the only
+                // one of the sixteen with a stored block BETWEEN two LZ blocks,
+                // and its second LZ block decoded garbage from its very first
+                // byte while its ring content was byte-exact -- so the only
+                // state left to differ was the model. With this, the whole
+                // archive is byte-exact. Intervening BWT blocks do NOT reset it
+                // (streams 1, 6, 7 and 12 have LZ blocks after two or three of
+                // them and decode correctly with the model carried across).
+                dec.ResetModel();
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] stored LZ block: payload_size=%u (param6=0, no size18)\n",
                             payload_size);
@@ -8372,8 +8393,13 @@ static bool DecodeOptimumBlockSequence(
                 if (const char* bp = NZ_ENV("NZOPT_DUMP_FAILBLOCK")) {
                     FILE* bf = fopen(bp, "wb");
                     if (bf) { fwrite(work.data(), 1, out_size, bf); fclose(bf); }
-                    fprintf(stderr, "[TDO] dumped failing block (%u bytes, out_data so far %zu) to %s\n",
-                            out_size, out_data->size(), bp);
+                    // ...and the INPUT that produced it, so the block can be
+                    // replayed on its own instead of decoding the archive again.
+                    const std::string ip = std::string(bp) + ".in";
+                    FILE* inf = fopen(ip.c_str(), "wb");
+                    if (inf) { fwrite(payload, 1, payload_size, inf); fclose(inf); }
+                    fprintf(stderr, "[TDO] dumped failing block (%u bytes, out_data so far %zu) to %s, payload (%u bytes, out_size=%u) to %s\n",
+                            out_size, out_data->size(), bp, payload_size, out_size, ip.c_str());
                 }
             }
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -8381,7 +8407,7 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, out_size, decode_block_ok ? 1 : 0);
             }
             if (!decode_block_ok) {
-                ok = false; break;
+                if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
             }
             cur_size = out_size;
             stgmark("lz", work.data(), cur_size);
@@ -8402,7 +8428,7 @@ static bool DecodeOptimumBlockSequence(
             if (!NzBwtRleDecodeU32(param2_data.data(),
                                    static_cast<std::uint32_t>(param2_data.size()),
                                    work.data(), cur_size, exp.data(), &esz)
-                || esz == 0u) { ok = false; break; }
+                || esz == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             exp.resize(esz); work.swap(exp); cur_size = esz;
             stgmark("p2", work.data(), cur_size);
         }
@@ -8419,7 +8445,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] param1: data.size=%zu cur_size=%u -> %d\n",
                         param1_data.size(), cur_size, p1ok ? 1 : 0);
             }
-            if (!p1ok) { ok = false; break; }
+            if (!p1ok) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             work.swap(tbuf);
             // cur_size unchanged
             stgmark("p1", work.data(), cur_size);
@@ -8446,13 +8472,13 @@ static bool DecodeOptimumBlockSequence(
         // sweep tt never had bit 0x80 set (the largest value seen is 0x43) while
         // p14 was set 1 272 times. So this decline covers a bit the encoder
         // expresses elsewhere, not a gap in the port.
-        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
                 tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
                 work.data(), cur_size, tbuf.data(), remaining + (1u << 16));
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x08u)) {
@@ -8476,7 +8502,7 @@ static bool DecodeOptimumBlockSequence(
             // headroom past the logical output size).
             std::vector<std::uint8_t> tbuf(remaining + 16u);
             const std::uint32_t n = NzTextTransformDict(work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x04u)) {
@@ -8484,7 +8510,7 @@ static bool DecodeOptimumBlockSequence(
             // order puts 0x04 after the 0x08 dictionary and before 0x02.
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x02u)) {
@@ -8497,7 +8523,7 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformInsertLf(
                 tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
                 work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x20u)) {
@@ -8508,7 +8534,7 @@ static bool DecodeOptimumBlockSequence(
             // literal payload didn't warrant the word dictionary).
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled && (tt_flags & 0x40u)) {
@@ -8517,7 +8543,7 @@ static bool DecodeOptimumBlockSequence(
             // is assert(0)); decoded from (input, output) pairs plus the binary.
             std::vector<std::uint8_t> tbuf(remaining);
             const std::uint32_t n = NzTextTransform6(work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
             cur_size = n;
@@ -8529,7 +8555,7 @@ static bool DecodeOptimumBlockSequence(
             // overrun (see NzTextTransformCrToCrLf's header comment).
             std::vector<std::uint8_t> tbuf(static_cast<std::size_t>(remaining) + 1u);
             const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
-            if (n == 0) { ok = false; break; }
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         }
         if (tt_enabled) stgmark("tt", work.data(), cur_size);
@@ -8548,7 +8574,7 @@ static bool DecodeOptimumBlockSequence(
                 fprintf(stderr, "[TDO] dece: param=%u data=%zu in=%u -> %d out=%u\n",
                         dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
             }
-            if (!dok || n == 0u) { ok = false; break; }
+            if (!dok || n == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
         } else {
             // No dece on this block: it breaks any run in progress.
@@ -8562,7 +8588,7 @@ static bool DecodeOptimumBlockSequence(
                     tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, dece_param, hx.c_str(), stg.c_str(),
                     stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
         }
-        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); ok = false; break; }
+        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
         progress::Add(cur_size);
         nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
@@ -8574,6 +8600,8 @@ static bool DecodeOptimumBlockSequence(
     }
 
     if (ok) pscope.Commit();
+    if (trace_blocks) fprintf(stderr, "[TDO] loop end: ok=%d pos=%zu stream_end=%zu out=%zu want=%llu\n",
+                              (int)ok, pos, stream_end, out_data->size(), (unsigned long long)total_size_hint);
     return ok;
 }
 

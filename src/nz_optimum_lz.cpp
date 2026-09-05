@@ -254,6 +254,15 @@ NzOptimumLzDecoder::NzOptimumLzDecoder(std::uint32_t window_capacity) {
     ring_.scrolled_once = false;
 }
 
+void NzOptimumLzDecoder::ResetModel() {
+    mem_ = OptimumColdState();
+    mem_.resize(kTotalMemSize, 0);
+    for (std::size_t i = 0; i < kAlignTableSize; i += 2) {
+        mem_[kAlignTableOff + i] = 0x00;
+        mem_[kAlignTableOff + i + 1] = 0x80;
+    }
+}
+
 std::uint32_t NzOptimumLzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
     std::uint32_t cap = capacity;
     std::uint32_t cur = cursor;
@@ -294,6 +303,9 @@ std::uint32_t NzOptimumLzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
 bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_len,
                                       std::uint8_t* out, std::uint32_t out_size) {
     if (out_size == 0) return true;
+    if (O1_DBG_ENV("NZOPT_DEBUG"))
+        fprintf(stderr, "ENTER DecodeBlock in_len=%u out_size=%u cursor=%u capacity=%u\n",
+                in_len, out_size, ring_.cursor, ring_.capacity);
 
     RangeDecoder rc;
     rc.Init(in, in_len);
@@ -744,7 +756,10 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
                         // stream stays inside the length table, far below this
                         // bound, so declining here cannot reject anything the
                         // original would have decoded.
-                        if (coff < 0 || static_cast<std::size_t>(coff) + 2u > mem_.size()) return false;
+                        if (coff < 0 || static_cast<std::size_t>(coff) + 2u > mem_.size()) {
+                            if (O1_DBG_ENV("NZOPT_DEBUG")) fprintf(stderr, "FAIL@coff: coff=%lld mem=%zu raw=%u local_74=%u local_54=%u\n", (long long)coff, mem_.size(), raw, local_74, local_54);
+                            return false;
+                        }
                         b = DecodeAdaptiveKS(rc, mem, coff, 0x10u, 5u);
                         raw += 1;
                     } while (b != 0);
@@ -883,6 +898,11 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
                     if (ring_.capacity <= acc) {
                         if (O1_DBG_ENV("NZOPT_DEBUG")) fprintf(stderr, "FAIL@distance: local_74=%u local_54=%u acc=%u capacity=%u slot=%u\n", local_74, local_54, acc, ring_.capacity, slot);
+                        if (const char* rp = O1_DBG_ENV("NZOPT_DUMP_RING")) {
+                            FILE* rf = fopen(rp, "wb");
+                            if (rf) { fwrite(base, 1, local_54, rf); fclose(rf); }
+                            fprintf(stderr, "dumped ring [0,%u) to %s\n", local_54, rp);
+                        }
                         failed = true; break;
                     }
                     rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = acc;
@@ -954,6 +974,8 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
         ring_.cursor = local_50;
     }
 
+    if (local_74 != out_size && O1_DBG_ENV("NZOPT_DEBUG"))
+        fprintf(stderr, "FAIL@short: local_74=%u out_size=%u\n", local_74, out_size);
     return local_74 == out_size;
 }
 
@@ -961,6 +983,8 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 std::uint32_t NzOptimumLzDecoder::WindowCapacity() const { return ring_.capacity; }
 
 void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
+    if (O1_DBG_ENV("NZOPT_DEBUG"))
+        fprintf(stderr, "FEED len=%u cursor_before=%u capacity=%u\n", len, ring_.cursor, ring_.capacity);
     // Transcription of the compact engine's ring-feed (entry around 0x080bcc60),
     // which pushes bytes that did NOT come out of the LZ engine (stored blocks,
     // post-filter output) through the same window later matches read from. It is

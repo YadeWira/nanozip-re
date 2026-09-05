@@ -108,6 +108,13 @@ public:
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
 
+    // Cold-start the adaptive model again, keeping the window. The original
+    // does this after a STORED LZ block (decr_param=1, param6=0): the next LZ
+    // block of the stream decodes from a cold model. Measured on a 130 MB
+    // `-co -p16` archive whose one stream with a stored block between two LZ
+    // blocks decoded garbage from byte 0 with a byte-exact ring.
+    void ResetModel();
+
     // The ring's capacity. param15's absolute offsets are ring positions, so the
     // post-filter needs it to map one back to the accumulated stream.
     std::uint32_t WindowCapacity() const;

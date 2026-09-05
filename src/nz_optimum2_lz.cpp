@@ -339,6 +339,15 @@ NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
     ring_.scrolled_once = false;
 }
 
+void NzOptimum2LzDecoder::ResetModel() {
+    mem_ = Optimum2ColdState();
+    mem_.resize(kTotalMemSize, 0);
+    for (std::size_t i = 0; i < kTier2AlignSize; i += 2) {
+        mem_[static_cast<std::size_t>(kTier2AlignOff) + i] = 0x00;
+        mem_[static_cast<std::size_t>(kTier2AlignOff) + i + 1] = 0x80;
+    }
+}
+
 std::uint32_t NzOptimum2LzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
     std::uint32_t cap = capacity;
     std::uint32_t cur = cursor;
