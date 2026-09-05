@@ -1360,6 +1360,9 @@ struct LegacyCnContext {
     // "Compressor #k"; an archive cut before its first data record never gets
     // one. Measured on m_<codec>.nz cut byte by byte around that record.
     bool saw_data_record = true;
+    // The archive is cut inside its first data record: the report is the
+    // family's short-end status (see the parser), not the decoder's own.
+    bool cut_first_data_record = false;
     // The original's status for the failure (ERROR_CODES.md): printed plain when
     // a record follows the failing one, as code<<8|slot when it was the last.
     std::uint32_t decode_code = 0;
@@ -1422,7 +1425,11 @@ int PrintCorruptLine(std::ostream& os, const LegacyCnContext& c) {
     ClearStatusLine(os);
     if (c.decode_eof || c.eof_before_decode) { os << "Archive corrupted. Unexpected end of file.\n"; return 2; }
     std::uint32_t code;
-    if (c.decode_code == 0u) code = c.truncated_input ? 25600u : 100u;
+    if (c.cut_first_data_record && c.legacy_method == 0x2bu &&
+        (c.legacy_method_p0 == 1u || c.legacy_method_p0 == 2u)) code = 2u << 8;        // lzpf
+    else if (c.cut_first_data_record && c.legacy_method == 0x2bu &&
+             (c.legacy_method_p0 == 3u || c.legacy_method_p0 == 4u)) code = 4u << 8;   // -cd/-cD
+    else if (c.decode_code == 0u) code = c.truncated_input ? 25600u : 100u;
     else code = c.decode_at_last_record ? ((c.decode_code << 8) | static_cast<std::uint32_t>(c.decode_slot & 0xffu)) : c.decode_code;
     os << "Archive corrupted. Error decoding (code " << code << ")\n";
     return 2;
@@ -4416,6 +4423,7 @@ bool TryParseLegacyCnArchive(
     bool eof_before_decode = false;
     // A data record whose header is complete (its payload may be cut off).
     bool saw_data_record = false;
+    bool cut_first_data_record = false;
 
     // No record-count cap: a 2.29 GB -cf container carries 16 streams x ~144 records
     // (2300+), and an earlier cap of 1024 made the walker stop half-way, so the
@@ -4473,6 +4481,14 @@ bool TryParseLegacyCnArchive(
             // the lzhds assertion -- come from decoding that stub), so keep it.
             if (ctype == 0u && cstream == 0u && found_codec && pos < bytes.size())
                 data_records.push_back({record_begin, bytes.size()});
+            // A cut inside the FIRST data record: whatever the decoder makes of
+            // the stub, the original reports its family's short-end status --
+            // 4 for -cd/-cD, 2 for -cf/-cF, 100 for the CM family -- shifted,
+            // since it is the last record. Measured byte by byte and at 15
+            // points across the first record of m_<codec>.nz, all eight codecs:
+            // constant there, garbage-dependent beyond it. (Dropping the stub
+            // instead, as the parallel workers do, was tried: it matches less.)
+            if (cut_in_data && !found_first_data) cut_first_data_record = true;
             // A filename table cut off by the end of the file: the original
             // reads the names that fit and then reports the truncation the way
             // it reports any other one ("Archive corrupted. Unexpected end of
@@ -6844,6 +6860,7 @@ bool TryParseLegacyCnArchive(
     ctx.truncated_input = truncated_input;
     ctx.eof_before_decode = eof_before_decode;
     ctx.saw_data_record = saw_data_record || has_parallel_streams;
+    ctx.cut_first_data_record = cut_first_data_record;
     {
         std::size_t acc = 0;
         for (const auto& dr : data_records) { acc += dr.second - dr.first; ctx.payload_record_ends.push_back(acc); }
