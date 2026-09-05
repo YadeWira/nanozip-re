@@ -2804,7 +2804,7 @@ bool AssembleParallelMultiFile(
     std::map<std::string, std::uint64_t> base;
     std::uint64_t acc = 0;
     for (const LegacyCnEntry& e : entries) {
-        if (!base.emplace(e.path, acc).second) return false;  // duplicate path
+        if (!base.emplace(e.path, acc).second) return false;
         acc += e.size;
     }
     if (acc != total) return false;
@@ -2953,7 +2953,9 @@ bool TryAssembleParallelStore(
         for (const auto& kv : streams) {
             const LegacyParallelStream& st = kv.second;
             if (st.chunks.empty() && !st.cut) continue;
-            if (!st.hasoff || !st.hassz || st.ooff > total_size || st.osz > total_size - st.ooff) return false;
+            // A worker that holds the WHOLE file writes no offset record (only
+            // slices get one): `-p2 tiny` is one stream with the file, one empty.
+            if (!st.hassz || (st.hasoff && st.ooff > total_size) || st.osz > total_size - (st.hasoff ? st.ooff : 0u)) return false;
             psink::Stream ps; psink::Slice sl;
             sl.entry = 0u; sl.file_off = st.ooff; sl.len = st.osz; sl.cmode = st.cmode; sl.cval = st.cval;
             sl.has_cksum = (st.cmode != ChecksumMode::kNone); sl.group = 0u;
@@ -2985,12 +2987,13 @@ bool TryAssembleParallelStore(
     for (const auto& kv : streams) {
         const LegacyParallelStream& st = kv.second;
         if (st.chunks.empty()) continue;
-        if (!st.hasoff || !st.hassz || st.cmode == ChecksumMode::kNone) {
+        if (!st.hassz || st.cmode == ChecksumMode::kNone) {
             if (NZ_ENV("NZ_TRACE_PARSTREAM"))
                 std::fprintf(stderr, "[PAR] store: stream %u missing off/sz/cksum\n", kv.first);
             return false;
         }
-        if (st.ooff > total_size || st.osz > total_size - st.ooff) return false;
+        if (st.hasoff && st.ooff > total_size) return false;
+        if (st.osz > total_size - (st.hasoff ? st.ooff : 0u)) return false;
 
         std::vector<unsigned char> slice;
         slice.reserve(static_cast<std::size_t>(st.osz));
@@ -4543,7 +4546,13 @@ bool TryParseLegacyCnArchive(
 
         // Codec params: type 11, main stream.  Payload: [p0] [p1] [extras...].
         // method byte = (csize<<4)|11 = 0x2b (lzpf/lzhd), 0x3b (optimum), 0x4b (cm).
-        if (!found_codec && ctype == 11u && is_main && csize >= 1u) {
+        // Any stream's codec record will do: every worker of a parallel container
+        // writes the same parameters, and with -t1 the original emits the LAST
+        // worker's records first and stream 0's last -- so waiting for stream 0's
+        // record dropped every table and attribute record written before it (a
+        // sliced -cn -p3 archive was rejected as "Data corrupted while reading
+        // headers!" because only stream 0's files were counted).
+        if (!found_codec && ctype == 11u && csize >= 1u) {
             method    = static_cast<unsigned char>((csize << 4u) | 11u);
             method_p0 = bytes[pos];
             method_p1 = (csize >= 2u) ? bytes[pos + 1u] : 0u;
@@ -10536,84 +10545,289 @@ void LegacyEmitBlockMetadata(std::ostream& out, unsigned stream, const std::vect
     }
 }
 
-// `a -cn`: the store container, single stream (the original goes parallel
-// above 8 MB of input; that is the next milestone).
+// One worker stream of the store container: the global bytes [begin, end) as
+// its own record run (kind, codec, then per block: table / mtimes / perms /
+// owners of the files that start, checksums of the files that end, data).
+// A file only partly inside the range is a SLICE: listed with the slice's size,
+// PREPENDED to the stream's entry list (whole files are appended, in order),
+// followed by a type-10 record with the slice's offset inside its file, and
+// checksummed as a slice. Measured on the original with -pN -t1 (the only
+// deterministic thread count): FUN_0804f0a0's emitters over the reader's
+// per-worker entry list (FUN_0804f260).
+struct LegacyStreamPiece {           // one entry of a worker's list
+    std::size_t src = 0;             // index into the sorted sources
+    std::uint64_t file_off = 0;      // where this piece starts inside the file
+    std::uint64_t len = 0;
+    bool slice = false;              // partial file: OFF record, flag 0x10
+};
+
+void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
+                             const std::vector<LegacyStreamPiece>& pieces, const std::vector<std::uint32_t>& piece_ck,
+                             std::size_t from, std::size_t to, std::size_t ck_from, std::size_t ck_to,
+                             ChecksumMode ckmode, const CliOptions& options) {
+    struct VecStream { std::vector<unsigned char>& v; } vs{out};
+    auto rec = [&](unsigned type, const unsigned char* d, std::size_t n) {
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, type, stream, n);
+        out.insert(out.end(), hdr.begin(), hdr.end()); if (n) out.insert(out.end(), d, d + n);
+    };
+    struct Buf { unsigned type; std::vector<unsigned char> b; };
+    auto flush = [&](Buf& bf) { if (!bf.b.empty()) { rec(bf.type, bf.b.data(), bf.b.size()); bf.b.clear(); } };
+    auto need = [&](Buf& bf, std::size_t n) { if (0x8000u - bf.b.size() < n) flush(bf); };
+    if (from < to) {
+        Buf table{1u, {}};
+        for (std::size_t i = from; i < to; ++i) {
+            const EncodeSource& e = src[pieces[i].src];
+            std::vector<unsigned char> item;
+            WriteLegacyVarint(pieces[i].len, &item);
+            item.insert(item.end(), e.archive_name.begin(), e.archive_name.end());
+            item.push_back(0u);
+            need(table, item.size()); table.b.insert(table.b.end(), item.begin(), item.end());
+            if (pieces[i].slice) {
+                // a slice ends the table record and gets its offset record at once
+                flush(table);
+                unsigned char off[8]; const std::uint64_t o = pieces[i].file_off;
+                for (unsigned k = 0; k < 8u; ++k) off[k] = static_cast<unsigned char>(o >> (8u * k));
+                rec(10u, off, 8u);
+            }
+        }
+        flush(table);
+        if (!options.no_timestamps) {
+            Buf mt{2u, {}};
+            const long off = LegacyLocalUtcOffsetSeconds();
+            std::uint32_t prev = static_cast<std::uint32_t>(src[pieces[from].src].mtime - off);
+            unsigned char b4[4] = {static_cast<unsigned char>(prev), static_cast<unsigned char>(prev >> 8), static_cast<unsigned char>(prev >> 16), static_cast<unsigned char>(prev >> 24)};
+            mt.b.insert(mt.b.end(), b4, b4 + 4);
+            for (std::size_t i = from + 1u; i < to; ++i) {
+                const std::uint32_t cur = static_cast<std::uint32_t>(src[pieces[i].src].mtime - off);
+                const std::int32_t d = static_cast<std::int32_t>(cur - prev);
+                const std::uint32_t zz = (static_cast<std::uint32_t>(d) << 1u) ^ static_cast<std::uint32_t>(d >> 31);
+                std::vector<unsigned char> v; WriteLegacyVarint(zz, &v);
+                need(mt, v.size()); mt.b.insert(mt.b.end(), v.begin(), v.end());
+                prev = cur;
+            }
+            flush(mt);
+        }
+        if (!options.no_permissions) {
+            bool all_default = true;
+            for (std::size_t i = from; i < to; ++i) if ((src[pieces[i].src].mode & 0xfffu) != 0x180u) { all_default = false; break; }
+            if (!all_default) {
+                Buf pm{4u, {}};
+                std::size_t i = from;
+                while (i < to) {
+                    const std::uint32_t m = src[pieces[i].src].mode & 0xfffu;
+                    std::size_t run = 1u;
+                    if (m < 0x200u)
+                        while (i + run < to && (src[pieces[i + run].src].mode & 0xfffu) == m && (0x1000u + 0x200u * (run - 1u) + m) <= 0xfdffu) ++run;
+                    const std::uint32_t v = (run == 1u) ? m : (0x1000u + 0x200u * (run - 2u) + m);
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    need(pm, 2u); pm.b.insert(pm.b.end(), b2, b2 + 2);
+                    i += run;
+                }
+                flush(pm);
+            }
+        }
+        if (options.restore_ownership) {
+            for (unsigned t = 8u; t <= 9u; ++t) {
+                Buf ow{t, {}};
+                for (std::size_t i = from; i < to; ++i) {
+                    const EncodeSource& e = src[pieces[i].src];
+                    const std::uint16_t v = (t == 8u) ? e.uid : e.gid;
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    ow.b.insert(ow.b.end(), b2, b2 + 2); need(ow, 2u);
+                }
+                flush(ow);
+            }
+        }
+    }
+    if (ck_from < ck_to && ckmode != ChecksumMode::kNone) {
+        const unsigned type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        const std::size_t width = (ckmode == ChecksumMode::kCrc16) ? 2u : 4u;
+        Buf ck{type, {}};
+        for (std::size_t i = ck_from; i < ck_to; ++i) {
+            const std::uint32_t c = piece_ck[i];
+            unsigned char b4[4] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 24)};
+            need(ck, width); ck.b.insert(ck.b.end(), b4, b4 + width);
+        }
+        flush(ck);
+    }
+    (void)vs;
+}
+
+// Writes one worker stream's whole record run into `out`: the global bytes
+// [begin, end) of the concatenated sources, in blocks of `window`.
+bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
+                            const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
+                            std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
+                            bool with_header, bool last_stream, std::ostream& os, bool* progress_shown) {
+    if (with_header) {
+        std::vector<unsigned char> hdr;
+        if (ckmode != ChecksumMode::kNone) {
+            const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+            WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
+        }
+        const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
+        const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec, codec + 2);
+        out.insert(out.end(), hdr.begin(), hdr.end());
+    }
+    // The pieces of this range, in the order the reader meets them, then the
+    // original's list order: slices prepended, whole files appended.
+    std::vector<LegacyStreamPiece> met;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const std::uint64_t fb = start[i], fe = start[i] + src[i].size;
+        // A 0-byte file at the very end of the stream (offset == total) is still
+        // this stream's: the reader passes it when it runs out of bytes.
+        if (src[i].size == 0u) { if (fb >= begin && (fb < end || (last_stream && fb == end))) met.push_back({i, 0u, 0u, false}); continue; }
+        if (fe <= begin || fb >= end) continue;
+        const std::uint64_t pb = std::max(fb, begin), pe = std::min(fe, end);
+        met.push_back({i, pb - fb, pe - pb, (pb != fb) || (pe != fe)});
+    }
+    // The worker's list IS its reading order: the stream's bytes come out in
+    // list order too (measured: -p3 -t1 over 7/5/8 MB files, worker 1's data
+    // starts with the head of the third file, then the tail of the first, then
+    // the whole second one -- exactly its table).
+    std::vector<LegacyStreamPiece> pieces;           // list order
+    for (const LegacyStreamPiece& pc : met) { if (pc.slice) pieces.insert(pieces.begin(), pc); else pieces.push_back(pc); }
+    met = pieces;
+    // An empty range with no file to announce: the header was all there is.
+    if (begin == end && pieces.empty()) return true;
+    std::vector<std::uint64_t> piece_pos(pieces.size(), 0u);
+    { std::uint64_t pos = 0; for (std::size_t k = 0; k < pieces.size(); ++k) { piece_pos[k] = pos; pos += pieces[k].len; } }
+    std::vector<std::uint32_t> piece_ck(pieces.size(), 0u);
+    // "started" / "finished" are decided in READING order but emitted in list
+    // order; the original's list is what its emitters walk, so mark per piece.
+    std::vector<bool> announced(pieces.size(), false), summed(pieces.size(), false);
+    std::uint64_t written = 0;
+    const std::uint64_t total = end - begin;
+    std::ifstream in;
+    std::size_t cur_met = 0; std::uint64_t cur_off = 0;   // reading cursor over `met`
+    std::vector<unsigned char> block, iobuf(1u << 16u);
+    LegacyFileChecksum ck(ckmode);
+    // checksums are computed per piece while reading
+    auto piece_index_of = [&](std::size_t met_i) -> std::size_t { return met_i; };
+    while (written < total || (total == 0u && written == 0u)) {
+        block.clear();
+        const std::uint64_t want = std::min<std::uint64_t>(window, total - written);
+        while (block.size() < want && cur_met < met.size()) {
+            const LegacyStreamPiece& pc = met[cur_met];
+            const EncodeSource& e = src[pc.src];
+            if (cur_off == 0u) {
+                in.close(); in.clear(); in.open(e.fs_path, std::ios::binary); in.seekg(static_cast<std::streamoff>(pc.file_off));
+                ck = LegacyFileChecksum(ckmode);
+                if (!*progress_shown) { PrintFileProgress(os, e.archive_name, "100%"); *progress_shown = true; }
+            }
+            if (pc.len == 0u) { piece_ck[piece_index_of(cur_met)] = ck.Final(); ++cur_met; cur_off = 0; continue; }
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size()}));
+            in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
+            if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << e.fs_path.string() << '\n'; return false; }
+            ck.Update(iobuf.data(), n);
+            block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
+            cur_off += n;
+            if (cur_off == pc.len) { piece_ck[piece_index_of(cur_met)] = ck.Final(); ++cur_met; cur_off = 0; }
+        }
+        while (cur_met < met.size() && met[cur_met].len == 0u) { piece_ck[piece_index_of(cur_met)] = LegacyFileChecksum(ckmode).Final(); ++cur_met; }
+        const std::uint64_t block_end = written + block.size();
+        // pieces that start in this block (list order), and those that end in it
+        std::size_t a_from = pieces.size(), a_to = 0, c_from = pieces.size(), c_to = 0;
+        for (std::size_t k = 0; k < pieces.size(); ++k) {
+            const bool starts = !announced[k] && (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && k < pieces.size() && cur_met > 0u));
+            if (starts) { announced[k] = true; a_from = std::min(a_from, k); a_to = std::max(a_to, k + 1u); }
+            const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= block_end;
+            if (ends) { summed[k] = true; c_from = std::min(c_from, k); c_to = std::max(c_to, k + 1u); }
+        }
+        if (a_from > a_to) a_from = a_to;
+        if (c_from > c_to) c_from = c_to;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, c_from, c_to, ckmode, options);
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, block.size());
+        out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), block.begin(), block.end());
+        written = block_end;
+        if (total == 0u) break;
+    }
+    return true;
+}
+
+// `a -cn`: the store container. One stream, or -pN worker streams laid out the
+// way the original's single-thread run (-t1) lays them: the last worker's
+// kind+codec records first, then workers 1..N-1 in order (each its header if
+// not yet written, then its body), then worker 0. Other thread counts make the
+// original's interleaving scheduler-dependent (measured: three runs, three
+// different archives), so this order is what we always write.
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
                          const std::chrono::steady_clock::time_point& add_start) {
     std::uint64_t total = 0;
     for (const EncodeSource& e : sources) total += e.size;
     const ChecksumMode ckmode = LegacyNormalizeChecksumModeForCompression(options.checksum);
-    const std::uint32_t enc = LegacyByteFloatEncode(total);
-    std::uint64_t window = LegacyByteFloatDecode(enc);
+    // -pN keeps every worker even when the input is smaller than N bytes: a
+    // worker whose range is empty writes its kind+codec records and nothing
+    // else (measured: `-p3 -t1 tiny` -> s2 header, s1 header, s2 body, s0 header).
+    const unsigned workers = (options.workers > 1u) ? options.workers : 1u;
+    const std::uint64_t per = total / workers;
+    std::uint64_t window = (per < 0x8000u) ? 0x10000u : LegacyByteFloatDecode(LegacyByteFloatEncode(per));
     if (window < 0x10000u) window = 0x10000u;
-    const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
 
     const fs::path out_path = ResolveArchivePath(options);
     if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
-
     PrintEncodeHeader(os, options.archive_path, "none", 0u, 512u, 20u, 4u, options.verbose);
 
-    // the header: type 14 with the signature, type 30 with 0x09
     static const char kSig[] = "NanoZip 0.09 alpha";
     WriteLegacyRecord(out, 14u, 0u, reinterpret_cast<const unsigned char*>(kSig), sizeof(kSig) - 1u);
     const unsigned char nine = 0x09u;
     WriteLegacyRecord(out, 30u, 0u, &nine, 1u);
-    const unsigned stream = 0u;
-    if (ckmode != ChecksumMode::kNone) {
-        const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
-        WriteLegacyRecord(out, kind_type, stream, nullptr, 0u);
-    }
-    const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
-    WriteLegacyRecord(out, 11u, stream, codec, 2u);
 
-    // The files as one stream, cut into blocks of `window` bytes.
-    std::vector<std::uint32_t> checksums(sources.size(), 0u);
     std::vector<std::uint64_t> start(sources.size(), 0u);
     { std::uint64_t pos = 0; for (std::size_t i = 0; i < sources.size(); ++i) { start[i] = pos; pos += sources[i].size; } }
-    std::vector<unsigned char> block; block.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(window, total) + 1u));
-    std::size_t started = 0, finished = 0;   // entries announced / checksummed so far
-    std::uint64_t written = 0;               // bytes of the stream written so far
-    std::size_t cur = 0;                     // entry the reader is in
-    std::uint64_t cur_off = 0;               // offset inside it
-    std::ifstream in;
-    LegacyFileChecksum ck(ckmode);
-    std::vector<unsigned char> iobuf(1u << 16u);
-    bool first_progress = true;
-    while (written < total || (written == 0u && total == 0u)) {
-        block.clear();
-        const std::uint64_t want = std::min<std::uint64_t>(window, total - written);
-        while (block.size() < want) {
-            if (cur_off == 0u) {
-                in.close(); in.clear(); in.open(sources[cur].fs_path, std::ios::binary);
-                ck = LegacyFileChecksum(ckmode);
-                if (first_progress) { PrintFileProgress(os, sources[cur].archive_name, "100%"); first_progress = false; }
+    bool progress_shown = false;
+    auto range_of = [&](unsigned k) -> std::pair<std::uint64_t, std::uint64_t> {
+        const std::uint64_t b = static_cast<std::uint64_t>(k) * per;
+        const std::uint64_t e = (k + 1u == workers) ? total : b + per;
+        return {b, e};
+    };
+    if (workers == 1u) {
+        std::vector<unsigned char> body;
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, &progress_shown)) return 1;
+        out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+    } else {
+        std::vector<unsigned char> body;
+        // the last worker's header first
+        {
+            const auto r = range_of(workers - 1u);
+            std::vector<unsigned char> h;
+            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, &progress_shown)) return 1;
+            // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
+            std::vector<unsigned char> hdr_only;
+            if (ckmode != ChecksumMode::kNone) {
+                const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+                WriteLegacyRecordHeader(&hdr_only, kind_type, workers - 1u, 0u);
             }
-            if (sources[cur].size == 0u) { checksums[cur] = ck.Final(); ++cur; cur_off = 0; continue; }
-            const std::uint64_t left_in_file = sources[cur].size - cur_off;
-            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({left_in_file, want - block.size(), iobuf.size()}));
-            in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
-            if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << sources[cur].fs_path.string() << '\n'; return 1; }
-            ck.Update(iobuf.data(), n);
-            block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
-            cur_off += n;
-            if (cur_off == sources[cur].size) { checksums[cur] = ck.Final(); ++cur; cur_off = 0; }
+            const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
+            const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
+            WriteLegacyRecordHeader(&hdr_only, 11u, workers - 1u, 2u); hdr_only.insert(hdr_only.end(), codec, codec + 2);
+            out.write(reinterpret_cast<const char*>(hdr_only.data()), static_cast<std::streamsize>(hdr_only.size()));
         }
-        // zero-size entries sitting exactly at the block end are consumed with it
-        while (cur < sources.size() && sources[cur].size == 0u) { checksums[cur] = LegacyFileChecksum(ckmode).Final(); ++cur; }
-        const std::uint64_t block_end = written + block.size();
-        // started: first byte inside the block (or a 0-byte file the reader passed)
-        std::size_t new_started = started;
-        while (new_started < sources.size() && (start[new_started] < block_end || (sources[new_started].size == 0u && new_started < cur))) ++new_started;
-        // finished: last byte inside the block
-        std::size_t new_finished = finished;
-        while (new_finished < sources.size() && start[new_finished] + sources[new_finished].size <= block_end && new_finished < cur) ++new_finished;
-        LegacyEmitBlockMetadata(out, stream, sources, checksums, started, new_started, finished, new_finished, ckmode, options);
-        started = new_started; finished = new_finished;
-        WriteLegacyRecord(out, 0u, stream, block.data(), block.size());
-        written = block_end;
-        if (total == 0u) break;
+        for (unsigned k = 1u; k < workers; ++k) {
+            const auto r = range_of(k);
+            body.clear();
+            // With nothing to store at all (only 0-byte files) the last worker's
+            // block -- table, stamps, checksums, an empty DATA -- comes AFTER
+            // every header, worker 0's included (measured with -p2 and -p3).
+            if (k == workers - 1u && total == 0u) continue;
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, &progress_shown)) return 1;
+            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+        }
+        {
+            const auto r = range_of(0u);
+            body.clear();
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, &progress_shown)) return 1;
+            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+        }
+        if (total == 0u) {
+            const auto r = range_of(workers - 1u);
+            body.clear();
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, &progress_shown)) return 1;
+            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+        }
     }
     if (!out) { os << "Error: write failure while building archive.\n"; return 1; }
     const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));

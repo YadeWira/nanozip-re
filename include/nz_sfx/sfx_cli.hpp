@@ -68,6 +68,8 @@ struct CliOptions {
     // 1 extension (default; case-insensitive extension, then size, then name),
     // 2 name, 3 size.
     unsigned sort_mode = 1;
+    // -p<n>: worker streams (0 = the original's automatic choice).
+    unsigned workers = 0;
 
     std::string output_path;
     std::vector<std::string> exclude_patterns;

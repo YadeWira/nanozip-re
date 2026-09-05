@@ -214,6 +214,7 @@ CliOptions ParseCli(int argc, char** argv) {
             else out.threads = v.empty() ? 0u : static_cast<unsigned>(std::stoul(v));
         } else if (sw[0] == 'p') {
             ok = is_digits(sw.substr(1));
+            if (ok && sw.size() > 1u) out.workers = static_cast<unsigned>(std::stoul(sw.substr(1)));
         } else if (sw[0] == 'm') {
             std::uint64_t dummy = 0; ok = parse_size(sw.substr(1), &dummy);
         } else ok = false;

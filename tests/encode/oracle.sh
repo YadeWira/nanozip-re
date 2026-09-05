@@ -41,8 +41,13 @@ open(f'{d}/blk2.bin','wb').write(bytes(random.randrange(256) for _ in range(6553
 open(f'{d}/blk3.bin','wb').write(bytes(random.randrange(256) for _ in range(65536)))
 open(f'{d}/one.bin','wb').write(b'\x42')
 open(f'{d}/big.bin','wb').write(bytes(random.randrange(256) for _ in range(1000000)))
+# parallel (-pN) shapes: files straddling worker boundaries, a file exactly on one
+open(f'{d}/p12.bin','wb').write(bytes(random.randrange(256) for _ in range(1200000)))
+open(f'{d}/p6.bin','wb').write(bytes(random.randrange(256) for _ in range(600000)))
+open(f'{d}/p3.dat','wb').write(bytes(random.randrange(256) for _ in range(300000)))
+open(f'{d}/p2.txt','w').write('parallel text line\n' * 5000)
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
-for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin']:
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
@@ -77,6 +82,25 @@ CASES=(
   "cn_bound2|-cn -sn|one.bin blk1.bin blk2.bin blk3.bin"
   "cn_big|-cn|big.bin a.txt"
   "cn_600|-cn|my.dir/f .hidden"
+  # parallel store: -pN with -t1 (the original's default thread count makes the stream
+  # emission order nondeterministic, so only -t1 can be an oracle)
+  "cn_p2|-cn -p2 -t1|p12.bin b.bin a.txt"
+  "cn_p3|-cn -p3 -t1|p12.bin p6.bin p3.dat p2.txt"
+  "cn_p4|-cn -p4 -t1|p12.bin p6.bin p3.dat p2.txt b.bin a.txt tiny"
+  "cn_p2_empty|-cn -p2 -t1 -sn|p6.bin empty"
+  "cn_p2_empty2|-cn -p2 -t1 -sn|empty p6.bin"
+  "cn_p3_hn|-cn -p3 -t1 -hn|p12.bin p6.bin a.txt"
+  "cn_p2_hc|-cn -p2 -t1 -hc|p12.bin p6.bin a.txt"
+  "cn_p2_nt|-cn -p2 -t1 -nt -np|p12.bin p6.bin"
+  "cn_p2_tree|-cn -p2 -t1 -r|sub p6.bin"
+  "cn_p8|-cn -p8 -t1|p12.bin a.txt"
+  "cn_p1|-cn -p1 -t1|p12.bin a.txt"
+  "cn_p2_one|-cn -p2 -t1|tiny"
+  "cn_p3_one|-cn -p3 -t1|tiny"
+  "cn_p4_two|-cn -p4 -t1 -sn|tiny one.bin"
+  "cn_p2_et|-cn -p2 -t1 -sn|empty tiny"
+  "cn_p2_te|-cn -p2 -t1 -sn|tiny empty"
+  "cn_p3_hn_one|-cn -p3 -t1 -hn|tiny"
   "cf_one|-cf|a.txt"
   "cF_one|-cF|a.txt"
   "cd_one|-cd|a.txt"
