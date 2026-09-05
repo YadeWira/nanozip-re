@@ -10968,7 +10968,34 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // -pN keeps every worker even when the input is smaller than N bytes: a
     // worker whose range is empty writes its kind+codec records and nothing
     // else (measured: `-p3 -t1 tiny` -> s2 header, s1 header, s2 body, s0 header).
-    const unsigned workers = (options.workers > 1u) ? options.workers : 1u;
+    unsigned workers = (options.workers > 1u) ? options.workers : 1u;
+    // The automatic split (FUN_0804f360): the store never splits; a compressing
+    // codec with 8 MB or more of input gets one worker per thread (T = min(-t,
+    // host)), or, when 90 % or more of the bytes are "media" by extension (aif,
+    // bmp, pgm, pnm, ppm, tga, tif, wav -- FUN_0804de80) and no other file is
+    // bigger than a tenth of the total, min(files, T).
+    if (options.workers == 0u && p0 != 0u && total >= 0x800000ull) {
+        const unsigned host = HostThreadCount();
+        unsigned threads = host;
+        if (options.threads > 0u && options.threads < host) threads = options.threads;
+        std::uint64_t media = 0, rest10 = total - total * 90u / 100u;
+        bool big_other = false;
+        for (const EncodeSource& e : sources) {
+            const std::string& n = e.archive_name;
+            bool is_media = false;
+            if (n.size() > 4u && n[n.size() - 4u] == '.') {
+                std::string ext = n.substr(n.size() - 3u);
+                for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                static const char* const kMedia[] = {"aif", "bmp", "pgm", "pnm", "ppm", "tga", "tif", "wav"};
+                for (const char* m : kMedia) if (ext == m) { is_media = true; break; }
+            }
+            if (is_media) { media += e.size; if (media >= total * 90u / 100u) break; }
+            else { if (rest10 < e.size) { big_other = true; break; } rest10 -= e.size; }
+        }
+        const bool media_heavy = !big_other && (media * 100u / (total + 1u) >= 90u);
+        workers = media_heavy ? static_cast<unsigned>(std::min<std::uint64_t>(sources.size(), threads)) : threads;
+        if (workers == 0u) workers = 1u;
+    }
     const std::uint64_t per = total / workers;
     std::uint64_t window = (per < 0x8000u) ? 0x10000u : LegacyByteFloatDecode(LegacyByteFloatEncode(per));
     if (window < 0x10000u) window = 0x10000u;
