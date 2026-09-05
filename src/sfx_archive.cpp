@@ -10376,6 +10376,28 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = it->path().filename().string();
         if (!WildcardMatch(pattern, name)) continue;
+#if defined(_WIN32)
+        // No lstat/st_mode on mingw: std::filesystem gives the kind, size and time;
+        // the mode is the POSIX default (the Windows original stores attributes
+        // instead, quirk 48 -- not written by this port yet).
+        std::error_code sec;
+        fs::file_status fst = fs::symlink_status(it->path(), sec);
+        if (sec) continue;
+        if (!fs::is_regular_file(fst) && !fs::is_directory(fst)) { fst = fs::status(it->path(), sec); if (sec) continue; }
+        const bool is_reg = fs::is_regular_file(fst), is_dir = fs::is_directory(fst);
+        if (is_reg) {
+            EncodeSource e;
+            e.archive_name = prefix + name;
+            e.fs_path = it->path();
+            e.display = dir_part.empty() ? name : dir_part + "/" + name;
+            { std::ifstream probe(it->path(), std::ios::binary); e.ghost = !probe.is_open(); }
+            e.size = fs::file_size(it->path(), sec); if (sec) e.size = 0u;
+            e.mode = 0644u;
+            const fs::file_time_type ft = fs::last_write_time(it->path(), sec);
+            e.mtime = sec ? 0 : FileTimeToUnix(ft);
+            out->push_back(std::move(e));
+        } else if (is_dir && recurse && name != "." && name != "..") {
+#else
         struct stat st{};
         if (::lstat(it->path().c_str(), &st) != 0) continue;
         if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
@@ -10394,6 +10416,7 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
             e.uid = static_cast<std::uint16_t>(st.st_uid); e.gid = static_cast<std::uint16_t>(st.st_gid);
             out->push_back(std::move(e));
         } else if (S_ISDIR(st.st_mode) && recurse && name != "." && name != "..") {
+#endif
             // the directory's path is built by concatenation, as the original
             // does ("sub/c.dat" for the argument `sub`, "./sub/c.dat" under `.`)
             LegacyScanDirectory(dir_part.empty() ? name : dir_part + "/" + name, "*", prefix + name + "/", recurse, out);
