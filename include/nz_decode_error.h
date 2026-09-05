@@ -34,6 +34,12 @@ inline void SetAt(std::uint32_t code, std::size_t input_pos) {
     if (t_state.code == 0u && t_state.fatal_id == 0u) { t_state.code = code; t_state.input_pos = input_pos; t_state.has_pos = true; }
 }
 inline void Fatal(std::uint32_t id) { if (t_state.fatal_id == 0u) t_state.fatal_id = id; }
+// A failure with no status of its own (the engine declined) still has a PLACE:
+// record it so the plain-vs-shifted rule can see whether another record of the
+// stream lay ahead. Never overrides a position a status already recorded.
+inline void SetPos(std::size_t input_pos) {
+    if (!t_state.has_pos) { t_state.input_pos = input_pos; t_state.has_pos = true; }
+}
 inline const State& Current() { return t_state; }
 // The CM/optimum family's per-stage check bytes: the stage that fails names the code.
 inline std::uint32_t StageCode(const char* stage) {

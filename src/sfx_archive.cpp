@@ -2864,9 +2864,11 @@ bool AssembleParallelMultiFile(
             // before it is the one the driver reports plainly. The single-file
             // parallel paths do the same; without it a multi-file container
             // printed status<<8|slot where the original prints the status.
-            // A clean end (no status of its own) stays SHIFTED even when it
-            // produced nothing: pmf_o 0.50/0.60 and pmf_Ou 0.60 report
-            // status<<8|slot there, so only a recorded input position decides.
+            // Only a recorded input position decides -- "produced nothing" is
+            // not a criterion (pmf_o 0.50/0.60 and pmf_Ou 0.60 produce nothing
+            // and are shifted). A block the engine declines without a status
+            // records its place too (nzr::derr::SetPos), which is what makes
+            // pmf_o 0.30 plain: its failing block is the first of six records.
             if (st.chunks.size() > 1u) {
                 std::uint64_t off = 0;
                 for (std::size_t q = 0; q + 1u < st.chunks.size(); ++q) off += st.chunks[q].second;
@@ -8465,6 +8467,12 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, out_size, decode_block_ok ? 1 : 0);
             }
             if (!decode_block_ok) {
+                // The engine declined without a status: keep the place anyway.
+                // In a parallel container the driver reports a failing slot
+                // PLAIN when a later record of that slot notices it, and the
+                // sink decides that from the position (pmf_o 0.30: the first of
+                // six records fails cleanly, the original prints 100, not 25600).
+                nzr::derr::SetPos(pos);
                 if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
             }
             cur_size = out_size;
