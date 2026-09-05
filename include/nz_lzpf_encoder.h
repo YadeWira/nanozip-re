@@ -61,7 +61,7 @@ struct AudioModel {
 std::uint32_t AudioCost(const std::int32_t* v, std::uint32_t n);
 void AudioUnpack(const std::uint8_t* src, std::uint32_t nbytes, std::int32_t* out, const AudioProbe& pr);
 void AudioProbeBlock(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len);
-bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len);
+bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len, std::uint32_t avail);
 std::uint32_t ResidualCostBits(const std::int32_t* v, std::uint32_t n, std::uint8_t* bytes);
 std::uint32_t MaskBits(std::uint32_t k);
 // The bit writer of FUN_080b1f20 / FUN_080b2030: MSB-first, 32-bit big-endian

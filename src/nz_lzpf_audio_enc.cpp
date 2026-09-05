@@ -294,7 +294,7 @@ void AudioProbeBlock(AudioProbe& pr, const std::uint8_t* block, std::uint32_t le
 // FUN_08081760: is the prefilter worth it? An LZ estimate (a 12-bit-hash parse
 // of the raw bytes, Huffman-costed) against the order-8 predictor's residual
 // cost; both are kept in the probe.
-bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len) {
+bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len, std::uint32_t avail) {
     if (len < 0x10u) return false;
     if (AudioSanityReject(block, len, pr) && AudioSanityReject(block + (((len >> 1u) + 3u) & ~3u), len >> 1u, pr)) return false;
     std::uint32_t hist[256]; std::memset(hist, 0, sizeof(hist));
@@ -313,12 +313,14 @@ bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len) {
                 const std::uint8_t c = block[pos];
                 prev = pos;
                 if (block[cand] != c) break;
-                if (pos + 1u < len && block[pos + 1u] == block[cand + 1u]) {
+                // the original reads block[pos + 1] / block[i + 1] without a bound: the
+                // window sits inside the 32 KB block, so those bytes exist (`avail`)
+                if ((pos + 1u < avail ? block[pos + 1u] : 0u) == block[cand + 1u]) {
                     std::uint32_t i = pos + 1u;
                     const std::uint8_t* q = block + cand + 1u;
                     while (i < len) {
                         ++q;
-                        if (i + 1u >= len || block[i + 1u] != *q) break;
+                        if ((i + 1u < avail ? block[i + 1u] : 0u) != *q) break;
                         ++i;
                     }
                     ++hist[(i - pos) & 0xffu];

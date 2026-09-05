@@ -760,37 +760,30 @@ static inline std::uint8_t ExeClass(std::uint8_t b) {
 static std::uint32_t ExeMetric(const std::uint8_t* p, std::uint32_t n) {
     if (n < 10u) return 0u;
     std::uint32_t count = 0;
-    std::intptr_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;   // the last four targets (pbVar6, pbVar7, local_18, local_14)
-    const std::uint8_t* const base = p;
+    // the last four targets: pbVar6, pbVar7, local_18, local_14 of the decompile;
+    // after a hit they become (old local_18, old pbVar6, target, old pbVar7)
+    std::intptr_t h6 = 0, h7 = 0, h18 = 0, h14 = 0;
     const std::uint8_t* const end = p + (n - 5u);
     const std::uint8_t* q = p;
-    while (q < end) {
+    do {
         std::uint8_t cls = ExeClass(*q);
         ++q;
-        for (;;) {
-            // rotate the history the way the decompile's swaps do
-            const std::intptr_t s = t0; t0 = t1; t1 = s;
-            if ((cls & 1u) == 0u) break;
+        while ((cls & 1u) != 0u) {
             if ((ExeClass(q[3]) & 2u) == 0u) {
                 q += 4;
                 if (end <= q) return count;
-                break;
+                break;   // back to the outer loop with the byte at q
             }
-            const std::intptr_t target = static_cast<std::intptr_t>(q - base) +
-                static_cast<std::intptr_t>(static_cast<std::int32_t>(LoadU32(q)));
+            const std::intptr_t target = static_cast<std::intptr_t>(q - p) + static_cast<std::intptr_t>(static_cast<std::int32_t>(LoadU32(q)));
             const std::uint8_t* nx = q + 4;
-            count += (t1 == target ? 1u : 0u) + (t2 == target ? 1u : 0u) + (t0 == target ? 1u : 0u) + (t3 == target ? 1u : 0u);
+            count += (h6 == target ? 1u : 0u) + (h18 == target ? 1u : 0u) + (h7 == target ? 1u : 0u) + (h14 == target ? 1u : 0u);
             if (end <= nx) return count;
             q += 5;
             cls = ExeClass(*nx);
-            // pbVar5 = local_18; local_18 = target; local_14 = pbVar7 (t0 before this rotate)
-            const std::intptr_t old18 = t2;
-            t2 = target;
-            t3 = t0;
-            t1 = t0;            // pbVar6 <- pbVar7 happens at the loop head (the rotate above); carry via s
-            t0 = old18;         // pbVar7 <- pbVar5 (= old local_18)
+            const std::intptr_t old18 = h18;
+            h14 = h7; h18 = target; h7 = h6; h6 = old18;
         }
-    }
+    } while (q < end);
     return count;
 }
 
@@ -847,7 +840,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         if (st.probe.audio_end <= st.probe.bytes_done) {
             bool skip_exe = false;
             if (st.probe.conf != 0u && 0x32u < score && st.probe.conf < score && 0x800u < len) {
-                audio_decision = AudioDecide(st.probe, src, 0x400u);
+                audio_decision = AudioDecide(st.probe, src, 0x400u, static_cast<std::uint32_t>(len));
                 if (st.probe.bytes_done < st.probe.audio_end) skip_exe = true;
             }
             if (!skip_exe) {
