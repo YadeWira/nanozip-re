@@ -31,6 +31,19 @@ os.chmod(f'{d}/a.txt', 0o644); os.chmod(f'{d}/b.bin', 0o600); os.chmod(f'{d}/sub
 for i, f in enumerate(['a.txt','b.bin','empty','tiny','sub/c.dat','sub/deep/d.log']):
     t = 1000000000 + i * 86400 * 37
     os.utime(f'{d}/{f}', (t, t))
+# the shapes the container rules were measured on
+os.makedirs(f'{d}/my.dir', exist_ok=True)
+open(f'{d}/my.dir/f','w').write('dotted dir\n'); open(f'{d}/.hidden','w').write('h\n')
+open(f'{d}/A.TXT','w').write('upper ' * 30); open(f'{d}/c.Txt','w').write('mixed\n'); open(f'{d}/x._','w').write('underscore\n')
+open(f'{d}/r98304.bin','wb').write(bytes(98304)); open(f'{d}/r98303.bin','wb').write(bytes(98303))
+open(f'{d}/blk1.bin','wb').write(bytes(random.randrange(256) for _ in range(65536)))
+open(f'{d}/blk2.bin','wb').write(bytes(random.randrange(256) for _ in range(65536)))
+open(f'{d}/blk3.bin','wb').write(bytes(random.randrange(256) for _ in range(65536)))
+open(f'{d}/one.bin','wb').write(b'\x42')
+open(f'{d}/big.bin','wb').write(bytes(random.randrange(256) for _ in range(1000000)))
+os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin']:
+    os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
 
@@ -45,6 +58,25 @@ CASES=(
   "cn_hc|-cn -hc|a.txt b.bin empty"
   "cn_hC|-cn -hC|a.txt b.bin empty"
   "cn_twice|-cn|a.txt a.txt"
+  "cn_sn|-cn -sn|tiny a.txt sub/c.dat b.bin empty"
+  "cn_sa|-cn -sa|A.TXT b.bin a.txt c.Txt x._ empty"
+  "cn_ss|-cn -ss|a.txt b.bin tiny empty sub/c.dat"
+  "cn_case|-cn|A.TXT c.Txt x._ a.txt b.bin"
+  "cn_dots|-cn -r|my.dir .hidden a.txt"
+  "cn_dotdir|-cn -r|."
+  "cn_star|-cn|*.txt"
+  "cn_nt|-cn -nt|a.txt b.bin empty"
+  "cn_np|-cn -np|a.txt b.bin empty"
+  "cn_nm|-cn -nm|a.txt b.bin empty"
+  "cn_fo|-cn -fo|a.txt b.bin empty"
+  "cn_sp|-cn -sp -r|sub a.txt"
+  "cn_x|-cn -r -xb.bin|a.txt b.bin sub"
+  "cn_round|-cn -sn|r98303.bin"
+  "cn_round2|-cn -sn|r98304.bin"
+  "cn_bound|-cn -sn|blk1.bin blk2.bin blk3.bin one.bin"
+  "cn_bound2|-cn -sn|one.bin blk1.bin blk2.bin blk3.bin"
+  "cn_big|-cn|big.bin a.txt"
+  "cn_600|-cn|my.dir/f .hidden"
   "cf_one|-cf|a.txt"
   "cF_one|-cF|a.txt"
   "cd_one|-cd|a.txt"
@@ -68,18 +100,17 @@ for spec in "${CASES[@]}"; do
   else
     verdict="DIFF $(cmp "$c/orig.nz" "$c/ours.nz" 2>&1 | grep -oE 'byte [0-9]+' | head -1) sizes $(stat -c%s "$c/orig.nz" 2>/dev/null)/$(stat -c%s "$c/ours.nz" 2>/dev/null)"
   fi
-  # cross-decode: the original reads ours, we read the original's; both against the source tree
+  # cross-decode: the original reads ours, we read the original's; each tree must
+  # equal what the ORIGINAL extracts from its OWN archive (so globs, `.`, -sp and -x
+  # need no path arithmetic here).
   cross=""
+  rm -rf "$c/x_ref"; mkdir -p "$c/x_ref"
+  ( cd "$c/x_ref" && env -i PATH=/usr/bin:/bin "$ORIG" x -y "../orig.nz" > out.txt 2>&1 ); rm -f "$c/x_ref/out.txt"
   for pair in "orig:ours" "ours:orig"; do
     reader=${pair%%:*}; arch=${pair#*:}; bin=$ORIG; [ $reader = ours ] && bin=$OURS
     rm -rf "$c/x_$reader"; mkdir -p "$c/x_$reader"
-    ( cd "$c/x_$reader" && env -i PATH=/usr/bin:/bin "$bin" x -y "../$arch.nz" > out.txt 2>&1 )
-    ok=1
-    for f in $files; do
-      if [ -d "$c/orig/$f" ]; then diff -rq "$c/orig/$f" "$c/x_$reader/$f" >/dev/null 2>&1 || ok=0
-      else cmp -s "$c/orig/$f" "$c/x_$reader/$f" || ok=0; fi
-    done
-    [ $ok = 1 ] && cross="$cross $reader-reads-$arch:ok" || cross="$cross $reader-reads-$arch:FAIL"
+    ( cd "$c/x_$reader" && env -i PATH=/usr/bin:/bin "$bin" x -y "../$arch.nz" > out.txt 2>&1 ); rm -f "$c/x_$reader/out.txt"
+    if diff -r "$c/x_ref" "$c/x_$reader" >/dev/null 2>&1; then cross="$cross $reader-reads-$arch:ok"; else cross="$cross $reader-reads-$arch:FAIL"; fi
   done
   [[ "$cross" != *FAIL* ]] && xok=$((xok+1))
   printf "%-10s %-38s %s\n" "$name" "$verdict" "$cross"

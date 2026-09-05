@@ -4410,6 +4410,9 @@ bool TryParseLegacyCnArchive(
     // multi-block archive the next block's table/mtime/perm/checksum records sit
     // BETWEEN two data records, so the payload is not one contiguous run.
     std::vector<std::pair<std::size_t, std::size_t>> data_records;
+    // The same records' PAYLOAD ranges (header excluded), whole records only:
+    // a stored archive's content is their concatenation.
+    std::vector<std::pair<std::size_t, std::size_t>> data_payloads;
     // Any record belonging to a non-zero stream => parallel (-pN) container,
     // which has its own framing and must not be spliced.
     bool has_parallel_streams = false;
@@ -4531,6 +4534,7 @@ bool TryParseLegacyCnArchive(
                     found_first_data = true;
                 }
                 data_records.push_back({record_begin, pos + csize});
+                data_payloads.push_back({pos, pos + csize});
             }
         }
         if (!is_main) {
@@ -5049,6 +5053,32 @@ bool TryParseLegacyCnArchive(
             std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%zu table_end=%zu prefix_found=%d entries=%zu\n",
                          (unsigned long long)total_data_size, data_offset, (size_t)table_end,
                          (int)prefix_found, entries.size());
+        // A stored archive cut into several blocks carries, before each block,
+        // the table/mtime/permission records of the files that START in it
+        // (measured on the original: 65536 bytes + a 1-byte file gives a second
+        // table between the two DATA records). The block-chain scan below only
+        // knows blocks and checksum trailers, so it declined every such archive
+        // ("Legacy stream prefix is not recognized"). The record walk already
+        // has every main-stream data record: when their payloads add up to the
+        // declared total, the content is simply their concatenation.
+        if (!prefix_found && !has_parallel_streams && data_payloads.size() > 1u) {
+            std::uint64_t sum = 0;
+            for (const auto& dp : data_payloads) sum += dp.second - dp.first;
+            if (sum == total_data_size) {
+                store_blocks_buffer.clear();
+                store_blocks_buffer.reserve(static_cast<std::size_t>(total_data_size));
+                for (const auto& dp : data_payloads)
+                    store_blocks_buffer.insert(store_blocks_buffer.end(),
+                                               bytes.begin() + static_cast<std::ptrdiff_t>(dp.first),
+                                               bytes.begin() + static_cast<std::ptrdiff_t>(dp.second));
+                store_multiblock = true;
+                metadata_end = data_records.front().first;
+                payload_start = data_records.front().first;
+                prefix_found = true;
+                nz_trace::Construct("store_assembly=data_records blocks=%zu", data_payloads.size());
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site0 (data records) -> %zu\n", payload_start);
+            }
+        }
         if (!prefix_found && entries.size() > 1u) {
             // Parallel store holding several files: the slices are raw, so
             // "decoding" a stream is copying its concatenated chunks.
@@ -10210,8 +10240,431 @@ int RunSimulateNativeLegacyStream(
 }
 
 
+
+// ===========================================================================
+// The legacy container WRITER (encode phase, milestone 1: `-cn`).
+//
+// Everything below is a transcription of the original's `a` path as read from
+// the decompile (~/.cache/nzre_tools/encode/decomp/, inventory.txt) and
+// measured against it byte for byte with tests/encode/oracle.sh:
+//   * the file scan (FUN_0804a3d0): per argument, readdir of the directory
+//     part, fnmatch of the pattern against each name, regular files appended
+//     in readdir order, directories recursed with pattern "*" under -r;
+//   * the sort (FUN_08052200 / FUN_08051f40): a merge sort that splits the
+//     list at n/2, takes the LEFT element when it compares less and the right
+//     one on ties; -se compares the extension with tolower(), then the size,
+//     then the whole name; -sa the name; -ss the size; -sn does not sort;
+//   * the byte-float (FUN_0804c930 / FUN_0804c9f0): the NEAREST encodable
+//     size, `(size + 0x8000) >> 16` first, then a 4-bit mantissa with
+//     half-ulp rounding;
+//   * the record chain: type 14 with the version string, type 30 with 0x09,
+//     the checksum kind (type 5/6/7, size 0), the codec record, then per block
+//     of `window` bytes read from the files as one continuous stream: the
+//     table of the files that START in the block, their mtimes (u32 absolute
+//     + zigzag deltas), their permission runs, uid/gid runs under -fo, the
+//     checksums of the files that END in the block, and the DATA record
+//     (FUN_0804f0a0 + FUN_0804df90 and the emitters FUN_0804e2c0/ec30/ee40/
+//     e6e0/e870). Every metadata emitter buffers 32768 bytes and splits its
+//     record there.
+// ===========================================================================
+
+struct EncodeSource {
+    std::string archive_name;     // the name written to the table
+    fs::path fs_path;             // where the bytes are
+    std::uint64_t size = 0;
+    std::uint32_t mode = 0644;    // st_mode & 0xfff
+    std::int64_t mtime = 0;       // epoch seconds
+    std::uint16_t uid = 0, gid = 0;
+};
+
+// FUN_0804c930: the byte-float NEAREST to `size` (the encoded byte, 1-based
+// like the original's; the codec record stores it minus one).
+std::uint32_t LegacyByteFloatEncode(std::uint64_t size) {
+    std::uint64_t u = (size + 0x8000u) >> 16u;          // 64 KB units, rounded
+    if (u < 16u) return static_cast<std::uint32_t>(u);
+    unsigned hi = 63u;
+    while (((u >> hi) & 1u) == 0u) --hi;                 // highest set bit
+    // mantissa = the 4 bits below the top one, rounded to nearest (half up)
+    const unsigned shift = hi - 4u;
+    std::uint64_t m = u;
+    if (shift > 0u) m = (u + (std::uint64_t{1} << (shift - 1u))) >> shift;
+    if (m >= 32u) { m >>= 1u; ++hi; }                    // rounding carried
+    // x = (exponent + 1) << 4 | mantissa, where the decoder does (m + 16) << (exponent - 1)
+    return static_cast<std::uint32_t>(((hi - 3u) << 4u) | (m & 0xfu));
+}
+
+// The decoder's own byte-float reading (x = p1 + 1): m = x & 15, s = x >> 4,
+// if (s) m = (m + 16) << (s - 1); size = m << 16.
+std::uint64_t LegacyByteFloatDecode(std::uint32_t x) {
+    std::uint64_t m = x & 0xfu;
+    const unsigned sft = x >> 4u;
+    if (sft != 0u) m = (m + 16u) << (sft - 1u);
+    return m << 16u;
+}
+
+// The original's record header: varint of (size << 4) | type, or | 15 plus an
+// extension byte (stream << 4 | type, minus 15 when the stream is 0) when the
+// type is 15 or more or the stream is not the main one. FUN_08051900.
+void WriteLegacyRecordHeader(std::vector<unsigned char>* out, unsigned type, unsigned stream, std::uint64_t size) {
+    const bool ext = (stream != 0u) || (type >= 15u);
+    WriteLegacyVarint((size << 4u) | (ext ? 15u : type), out);
+    if (ext) {
+        std::uint32_t e = stream * 16u + type - (stream == 0u ? 15u : 0u);
+        if (e > 0xf7u) { out->push_back(static_cast<unsigned char>(e | 0xf8u)); e = (e >> 3u) - 0x1fu; }
+        out->push_back(static_cast<unsigned char>(e));
+    }
+}
+
+void WriteLegacyRecord(std::ostream& out, unsigned type, unsigned stream, const unsigned char* data, std::size_t size) {
+    std::vector<unsigned char> hdr;
+    WriteLegacyRecordHeader(&hdr, type, stream, size);
+    out.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    if (size != 0u) out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+}
+
+// A metadata emitter's buffer: 32768 bytes, flushed as a record of its type
+// whenever the next item would not fit (the original's `0x8000 - used < need`).
+struct LegacyMetaBuffer {
+    unsigned type; unsigned stream; std::ostream& out; std::vector<unsigned char> buf;
+    LegacyMetaBuffer(unsigned t, unsigned s, std::ostream& o) : type(t), stream(s), out(o) { buf.reserve(0x8000u); }
+    void Need(std::size_t n) { if (0x8000u - buf.size() < n) Flush(); }
+    void Put(const unsigned char* d, std::size_t n) { buf.insert(buf.end(), d, d + n); }
+    void Flush() { if (!buf.empty()) { WriteLegacyRecord(out, type, stream, buf.data(), buf.size()); buf.clear(); } }
+};
+
+// The original's file scan. `dir_part` is the directory to read (the argument
+// up to its last slash), `pattern` what each name must match; `prefix` is what
+// the archive names start with.
+void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern, const std::string& prefix,
+                         bool recurse, std::vector<EncodeSource>* out) {
+    std::error_code ec;
+    const fs::path dir = dir_part.empty() ? fs::path(".") : fs::path(dir_part);
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (!WildcardMatch(pattern, name)) continue;
+        struct stat st{};
+        if (::lstat(it->path().c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            // stat() follows links in the original: a symlink to a file is taken as the file
+            if (::stat(it->path().c_str(), &st) != 0) continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            EncodeSource e;
+            e.archive_name = prefix + name;
+            e.fs_path = it->path();
+            e.size = static_cast<std::uint64_t>(st.st_size);
+            e.mode = static_cast<std::uint32_t>(st.st_mode & 0xfffu);
+            e.mtime = static_cast<std::int64_t>(st.st_mtime);
+            e.uid = static_cast<std::uint16_t>(st.st_uid); e.gid = static_cast<std::uint16_t>(st.st_gid);
+            out->push_back(std::move(e));
+        } else if (S_ISDIR(st.st_mode) && recurse && name != "." && name != "..") {
+            LegacyScanDirectory(it->path().string(), "*", prefix + name + "/", recurse, out);
+        }
+    }
+}
+
+// One argument of `a`: split at the last slash, scan. "." and ".." as the
+// pattern name the directory itself (`a -r x.nz .` stores names without "./").
+void LegacyScanArgument(const std::string& arg, bool recurse, std::vector<EncodeSource>* out) {
+    std::string dir_part, pattern = arg;
+    const std::size_t slash = arg.find_last_of('/');
+    if (slash != std::string::npos) { dir_part = arg.substr(0, slash); pattern = arg.substr(slash + 1u); if (dir_part.empty()) dir_part = "/"; }
+    const std::string prefix = dir_part.empty() ? std::string() : (dir_part == "." ? std::string() : dir_part + "/");
+    if (pattern == "." || pattern == "..") {
+        if (recurse) LegacyScanDirectory(dir_part.empty() ? pattern : dir_part + "/" + pattern, "*",
+                                         pattern == "." ? prefix : prefix + pattern + "/", recurse, out);
+        return;
+    }
+    LegacyScanDirectory(dir_part, pattern, prefix, recurse, out);
+}
+
+// FUN_08051f40's comparison, mode 1 = extension, 2 = name, 3 = size. Returns
+// true when `a` goes BEFORE `b`; equal keys return false (the merge then takes b).
+bool LegacyEncodeLess(const EncodeSource& a, const EncodeSource& b, unsigned mode) {
+    if (mode == 3u) return a.size < b.size;
+    if (mode == 2u) return a.archive_name < b.archive_name;
+    // extension: from the end back to the last '.' that follows the last '/';
+    // none -> the empty string
+    auto ext_of = [](const std::string& n) -> std::string {
+        std::size_t i = n.size();
+        while (i > 0u) { const char c = n[i - 1u]; if (c == '/') return std::string(); if (c == '.') return n.substr(i); --i; }
+        return std::string();
+    };
+    const std::string ea = ext_of(a.archive_name), eb = ext_of(b.archive_name);
+    std::size_t k = 0;
+    for (;; ++k) {
+        const int ca = (k < ea.size()) ? std::tolower(static_cast<unsigned char>(ea[k])) : 0;
+        const int cb = (k < eb.size()) ? std::tolower(static_cast<unsigned char>(eb[k])) : 0;
+        if (ca != cb) return ca < cb;
+        if (ca == 0) break;
+    }
+    if (a.size != b.size) return a.size < b.size;
+    return a.archive_name < b.archive_name;
+}
+
+// FUN_08052200: split at n/2 (the FIRST n/2 nodes stay in the left list), sort
+// both halves, merge taking the left when it is less and the right otherwise.
+void LegacyMergeSort(std::vector<EncodeSource>* v, unsigned mode) {
+    if (v->size() < 2u) return;
+    const std::size_t half = v->size() >> 1u;
+    std::vector<EncodeSource> left(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(half));
+    std::vector<EncodeSource> right(v->begin() + static_cast<std::ptrdiff_t>(half), v->end());
+    LegacyMergeSort(&left, mode); LegacyMergeSort(&right, mode);
+    v->clear(); std::size_t i = 0, j = 0;
+    while (i < left.size() && j < right.size()) {
+        if (LegacyEncodeLess(left[i], right[j], mode)) v->push_back(std::move(left[i++]));
+        else v->push_back(std::move(right[j++]));
+    }
+    while (i < left.size()) v->push_back(std::move(left[i++]));
+    while (j < right.size()) v->push_back(std::move(right[j++]));
+}
+
+// The writer's UTC offset (quirk 31): the stored stamp is mtime - offset.
+long LegacyLocalUtcOffsetSeconds() {
+    static const long off = [] {
+        const std::time_t now = std::time(nullptr);
+        std::tm tmv{};
+#if defined(_WIN32)
+        localtime_s(&tmv, &now);
+        return static_cast<long>(-_timezone + (tmv.tm_isdst > 0 ? 3600 : 0));
+#else
+        localtime_r(&now, &tmv);
+        return static_cast<long>(tmv.tm_gmtoff);
+#endif
+    }();
+    return off;
+}
+
+// Running checksum over one file's bytes, finished the way the archive stores it.
+struct LegacyFileChecksum {
+    ChecksumMode mode; std::uint32_t c16 = 0xffffu, c32 = 0xffffffffu, f1 = 0, f2 = 0; std::uint8_t pend = 0; bool has_pend = false;
+    explicit LegacyFileChecksum(ChecksumMode m) : mode(m) {}
+    void Update(const unsigned char* d, std::size_t n) {
+        switch (mode) {
+            case ChecksumMode::kCrc16: c16 = UpdateCrc16(c16, d, n); break;
+            case ChecksumMode::kCrc32: c32 = UpdateCrc32(c32, d, n); break;
+            case ChecksumMode::kFletcher32: UpdateFletcher32(&f1, &f2, &pend, &has_pend, d, n); break;
+            default: break;
+        }
+    }
+    std::uint32_t Final() const {
+        switch (mode) {
+            case ChecksumMode::kCrc16: return (c16 ^ 0xffffu) & 0xffffu;
+            case ChecksumMode::kCrc32: return c32 ^ 0xffffffffu;
+            case ChecksumMode::kFletcher32: return FinalizeFletcher32(f1, f2, pend, has_pend);
+            default: return 0u;
+        }
+    }
+};
+
+// Table + mtimes + permissions (+ owners) for the entries [from, to) -- the
+// files that START in the block about to be written (FUN_0804f0a0's first
+// four emitters), then the checksums of [ck_from, ck_to) -- the files that
+// END in it.
+void LegacyEmitBlockMetadata(std::ostream& out, unsigned stream, const std::vector<EncodeSource>& src,
+                             const std::vector<std::uint32_t>& checksums, std::size_t from, std::size_t to,
+                             std::size_t ck_from, std::size_t ck_to, ChecksumMode ckmode,
+                             const CliOptions& options) {
+    if (from < to) {
+        LegacyMetaBuffer table(1u, stream, out);
+        for (std::size_t i = from; i < to; ++i) {
+            std::vector<unsigned char> item;
+            WriteLegacyVarint(src[i].size, &item);
+            item.insert(item.end(), src[i].archive_name.begin(), src[i].archive_name.end());
+            item.push_back(0u);
+            table.Need(item.size()); table.Put(item.data(), item.size());
+        }
+        table.Flush();
+        if (!options.no_timestamps) {
+            LegacyMetaBuffer mt(2u, stream, out);
+            const long off = LegacyLocalUtcOffsetSeconds();
+            std::uint32_t prev = static_cast<std::uint32_t>(src[from].mtime - off);
+            unsigned char b4[4] = {static_cast<unsigned char>(prev), static_cast<unsigned char>(prev >> 8), static_cast<unsigned char>(prev >> 16), static_cast<unsigned char>(prev >> 24)};
+            mt.Put(b4, 4u);
+            for (std::size_t i = from + 1u; i < to; ++i) {
+                const std::uint32_t cur = static_cast<std::uint32_t>(src[i].mtime - off);
+                const std::int32_t d = static_cast<std::int32_t>(cur - prev);
+                const std::uint32_t zz = (static_cast<std::uint32_t>(d) << 1u) ^ static_cast<std::uint32_t>(d >> 31);
+                std::vector<unsigned char> v; WriteLegacyVarint(zz, &v);
+                mt.Need(v.size()); mt.Put(v.data(), v.size());
+                prev = cur;
+            }
+            mt.Flush();
+        }
+        if (!options.no_permissions) {
+            bool all_default = true;
+            for (std::size_t i = from; i < to; ++i) if ((src[i].mode & 0xfffu) != 0x180u) { all_default = false; break; }
+            if (!all_default) {
+                LegacyMetaBuffer pm(4u, stream, out);
+                std::size_t i = from;
+                while (i < to) {
+                    const std::uint32_t m = src[i].mode & 0xfffu;
+                    std::size_t run = 1u;
+                    if (m < 0x200u) {
+                        while (i + run < to && (src[i + run].mode & 0xfffu) == m && (0x1000u + 0x200u * (run - 1u) + m) <= 0xfdffu) ++run;
+                    }
+                    const std::uint32_t v = (run == 1u) ? m : (0x1000u + 0x200u * (run - 2u) + m);
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    pm.Need(2u); pm.Put(b2, 2u);
+                    i += run;
+                }
+                pm.Flush();
+            }
+        }
+        if (options.restore_ownership) {
+            for (unsigned t = 8u; t <= 9u; ++t) {
+                LegacyMetaBuffer ow(t, stream, out);
+                for (std::size_t i = from; i < to; ++i) {
+                    const std::uint16_t v = (t == 8u) ? src[i].uid : src[i].gid;
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    ow.Put(b2, 2u); ow.Need(2u);
+                }
+                ow.Flush();
+            }
+        }
+    }
+    if (ck_from < ck_to && ckmode != ChecksumMode::kNone) {
+        const unsigned type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        const std::size_t width = (ckmode == ChecksumMode::kCrc16) ? 2u : 4u;
+        LegacyMetaBuffer ck(type, stream, out);
+        for (std::size_t i = ck_from; i < ck_to; ++i) {
+            const std::uint32_t c = checksums[i];
+            unsigned char b4[4] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 24)};
+            ck.Need(width); ck.Put(b4, width);
+        }
+        ck.Flush();
+    }
+}
+
+// `a -cn`: the store container, single stream (the original goes parallel
+// above 8 MB of input; that is the next milestone).
+int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
+                         const std::chrono::steady_clock::time_point& add_start) {
+    std::uint64_t total = 0;
+    for (const EncodeSource& e : sources) total += e.size;
+    const ChecksumMode ckmode = LegacyNormalizeChecksumModeForCompression(options.checksum);
+    const std::uint32_t enc = LegacyByteFloatEncode(total);
+    std::uint64_t window = LegacyByteFloatDecode(enc);
+    if (window < 0x10000u) window = 0x10000u;
+    const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
+
+    const fs::path out_path = ResolveArchivePath(options);
+    if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
+
+    PrintEncodeHeader(os, options.archive_path, "none", 0u, 512u, 20u, 4u, options.verbose);
+
+    // the header: type 14 with the signature, type 30 with 0x09
+    static const char kSig[] = "NanoZip 0.09 alpha";
+    WriteLegacyRecord(out, 14u, 0u, reinterpret_cast<const unsigned char*>(kSig), sizeof(kSig) - 1u);
+    const unsigned char nine = 0x09u;
+    WriteLegacyRecord(out, 30u, 0u, &nine, 1u);
+    const unsigned stream = 0u;
+    if (ckmode != ChecksumMode::kNone) {
+        const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        WriteLegacyRecord(out, kind_type, stream, nullptr, 0u);
+    }
+    const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
+    WriteLegacyRecord(out, 11u, stream, codec, 2u);
+
+    // The files as one stream, cut into blocks of `window` bytes.
+    std::vector<std::uint32_t> checksums(sources.size(), 0u);
+    std::vector<std::uint64_t> start(sources.size(), 0u);
+    { std::uint64_t pos = 0; for (std::size_t i = 0; i < sources.size(); ++i) { start[i] = pos; pos += sources[i].size; } }
+    std::vector<unsigned char> block; block.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(window, total) + 1u));
+    std::size_t started = 0, finished = 0;   // entries announced / checksummed so far
+    std::uint64_t written = 0;               // bytes of the stream written so far
+    std::size_t cur = 0;                     // entry the reader is in
+    std::uint64_t cur_off = 0;               // offset inside it
+    std::ifstream in;
+    LegacyFileChecksum ck(ckmode);
+    std::vector<unsigned char> iobuf(1u << 16u);
+    bool first_progress = true;
+    while (written < total || (written == 0u && total == 0u)) {
+        block.clear();
+        const std::uint64_t want = std::min<std::uint64_t>(window, total - written);
+        while (block.size() < want) {
+            if (cur_off == 0u) {
+                in.close(); in.clear(); in.open(sources[cur].fs_path, std::ios::binary);
+                ck = LegacyFileChecksum(ckmode);
+                if (first_progress) { PrintFileProgress(os, sources[cur].archive_name, "100%"); first_progress = false; }
+            }
+            if (sources[cur].size == 0u) { checksums[cur] = ck.Final(); ++cur; cur_off = 0; continue; }
+            const std::uint64_t left_in_file = sources[cur].size - cur_off;
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({left_in_file, want - block.size(), iobuf.size()}));
+            in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
+            if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << sources[cur].fs_path.string() << '\n'; return 1; }
+            ck.Update(iobuf.data(), n);
+            block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
+            cur_off += n;
+            if (cur_off == sources[cur].size) { checksums[cur] = ck.Final(); ++cur; cur_off = 0; }
+        }
+        // zero-size entries sitting exactly at the block end are consumed with it
+        while (cur < sources.size() && sources[cur].size == 0u) { checksums[cur] = LegacyFileChecksum(ckmode).Final(); ++cur; }
+        const std::uint64_t block_end = written + block.size();
+        // started: first byte inside the block (or a 0-byte file the reader passed)
+        std::size_t new_started = started;
+        while (new_started < sources.size() && (start[new_started] < block_end || (sources[new_started].size == 0u && new_started < cur))) ++new_started;
+        // finished: last byte inside the block
+        std::size_t new_finished = finished;
+        while (new_finished < sources.size() && start[new_finished] + sources[new_finished].size <= block_end && new_finished < cur) ++new_finished;
+        LegacyEmitBlockMetadata(out, stream, sources, checksums, started, new_started, finished, new_finished, ckmode, options);
+        started = new_started; finished = new_finished;
+        WriteLegacyRecord(out, 0u, stream, block.data(), block.size());
+        written = block_end;
+        if (total == 0u) break;
+    }
+    if (!out) { os << "Error: write failure while building archive.\n"; return 1; }
+    const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+    out.flush();
+    PrintEncodeFooter(os, total, produced, ElapsedSince(add_start), options.verbose);
+    return 0;
+}
+
+// The original's file scan and sort, for every compressor: patterns matched
+// with readdir + fnmatch, "No files found with <arg>" for an argument that
+// matched nothing, -x exclusions, -sp, then the -s<mode> merge sort.
+std::vector<EncodeSource> CollectEncodeSources(const CliOptions& options, std::ostream& os) {
+    std::vector<EncodeSource> found;
+    for (const std::string& arg : options.positional) {
+        const std::size_t before = found.size();
+        LegacyScanArgument(arg, options.recurse, &found);
+        if (found.size() == before) os << "No files found with " << arg << '\n';
+    }
+    if (!options.exclude_patterns.empty()) {
+        std::vector<EncodeSource> kept;
+        for (EncodeSource& e : found) if (!IsExcluded(e.archive_name, options.exclude_patterns)) kept.push_back(std::move(e));
+        found.swap(kept);
+    }
+    if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = fs::path(e.archive_name).filename().string();
+    if (options.sort_mode != 0u) LegacyMergeSort(&found, options.sort_mode);
+    return found;
+}
+
 int RunAdd(const CliOptions& options, std::ostream& os) {
     const auto add_start = std::chrono::steady_clock::now();
+    std::vector<EncodeSource> found = CollectEncodeSources(options, os);
+    if (found.empty()) { os << "Nothing to do (no files found).\n"; return 1; }
+    if (options.compressor == Compressor::kNone) {
+        return RunAddStoreContainer(options, std::move(found), os, add_start);
+    }
+    // The other codecs still go through the stub writer (uncompressed bytes in
+    // legacy framing, one file table): give it the original's file list.
+    {
+        std::vector<SourceFile> sources;
+        for (const EncodeSource& e : found) {
+            SourceFile sf;
+            sf.source_path = e.fs_path; sf.archive_name = e.archive_name; sf.size = e.size;
+            sf.permissions = e.mode; sf.mtime_unix = e.mtime;
+            if (options.checksum != ChecksumMode::kNone) ComputeFileChecksum(e.fs_path, options.checksum, &sf.checksum);
+            sources.push_back(std::move(sf));
+        }
+        std::ostringstream native_log;
+        const int native_exit = RunAddNativeLegacyStream(options, sources, native_log);
+        os << native_log.str();
+        return native_exit;
+    }
     const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
 
     std::vector<SourceFile> sources;

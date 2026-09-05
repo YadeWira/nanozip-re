@@ -63,6 +63,11 @@ struct CliOptions {
     bool no_timestamps = false;
     bool no_permissions = false;
     bool no_filename_ext = false;
+    // -s<n,e,a,s>: the order files take in the archive, the original's own
+    // numbering (FUN_08052200's merge sort): 0 none (argument/readdir order),
+    // 1 extension (default; case-insensitive extension, then size, then name),
+    // 2 name, 3 size.
+    unsigned sort_mode = 1;
 
     std::string output_path;
     std::vector<std::string> exclude_patterns;

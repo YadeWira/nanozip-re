@@ -199,6 +199,7 @@ CliOptions ParseCli(int argc, char** argv) {
         } else if (sw[0] == 's') {
             const std::string v = sw.substr(1);
             ok = (v == "n" || v == "e" || v == "a" || v == "s");
+            if (ok) out.sort_mode = (v == "n") ? 0u : (v == "e") ? 1u : (v == "a") ? 2u : 3u;
         } else if (sw[0] == 'o') {
             out.output_path = sw.substr(1);            // may be empty: no effect
         } else if (sw[0] == 'x') {
@@ -261,9 +262,10 @@ CliOptions ParseCli(int argc, char** argv) {
         if (!ends(".nz") && !ends(".exe")) out.archive_path += ".nz";
     }
 
+    // No file arguments: the original scans "*" (measured: `nz a new.nz` in a
+    // directory holding one file archives that file).
     if ((out.command == Command::kAdd || out.command == Command::kSimulate) && out.positional.empty()) {
-        out.show_usage = true;
-        out.error = "no input files provided";
+        out.positional.push_back("*");
     }
 
     return out;

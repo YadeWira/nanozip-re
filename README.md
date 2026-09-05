@@ -40,6 +40,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
+| **Encode**, `a -cn` against the original's `a` on the same inputs and switches (`tests/encode/oracle.sh`: file order in its four `-s` modes, `-r`, `-sp`, `-x`, `-nt`/`-np`/`-nm`/`-fo`, every checksum kind, block boundaries, a 1 MB multi-block input) | 28/28 archives byte-identical, each read by the other binary; the compressed codecs still write the stub |
 | Release package, 72 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 184/184 hashes |
 | Console matrices, 182 cases, and the pty prompt harness (`tests/parity/`) | 92 byte-identical, 84 differing only in status-line writes (how many `N MB` figures fit depends on the seconds the decode crosses, and the original's footer adds an `IO-out` clause), and 6 real: two are the compression commands the encode phase will bring, four are the documented departures ([quirks 3, 28, 29](docs/ORIGINAL_QUIRKS.md)) |
 | Directory trees: deep paths, symlinks, unreadable files, setuid/sticky modes, UTF-8 and space names, extreme timestamps, `-fo` (`tests/sweep_dirs.sh`) | 16/16 archives extract identically (contents, mode, mtime, links) |
