@@ -1192,6 +1192,7 @@ struct NzImageModel::Impl {
     uint8_t plane_shift_[5];                 // obj+0x52936 (u16 stride, low bytes)
     AudioBitcountDecoder bc_a_[4];           // obj+0x50f00 + k*0x680  (vtable 0x0813c848)
     AudioBitcountDecoderB bc_b_[4];          // obj+0x8e60  + k*0x12020 (vtable 0x0813c860)
+    bool have_ = true;                       // obj+0x52920: set by the ctor and at every chunk commit
     std::vector<uint8_t> bitcount_;          // auStack_100e0
     std::vector<int32_t> resid_;             // auStack_500fc
 
@@ -1206,6 +1207,29 @@ struct NzImageModel::Impl {
         flags_ = flags; variant_b_ = vb;
         for (int k = 0; k < 4; ++k) { plane_[k].order = order03; plane_[k].Reset(); }
         plane_[4].order = order4; plane_[4].Reset();
+    }
+
+    // FUN_080b6170 (see the header). The flag bit 1 branch (LMS planes and the
+    // cascade coefficients) is written from the decompile but exercised by no
+    // codec's reset yet: only lzpf (flags 0) and the -cd/-co families call it.
+    void Reset() {
+        width_ = 1; col_ = 0; row_ = 0; align_ = 0; grp_ = 1; nch_ = 1; endian_ = 0;
+        if (!have_) return;
+        have_ = false;
+        r0_ = 0; r1_ = 0;
+        if (flags_ & 4u) std::fill(ring0_.begin(), ring0_.end(), 0);
+        std::fill(ring1_.begin(), ring1_.end(), 0);
+        std::memset(casc_shift_, 0x0c, sizeof(casc_shift_));
+        for (auto& s : plane_shift_) s = 0x0f;
+        if (flags_ & 2u) {
+            for (int k = 0; k < 5; ++k) plane_[k].Reset();
+            for (auto& row : casc_) for (auto& st : row) { std::memset(st.coef, 0, sizeof(st.coef)); std::memset(st.hist, 0, sizeof(st.hist)); }
+        }
+        // flag bit 0: the four per-channel bit-count models go back to their
+        // initial state (the class's slot-0 routine through the object's vtable)
+        if (flags_ & 1u) {
+            for (int k = 0; k < 4; ++k) { if (variant_b_) bc_b_[k].Reset(); else bc_a_[k].Reset(); }
+        }
     }
 
     // FUN_080bdb20: clear a plane's sample/sign windows and its prediction; the
@@ -1389,6 +1413,7 @@ struct NzImageModel::Impl {
             p += rem_mod;
         }
         // LAB_080a92cb: commit the chunk's format into the object.
+        have_ = true;
         align_ = (uint8_t)rem_mod;
         grp_ = (uint8_t)(bps * nch);
         nch_ = (uint8_t)nch;
@@ -1565,6 +1590,7 @@ struct NzImageModel::Impl {
 
 NzImageModel::NzImageModel() : impl_(new Impl()) {}
 NzImageModel::~NzImageModel() = default;
+void NzImageModel::Reset() { impl_->Reset(); }
 void NzImageModel::Configure(std::uint8_t flags, std::uint32_t order03, std::uint32_t order4, bool vb) {
     impl_->Configure(flags, order03, order4, vb);
 }

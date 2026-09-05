@@ -867,7 +867,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         if (got == 0u) {
             literal(0u);
             st.BackfillSparse(len);
-            st.audio.ResetAll();
+            st.audio.ResetAll(); st.image.Reset();
         } else {
             out.insert(out.end(), hdr.begin(), hdr.end());
             out.insert(out.end(), payload.begin(), payload.end());
@@ -881,6 +881,31 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         const AudioProbe& q = st.probe;
         std::fprintf(stderr, "[lzpfenc] len=%zu score=%u probe{s=%u le=%u w=%u ch=%u pfx=%u hdr=%u code=%x conf=%u lz=%u pf=%u done=%u end=%u} dec=%d exe=%u\n",
                      len, score, q.signed_, q.le, q.width, q.chans, q.prefix, q.hdr, q.code, q.conf, q.lz_cost, q.pf_cost, q.bytes_done, q.audio_end, (int)audio_decision, exe_metric);
+    }
+    // the image flavour (FUN_0805a790: `rows_done < height || (0x32 < score && detect)`),
+    // checked BEFORE the audio span; a declined block is a literal with flags 0
+    // and resets both models (the driver's LAB_0805ab47 for every non-prefilter block)
+    ImageProbe img;
+    ImageDetect(img, src, static_cast<std::uint32_t>(len));
+    if (st.image.rows_done < st.image.height || (0x32u < score && img.width != 0u)) {
+        std::vector<std::uint8_t> hdr;
+        WriteBlockHeader(hdr, static_cast<std::uint32_t>(len), 4u, 1u);
+        std::vector<std::uint8_t> payload;
+        const std::size_t got = ImageEncodeBlock(st.image, img, block, static_cast<std::uint32_t>(len), payload, (align + hdr.size()) & 3u);
+        if (got == 0u) {
+            literal(0u);
+            st.BackfillSparse(len);
+            st.audio.ResetAll();
+            st.image.Reset();
+        } else {
+            out.insert(out.end(), hdr.begin(), hdr.end());
+            out.insert(out.end(), payload.begin(), payload.end());
+            st.BackfillSparse(len);
+        }
+        st.literal_bytes += len;
+        st.exe_pos += len;
+        st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
+        return;
     }
     if (st.probe_ctx.bytes_done < st.probe_ctx.audio_end) { audio_block(); return; }
     std::uint32_t flags58 = 0u;
@@ -898,7 +923,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
             st.literal_bytes += len;
             st.exe_pos += len;
             st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
-            st.audio.ResetAll();
+            st.audio.ResetAll(); st.image.Reset();
             return;
         }
     }
@@ -945,7 +970,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
     st.literal_bytes += len;
     st.exe_pos += len;
     st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
-    st.audio.ResetAll();   // FUN_080b6b60 after every non-prefilter block
+    st.audio.ResetAll(); st.image.Reset();   // FUN_080b6b60 after every non-prefilter block
 }
 
 }  // namespace nzr::lzpf_enc

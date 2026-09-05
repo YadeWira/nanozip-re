@@ -58,6 +58,42 @@ struct AudioModel {
     void ResetAll() { for (auto& p : plane) p.Reset(); }   // FUN_080b1950
 };
 
+// FUN_080899d0's 0x28-byte struct: what the image detector found.
+struct ImageProbe {
+    std::uint32_t width = 0, height = 0, prefix = 0, nch = 1, bps = 1, w5 = 0;
+};
+bool ImageDetect(ImageProbe& pr, const std::uint8_t* block, std::uint32_t len);
+
+// The image model object (FUN_080b5f50 layout, the fields the lzpf flavour --
+// flags 0 -- touches) plus the one piece of the original's STACK the block
+// encoder depends on: FUN_08089a80's 65536-entry match table is an
+// uninitialised local that doubles as the residual planes, so the previous
+// block's residuals (and the previous gate's positions) are what the next
+// block's gate reads. Zero on the thread's first call; kept here across blocks
+// and NOT touched by Reset() (FUN_080b6170 does not know about the stack).
+struct ImageEncModel {
+    std::vector<std::int16_t> ring1;   // obj+4: one short per sample, index & 0x7fff (0x8003 shorts)
+    std::uint32_t r1 = 0;              // obj+0x52914
+    std::uint32_t width = 1;           // obj+0x5291a (u16)
+    std::uint32_t height = 0;          // obj+0x5291c (u16)
+    std::uint32_t rows_done = 0;       // obj+0x5291e (u16)
+    std::uint32_t col = 0;             // obj+0x52918 (u16): pixels of the row a block ended inside
+    std::uint8_t align = 0, nch = 1, grp = 1, bps = 1, endian = 0;   // obj+0x52921/22/23/24/25
+    std::vector<std::uint32_t> stack_tbl;
+    ImageEncModel() : ring1(0x8003u, 0), stack_tbl(65543u, 0) {}
+    void Reset() {                      // FUN_080b6170
+        width = 1; col = 0; rows_done = 0; height = 0; align = 0; grp = 1; nch = 1; bps = 1; endian = 0;
+        r1 = 0; std::fill(ring1.begin(), ring1.end(), 0);
+    }
+};
+
+// FUN_08089a80 for the lzpf configuration (flags 0). Appends the block's bytes
+// to `out`; returns their count, or 0 when the image model declines (the caller
+// then stores a literal). `pr` is this block's detect (width 0 = none: a
+// continuation block); `align` is the output address of the block payload & 3.
+std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
+                             std::uint32_t len, std::vector<std::uint8_t>& out, std::uintptr_t align);
+
 std::uint32_t AudioCost(const std::int32_t* v, std::uint32_t n);
 void AudioUnpack(const std::uint8_t* src, std::uint32_t nbytes, std::int32_t* out, const AudioProbe& pr);
 void AudioProbeBlock(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len);
@@ -145,6 +181,7 @@ struct State {
     AudioProbe probe;                         // the analysis job's copy (job+0x8060)
     AudioProbe probe_ctx;                     // the codec's copy (ctx+0x487c0), the one the encoder edits
     AudioModel audio;                         // +0x10080 (ctx + 0x4020)
+    ImageEncModel image;                      // +0x12200 (the image model object)
 
     void Init(bool variant_b, std::size_t capacity);
     // FUN_080b6bb0: when fewer than 32 KB remain, zero [cursor, capacity + 32 KB) and rewind.

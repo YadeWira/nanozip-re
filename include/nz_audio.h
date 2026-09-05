@@ -122,6 +122,14 @@ class NzImageModel {
     void Configure(std::uint8_t flags, std::uint32_t order_planes0_3,
                    std::uint32_t order_plane4, bool bitcount_variant_b);
 
+    // FUN_080b6170: the dispatcher's reset after every non-prefilter block (an
+    // LZ or literal block; audio and image blocks leave it alone). The format
+    // goes back to 1 x 1 x 1 and, if a chunk was committed since the last
+    // reset, the rings, their indices and the shift tables are cleared too. The
+    // object is NOT reset between chunks: an image's first block predicts from
+    // whatever the previous image left in the rings.
+    void Reset();
+
     // Decodes one block of `out_size` bytes (FUN_080a9ca0). Returns the number
     // of input bytes consumed, or 0 on malformed input (output is garbage then).
     std::size_t Decode(const std::uint8_t* in, std::size_t in_size,

@@ -869,6 +869,9 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         // unobserved, so that reset is wired but untested.
         if (pf_ctx == nullptr) return 0;
         if (flags & 2u) { pf_ctx->ResetAll(); if (pf_lms1) pf_lms1->Init(); if (pf_lms2) pf_lms2->Init(); }
+        // every non-image chunk resets the image object in this family (GDB: one
+        // FUN_080b6170 before each of a WAV's five prefilter chunks, and before every LZ chunk)
+        if (img) img->Reset();
         std::vector<std::uint8_t> pf_out(out_size);
         const std::size_t used = nzr::lzpf::DecodePrefilterStream(
             r.cur, CdAvail(r),
@@ -911,6 +914,7 @@ std::uint32_t DecodeChunk(const std::uint8_t* block, std::size_t block_len, std:
         if (pf_lms1) pf_lms1->Init();
         if (pf_lms2) pf_lms2->Init();
     }
+    if (img) img->Reset();   // FUN_080b6170: an LZ chunk resets the image object too
 
     std::vector<std::uint8_t> slice(out_size + 64, 0);  // chunk compact recon, linearised
 

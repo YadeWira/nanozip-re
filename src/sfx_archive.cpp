@@ -3932,8 +3932,11 @@ bool DecodeLzpfMember(
         pf_lms_ch2.Init();
         // The image model: the (uVar9 & 7) == 4 block with bit 3 set runs
         // FUN_080a9ca0 on the dispatcher's image object (param_1 + 0x121f0) instead
-        // of the prefilter core. One per stream, never reset. -cf and -cF share
-        // the profile (GDB: flags 0x00, all five planes order 16).
+        // of the prefilter core. One per stream, reset after every non-prefilter
+        // block (FUN_080b6170) and kept across chunk boundaries -- the encode
+        // oracle's `gray.tif a.txt pic.tga` decoded the TGA from the TIFF's rings
+        // without the reset. -cf and -cF share the profile (GDB: flags 0x00, all
+        // five planes order 16).
         nzr::audio::NzImageModel lzpf_img;
         lzpf_img.Configure(0x00u, 16u, 16u, true);
         while (total_written < total) {
@@ -4083,6 +4086,7 @@ bool DecodeLzpfMember(
             pf_ctx.ResetAll();
             pf_lms_ch1.Init();
             pf_lms_ch2.Init();
+            lzpf_img.Reset();   // FUN_080b6170 rides along (LAB_0805ab47 of the encoder's driver)
             std::uint64_t block_out_size = uvar9 >> 3u;
             if (block_out_size == 0u) block_out_size = 0x8000u;
             if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
@@ -7492,6 +7496,7 @@ static bool TryDecodeLegacyCm(
                             payload_size, alt_out_size, adp);
                 }
                 if (mode2_type) aud.Reset();
+                img.Reset();   // every non-image block resets the image object (GDB, FUN_080b6170)
                 std::vector<std::uint8_t> abuf(alt_out_size);
                 const bool aok = aud.Decode(payload, payload_size, abuf.data(), alt_out_size);
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -7526,8 +7531,11 @@ static bool TryDecodeLegacyCm(
             progress::Add(work3.size());
             continue;
         }
-        // Every non-audio block resets the audio predictor.
+        // Every non-audio block resets the audio predictor; every LZ block resets
+        // the image object too (FUN_080b6170; image -> LZ -> image decoded the second
+        // image from the first one's rings without it).
         aud.Reset();
+        img.Reset();
 
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t param6 = raw[pos++];
@@ -8117,7 +8125,9 @@ static bool DecodeOptimumBlockSequence(
                 // Image block (FUN_080a9ca0 on the codec's image object; the
                 // community reference wrongly treats this shape as CM-only and
                 // returns false for the optimum family). Every non-audio block
-                // resets the audio predictor; the image object is never reset.
+                // resets the audio predictor, and every non-image block (audio or LZ)
+                // resets the image object: the two side models are symmetric here,
+                // unlike lzpf's dispatcher where audio blocks leave the image alone.
                 audio.Reset();
                 std::vector<std::uint8_t> ibuf(audio_out_size);
                 const std::size_t iused = image.Decode(payload, payload_size, ibuf.data(), audio_out_size);
@@ -8138,6 +8148,7 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, audio_out_size, mode2_type, adp);
             }
             if (mode2_type) audio.Reset();
+            image.Reset();   // every non-image block resets the image object in this family (GDB: one FUN_080b6170 per audio block)
             std::vector<std::uint8_t> abuf(audio_out_size);
             const bool aok = audio.Decode(payload, payload_size, abuf.data(), audio_out_size);
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -8151,8 +8162,10 @@ static bool DecodeOptimumBlockSequence(
         }
         // Every non-audio block resets the audio predictor (reference
         // DecodeFromStream calls audio_pred->Reset() on the way past the
-        // decr_param == 2 branch), so its state never carries across one.
+        // decr_param == 2 branch), so its state never carries across one. The
+        // image object resets here too (FUN_080b6170).
         audio.Reset();
+        image.Reset();
 
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t param6 = raw[pos++];

@@ -59,12 +59,43 @@ def wav(path, ch, bits, n, gen):
 wav(f'{d}/tone.wav', 2, 16, 40000, lambda i, c: 12000 * math.sin(i * 0.031 + c) + 3000 * math.sin(i * 0.17) + random.randrange(-40, 41))
 wav(f'{d}/voice8.wav', 1, 8, 60000, lambda i, c: 128 + 60 * math.sin(i * 0.05) * math.sin(i * 0.0007) + random.randrange(-3, 4))
 open(f'{d}/raw16.pcm', 'wb').write(b''.join(struct.pack('<h', int(9000 * math.sin(i * 0.02) + random.randrange(-100, 101))) for i in range(50000)))
+# images for the lzpf image path (gray TIFF one block, RGB TGA seven blocks, PGM;
+# the 8-bit BMP's palette ramp makes the image gate decline -> literal)
+def gray(w, h, f):
+    return bytes(max(0, min(255, int(f(x, y)))) for y in range(h) for x in range(w))
+def rgb(w, h, f):
+    out = bytearray()
+    for y in range(h):
+        for x in range(w):
+            r, g, b = f(x, y); out += bytes([max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b)))])
+    return bytes(out)
+def tiff_gray(path, w, h, px):
+    tags = [(0x100,3,1,w),(0x101,3,1,h),(0x102,3,1,8),(0x103,3,1,1),(0x106,3,1,1),(0x111,4,1,8+2+9*12+4),(0x115,3,1,1),(0x116,3,1,h),(0x117,4,1,w*h)]
+    ifd = struct.pack('>H', len(tags)) + b''.join(struct.pack('>HHI', t, ty, n) + (struct.pack('>HH', v, 0) if ty == 3 else struct.pack('>I', v)) for t, ty, n, v in tags) + struct.pack('>I', 0)
+    open(path, 'wb').write(b'MM\x00\x2a' + struct.pack('>I', 8) + ifd + px)
+def tga_rgb(path, w, h, px):
+    open(path, 'wb').write(bytes([0, 0, 2, 0,0,0,0,0, 0,0, 0,0]) + struct.pack('<HH', w, h) + bytes([24, 0x20]) + px)
+def bmp_gray8(path, w, h, px):
+    stride = (w + 3) & ~3
+    rows = b''.join(px[y*w:(y+1)*w] + bytes(stride - w) for y in range(h - 1, -1, -1))
+    pal = b''.join(struct.pack('<BBBB', i, i, i, 0) for i in range(256))
+    off = 14 + 40 + 1024
+    hdr = b'BM' + struct.pack('<IHHI', off + len(rows), 0, 0, off) + struct.pack('<IiiHHIIiiII', 40, w, h, 1, 8, 0, len(rows), 2835, 2835, 256, 256)
+    open(path, 'wb').write(hdr + pal + rows)
+def pgm(path, w, h, px):
+    open(path, 'wb').write(f'P5\n# oracle fixture\n{w} {h}\n255\n'.encode() + px)
+g = lambda x, y: 128 + 70 * math.sin(x * 0.045) * math.cos(y * 0.031) + 25 * math.sin((x + y) * 0.2) + random.randrange(-18, 19)
+c = lambda x, y: (120 + 80 * math.sin(x * 0.03) + random.randrange(-14, 15), 100 + 60 * math.cos(y * 0.04) + random.randrange(-14, 15), 140 + 50 * math.sin((x - y) * 0.05) + random.randrange(-14, 15))
+tiff_gray(f'{d}/gray.tif', 160, 150, gray(160, 150, g))
+tga_rgb(f'{d}/pic.tga', 300, 220, rgb(300, 220, c))
+bmp_gray8(f'{d}/gray8.bmp', 200, 180, gray(200, 180, g))
+pgm(f'{d}/gray.pgm', 180, 160, gray(180, 160, g))
 # an executable and a text+random mix for the compressing codecs
 import shutil; shutil.copy('/usr/bin/ls', f'{d}/exe.bin')
 open(f'{d}/mix.bin','wb').write((('lorem ipsum dolor sit amet ' * 40 + '\n') * 900).encode() + bytes(random.randrange(256) for _ in range(700000)))
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
 open(f'{d}/unread.bin','wb').write(bytes(5000)); os.utime(f'{d}/unread.bin', (1200000000, 1200000000)); os.chmod(f'{d}/unread.bin', 0)
-for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin','tone.wav','voice8.wav','raw16.pcm']:
+for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt','exe.bin','mix.bin','tone.wav','voice8.wav','raw16.pcm','gray.tif','pic.tga','gray8.bmp','gray.pgm']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
 }
@@ -154,6 +185,14 @@ CASES=(
   "cf_wav8|-cf -t1|voice8.wav"
   "cf_raw16|-cf -t1|raw16.pcm"
   "cf_media|-cf -t1 -sn|tone.wav a.txt voice8.wav raw16.pcm"
+  "cf_img_tif|-cf -t1|gray.tif"
+  "cf_img_tga|-cf -t1|pic.tga"
+  "cF_img_tga|-cF -t1|pic.tga"
+  "cf_img_bmp8|-cf -t1|gray8.bmp"
+  "cf_img_pgm|-cf -t1|gray.pgm"
+  "cf_img_mix|-cf -t1 -sn|gray.tif a.txt pic.tga tone.wav gray.pgm"
+  "cf_img_two|-cf -t1 -sn|gray.tif pic.tga"
+  "cf_img_aud|-cf -t1 -sn|gray.tif tone.wav pic.tga"
   "cd_one|-cd|a.txt"
   "cD_one|-cD|a.txt"
   "co_one|-co|a.txt"
