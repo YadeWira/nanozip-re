@@ -47,6 +47,7 @@ open(f'{d}/p6.bin','wb').write(bytes(random.randrange(256) for _ in range(600000
 open(f'{d}/p3.dat','wb').write(bytes(random.randrange(256) for _ in range(300000)))
 open(f'{d}/p2.txt','w').write('parallel text line\n' * 5000)
 os.chmod(f'{d}/my.dir/f', 0o600); os.chmod(f'{d}/.hidden', 0o600)
+open(f'{d}/unread.bin','wb').write(bytes(5000)); os.utime(f'{d}/unread.bin', (1200000000, 1200000000)); os.chmod(f'{d}/unread.bin', 0)
 for f in ['my.dir/f','.hidden','A.TXT','c.Txt','x._','r98304.bin','r98303.bin','blk1.bin','blk2.bin','blk3.bin','one.bin','big.bin','p12.bin','p6.bin','p3.dat','p2.txt']:
     os.utime(f'{d}/{f}', (1200000000, 1200000000))
 PY
@@ -76,6 +77,12 @@ CASES=(
   "cn_fo|-cn -fo|a.txt b.bin empty"
   "cn_sp|-cn -sp -r|sub a.txt"
   "cn_x|-cn -r -xb.bin|a.txt b.bin sub"
+  "cn_x2|-cn -sn -r -x*.dat|sub a.txt"
+  "cn_x3|-cn -sn -p2 -t1 -xb.bin|p12.bin b.bin a.txt"
+  "cn_x4|-cn -sn -xb.bin -r|."
+  "cn_xonly|-cn -xa.txt|a.txt"
+  "cn_unread|-cn -sn|a.txt unread.bin b.bin"
+  "cn_unread2|-cn -sn|b.bin unread.bin"
   "cn_round|-cn -sn|r98303.bin"
   "cn_round2|-cn -sn|r98304.bin"
   "cn_bound|-cn -sn|blk1.bin blk2.bin blk3.bin one.bin"
@@ -110,7 +117,10 @@ CASES=(
   "cc_one|-cc|a.txt"
 )
 
-same=0; xok=0; total=0; fails=""
+same=0; xok=0; cok=0; total=0; fails=""; cfails=""
+norm_console() {
+  sed -E 's/^(Intel|AMD|unknown).*//; s/Linux(32|64)/LinuxNN/; s/Archive: .*/Archive: X/; s/in [0-9.]+s, [0-9]+ [KMG]?B\/s/in T, R/; s/IO-(in|out): [0-9.]+s, [0-9]+ [KMG]?B\/s/IO-\1: T, R/g; s/ IO-out: T, R//' "$1"
+}
 for spec in "${CASES[@]}"; do
   name=${spec%%|*}; rest=${spec#*|}; sw=${rest%%|*}; files=${rest#*|}
   [ -n "$FILTER" ] && [[ "$name" != *"$FILTER"* ]] && continue
@@ -137,7 +147,11 @@ for spec in "${CASES[@]}"; do
     if diff -r "$c/x_ref" "$c/x_$reader" >/dev/null 2>&1; then cross="$cross $reader-reads-$arch:ok"; else cross="$cross $reader-reads-$arch:FAIL"; fi
   done
   [[ "$cross" != *FAIL* ]] && xok=$((xok+1))
-  printf "%-10s %-38s %s\n" "$name" "$verdict" "$cross"
+  # console of `a`: byte-compared after removing what only timing decides (rates,
+  # seconds, the IO-out figure that appears when a write took a millisecond) and
+  # the host line of the banner.
+  if diff -q <(norm_console "$c/orig.out") <(norm_console "$c/ours.out") >/dev/null; then cok=$((cok+1)); con="console:same"; else con="console:DIFF"; cfails="$cfails $name"; fi
+  printf "%-10s %-38s %s %s\n" "$name" "$verdict" "$cross" "$con"
   [ "$verdict" != IDENTICAL ] && fails="$fails $name"
 done
-echo "oracle: $same/$total archives byte-identical, $xok/$total cross-decode both ways$([ -n "$fails" ] && echo " -- differing:$fails")"
+echo "oracle: $same/$total archives byte-identical, $xok/$total cross-decode both ways, $cok/$total consoles identical$([ -n "$fails" ] && echo " -- differing:$fails")$([ -n "$cfails" ] && echo " -- console:$cfails")"

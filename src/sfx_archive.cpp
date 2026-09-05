@@ -10284,6 +10284,12 @@ struct EncodeSource {
     std::uint32_t mode = 0644;    // st_mode & 0xfff
     std::int64_t mtime = 0;       // epoch seconds
     std::uint16_t uid = 0, gid = 0;
+    std::string display;          // the path as scanned ("./x" under `.`, "sub/x"): the console's name
+    // -x matches and unreadable files stay in the list: they count for the
+    // worker split and the window, and when the reader reaches one it prints
+    // "Cannot open: <display>" and stores nothing (measured; an explicit
+    // `b.bin` under -xb.bin, a chmod 000 file, both the same).
+    bool ghost = false;
 };
 
 // FUN_0804c930: the byte-float NEAREST to `size` (the encoded byte, 1-based
@@ -10361,13 +10367,17 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
             EncodeSource e;
             e.archive_name = prefix + name;
             e.fs_path = it->path();
+            e.display = dir_part.empty() ? name : dir_part + "/" + name;
+            e.ghost = ::access(it->path().c_str(), R_OK) != 0;
             e.size = static_cast<std::uint64_t>(st.st_size);
             e.mode = static_cast<std::uint32_t>(st.st_mode & 0xfffu);
             e.mtime = static_cast<std::int64_t>(st.st_mtime);
             e.uid = static_cast<std::uint16_t>(st.st_uid); e.gid = static_cast<std::uint16_t>(st.st_gid);
             out->push_back(std::move(e));
         } else if (S_ISDIR(st.st_mode) && recurse && name != "." && name != "..") {
-            LegacyScanDirectory(it->path().string(), "*", prefix + name + "/", recurse, out);
+            // the directory's path is built by concatenation, as the original
+            // does ("sub/c.dat" for the argument `sub`, "./sub/c.dat" under `.`)
+            LegacyScanDirectory(dir_part.empty() ? name : dir_part + "/" + name, "*", prefix + name + "/", recurse, out);
         }
     }
 }
@@ -10557,7 +10567,7 @@ void LegacyEmitBlockMetadata(std::ostream& out, unsigned stream, const std::vect
 struct LegacyStreamPiece {           // one entry of a worker's list
     std::size_t src = 0;             // index into the sorted sources
     std::uint64_t file_off = 0;      // where this piece starts inside the file
-    std::uint64_t len = 0;
+    std::uint64_t len = 0;           // bytes stored (0 for a ghost)
     bool slice = false;              // partial file: OFF record, flag 0x10
 };
 
@@ -10655,10 +10665,126 @@ void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, c
 
 // Writes one worker stream's whole record run into `out`: the global bytes
 // [begin, end) of the concatenated sources, in blocks of `window`.
+// The original's `a` console for the store (measured 2026-09-05 against
+// linux32/nz; the decoder's engine in namespace progress is the same code seen
+// from the other side, FUN_0804b740 / FUN_0804ab00):
+//  * one slot per worker: done = input bytes of the blocks it has completed,
+//    total = the bytes of its range; a slot draws "<pct>%" with
+//    pct = ((done>>10)|1)*100 / ((total>>10)|1) -- KB units OR'd with 1, so a
+//    two-block 75501-byte store shows 89 % (65*100/73), not 86;
+//  * the fields of slots 0.. up to the first slot still at 0 are joined by '|',
+//    then four spaces and one backspace per character written;
+//  * a worker tick (every completed block) redraws only when the whole second
+//    of time() differs from the previous worker tick; the file-start tick has a
+//    gate of its own and prints the name in 40 columns plus a space first.
+//    Hence, in a run under a second: name, empty fields, then ONE field draw
+//    after the first block -- 100 % for a one-block store, the block-1 figure
+//    for two; and with -pN under -t1 an EMPTY field, since worker N-1 runs
+//    first and slot 0 is still at zero.
+struct EncodeStatus {
+    std::vector<std::uint64_t> done, total;
+    std::time_t writer_sec = 0, worker_sec = 0;
+    explicit EncodeStatus(std::size_t workers) : done(workers, 0u), total(workers, 0u) {}
+    static std::string Pct(std::uint64_t d, std::uint64_t t) {
+        return std::to_string((((d >> 10u) | 1u) * 100u) / ((t >> 10u) | 1u)) + "%";
+    }
+    std::string Fields() const {
+        std::string f;
+        for (std::size_t k = 0; k < done.size() && k < 8u; ++k) {
+            if (done[k] == 0u) break;
+            if (!f.empty()) f += '|';
+            f += Pct(done[k], total[k]);
+        }
+        return f;
+    }
+    void DrawFields(std::ostream& os) const {
+        const std::string f = Fields();
+        os << f << "    " << std::string(f.size() + 4u, '\b');
+        os.flush();
+    }
+    void FileStart(std::ostream& os, const std::string& name) {
+        const std::time_t sec = std::time(nullptr);
+        if (sec == writer_sec) return;
+        writer_sec = sec;
+        ClearStatusLine(os);
+        os << progress::Name40(name) << ' ';
+        DrawFields(os);
+    }
+    // A ghost's bytes join the slot at the next block end (the name tick before
+    // the first block shows an empty field even after "Cannot open"): the slot
+    // counts what the worker has consumed of its range, block by block.
+    std::vector<std::uint64_t> pending;
+    void Passed(std::size_t k, std::uint64_t bytes) { if (pending.size() < done.size()) pending.resize(done.size(), 0u); if (k < done.size()) pending[k] += bytes; }
+    void BlockDone(std::ostream& os, std::size_t k, std::uint64_t bytes) {
+        if (pending.size() < done.size()) pending.resize(done.size(), 0u);
+        if (k < done.size()) { done[k] += bytes + pending[k]; pending[k] = 0u; }
+        const std::time_t sec = std::time(nullptr);
+        if (sec == worker_sec) return;
+        worker_sec = sec;
+        DrawFields(os);
+    }
+};
+
+// "Threads: T, memory: 512 MB[, IO-buffers: R+W MB]" -- T = min(-t, host), the
+// buffers only with more than one thread (a -t1 run has none: -v then says
+// "Setting up IO write buffer: 0 MB" and the Compressor lines carry no
+// IO-buffer). A -pN above T is preceded by the warning line. One Compressor
+// line per worker, "[M MB]" from that worker's window, -v adding its share of
+// the read buffer (R/N, half-up MB).
+void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window) {
+    const unsigned host = HostThreadCount();
+    unsigned threads = host;
+    if (options.threads > 0u && options.threads < host) threads = options.threads;
+    const auto mb = [](std::uint64_t b) { return ((b >> 19u) + 1u) >> 1u; };
+    const std::uint64_t rbuf = options.read_buffer_bytes ? options.read_buffer_bytes : (20ull << 20u);
+    const std::uint64_t wbuf = options.write_buffer_bytes ? options.write_buffer_bytes : (4ull << 20u);
+    if (workers > threads) os << "Warning: number of compressors set is higher than the number of threads!\n";
+    os << "Archive: " << options.archive_path << '\n';
+    os << "Threads: " << threads << ", memory: 512 MB";
+    if (threads > 1u) os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
+    os << '\n';
+    if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
+    for (unsigned k = 0; k < workers; ++k) {
+        ClearStatusLine(os);
+        os << "Compressor #" << k << ": none [" << mb(window) << " MB]";
+        if (options.verbose && threads > 1u) os << " IO-buffer: " << mb(rbuf / workers) << " MB.";
+        os << '\n';
+    }
+}
+
+// "Compressed X into Y in T, R[ (bpb)]" then "IO-in: T, R.[ IO-out: T, R]" --
+// times in whole milliseconds (1 byte in under a millisecond prints "1000 B/s"),
+// the IO-in figure from the time spent reading, IO-out only when writing took a
+// measurable millisecond.
+void PrintStoreEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t out_bytes,
+                            std::uint64_t total_ms, std::uint64_t read_ms, std::uint64_t write_ms, bool verbose) {
+    const auto rate = [](std::uint64_t bytes, std::uint64_t ms) {
+        return FormatRate(static_cast<double>(bytes) * 1000.0 / static_cast<double>(ms ? ms : 1u));
+    };
+    char buf[256];
+    ClearStatusLine(os);
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %.2fs, %s",
+                  FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
+                  static_cast<double>(total_ms) / 1000.0, rate(in_bytes, total_ms).c_str());
+    os << buf;
+    if (verbose) {
+        std::snprintf(buf, sizeof(buf), " (%.3f bpb)", static_cast<double>(out_bytes) * 8.0 / static_cast<double>(in_bytes + 1u));
+        os << buf;
+    }
+    os << '\n';
+    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", static_cast<double>(read_ms) / 1000.0, rate(in_bytes, read_ms).c_str());
+    os << buf;
+    if (write_ms > 0u) {
+        std::snprintf(buf, sizeof(buf), " IO-out: %.2fs, %s", static_cast<double>(write_ms) / 1000.0, rate(out_bytes, write_ms).c_str());
+        os << buf;
+    }
+    os << '\n';
+}
+
 bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
                             const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
                             std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
-                            bool with_header, bool last_stream, std::ostream& os, bool* progress_shown) {
+                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms) {
     if (with_header) {
         std::vector<unsigned char> hdr;
         if (ckmode != ChecksumMode::kNone) {
@@ -10671,7 +10797,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
     // The pieces of this range, in the order the reader meets them, then the
-    // original's list order: slices prepended, whole files appended.
+    // original's list order: slices prepended, whole files appended. Ghosts (-x
+    // matches, unreadable files) take their bytes in the split but store none.
     std::vector<LegacyStreamPiece> met;
     for (std::size_t i = 0; i < src.size(); ++i) {
         const std::uint64_t fb = start[i], fe = start[i] + src[i].size;
@@ -10680,57 +10807,93 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         if (src[i].size == 0u) { if (fb >= begin && (fb < end || (last_stream && fb == end))) met.push_back({i, 0u, 0u, false}); continue; }
         if (fe <= begin || fb >= end) continue;
         const std::uint64_t pb = std::max(fb, begin), pe = std::min(fe, end);
-        met.push_back({i, pb - fb, pe - pb, (pb != fb) || (pe != fe)});
+        if (pe <= pb) continue;
+        met.push_back({i, pb - fb, src[i].ghost ? 0u : pe - pb, (pb != fb) || (pe != fe)});
     }
     // The worker's list IS its reading order: the stream's bytes come out in
     // list order too (measured: -p3 -t1 over 7/5/8 MB files, worker 1's data
     // starts with the head of the third file, then the tail of the first, then
     // the whole second one -- exactly its table).
-    std::vector<LegacyStreamPiece> pieces;           // list order
-    for (const LegacyStreamPiece& pc : met) { if (pc.slice) pieces.insert(pieces.begin(), pc); else pieces.push_back(pc); }
-    met = pieces;
+    {
+        std::vector<LegacyStreamPiece> ordered;
+        for (const LegacyStreamPiece& pc : met) { if (pc.slice) ordered.insert(ordered.begin(), pc); else ordered.push_back(pc); }
+        met = ordered;
+    }
     // An empty range with no file to announce: the header was all there is.
-    if (begin == end && pieces.empty()) return true;
+    if (begin == end && met.empty()) return true;
+    // `pieces` = the list without its ghosts (what the tables, stamps and
+    // checksums describe); piece_of maps a reading position to it.
+    std::vector<LegacyStreamPiece> pieces;
+    std::vector<std::size_t> piece_of(met.size(), 0u);
+    for (std::size_t m = 0; m < met.size(); ++m) {
+        if (src[met[m].src].ghost) { piece_of[m] = static_cast<std::size_t>(-1); continue; }
+        piece_of[m] = pieces.size(); pieces.push_back(met[m]);
+    }
     std::vector<std::uint64_t> piece_pos(pieces.size(), 0u);
-    { std::uint64_t pos = 0; for (std::size_t k = 0; k < pieces.size(); ++k) { piece_pos[k] = pos; pos += pieces[k].len; } }
+    std::uint64_t total = 0;   // the bytes this stream stores
+    for (std::size_t k = 0; k < pieces.size(); ++k) { piece_pos[k] = total; total += pieces[k].len; }
     std::vector<std::uint32_t> piece_ck(pieces.size(), 0u);
     // "started" / "finished" are decided in READING order but emitted in list
     // order; the original's list is what its emitters walk, so mark per piece.
     std::vector<bool> announced(pieces.size(), false), summed(pieces.size(), false);
     std::uint64_t written = 0;
-    const std::uint64_t total = end - begin;
+    // Only ghosts: their reports, and no block at all (`-xa.txt a.txt` gives a
+    // 27-byte archive -- kind and codec records, nothing else).
+    if (pieces.empty()) {
+        for (const LegacyStreamPiece& pc : met) { ClearStatusLine(os); os << "Cannot open: " << src[pc.src].display << '\n'; }
+        return true;
+    }
     std::ifstream in;
     std::size_t cur_met = 0; std::uint64_t cur_off = 0;   // reading cursor over `met`
     std::vector<unsigned char> block, iobuf(1u << 16u);
     LegacyFileChecksum ck(ckmode);
-    // checksums are computed per piece while reading
-    auto piece_index_of = [&](std::size_t met_i) -> std::size_t { return met_i; };
+    // Ghosts and 0-byte files at the reading cursor: the ghost is reported, the
+    // empty file gets its (empty) checksum; both are passed without a read.
+    const auto pass_empty = [&]() {
+        while (cur_met < met.size() && (piece_of[cur_met] == static_cast<std::size_t>(-1) || met[cur_met].len == 0u)) {
+            if (piece_of[cur_met] == static_cast<std::size_t>(-1)) {
+                ClearStatusLine(os);
+                os << "Cannot open: " << src[met[cur_met].src].display << '\n';
+                // its bytes count as done for the slot (a one-block store with a
+                // ghost still shows 100 %; a two-block one shows block 1 over the
+                // total WITH the ghost)
+                status.Passed(stream, src[met[cur_met].src].size);
+            } else {
+                status.FileStart(os, src[met[cur_met].src].display);   // an empty file is opened too
+                piece_ck[piece_of[cur_met]] = LegacyFileChecksum(ckmode).Final();
+            }
+            ++cur_met; cur_off = 0;
+        }
+    };
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
         const std::uint64_t want = std::min<std::uint64_t>(window, total - written);
         while (block.size() < want && cur_met < met.size()) {
+            pass_empty();
+            if (cur_met >= met.size()) break;
             const LegacyStreamPiece& pc = met[cur_met];
             const EncodeSource& e = src[pc.src];
             if (cur_off == 0u) {
                 in.close(); in.clear(); in.open(e.fs_path, std::ios::binary); in.seekg(static_cast<std::streamoff>(pc.file_off));
                 ck = LegacyFileChecksum(ckmode);
-                if (!*progress_shown) { PrintFileProgress(os, e.archive_name, "100%"); *progress_shown = true; }
+                status.FileStart(os, e.display);
             }
-            if (pc.len == 0u) { piece_ck[piece_index_of(cur_met)] = ck.Final(); ++cur_met; cur_off = 0; continue; }
             const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size()}));
+            const auto t_read = std::chrono::steady_clock::now();
             in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
+            *read_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_read).count());
             if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << e.fs_path.string() << '\n'; return false; }
             ck.Update(iobuf.data(), n);
             block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
             cur_off += n;
-            if (cur_off == pc.len) { piece_ck[piece_index_of(cur_met)] = ck.Final(); ++cur_met; cur_off = 0; }
+            if (cur_off == pc.len) { piece_ck[piece_of[cur_met]] = ck.Final(); ++cur_met; cur_off = 0; }
         }
-        while (cur_met < met.size() && met[cur_met].len == 0u) { piece_ck[piece_index_of(cur_met)] = LegacyFileChecksum(ckmode).Final(); ++cur_met; }
+        pass_empty();
         const std::uint64_t block_end = written + block.size();
         // pieces that start in this block (list order), and those that end in it
         std::size_t a_from = pieces.size(), a_to = 0, c_from = pieces.size(), c_to = 0;
         for (std::size_t k = 0; k < pieces.size(); ++k) {
-            const bool starts = !announced[k] && (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && k < pieces.size() && cur_met > 0u));
+            const bool starts = !announced[k] && (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && cur_met > 0u));
             if (starts) { announced[k] = true; a_from = std::min(a_from, k); a_to = std::max(a_to, k + 1u); }
             const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= block_end;
             if (ends) { summed[k] = true; c_from = std::min(c_from, k); c_to = std::max(c_to, k + 1u); }
@@ -10741,6 +10904,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, block.size());
         out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), block.begin(), block.end());
         written = block_end;
+        status.BlockDone(os, stream, block.size());
         if (total == 0u) break;
     }
     return true;
@@ -10754,8 +10918,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
 // different archives), so this order is what we always write.
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
                          const std::chrono::steady_clock::time_point& add_start) {
-    std::uint64_t total = 0;
-    for (const EncodeSource& e : sources) total += e.size;
+    // Ghosts count here (the split and the window are sized before anything is
+    // opened), but not in what the footer reports as compressed.
+    std::uint64_t total = 0, stored = 0;
+    for (const EncodeSource& e : sources) { total += e.size; if (!e.ghost) stored += e.size; }
     const ChecksumMode ckmode = LegacyNormalizeChecksumModeForCompression(options.checksum);
     // -pN keeps every worker even when the input is smaller than N bytes: a
     // worker whose range is empty writes its kind+codec records and nothing
@@ -10769,7 +10935,15 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
-    PrintEncodeHeader(os, options.archive_path, "none", 0u, 512u, 20u, 4u, options.verbose);
+    PrintStoreEncodeHeader(os, options, workers, window);
+    EncodeStatus status(workers);
+    std::uint64_t read_ms = 0, write_ms = 0;
+    const auto timed_write = [&](const std::vector<unsigned char>& v) {
+        const auto t0 = std::chrono::steady_clock::now();
+        out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
+        out.flush();
+        write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+    };
 
     static const char kSig[] = "NanoZip 0.09 alpha";
     WriteLegacyRecord(out, 14u, 0u, reinterpret_cast<const unsigned char*>(kSig), sizeof(kSig) - 1u);
@@ -10778,23 +10952,23 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
 
     std::vector<std::uint64_t> start(sources.size(), 0u);
     { std::uint64_t pos = 0; for (std::size_t i = 0; i < sources.size(); ++i) { start[i] = pos; pos += sources[i].size; } }
-    bool progress_shown = false;
     auto range_of = [&](unsigned k) -> std::pair<std::uint64_t, std::uint64_t> {
         const std::uint64_t b = static_cast<std::uint64_t>(k) * per;
         const std::uint64_t e = (k + 1u == workers) ? total : b + per;
         return {b, e};
     };
+    for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
     if (workers == 1u) {
         std::vector<unsigned char> body;
-        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, &progress_shown)) return 1;
-        out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms)) return 1;
+        timed_write(body);
     } else {
         std::vector<unsigned char> body;
         // the last worker's header first
         {
             const auto r = range_of(workers - 1u);
             std::vector<unsigned char> h;
-            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, &progress_shown)) return 1;
+            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms)) return 1;
             // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
             std::vector<unsigned char> hdr_only;
             if (ckmode != ChecksumMode::kNone) {
@@ -10804,7 +10978,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
             const unsigned char codec[2] = {0u, static_cast<unsigned char>(p1)};
             WriteLegacyRecordHeader(&hdr_only, 11u, workers - 1u, 2u); hdr_only.insert(hdr_only.end(), codec, codec + 2);
-            out.write(reinterpret_cast<const char*>(hdr_only.data()), static_cast<std::streamsize>(hdr_only.size()));
+            timed_write(hdr_only);
         }
         for (unsigned k = 1u; k < workers; ++k) {
             const auto r = range_of(k);
@@ -10813,26 +10987,27 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             // block -- table, stamps, checksums, an empty DATA -- comes AFTER
             // every header, worker 0's included (measured with -p2 and -p3).
             if (k == workers - 1u && total == 0u) continue;
-            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, &progress_shown)) return 1;
-            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms)) return 1;
+            timed_write(body);
         }
         {
             const auto r = range_of(0u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, &progress_shown)) return 1;
-            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms)) return 1;
+            timed_write(body);
         }
         if (total == 0u) {
             const auto r = range_of(workers - 1u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, &progress_shown)) return 1;
-            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms)) return 1;
+            timed_write(body);
         }
     }
     if (!out) { os << "Error: write failure while building archive.\n"; return 1; }
     const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
     out.flush();
-    PrintEncodeFooter(os, total, produced, ElapsedSince(add_start), options.verbose);
+    const std::uint64_t total_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - add_start).count());
+    PrintStoreEncodeFooter(os, stored, produced, total_ms, read_ms, write_ms, options.verbose);
     return 0;
 }
 
@@ -10846,11 +11021,10 @@ std::vector<EncodeSource> CollectEncodeSources(const CliOptions& options, std::o
         LegacyScanArgument(arg, options.recurse, &found);
         if (found.size() == before) os << "No files found with " << arg << '\n';
     }
-    if (!options.exclude_patterns.empty()) {
-        std::vector<EncodeSource> kept;
-        for (EncodeSource& e : found) if (!IsExcluded(e.archive_name, options.exclude_patterns)) kept.push_back(std::move(e));
-        found.swap(kept);
-    }
+    // -x is matched against the path as scanned (`-xb.bin` does not exclude
+    // `./b.bin` under `-r .`; `-x*.dat` does exclude `sub/c.dat`), and an
+    // excluded file is not dropped here: it becomes a ghost the reader reports.
+    for (EncodeSource& e : found) if (IsExcluded(e.display, options.exclude_patterns)) e.ghost = true;
     if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = fs::path(e.archive_name).filename().string();
     if (options.sort_mode != 0u) LegacyMergeSort(&found, options.sort_mode);
     return found;
