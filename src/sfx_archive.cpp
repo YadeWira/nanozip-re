@@ -4385,6 +4385,12 @@ bool TryParseLegacyCnArchive(
     // first block; a parallel container additionally puts some files ONLY in a
     // non-main stream's table.
     std::vector<std::array<std::size_t, 3>> all_tables;  // {stream, begin, end}
+    // Per table, whether a type-10 (slice offset) record follows it in its
+    // stream: that is the original's "this entry is a slice of a file split
+    // across streams" flag (entry byte 0x21 & 0x10), set on EVERY slice of such
+    // a file, the offset-0 one included. It decides the listing order below.
+    std::vector<bool> table_has_off;
+    std::map<unsigned, std::size_t> last_table_of_stream;   // stream -> index into all_tables
     // Per-file attribute records ({stream, type, begin, end}), in record order.
     std::vector<std::array<std::size_t, 4>> attr_records;
     // Start of the first main-stream type-0 record == end of the leading
@@ -4441,6 +4447,11 @@ bool TryParseLegacyCnArchive(
         }
 
         if (ctype == 0u && found_codec) saw_data_record = true;
+        if (ctype == 10u && found_codec) {
+            const auto lt = last_table_of_stream.find(cstream);
+            if (lt != last_table_of_stream.end() && lt->second < table_has_off.size())
+                table_has_off[lt->second] = true;
+        }
 
         if (pos + csize > bytes.size()) {
             truncated_input = true;
@@ -4472,6 +4483,7 @@ bool TryParseLegacyCnArchive(
                 table_end = bytes.size();
                 found_table = true;
                 all_tables.push_back({0u, pos, bytes.size()});
+                table_has_off.push_back(false);
             }
             break;
         }
@@ -4582,6 +4594,8 @@ bool TryParseLegacyCnArchive(
                     found_table = true;
                 }
                 all_tables.push_back({static_cast<std::size_t>(cstream), pos, pos + csize});
+                table_has_off.push_back(false);
+                last_table_of_stream[cstream] = all_tables.size() - 1u;
             }
             pos += csize;
         }
@@ -4627,7 +4641,12 @@ bool TryParseLegacyCnArchive(
     // Per stream, the entry indices its own tables name, in order: that stream's
     // attribute records cover exactly those, in exactly that order.
     std::map<unsigned, std::vector<std::size_t>> stream_named;
-    for (const auto& table_span : all_tables) {
+    // Parallel to stream_named: whether that table entry is a slice of a split
+    // file (its table is followed by a type-10 offset record).
+    std::map<unsigned, std::vector<bool>> stream_split;
+    for (std::size_t table_index = 0; table_index < all_tables.size(); ++table_index) {
+    const auto& table_span = all_tables[table_index];
+    const bool table_split = table_index < table_has_off.size() && table_has_off[table_index];
     const unsigned table_stream = static_cast<unsigned>(table_span[0]);
     std::size_t p = table_span[1];
     const std::size_t table_end = table_span[2];
@@ -4673,11 +4692,13 @@ bool TryParseLegacyCnArchive(
             const auto known = path_index.find(e.path);
             if (known != path_index.end()) {
                 stream_named[table_stream].push_back(known->second);
+                stream_split[table_stream].push_back(table_split);
                 continue;
             }
         }
         path_index.emplace(e.path, entries.size());
         stream_named[table_stream].push_back(entries.size());
+        stream_split[table_stream].push_back(table_split);
         total_data_size += file_size;
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] store size check: total_data_size=%llu size=%zu\n",
@@ -4875,41 +4896,61 @@ bool TryParseLegacyCnArchive(
     // verification in RunLegacyCnExtractOrTest is skipped, which used to let a
     // wrong decode be written out silently. When the walk does not fully
     // understand the run we fall through to the older per-shape heuristics.
-    // In a parallel container the file ORDER is not record order: a stream is a
-    // worker, and the first table in the file belongs to whichever worker
-    // started first. The order the original lists (and lays out) is the order of
-    // the stream whose tables name the most distinct files -- the worker that
-    // saw the whole job. Files that stream never names keep their record order
-    // after it. Verified against the original on every parallel multi-file
-    // archive here; a sequential container has one stream and is unaffected.
+    // In a parallel container the file ORDER is not record order. The original
+    // keeps one entry list per worker stream (in table order) and merges them
+    // into the global list one stream at a time, in stream-id order
+    // (FUN_080922a0, read with GDB on `l`: a watchpoint on the list head and a
+    // dump of both lists at every call, see the wiki's Reverse-Engineering
+    // notes). The merge walks the stream's list collecting a RUN; a slice of a
+    // split file (entry flag 0x10 = its table is followed by an offset record)
+    // ends the run: the run is spliced at the HEAD of the global list, keeping
+    // its internal order, and the slice itself is either ADDED to the entry of
+    // the same name already in the list (size summed, checksum zeroed -- the
+    // `n/a`) or, if none, starts the next run. Whatever is left at the end of
+    // the stream is spliced at the head too. So the listing is a sequence of
+    // reversed stream blocks, each block in table order, minus the slices that
+    // were already known. Verified on -p2/-p3/-p4 of one set and on the pmf_*
+    // fixtures; a sequential container has one stream and is unaffected.
     if (has_parallel_streams && entries.size() > 1u) {
-        const std::vector<std::size_t>* best = nullptr;
-        std::size_t best_distinct = 0;
-        for (const auto& kv : stream_named) {
-            std::set<std::size_t> distinct(kv.second.begin(), kv.second.end());
-            if (distinct.size() > best_distinct) { best_distinct = distinct.size(); best = &kv.second; }
+        std::vector<std::size_t> global;
+        std::vector<bool> present(entries.size(), false);
+        for (const auto& kv : stream_named) {              // std::map: ascending stream id
+            const std::vector<std::size_t>& names = kv.second;
+            const auto fl = stream_split.find(kv.first);
+            std::vector<std::size_t> run;
+            const auto flush = [&]() {
+                if (run.empty()) return;
+                for (std::size_t idx : run) present[idx] = true;
+                global.insert(global.begin(), run.begin(), run.end());
+                run.clear();
+            };
+            for (std::size_t k = 0; k < names.size(); ++k) {
+                const std::size_t idx = names[k];
+                if (idx >= entries.size()) continue;
+                const bool split = fl != stream_split.end() && k < fl->second.size() && fl->second[k];
+                if (split) flush();
+                if (present[idx]) continue;                // merged into the entry already listed
+                bool in_run = false;
+                for (std::size_t r : run) if (r == idx) { in_run = true; break; }
+                if (!in_run) run.push_back(idx);
+            }
+            flush();
         }
-        if (best != nullptr && best_distinct > 1u) {
-            std::vector<std::size_t> order;
-            std::vector<bool> placed(entries.size(), false);
-            for (std::size_t idx : *best) {
-                if (idx < entries.size() && !placed[idx]) { placed[idx] = true; order.push_back(idx); }
+        // Anything no stream table named (should not happen) keeps record order after it.
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            if (!present[i]) global.push_back(i);
+        if (global.size() == entries.size()) {
+            std::vector<LegacyCnEntry> reordered;
+            reordered.reserve(global.size());
+            std::vector<std::size_t> remap(entries.size(), 0);
+            for (std::size_t k = 0; k < global.size(); ++k) {
+                remap[global[k]] = k;
+                reordered.push_back(entries[global[k]]);
             }
-            for (std::size_t i = 0; i < entries.size(); ++i)
-                if (!placed[i]) order.push_back(i);
-            if (order.size() == entries.size()) {
-                std::vector<LegacyCnEntry> reordered;
-                reordered.reserve(order.size());
-                std::vector<std::size_t> remap(entries.size(), 0);
-                for (std::size_t k = 0; k < order.size(); ++k) {
-                    remap[order[k]] = k;
-                    reordered.push_back(entries[order[k]]);
-                }
-                entries.swap(reordered);
-                for (auto& kv : stream_named)
-                    for (std::size_t& idx : kv.second)
-                        if (idx < remap.size()) idx = remap[idx];
-            }
+            entries.swap(reordered);
+            for (auto& kv : stream_named)
+                for (std::size_t& idx : kv.second)
+                    if (idx < remap.size()) idx = remap[idx];
         }
     }
 
