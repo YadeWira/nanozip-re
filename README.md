@@ -40,7 +40,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
-| Release package, 71 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 183/183 hashes |
+| Release package, 72 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 184/184 hashes |
 | Console matrices, 182 cases, and the pty prompt harness (`tests/parity/`) | 90 byte-identical, 86 differing only in status-line writes (how many `N MB` figures fit depends on the seconds the decode crosses, and the original's footer adds an `IO-out` clause), and 6 real: two are the compression commands the encode phase will bring, four are the documented departures ([quirks 3, 28, 29](docs/ORIGINAL_QUIRKS.md)) |
 | Directory trees: deep paths, symlinks, unreadable files, setuid/sticky modes, UTF-8 and space names, extreme timestamps, `-fo` (`tests/sweep_dirs.sh`) | 16/16 archives extract identically (contents, mode, mtime, links) |
 | Archives made by the **Windows** original, 8 codecs, and our Windows build's console against it (`tests/windows_original.sh` through wine, `tests/parity/windows_vm_check.ps1` on a real Windows 10 machine) | 24/24 through wine; on Windows 47/48 identical and one progress-tick difference, contents, sizes and the restored file **attributes** included |

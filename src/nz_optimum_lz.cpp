@@ -898,10 +898,13 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
                     if (ring_.capacity <= acc) {
                         if (O1_DBG_ENV("NZOPT_DEBUG")) fprintf(stderr, "FAIL@distance: local_74=%u local_54=%u acc=%u capacity=%u slot=%u\n", local_74, local_54, acc, ring_.capacity, slot);
-                        if (const char* rp = O1_DBG_ENV("NZOPT_DUMP_RING")) {
+                        // The ring as it stands at the failing match (NZOPT_DUMP_RING,
+                        // above, is the per-call dump and writes one numbered file per
+                        // DecodeBlock -- 66 of them on a 16-stream archive).
+                        if (const char* rp = O1_DBG_ENV("NZOPT_DUMP_RING_AT_FAIL")) {
                             FILE* rf = fopen(rp, "wb");
                             if (rf) { fwrite(base, 1, local_54, rf); fclose(rf); }
-                            fprintf(stderr, "dumped ring [0,%u) to %s\n", local_54, rp);
+                            fprintf(stderr, "dumped ring [0,%u) at the failing match to %s\n", local_54, rp);
                         }
                         failed = true; break;
                     }
