@@ -61,7 +61,7 @@ machine. The archive itself is mapped, not copied into the heap. Details: [Decod
 [Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status),
 [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
 
-**Not there yet:** encode of `-co/-cO/-cc` and `s`, and self-extractor creation (`w32c`), and the `-m` switch's window choice (only the input-size rule is reproduced); `a -cn` (single and `-pN`), `a -cf/-cF`, `a -cd` and `a -cD` (plain data, the exe and block-RLE filters, the text pipeline with its word dictionary, the audio and image models, under `-t1` and the default `-m`) are byte-exact. `a` with one of the three unported compressors prints a one-line refusal and writes nothing (the decode phase's stub container, which the original could not read, is gone). Known limits: the
+**Not there yet:** encode of `-co/-cO/-cc` and `s`, and self-extractor creation (`w32c`); `a -cn` (single and `-pN`), `a -cf/-cF`, `a -cd` and `a -cD` (plain data, the exe and block-RLE filters, the text pipeline with its word dictionary, the audio and image models, under `-t1`, at every `-m`) are byte-exact. `a` with one of the three unported compressors prints a one-line refusal and writes nothing (the decode phase's stub container, which the original could not read, is gone). Known limits: the
 `IO-out` footer figure and the progress redraw count are timing-dependent; a single-stream archive is
 assembled in memory and written after the decode, and a parallel one is written by its worker streams as
 each finishes, like the original, but every worker still holds its whole stream (a 16-stream 2.5 GB

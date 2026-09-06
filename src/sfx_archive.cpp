@@ -11121,7 +11121,25 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         if (workers == 0u) workers = 1u;
     }
     const std::uint64_t per = total / workers;
-    std::uint64_t window = (per < 0x8000u) ? 0x10000u : LegacyByteFloatDecode(LegacyByteFloatEncode(per));
+    // FUN_0804cec0: the window is the byte-float rounding of the smaller of the
+    // input size and the -m budget reduced per codec -- the budget itself for the
+    // store and -cf; minus 64 MB for -cF (0 below it: a 64 KB window under -m64m);
+    // minus a quarter and a sixteenth for -cd (11/16); minus a quarter, an eighth,
+    // a sixteenth and a thirty-second for -cD (17/32); both sides capped at
+    // 0xf0000000. Under 64 KB the window is 64 KB. (Measured: -cd -m1m -> 704 KB,
+    // -cD -m1m -> 576 KB, -cf -m300k -> 320 KB, the rounding being to the nearest.)
+    const std::uint64_t budget = options.memory_bytes;
+    std::uint64_t reduced;
+    switch (p0) {
+        case 2u: reduced = (budget > 0x3ffffffull) ? budget - 0x4000000ull : 0ull; break;
+        case 3u: reduced = budget - (budget >> 2u) - (budget >> 4u); break;
+        case 4u: reduced = budget - (budget >> 2u) - (budget >> 3u) - (budget >> 4u) - (budget >> 5u); break;
+        default: reduced = budget; break;
+    }
+    if (reduced > 0xf0000000ull) reduced = 0xf0000000ull;
+    const std::uint64_t cap = std::min<std::uint64_t>(per, 0xf0000000ull);
+    const std::uint64_t basis = std::min(reduced, cap);
+    std::uint64_t window = (basis < 0x8000u) ? 0x10000u : LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
     if (window < 0x10000u) window = 0x10000u;
 
     const fs::path out_path = ResolveArchivePath(options);

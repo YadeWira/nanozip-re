@@ -103,6 +103,11 @@ with 0, 2^1 … 2^31, 0.
 - **The window size is a byte, not a number**: `bytefloat(p1 + 1)` in 64 KB units (a 4-bit
   mantissa and exponent) is what every codec derives its window/dictionary/ring from, so
   the actual window is rarely exactly what `-m` asked for.
+- **`-m` buys less window than it says**: the window is the byte-float rounding of the smaller of
+  the input size and the budget reduced per codec -- the budget itself for the store and `-cf`,
+  11/16 of it for `-cd`, 17/32 for `-cD`, and for `-cF` the budget minus 64 MB, so every `-cF`
+  run under `-m64m` gets a 64 KB window (and `-m70m` a 6 MB one). Rounding is to the nearest
+  representable value, so `-cf -m300k` uses a 320 KB window.
 - **The version string is a record**: an archive begins with a type-14 record holding
   `NanoZip 0.09 alpha` and a type-30 record holding the byte 9; the "incompatible version"
   message reports that byte divided by 100.
