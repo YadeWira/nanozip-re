@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <memory>
 
 namespace nzr {
 namespace optimum {
@@ -127,7 +128,19 @@ public:
     // blocks must NOT be fed -- the reference returns before touching the
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
+
+    // The -co optimal parser (FUN_0806f8e0, the DAT_08183620 == 0 / -t1 path):
+    // turn one block's bytes into the decision list the original's parser would
+    // pick, using the models in their CURRENT state (pricing only reads them;
+    // the price caches inside mem_ are the only thing it writes). The block's
+    // bytes are appended to the window exactly as a decode would. Feed the
+    // result to EncodeBlock to get the payload.
+    bool ParseBlock(const std::uint8_t* data, std::uint32_t size,
+                    std::vector<OptimumDecision>& out);
 private:
+    struct ParserState;
+    std::shared_ptr<ParserState> parser_;
+
     template <class IO> bool RunBlock(IO& io, const OptimumDecision* dec, std::size_t ndec,
                                       std::uint8_t* out, std::uint32_t out_size);
     std::vector<OptimumDecision> decisions_;

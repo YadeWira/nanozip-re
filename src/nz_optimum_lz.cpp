@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <memory>
 
 // DAT_08172900 == nz_cm.cpp's kLzModelInterpolation (confirmed byte-identical
@@ -1052,10 +1053,54 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
     // block started in and compare with the input -- the encoder's mirror check.
     static const bool recode = (NZ_ENV("NZOPT_RECODE") != nullptr);
     std::unique_ptr<NzOptimumLzDecoder> before;
-    if (recode) { before = std::make_unique<NzOptimumLzDecoder>(*this); record_ = true; decisions_.clear(); }
+    const bool parsechk = (NZ_ENV("NZOPT_PARSECHK") != nullptr);
+    const bool want_dec = recode || parsechk || (NZ_ENV("NZOPT_DUMP_DECISIONS") != nullptr);
+    if (want_dec) { record_ = true; decisions_.clear(); }
+    if (recode || parsechk) before = std::make_unique<NzOptimumLzDecoder>(*this);
     DecodeIO io;
     io.rc.Init(in, in_len);
     const bool ok = RunBlock(io, nullptr, 0u, out, out_size);
+    if (const char* dd = NZ_ENV("NZOPT_DUMP_DECISIONS")) {
+        // one line per decision of this block, for the parser oracle
+        static thread_local int blk = 0;
+        std::fprintf(stderr, "[DEC] block=%d out_size=%u in_len=%u ndec=%zu\n", blk++, out_size, in_len, decisions_.size());
+        if (*dd == 'v') for (std::size_t i = 0; i < decisions_.size(); ++i) {
+            const OptimumDecision& d = decisions_[i];
+            if (d.is_literal) std::fprintf(stderr, "[DEC] %zu lit %02x\n", i, d.byte);
+            else std::fprintf(stderr, "[DEC] %zu match sg=%u len=%u dist=%u\n", i, d.sg, d.len, d.dist);
+        }
+    }
+    if (NZ_ENV("NZOPT_PARSECHK") != nullptr && ok && before) {
+        // run the parser from the pre-block state and compare its decisions
+        std::vector<OptimumDecision> mine;
+        NzOptimumLzDecoder snap(*before);
+        bool pok = false;
+        try { pok = snap.ParseBlock(out, out_size, mine); }
+        catch (...) { pok = false; }
+        std::size_t first = 0;
+        while (first < mine.size() && first < decisions_.size()) {
+            const OptimumDecision& a = mine[first];
+            const OptimumDecision& b = decisions_[first];
+            if (a.is_literal != b.is_literal) break;
+            if (a.is_literal) { if (a.byte != b.byte) break; }
+            else if (a.sg != b.sg || a.len != b.len || a.dist != b.dist) break;
+            ++first;
+        }
+        const bool same = pok && mine.size() == decisions_.size() && first == mine.size();
+        std::fprintf(stderr, "[PARSECHK] out=%u target=%zu mine=%zu match=%zu -> %s\n",
+                     out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF");
+        if (!same) {
+            for (std::size_t i = (first > 2 ? first - 2 : 0); i < first + 3 && i < std::max(mine.size(), decisions_.size()); ++i) {
+                auto pr = [&](const char* tag, const std::vector<OptimumDecision>& v) {
+                    if (i >= v.size()) { std::fprintf(stderr, "  %s[%zu] -\n", tag, i); return; }
+                    const OptimumDecision& d = v[i];
+                    if (d.is_literal) std::fprintf(stderr, "  %s[%zu] lit %02x\n", tag, i, d.byte);
+                    else std::fprintf(stderr, "  %s[%zu] match sg=%u len=%u dist=%u\n", tag, i, d.sg, d.len, d.dist);
+                };
+                pr("want", decisions_); pr("got ", mine);
+            }
+        }
+    }
     if (recode && ok) {
         std::vector<std::uint8_t> payload;
         const bool eok = before->EncodeBlock(decisions_.data(), decisions_.size(), out_size, payload);
