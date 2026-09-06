@@ -76,9 +76,29 @@ std::uint32_t NzOptimumLzWindowSizeFromP1(std::uint8_t method_p1);
 // Persistent per-stream decode state. Construct ONE instance per container
 // stream (not per block) and feed it every decr_param==1 block belonging to
 // that stream, in order.
+// One parse decision of the compact LZ engine: a literal byte, or a match given
+// as the decoder sees it (slot group 0 = a new distance, 1..4 = rep0..rep3;
+// `dist` = the distance in bytes, `len` the match length).
+struct OptimumDecision {
+    std::uint8_t is_literal = 0;
+    std::uint8_t byte = 0;
+    std::uint8_t sg = 0;
+    std::uint32_t len = 0;
+    std::uint32_t dist = 0;
+};
+
 class NzOptimumLzDecoder {
 public:
     explicit NzOptimumLzDecoder(std::uint32_t window_capacity);
+    // The encoder's side of the same block loop: codes `dec` with the models in
+    // their current state (the state advances exactly as a decode would) and
+    // range-codes the result into `payload` (FUN_0806d8f0's coder, one final
+    // byte). The window receives the block's bytes as in a decode.
+    bool EncodeBlock(const OptimumDecision* dec, std::size_t ndec, std::uint32_t out_size,
+                     std::vector<std::uint8_t>& payload);
+    // Decode-side: keep the decisions of the last DecodeBlock (for the recode check).
+    void RecordDecisions(bool on) { record_ = on; }
+    const std::vector<OptimumDecision>& LastDecisions() const { return decisions_; }
 
     // Decode one block. `in`/`in_len` is this block's compressed payload
     // (the range-coder bitstream, starting at its very first byte -- no extra
@@ -107,6 +127,12 @@ public:
     // blocks must NOT be fed -- the reference returns before touching the
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
+private:
+    template <class IO> bool RunBlock(IO& io, const OptimumDecision* dec, std::size_t ndec,
+                                      std::uint8_t* out, std::uint32_t out_size);
+    std::vector<OptimumDecision> decisions_;
+    bool record_ = false;
+public:
 
     // Cold-start the adaptive model again, keeping the window. The original
     // does this after a STORED LZ block (decr_param=1, param6=0): the next LZ
