@@ -354,8 +354,13 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                 (unsigned)ndec, out_size, ring_.cursor, ring_.capacity);
     // the decision cursor (encode side); a zero decision when decoding
     std::size_t di = 0;
-    OptimumDecision cur = (dec != nullptr && ndec != 0) ? dec[0] : OptimumDecision{};
-    auto next_dec = [&]() { if (dec != nullptr) { ++di; cur = (di < ndec) ? dec[di] : OptimumDecision{}; } };
+    OptimumDecision cur{};
+    if (dec != nullptr && ndec != 0) cur = dec[0];
+    else if (feed_) { OptimumDecision d{}; if (feed_(d)) cur = d; }
+    auto next_dec = [&]() {
+        if (dec != nullptr) { ++di; cur = (di < ndec) ? dec[di] : OptimumDecision{}; }
+        else if (feed_) { OptimumDecision d{}; cur = feed_(d) ? d : OptimumDecision{}; }
+    };
 
     std::uint32_t rep[4] = {1, 1, 1, 1};
     std::uint8_t* mem = mem_.data();
@@ -591,6 +596,11 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                                           ((pm4 == am4 ? 1u : 0u) << 3);
                 uVar15 = matchmask | (static_cast<std::uint32_t>(predB) << 24) |
                          (static_cast<std::uint32_t>(am2) << 16);
+
+                // the emitter's price-cache refresh: coding a symbol measures its
+                // real cost and writes it back, so the parser's next flush prices
+                // against what the coder just paid rather than a stale estimate
+                if (feed_) RefreshPriceCaches(cur, uVar15, local_81, local_9c, predB, am2, local_94);
 
                 int dispIdx = static_cast<int>((matchmask & 7u) + static_cast<std::uint32_t>(predB) * 8u);
                 std::uint8_t dat380 = OptimumDat08172380()[local_81];
@@ -1073,9 +1083,10 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
     if (NZ_ENV("NZOPT_PARSECHK") != nullptr && ok && before) {
         // run the parser from the pre-block state and compare its decisions
         std::vector<OptimumDecision> mine;
+        std::vector<std::uint8_t> mypayload;
         NzOptimumLzDecoder snap(*before);
         bool pok = false;
-        try { pok = snap.ParseBlock(out, out_size, mine); }
+        try { pok = snap.EncodeBlockParsed(out, out_size, mypayload, &mine); }
         catch (...) { pok = false; }
         std::size_t first = 0;
         while (first < mine.size() && first < decisions_.size()) {
@@ -1087,8 +1098,11 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
             ++first;
         }
         const bool same = pok && mine.size() == decisions_.size() && first == mine.size();
-        std::fprintf(stderr, "[PARSECHK] out=%u target=%zu mine=%zu match=%zu -> %s\n",
-                     out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF");
+        const bool paysame = (mypayload.size() == in_len) &&
+                             std::memcmp(mypayload.data(), in, in_len) == 0;
+        std::fprintf(stderr, "[PARSECHK] out=%u target=%zu mine=%zu match=%zu -> %s payload=%zu/%u %s\n",
+                     out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF",
+                     mypayload.size(), in_len, paysame ? "EXACT" : "diff");
         if (!same) {
             for (std::size_t i = (first > 2 ? first - 2 : 0); i < first + 3 && i < std::max(mine.size(), decisions_.size()); ++i) {
                 auto pr = [&](const char* tag, const std::vector<OptimumDecision>& v) {
@@ -1123,6 +1137,38 @@ bool NzOptimumLzDecoder::EncodeBlock(const OptimumDecision* dec, std::size_t nde
     const bool ok = RunBlock(io, dec, ndec, tmp.data(), out_size);
     record_ = saved_record;
     if (!ok) return false;
+    RangeEncodePairs(q, payload);
+    return true;
+}
+
+bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
+                                           std::vector<std::uint8_t>& payload,
+                                           std::vector<OptimumDecision>* out_decisions) {
+    if (size == 0u || size > 0x8000u) return false;   // one chunk at a time for now
+    BeginParse(data, size);
+    EncodeIO io;
+    std::vector<std::uint16_t> q;
+    io.q = &q;
+    std::vector<std::uint8_t> tmp(static_cast<std::size_t>(size) + 16u);
+    std::vector<OptimumDecision> pending;
+    std::size_t pi = 0;
+    std::uint32_t produced = 0;
+    bool parse_ok = true;
+    feed_ = [&](OptimumDecision& d) -> bool {
+        if (produced >= size) return false;   // the block is covered; a clean end
+        while (pi >= pending.size()) {
+            pending.clear();
+            pi = 0;
+            if (!ParseNextFlush(pending) || pending.empty()) { parse_ok = false; return false; }
+        }
+        d = pending[pi++];
+        produced += d.is_literal ? 1u : d.len;
+        if (out_decisions != nullptr) out_decisions->push_back(d);
+        return true;
+    };
+    const bool ok = RunBlock(io, nullptr, 0u, tmp.data(), size);
+    feed_ = nullptr;
+    if (!ok || !parse_ok) return false;
     RangeEncodePairs(q, payload);
     return true;
 }

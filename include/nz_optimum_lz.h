@@ -55,6 +55,7 @@
 #include <cstddef>
 #include <vector>
 #include <memory>
+#include <functional>
 
 namespace nzr {
 namespace optimum {
@@ -137,9 +138,25 @@ public:
     // result to EncodeBlock to get the payload.
     bool ParseBlock(const std::uint8_t* data, std::uint32_t size,
                     std::vector<OptimumDecision>& out);
+
+    // Parse AND code one block in the original's interleaved order: the parser
+    // hands the coder one flush of decisions at a time and the coder advances
+    // the models before the next flush is parsed, so prices track the model as
+    // it adapts inside the block. This is the real encoder entry point.
+    bool EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
+                           std::vector<std::uint8_t>& payload,
+                           std::vector<OptimumDecision>* out_decisions);
 private:
     struct ParserState;
     std::shared_ptr<ParserState> parser_;
+    // when set, RunBlock pulls the next decision from here instead of a list
+    std::function<bool(OptimumDecision&)> feed_;
+    // one flush of the DP from the current ring cursor and model state
+    void RefreshPriceCaches(const OptimumDecision& d, std::uint32_t mm, std::uint8_t hist,
+                            std::uint32_t ctxWord, std::uint8_t predB, std::uint8_t am2,
+                            std::uint32_t remain);
+    bool ParseNextFlush(std::vector<OptimumDecision>& out);
+    void BeginParse(const std::uint8_t* data, std::uint32_t size);
 
     template <class IO> bool RunBlock(IO& io, const OptimumDecision* dec, std::size_t ndec,
                                       std::uint8_t* out, std::uint32_t out_size);

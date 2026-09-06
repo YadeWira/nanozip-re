@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <cstring>
 
 // DAT_08172900, the stretch table: a plain global, declared the way
@@ -101,6 +102,13 @@ struct NzOptimumLzDecoder::ParserState {
     std::vector<std::uint32_t> lr;
     std::uint32_t lrmask = 0, lrhash = 0;
     bool ready = false;
+    // the block being parsed, and how much of it has been handed to the coder
+    const std::uint8_t* src = nullptr;
+    std::uint32_t size = 0, consumed = 0, pos0 = 0;
+    std::uint32_t rep0[4] = {1, 1, 1, 1};
+    std::uint8_t hist0 = 0xff;
+    std::uint16_t ctx0 = 0;
+    bool started = false;
 
     void Init(std::uint32_t W) {
         if (ready) return;
@@ -212,6 +220,9 @@ struct NzOptimumLzDecoder::ParserState {
             if (lim <= k) { *ls = ch[0]; *gt = ch[1]; return; }
             if (base[cur + k] == base[cp + k]) {
                 const std::int32_t pre = static_cast<std::int32_t>(k) - 1;
+                // the original abandons the walk here when four or more bytes
+                // already matched but the chain entry's tag does not
+                if (pre > 2 && ((cp ^ chain) != (~maskA & w))) return;
                 std::uint32_t j = k;
                 for (;;) { const std::uint32_t nx = j + 1u; if (lim <= nx) { j = nx; break; } if (base[cur + nx] != base[cp + nx]) { j = nx; break; } j = nx; }
                 if (bestlen < j) {
@@ -253,13 +264,16 @@ const std::uint32_t* LrOut() {
 // class at 0x3d848 (a class covers a bit length and the two bits under its top
 // one; the cache is filled by whichever length bucket asked first).
 std::uint32_t PriceDistance(std::uint8_t* mem, const std::uint8_t* T,
-                            const std::uint8_t* D4D0, std::uint32_t D, std::uint32_t len) {
+                            const std::uint8_t* D4D0, std::uint32_t D, std::uint32_t len,
+                            bool use_cache) {
     const std::uint32_t bl = BitLen1(D);
     const std::uint32_t sh = (bl > 2u) ? (bl - 2u) : 0u;
     const std::size_t cls = (((D >> sh) & 3u) * 0x20u + bl) & 0x7fu;
     const std::size_t cell = 0x3d848u + cls * 2u;
-    const std::uint16_t cached = Rd16(mem, cell);
-    if (cached != 0u) return cached;
+    if (use_cache) {
+        const std::uint16_t cached = Rd16(mem, cell);
+        if (cached != 0u) return cached;
+    }
     const std::uint32_t v = len - 2u;
     const std::uint32_t bucket = D4D0[(v > 0xfu) ? 0xfu : v];
     std::uint32_t acc = 0;
@@ -310,6 +324,76 @@ std::uint32_t PriceDistance(std::uint8_t* mem, const std::uint8_t* T,
         }
     }
     Wr16(mem, cell, static_cast<std::uint16_t>(acc));
+    return acc;
+}
+
+// The rep-select price for a0 (0..3 = rep slot, 4 = a brand-new distance),
+// cached at 0x3e200 by (history, match mask, slot). The value excludes the
+// dispatch bit, which the caller adds.
+std::uint32_t SelDelta(std::uint8_t* mem, const std::uint8_t* T, std::uint8_t hist,
+                       std::uint32_t mm, std::uint32_t a0, bool use_cache) {
+    const std::uint32_t ti = (hist & 0xfu) + (mm & 7u) * 0x10u;
+    const std::size_t off = 0x3d980u + static_cast<std::size_t>(ti) * 16u;
+    const std::uint32_t sg = (a0 >= 4u) ? 0u : (a0 + 1u);
+    const std::size_t ci = (hist & 7u) + (mm & 7u) * 8u + static_cast<std::size_t>(sg) * 0x40u;
+    if (use_cache) {
+        const std::uint8_t cv = Rd8(mem, 0x3e200 + ci);
+        if (cv != 0xffu) return cv;
+    }
+    // the original prices this first bit with the polarity of a new distance
+    // even on the rep path -- transcribed as is
+    std::uint32_t px = Cost(T, 1u, Bias(Rd16(mem, off) >> 4u));
+    if (a0 < 4u) {
+        std::uint32_t tp = ti * 8u + 1u;
+        int left = 3;
+        for (;;) {
+            const std::uint32_t at = tp;
+            const bool last = (static_cast<int>(a0) - 3 + left) == 0;
+            ++tp;
+            px += Cost(T, last ? 1u : 0u, Bias(Rd16(mem, 0x3d980u + static_cast<std::size_t>(at) * 2u) >> 4u));
+            --left;
+            if (last || left == 0) break;
+        }
+    }
+    Wr8(mem, 0x3e200 + ci, static_cast<std::uint8_t>((px < 0xfeu) ? px : 0xfeu));
+    return px;
+}
+
+// The length price, cached at 0x39c08 by (len-2, is-rep0). A length whose
+// v = len-2 reaches 0xff prices at zero: the original skips the whole block
+// rather than clamping, so very long matches look free.
+std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
+                      std::uint32_t a0, bool use_cache) {
+    const std::uint32_t v = L - 2u;
+    if (v >= 0xffu) return 0u;
+    const std::size_t li = (a0 == 0u ? 1u : 0u) + static_cast<std::size_t>(v) * 2u;
+    if (use_cache) {
+        const std::uint8_t lc = Rd8(mem, 0x39c08 + li);
+        if (lc != 0u) return lc;
+    }
+    std::uint32_t acc = 0;
+    std::uint32_t idx = (a0 == 0u ? 1u : 0u) << 4u;
+    std::uint32_t vv = v, nb = 0;
+    for (;;) {
+        vv >>= 1u;
+        const std::uint32_t cellp = Rd16(mem, 0x396c0u + static_cast<std::size_t>(idx) * 2u) >> 4u;
+        ++idx; ++nb;
+        acc += Cost(T, (vv != 0u) ? 1u : 0u, cellp);
+        if (vv == 0u) break;
+    }
+    const std::uint32_t rowb = (nb - 1u) << 5u;
+    std::uint32_t persisted = (a0 == 4u) ? 3u : 1u;
+    const std::uint32_t nbits = (nb < 5u) ? ((nb - 1u) ? (nb - 1u) : 1u) : 4u;
+    const std::uint32_t raws = (nb < 5u) ? 0u : (nb - 5u);
+    std::uint32_t bits = v << ((0x20u - nbits) & 0x1fu);
+    for (std::uint32_t i = 0; i < nbits; ++i) {
+        const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
+        const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
+        acc += Cost(T, bit, Rd16(mem, c2) >> 4u);
+        persisted = bit + persisted * 2u;
+    }
+    if (raws != 0u) acc += raws * 0x1cu;
+    Wr8(mem, 0x39c08 + li, static_cast<std::uint8_t>((acc < 0xffu) ? acc : 0xffu));
     return acc;
 }
 
@@ -384,12 +468,43 @@ std::uint32_t PriceLiteral(const std::uint8_t* mem, const std::uint8_t* T,
 
 }  // namespace
 
-bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size,
-                                    std::vector<OptimumDecision>& out) {
-    if (size == 0u) return true;
+// Coding a symbol measures its real cost, and the original writes that cost
+// straight back into the price cache. Without this the caches keep the value
+// the parser computed against an older model, which is what made long matches
+// look more expensive than the original judged them.
+void NzOptimumLzDecoder::RefreshPriceCaches(const OptimumDecision& d, std::uint32_t mm,
+                                            std::uint8_t hist, std::uint32_t ctxWord,
+                                            std::uint8_t predB, std::uint8_t am2,
+                                            std::uint32_t remain) {
+    std::uint8_t* const mem = mem_.data();
+    const std::uint8_t* const T = CostTable();
+    if (d.is_literal) {
+        const std::uint32_t p = PriceLiteral(mem, T, ctxWord, hist, d.byte, mm, predB, am2, remain);
+        const std::size_t lci = static_cast<std::size_t>(ctxWord & 0xffu) * 0x100u + d.byte;
+        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((p < 0xfeu) ? p : 0xfeu));
+        return;
+    }
+    const std::uint32_t a0 = (d.sg == 0u) ? 4u : (d.sg - 1u);
+    SelDelta(mem, T, hist, mm, a0, false);
+    if (d.len >= 2u) LenCost(mem, T, d.len, a0, false);
+    if (a0 == 4u && d.dist != 0u)
+        PriceDistance(mem, T, OptimumDat081724d0(), d.dist - 1u, d.len, false);
+}
+
+void NzOptimumLzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
     if (!parser_) parser_ = std::make_shared<ParserState>();
     ParserState& F = *parser_;
     F.Init(ring_.capacity);
+    F.src = data; F.size = size; F.consumed = 0; F.started = false; F.pos0 = 0;
+    F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
+    F.hist0 = 0xff; F.ctx0 = 0;
+}
+
+// One flush of the DP, from the ring and the models as they stand right now.
+bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
+    if (!parser_) return false;
+    ParserState& F = *parser_;
+    if (F.consumed >= F.size) return false;
 
     const std::uint8_t* const T = CostTable();
     const std::uint32_t* const LRO = LrOut();
@@ -409,33 +524,35 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
     static thread_local std::vector<Node> nodes;
     nodes.assign(0x120u, Node{});
 
-    // carried across chunks, as the original's aiStack_3030 / local_3032 do
-    std::uint32_t rep0[4] = {1, 1, 1, 1};
-    std::uint8_t hist0 = 0xff;
-    std::uint16_t ctx0 = 0;
-
-    std::uint32_t done_in = 0;
-    while (done_in < size) {
-        const std::uint32_t chunk = std::min<std::uint32_t>(size - done_in, 0x8000u);
-        const std::uint32_t before = ring_.EnsureHeadroom(chunk);
-        std::uint8_t* const base = ring_.Base();
-        if (before == 0u && ring_.cursor == 0u) { rep0[0] = rep0[1] = rep0[2] = rep0[3] = 1; }
-        const std::uint32_t pos0 = ring_.cursor;
-        std::memcpy(base + pos0, data + done_in, chunk);
-        const std::uint32_t cend = pos0 + chunk;
-        // the four reps are dropped when they point outside the valid window
+    std::uint32_t* const rep0 = F.rep0;
+    std::uint8_t& hist0 = F.hist0;
+    std::uint16_t& ctx0 = F.ctx0;
+    if (!F.started) {
+        F.started = true;
+        // the coder will call EnsureHeadroom for the same span, so doing it here
+        // first keeps the two in step; the whole block goes into the window up
+        // front, the way the original appends the chunk before parsing it
+        ring_.EnsureHeadroom(F.size);
+        F.pos0 = ring_.cursor;
+        std::memcpy(ring_.Base() + F.pos0, F.src, F.size);
+        std::uint8_t* const b0 = ring_.Base();
+        const std::uint32_t e0 = F.pos0 + F.size;
         for (int k = 0; k < 4; ++k) {
-            std::uint32_t p = pos0 - (rep0[k] + 1u);
-            if (pos0 < rep0[k] + 1u) p += cap;
-            if (cap <= p || (p < cend && pos0 <= p)) rep0[k] = 1;
+            std::uint32_t p = F.pos0 - (rep0[k] + 1u);
+            if (F.pos0 < rep0[k] + 1u) p += cap;
+            if (cap <= p || (p < e0 && F.pos0 <= p)) rep0[k] = 1;
         }
-        // the rolling hash over the 256 bytes at the chunk start
         std::uint32_t lrh = 0;
-        for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + base[pos0 + i];
+        for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[F.pos0 + i];
         F.lrhash = lrh;
-
-        std::uint32_t emitted = 0;   // bytes of this chunk already turned into decisions
-        while (emitted < chunk) {
+    }
+    {
+        std::uint8_t* const base = ring_.Base();
+        const std::uint32_t chunk = F.size;
+        const std::uint32_t pos0 = F.pos0;
+        const std::uint32_t cend = pos0 + chunk;
+        const std::uint32_t emitted = F.consumed;
+        {
             const std::uint32_t remain0 = chunk - emitted;
             for (auto& n : nodes) n.tag = 0;
             nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
@@ -478,72 +595,19 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
 
                 // ---- the rep-select price for a slot (0..3 = rep, 4 = new distance)
                 auto SelPrice = [&](std::uint32_t slot) -> std::uint32_t {
-                    const std::uint32_t ci = (nd.hist & 7u) + (mm & 7u) * 8u + (slot + 1u) * 0x40u;
-                    const std::uint8_t cv = Rd8(mem, 0x3e200 + ci);
-                    if (cv != 0xffu) return cv + dmatch;
-                    const std::uint32_t ti = (nd.hist & 0xfu) + (mm & 7u) * 0x10u;
-                    const std::size_t off = 0x3d980u + static_cast<std::size_t>(ti) * 16u;
-                    std::uint32_t tp = ti * 8u + 1u;
-                    // the original prices this first bit with the polarity of a new
-                    // distance even on the rep path -- transcribed as is
-                    std::uint32_t px = Cost(T, 1u, Bias(Rd16(mem, off) >> 4u)) + dmatch;
-                    int left = 3;
-                    for (;;) {
-                        const std::uint32_t at = tp;
-                        const bool last = (static_cast<int>(slot) - 3 + left) == 0;
-                        ++tp;
-                        px += Cost(T, last ? 1u : 0u, Bias(Rd16(mem, 0x3d980u + static_cast<std::size_t>(at) * 2u) >> 4u));
-                        --left;
-                        if (last || left == 0) break;
-                    }
-                    const std::uint32_t d = px - dmatch;
-                    Wr8(mem, 0x3e200 + ci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfdu));
-                    return px;
+                    return dmatch + SelDelta(mem, T, nd.hist, mm, slot, true);
                 };
                 // ---- the length price, cached at 0x39c08 by (len-2, is-rep0)
                 auto LenPrice = [&](std::uint32_t L, std::uint32_t slot) -> std::uint32_t {
-                    const std::uint32_t v = L - 2u;
-                    if (v >= 0xffu) return 0u;
-                    const std::size_t li = (slot == 0u ? 1u : 0u) + static_cast<std::size_t>(v) * 2u;
-                    const std::uint8_t lc = Rd8(mem, 0x39c08 + li);
-                    if (lc != 0u) return lc;
-                    std::uint32_t acc = 0;
-                    std::uint32_t idx = (slot == 0u ? 1u : 0u) << 4u;
-                    std::uint32_t vv = v, nb = 0;
-                    for (;;) {
-                        vv >>= 1u;
-                        const std::uint32_t cellp = Rd16(mem, 0x396c0u + static_cast<std::size_t>(idx) * 2u) >> 4u;
-                        ++idx; ++nb;
-                        acc += Cost(T, (vv != 0u) ? 1u : 0u, cellp);
-                        if (vv == 0u) break;
-                    }
-                    const std::uint32_t rowb = (nb - 1u) << 5u;
-                    std::uint32_t persisted = 3u;
-                    std::uint32_t nbits = (nb < 5u) ? ((nb - 1u) ? (nb - 1u) : 1u) : 4u;
-                    const std::uint32_t raws = (nb < 5u) ? 0u : (nb - 5u);
-                    std::uint32_t bits = v << ((0x20u - nbits) & 0x1fu);
-                    for (std::uint32_t i = 0; i < nbits; ++i) {
-                        const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
-                        const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
-                        acc += Cost(T, bit, Rd16(mem, c2) >> 4u);
-                        persisted = bit + persisted * 2u;
-                    }
-                    if (raws != 0u) acc += raws * 0x1cu;
-                    Wr8(mem, 0x39c08 + li, static_cast<std::uint8_t>((acc < 0xffu) ? acc : 0xfeu));
-                    return acc;
+                    return LenCost(mem, T, L, slot, true);
                 };
                 // ---- write one relaxed node; false means the existing path is
                 // cheaper, which ends the whole relaxation
                 auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
                                   const std::uint32_t* nr, std::uint32_t price) -> bool {
                     Node& tg = nodes[ni + L];
-                    // PROVISIONAL: the decompile compares strictly (the first writer
-                    // keeps a tie), but a strict compare agrees with the original far
-                    // less often -- two mirror fixtures tie here and the original
-                    // resolves them in OPPOSITE directions, so a price term is still
-                    // missing rather than a tie-break rule. Overwriting on a tie is
-                    // what currently matches the original best; see the notes.
-                    if (tg.tag == static_cast<std::uint16_t>(chunk) && price > tg.price) return false;
+                    // the first writer keeps a tie, as the decompile compares
+                    if (tg.tag == static_cast<std::uint16_t>(chunk) && price >= tg.price) return false;
                     tg.tag = static_cast<std::uint16_t>(chunk);
                     tg.price = static_cast<std::uint16_t>(price);
                     tg.back = static_cast<std::uint16_t>(ni);
@@ -605,6 +669,11 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                 // is never taken.
                 std::vector<Cand> cands;
                 F.Find(base, cur, cend, remain, cands, 0x10u);
+                if (trace) {
+                    std::fprintf(stderr, "[C] rem=%u ni=%u n=%zu:", chunk - emitted, ni, cands.size());
+                    for (const Cand& cc : cands) std::fprintf(stderr, " {src=%u len=%u}", cc.src - pos0, cc.len);
+                    std::fprintf(stderr, "\n");
+                }
                 const std::uint32_t thr = std::max<std::uint32_t>(best, 2u);
                 if (!cands.empty() && cands.back().len > thr) {
                     const std::uint32_t toplen = cands.back().len;
@@ -626,6 +695,8 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                         } else {
                             if (ni + toplen > front) front = ni + toplen;
                             const std::uint32_t sel = SelPrice(4u);
+                            if (trace) std::fprintf(stderr, "[W] rem=%u ni=%u best=%u thr=%u toplen=%u sel=%u\n",
+                                                    chunk - emitted, ni, best, thr, toplen, sel);
                             // walk the length down, switching to the shortest
                             // candidate that still reaches it (the nearest distance
                             // for that length)
@@ -636,12 +707,15 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                                 const Cand& c = cands[ci];
                                 const std::uint32_t dist = (cur >= c.src) ? (cur - c.src) : (cur + cap - c.src);
                                 if (dist == 0u || dist > cap) break;
-                                if (c.src != lastsrc) { dprice = PriceDistance(mem, T, D4D0, dist - 1u, L); lastsrc = c.src; }
+                                if (c.src != lastsrc) { dprice = PriceDistance(mem, T, D4D0, dist - 1u, L, true); lastsrc = c.src; }
                                 const std::uint32_t bp = nd.price + sel + dprice;
                                 const Node& tgc = nodes[ni + L];
                                 if (tgc.tag == static_cast<std::uint16_t>(chunk) && (dprice >> 3u) + bp >= tgc.price) break;
                                 const std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
-                                if (!Update(L, 4u, dist, nr, bp + LenPrice(L, 4u))) break;
+                                const std::uint32_t px = bp + LenPrice(L, 4u);
+                                const bool okup = Update(L, 4u, dist, nr, px);
+                                if (trace) std::fprintf(stderr, "[W]   L=%u dist=%u sel=%u dp=%u px=%u -> %d\n", L, dist, sel, dprice, px, (int)okup);
+                                if (!okup) break;
                             }
                         }
                     }
@@ -657,7 +731,7 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                     if (lc == 0xffu) {
                         lp = PriceLiteral(mem, T, nd.ctx, nd.hist, lit, mm, predB, am2, remain);
                         const std::uint32_t d = lp;
-                        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfdu));
+                        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfeu));
                         lp += dlit;
                     } else {
                         lp = lc + dlit;
@@ -687,6 +761,24 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
             }
             (void)flushed;
             if (endnode == 0u) endnode = 1u;
+            const char* nodesenv = NZ_ENV("NZOPT_NODES");
+            if (nodesenv != nullptr && (chunk - emitted) == static_cast<std::uint32_t>(std::atoi(nodesenv))) {
+                std::fprintf(stderr, "[N] FLUSH front=%u end=%u rem=%u\n", front, endnode, chunk - emitted);
+                {
+                    std::string dc, lc2, rs;
+                    char b[64];
+                    for (int k = 0; k < 0x80; ++k) { std::uint16_t v = Rd16(mem, 0x3d848 + k*2); if (v) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); dc += b; } }
+                    for (int k = 0; k < 0x40; ++k) { std::uint8_t v = Rd8(mem, 0x39c08 + k); if (v) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); lc2 += b; } }
+                    for (int k = 0; k < 0x180; ++k) { std::uint8_t v = Rd8(mem, 0x3e200 + k); if (v != 0xff) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); rs += b; } }
+                    std::fprintf(stderr, "[N] distcache=%s\n[N] lencache=%s\n[N] repsel=%s\n", dc.c_str(), lc2.c_str(), rs.c_str());
+                }
+                for (std::uint32_t k = 0; k < 20u; ++k) {
+                    const Node& n = nodes[k];
+                    if (n.tag == static_cast<std::uint16_t>(chunk) || k == 0u)
+                        std::fprintf(stderr, "[N]   node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u rep=%u,%u,%u,%u\n",
+                                     k, n.price, n.back, n.len, n.ctx, n.hist, n.sg, n.dist, n.rep[0], n.rep[1], n.rep[2], n.rep[3]);
+                }
+            }
 
             // ---- backtrack and emit
             std::vector<std::uint32_t> chain;
@@ -716,12 +808,25 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
             if (trace) std::fprintf(stderr, "[PARSE] emitted=%u adv=%u chain=%zu end=%u\n", emitted, adv, chain.size(), endnode);
             // feed the finder over the bytes the chosen path consumed
             F.Skip(base, pos0 + emitted, adv);
-            emitted += adv;
-            if (emitted > chunk) return false;
+            F.consumed = emitted + adv;
+            if (F.consumed > chunk) return false;
         }
-        ring_.cursor = cend;
-        done_in += chunk;
     }
+    return true;
+}
+
+// The frozen-model reference: parse a whole block without letting the coder
+// advance the models in between. Kept for comparison; the real encoder uses
+// EncodeBlockParsed, which interleaves the two the way the original does.
+bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size,
+                                    std::vector<OptimumDecision>& out) {
+    if (size == 0u) return true;
+    if (size > 0x8000u) return false;   // one chunk at a time for now
+    BeginParse(data, size);
+    while (parser_->consumed < size) {
+        if (!ParseNextFlush(out)) return false;
+    }
+    ring_.cursor = parser_->pos0 + size;
     return true;
 }
 
