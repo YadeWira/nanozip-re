@@ -476,100 +476,85 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                 const std::uint32_t dmatch = Cost(T, 0u, Bias(dmix));   // dispatch bit 0 = match
                 const std::uint32_t dlit   = Cost(T, 1u, Bias(dmix));   // dispatch bit 1 = literal
 
-                // ---- relax with one candidate (match of `len` at rep slot `slot`)
-                // `minlen` is the shortest length worth relaxing: a rep match walks
-                // down to 2, a finder candidate only down to its own threshold.
-                auto relax = [&](std::uint32_t len, std::uint32_t slot, std::uint32_t dist,
-                                 const std::uint32_t* nr, std::uint32_t minlen) {
-                    // a brand-new distance also pays for the distance itself
-                    const std::uint32_t dprice =
-                        (slot == 4u) ? PriceDistance(mem, T, D4D0, dist - 1u, len) : 0u;
-                    // rep-select price, cached at 0x3e200 by (hist&7, mm&7, slot)
+                // ---- the rep-select price for a slot (0..3 = rep, 4 = new distance)
+                auto SelPrice = [&](std::uint32_t slot) -> std::uint32_t {
                     const std::uint32_t ci = (nd.hist & 7u) + (mm & 7u) * 8u + (slot + 1u) * 0x40u;
-                    std::uint32_t sel;
                     const std::uint8_t cv = Rd8(mem, 0x3e200 + ci);
-                    if (cv == 0xffu) {
-                        const std::uint32_t ti = (nd.hist & 0xfu) + (mm & 7u) * 0x10u;
-                        std::size_t off = 0x3d980u + static_cast<std::size_t>(ti) * 16u;
-                        std::uint32_t tp = ti * 8u + 1u;
-                        // NOTE: the original prices this first bit with the polarity of a
-                        // NEW distance even here, on the rep path -- transcribed as is.
-                        std::uint32_t px = Cost(T, 1u, Bias(Rd16(mem, off) >> 4u)) + dmatch;
-                        int left = 3;
-                        for (;;) {
-                            const std::uint32_t at = tp;
-                            const bool last = (static_cast<int>(slot) - 3 + left) == 0;
-                            ++tp;
-                            px += Cost(T, last ? 1u : 0u, Bias(Rd16(mem, 0x3d980u + static_cast<std::size_t>(at) * 2u) >> 4u));
-                            --left;
-                            if (last || left == 0) break;
-                        }
-                        const std::uint32_t d = px - dmatch;
-                        Wr8(mem, 0x3e200 + ci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfdu));
-                        sel = px;
-                    } else {
-                        sel = cv + dmatch;
+                    if (cv != 0xffu) return cv + dmatch;
+                    const std::uint32_t ti = (nd.hist & 0xfu) + (mm & 7u) * 0x10u;
+                    const std::size_t off = 0x3d980u + static_cast<std::size_t>(ti) * 16u;
+                    std::uint32_t tp = ti * 8u + 1u;
+                    // the original prices this first bit with the polarity of a new
+                    // distance even on the rep path -- transcribed as is
+                    std::uint32_t px = Cost(T, 1u, Bias(Rd16(mem, off) >> 4u)) + dmatch;
+                    int left = 3;
+                    for (;;) {
+                        const std::uint32_t at = tp;
+                        const bool last = (static_cast<int>(slot) - 3 + left) == 0;
+                        ++tp;
+                        px += Cost(T, last ? 1u : 0u, Bias(Rd16(mem, 0x3d980u + static_cast<std::size_t>(at) * 2u) >> 4u));
+                        --left;
+                        if (last || left == 0) break;
                     }
-                    // the length price, cached at 0x39c08 by (len-2, isRep0)
-                    std::uint32_t L = len;
-                    std::uint32_t target = ni + L;
-                    while (L >= minlen) {
-                        const std::uint32_t v = L - 2u;
-                        std::uint32_t lp = 0;
-                        if (v < 0xffu) {
-                            const std::size_t li = (slot == 0u ? 1u : 0u) + static_cast<std::size_t>(v) * 2u;
-                            const std::uint8_t lc = Rd8(mem, 0x39c08 + li);
-                            if (lc == 0u) {
-                                std::uint32_t acc = 0;
-                                std::uint32_t idx = (slot == 0u ? 1u : 0u) << 4u;
-                                std::uint32_t vv = v, nb = 0;
-                                for (;;) {
-                                    vv >>= 1u;
-                                    const std::uint32_t cellp = Rd16(mem, 0x396c0u + static_cast<std::size_t>(idx) * 2u) >> 4u;
-                                    ++idx; ++nb;
-                                    acc += Cost(T, (vv != 0u) ? 1u : 0u, cellp);
-                                    if (vv == 0u) break;
-                                }
-                                const std::uint32_t rowb = (nb - 1u) << 5u;
-                                std::uint32_t persisted = 3u;   // (uStack_2311c == 4) * 2 + 1
-                                std::uint32_t nbits;
-                                std::uint32_t raws = 0;
-                                if (nb < 5u) { nbits = (nb - 1u) ? (nb - 1u) : 1u; }
-                                else { nbits = 4u; raws = nb - 5u; }
-                                std::uint32_t sh = 0x20u - nbits;
-                                std::uint32_t bits = v << sh;
-                                for (std::uint32_t i = 0; i < nbits; ++i) {
-                                    const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
-                                    const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
-                                    acc += Cost(T, bit, Rd16(mem, c2) >> 4u);
-                                    persisted = bit + persisted * 2u;
-                                }
-                                if (raws != 0u) acc += raws * 0x1cu;
-                                lp = acc;
-                                Wr8(mem, 0x39c08 + li, static_cast<std::uint8_t>((acc < 0xffu) ? acc + 1u - 1u : 0xfeu));
-                            } else {
-                                lp = lc;
-                            }
-                        }
-                        const std::uint32_t price = nd.price + sel + lp + dprice;
-                        Node& tg = nodes[target];
-                        if (tg.tag != static_cast<std::uint16_t>(chunk) || price < tg.price) {
-                            tg.tag = static_cast<std::uint16_t>(chunk);
-                            tg.price = static_cast<std::uint16_t>(price);
-                            tg.back = static_cast<std::uint16_t>(ni);
-                            tg.len = static_cast<std::uint16_t>(L);
-                            tg.sg = static_cast<std::uint8_t>(slot == 4u ? 0u : slot + 1u);   // slot 4 = a brand-new distance
-                            tg.dist = dist;
-                            tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
-                            const std::uint32_t sp = (cur >= dist) ? (cur - dist) : (cur + cap - dist);
-                            tg.ctx = static_cast<std::uint16_t>(At(base, sp + L) * 0x100u + At(base, cur + L - 1u));
-                            for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
-                            if (target > front) front = target;
-                        } else {
-                            break;   // the existing path into this node is cheaper
-                        }
-                        --L; --target;
+                    const std::uint32_t d = px - dmatch;
+                    Wr8(mem, 0x3e200 + ci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfdu));
+                    return px;
+                };
+                // ---- the length price, cached at 0x39c08 by (len-2, is-rep0)
+                auto LenPrice = [&](std::uint32_t L, std::uint32_t slot) -> std::uint32_t {
+                    const std::uint32_t v = L - 2u;
+                    if (v >= 0xffu) return 0u;
+                    const std::size_t li = (slot == 0u ? 1u : 0u) + static_cast<std::size_t>(v) * 2u;
+                    const std::uint8_t lc = Rd8(mem, 0x39c08 + li);
+                    if (lc != 0u) return lc;
+                    std::uint32_t acc = 0;
+                    std::uint32_t idx = (slot == 0u ? 1u : 0u) << 4u;
+                    std::uint32_t vv = v, nb = 0;
+                    for (;;) {
+                        vv >>= 1u;
+                        const std::uint32_t cellp = Rd16(mem, 0x396c0u + static_cast<std::size_t>(idx) * 2u) >> 4u;
+                        ++idx; ++nb;
+                        acc += Cost(T, (vv != 0u) ? 1u : 0u, cellp);
+                        if (vv == 0u) break;
                     }
+                    const std::uint32_t rowb = (nb - 1u) << 5u;
+                    std::uint32_t persisted = 3u;
+                    std::uint32_t nbits = (nb < 5u) ? ((nb - 1u) ? (nb - 1u) : 1u) : 4u;
+                    const std::uint32_t raws = (nb < 5u) ? 0u : (nb - 5u);
+                    std::uint32_t bits = v << ((0x20u - nbits) & 0x1fu);
+                    for (std::uint32_t i = 0; i < nbits; ++i) {
+                        const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
+                        const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
+                        acc += Cost(T, bit, Rd16(mem, c2) >> 4u);
+                        persisted = bit + persisted * 2u;
+                    }
+                    if (raws != 0u) acc += raws * 0x1cu;
+                    Wr8(mem, 0x39c08 + li, static_cast<std::uint8_t>((acc < 0xffu) ? acc : 0xfeu));
+                    return acc;
+                };
+                // ---- write one relaxed node; false means the existing path is
+                // cheaper, which ends the whole relaxation
+                auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
+                                  const std::uint32_t* nr, std::uint32_t price) -> bool {
+                    Node& tg = nodes[ni + L];
+                    // PROVISIONAL: the decompile compares strictly (the first writer
+                    // keeps a tie), but a strict compare agrees with the original far
+                    // less often -- two mirror fixtures tie here and the original
+                    // resolves them in OPPOSITE directions, so a price term is still
+                    // missing rather than a tie-break rule. Overwriting on a tie is
+                    // what currently matches the original best; see the notes.
+                    if (tg.tag == static_cast<std::uint16_t>(chunk) && price > tg.price) return false;
+                    tg.tag = static_cast<std::uint16_t>(chunk);
+                    tg.price = static_cast<std::uint16_t>(price);
+                    tg.back = static_cast<std::uint16_t>(ni);
+                    tg.len = static_cast<std::uint16_t>(L);
+                    tg.sg = static_cast<std::uint8_t>(slot == 4u ? 0u : slot + 1u);
+                    tg.dist = dist;
+                    tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                    const std::uint32_t sp = (cur >= dist) ? (cur - dist) : (cur + cap - dist);
+                    tg.ctx = static_cast<std::uint16_t>(At(base, sp + L) * 0x100u + At(base, cur + L - 1u));
+                    for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
+                    return true;
                 };
 
                 // ---- the four rep offsets
@@ -581,10 +566,10 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                     std::uint32_t src = cur - (r + 1u);
                     if (cur < r + 1u) src += cap;
                     if (src >= cap) continue;
-                    std::uint32_t avail = std::min<std::uint32_t>(cap - src, remain);
+                    const std::uint32_t avail = std::min<std::uint32_t>(cap - src, remain);
                     if (avail == 0u) continue;
                     std::uint32_t len = 0;
-                    while (len < avail && base[cur + len] == base[src + len]) ++len;
+                    while (len < avail && At(base, cur + len) == At(base, src + len)) ++len;
                     if (len <= best || len == 1u) { best = std::max(best, len); continue; }
                     best = len;
                     std::uint32_t nr[4];
@@ -592,7 +577,11 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                     for (std::uint32_t k = i; k > 0u; --k) nr[k] = nr[k - 1u];
                     nr[0] = r;
                     if (len < 0x20u && ni + len < 0x120u) {
-                        relax(len, i, r + 1u, nr, 2u);
+                        if (ni + len > front) front = ni + len;
+                        const std::uint32_t sel = SelPrice(i);
+                        for (std::uint32_t L = len; L >= 2u; --L) {
+                            if (!Update(L, i, r + 1u, nr, nd.price + sel + LenPrice(L, i))) break;
+                        }
                     } else {
                         Node& tg = nodes[ni + 1u];
                         tg.tag = static_cast<std::uint16_t>(chunk);
@@ -606,41 +595,58 @@ bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size
                         took_long = true;
                     }
                 }
-                if (took_long) { endnode = front; flushed = true; break; }
+                if (took_long) { endnode = front; break; }
 
-                // ---- the bt4 finder, then the long-range probe
+                // ---- the bt4 finder. Its candidates are appended in increasing
+                // length; the relaxation walks the LENGTH downward and switches to
+                // the shortest candidate that still reaches it (the nearest distance
+                // for that length), which is why each candidate is not relaxed on
+                // its own. The threshold starts at 2, so a 2-byte brand-new distance
+                // is never taken.
                 std::vector<Cand> cands;
                 F.Find(base, cur, cend, remain, cands, 0x10u);
-                // the finder's threshold starts at 2, not 1 (a 2-byte brand-new
-                // distance is never taken), and the list is walked longest-first,
-                // stopping at the first candidate that is not longer than it
-                std::uint32_t thr = std::max<std::uint32_t>(best, 2u);
-                for (auto it = cands.rbegin(); it != cands.rend(); ++it) {
-                    const Cand& c = *it;
-                    if (c.len <= thr) break;
-                    // a candidate may sit on the previous lap of the ring, so the
-                    // distance wraps by the capacity
-                    const std::uint32_t dist = (cur >= c.src) ? (cur - c.src) : (cur + cap - c.src);
-                    if (dist == 0u || dist > cap) continue;
-                    std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
-                    if (c.len < 0x20u && ni + c.len < 0x120u) {
-                        best = c.len; thr = c.len;
-                        relax(c.len, 4u, dist, nr, 2u);
-                    } else {
-                        Node& tg = nodes[ni + 1u];
-                        tg.tag = static_cast<std::uint16_t>(chunk);
-                        tg.back = static_cast<std::uint16_t>(ni);
-                        tg.len = static_cast<std::uint16_t>(c.len);
-                        tg.sg = 0u;
-                        tg.dist = dist;
-                        tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
-                        for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
-                        front = ni + 1u;
-                        took_long = true;
-                        break;
+                const std::uint32_t thr = std::max<std::uint32_t>(best, 2u);
+                if (!cands.empty() && cands.back().len > thr) {
+                    const std::uint32_t toplen = cands.back().len;
+                    const std::uint32_t topdist = (cur >= cands.back().src)
+                        ? (cur - cands.back().src) : (cur + cap - cands.back().src);
+                    if (topdist != 0u && topdist <= cap) {
+                        if (toplen >= 0x20u || ni + toplen >= 0x120u) {
+                            Node& tg = nodes[ni + 1u];
+                            tg.tag = static_cast<std::uint16_t>(chunk);
+                            tg.back = static_cast<std::uint16_t>(ni);
+                            tg.len = static_cast<std::uint16_t>(toplen);
+                            tg.sg = 0u;
+                            tg.dist = topdist;
+                            tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                            tg.rep[0] = topdist - 1u; tg.rep[1] = nd.rep[0];
+                            tg.rep[2] = nd.rep[1]; tg.rep[3] = nd.rep[2];
+                            front = ni + 1u;
+                            took_long = true;
+                        } else {
+                            if (ni + toplen > front) front = ni + toplen;
+                            const std::uint32_t sel = SelPrice(4u);
+                            // walk the length down, switching to the shortest
+                            // candidate that still reaches it (the nearest distance
+                            // for that length)
+                            std::size_t ci = cands.size() - 1u;
+                            std::uint32_t dprice = 0, lastsrc = 0xffffffffu;
+                            for (std::uint32_t L = toplen; L > thr; --L) {
+                                while (ci > 0u && L <= cands[ci - 1u].len) --ci;
+                                const Cand& c = cands[ci];
+                                const std::uint32_t dist = (cur >= c.src) ? (cur - c.src) : (cur + cap - c.src);
+                                if (dist == 0u || dist > cap) break;
+                                if (c.src != lastsrc) { dprice = PriceDistance(mem, T, D4D0, dist - 1u, L); lastsrc = c.src; }
+                                const std::uint32_t bp = nd.price + sel + dprice;
+                                const Node& tgc = nodes[ni + L];
+                                if (tgc.tag == static_cast<std::uint16_t>(chunk) && (dprice >> 3u) + bp >= tgc.price) break;
+                                const std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
+                                if (!Update(L, 4u, dist, nr, bp + LenPrice(L, 4u))) break;
+                            }
+                        }
                     }
                 }
-                if (took_long) { endnode = front; flushed = true; break; }
+                if (took_long) { endnode = front; break; }
 
                 // ---- the literal
                 {
