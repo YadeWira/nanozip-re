@@ -296,7 +296,9 @@ std::uint32_t PriceDistance(std::uint8_t* mem, const std::uint8_t* T,
     const std::uint32_t n1 = (bl < 2u) ? 1u : 2u;
     {
         std::uint32_t t1 = 1;
-        std::uint32_t b1 = D << ((0x20u - n1) & 0x1fu);
+        // the two tier-1 bits are the TOP of D (the leading one and the bit
+        // under it), not its low pair: the shift is 0x20 - bl once bl reaches 3
+        std::uint32_t b1 = D << ((0x20u - ((bl > 1u) ? bl : 1u)) & 0x1fu);
         for (std::uint32_t i = 0; i < n1; ++i) {
             const std::uint32_t bit = (b1 >> 31u) & 1u; b1 <<= 1u;
             const std::size_t c = 0x39f40u + static_cast<std::size_t>(t1 + 0xf80u + bl * 0x60u) * 2u;
@@ -340,9 +342,9 @@ std::uint32_t SelDelta(std::uint8_t* mem, const std::uint8_t* T, std::uint8_t hi
         const std::uint8_t cv = Rd8(mem, 0x3e200 + ci);
         if (cv != 0xffu) return cv;
     }
-    // the original prices this first bit with the polarity of a new distance
-    // even on the rep path -- transcribed as is
-    std::uint32_t px = Cost(T, 1u, Bias(Rd16(mem, off) >> 4u));
+    // b1 says new-distance (1) or rep (0), and each path prices it with its own
+    // polarity -- the rep site costs a zero here, the finder site a one
+    std::uint32_t px = Cost(T, (a0 >= 4u) ? 1u : 0u, Bias(Rd16(mem, off) >> 4u));
     if (a0 < 4u) {
         std::uint32_t tp = ti * 8u + 1u;
         int left = 3;
@@ -385,7 +387,9 @@ std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
     std::uint32_t persisted = (a0 == 4u) ? 3u : 1u;
     const std::uint32_t nbits = (nb < 5u) ? ((nb - 1u) ? (nb - 1u) : 1u) : 4u;
     const std::uint32_t raws = (nb < 5u) ? 0u : (nb - 5u);
-    std::uint32_t bits = v << ((0x20u - nbits) & 0x1fu);
+    // past four bits the original shifts by 0x21 - nb, not 0x20 - nbits: a
+    // length that needs six or more raw bits reads them one place over
+    std::uint32_t bits = v << (((nb < 5u) ? (0x20u - nbits) : (0x21u - nb)) & 0x1fu);
     for (std::uint32_t i = 0; i < nbits; ++i) {
         const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
         const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
@@ -468,22 +472,28 @@ std::uint32_t PriceLiteral(const std::uint8_t* mem, const std::uint8_t* T,
 
 }  // namespace
 
+std::uint32_t NzOptimumLzDecoder::PriceBit(std::uint32_t bit, std::uint32_t pf) {
+    return Cost(CostTable(), bit, pf);
+}
+
+// The literal price is the cost the coder actually paid, summed bit by bit while
+// coding, exactly as the original accumulates it -- not a second transcription of
+// the mixer that could drift from the coder's own.
+void NzOptimumLzDecoder::StoreLiteralCost(std::uint32_t ctxLow, std::uint8_t lit, std::uint32_t cost) {
+    std::uint8_t* const mem = mem_.data();
+    const std::size_t lci = static_cast<std::size_t>(ctxLow & 0xffu) * 0x100u + lit;
+    Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((cost < 0xfeu) ? cost : 0xfeu));
+}
+
 // Coding a symbol measures its real cost, and the original writes that cost
-// straight back into the price cache. Without this the caches keep the value
-// the parser computed against an older model, which is what made long matches
-// look more expensive than the original judged them.
-void NzOptimumLzDecoder::RefreshPriceCaches(const OptimumDecision& d, std::uint32_t mm,
-                                            std::uint8_t hist, std::uint32_t ctxWord,
-                                            std::uint8_t predB, std::uint8_t am2,
-                                            std::uint32_t remain) {
+// straight back into the price cache it priced from. Recomputing each component
+// against the model as it stands just before the decision is coded gives the same
+// number, because the coder reads every cell before it updates it.
+void NzOptimumLzDecoder::RefreshMatchPrices(const OptimumDecision& d, std::uint32_t mm,
+                                            std::uint8_t hist) {
+    if (d.is_literal) return;               // the coder stores its own measured cost
     std::uint8_t* const mem = mem_.data();
     const std::uint8_t* const T = CostTable();
-    if (d.is_literal) {
-        const std::uint32_t p = PriceLiteral(mem, T, ctxWord, hist, d.byte, mm, predB, am2, remain);
-        const std::size_t lci = static_cast<std::size_t>(ctxWord & 0xffu) * 0x100u + d.byte;
-        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((p < 0xfeu) ? p : 0xfeu));
-        return;
-    }
     const std::uint32_t a0 = (d.sg == 0u) ? 4u : (d.sg - 1u);
     SelDelta(mem, T, hist, mm, a0, false);
     if (d.len >= 2u) LenCost(mem, T, d.len, a0, false);
@@ -522,7 +532,9 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
         std::uint32_t rep[4] = {0, 0, 0, 0};
     };
     static thread_local std::vector<Node> nodes;
-    nodes.assign(0x120u, Node{});
+    // six extra slots: the lookahead below reads up to node ni+6, and the
+    // original reads the stack locals that follow its array there
+    nodes.assign(0x120u + 8u, Node{});
 
     std::uint32_t* const rep0 = F.rep0;
     std::uint8_t& hist0 = F.hist0;
@@ -623,6 +635,12 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
 
                 // ---- the four rep offsets
                 std::uint32_t best = 1;
+                // The finder's threshold is NOT the longest rep match found: the
+                // original keeps a separate counter that starts at 2 and rises to
+                // the longest length a rep relaxation actually WROTE. A rep that
+                // matched long but lost every comparison leaves it at 2, and the
+                // finder then gets to price its own candidates.
+                std::uint32_t thrv = 2;
                 bool took_long = false;
                 for (std::uint32_t i = 0; i < 4u && !took_long; ++i) {
                     const std::uint32_t r = nd.rep[i];
@@ -645,6 +663,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         const std::uint32_t sel = SelPrice(i);
                         for (std::uint32_t L = len; L >= 2u; --L) {
                             if (!Update(L, i, r + 1u, nr, nd.price + sel + LenPrice(L, i))) break;
+                            if (L > thrv) thrv = L;
                         }
                     } else {
                         Node& tg = nodes[ni + 1u];
@@ -674,7 +693,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                     for (const Cand& cc : cands) std::fprintf(stderr, " {src=%u len=%u}", cc.src - pos0, cc.len);
                     std::fprintf(stderr, "\n");
                 }
-                const std::uint32_t thr = std::max<std::uint32_t>(best, 2u);
+                const std::uint32_t thr = thrv;
                 if (!cands.empty() && cands.back().len > thr) {
                     const std::uint32_t toplen = cands.back().len;
                     const std::uint32_t topdist = (cur >= cands.back().src)
@@ -724,6 +743,21 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
 
                 // ---- the literal
                 {
+                    Node& tg = nodes[ni + 1u];
+                    const bool tagged = (tg.tag == static_cast<std::uint16_t>(chunk));
+                    // Before pricing anything the original looks six nodes ahead:
+                    // if any of them is already at most three units plus twice the
+                    // literal dispatch bit above this node, the literal cannot
+                    // matter and it is skipped outright.
+                    if (tagged) {
+                        std::uint32_t m = tg.price;
+                        for (std::uint32_t k = 2u; k <= 6u; ++k) {
+                            const Node& q = nodes[ni + k];
+                            if (q.tag == static_cast<std::uint16_t>(chunk) && q.price < m) m = q.price;
+                        }
+                        if (m <= nd.price + 3u + dlit * 2u) goto lit_done;
+                    }
+                    {
                     const std::uint8_t lit = base[cur];
                     const std::size_t lci = static_cast<std::size_t>(nd.ctx & 0xffu) * 0x100u + lit;
                     std::uint32_t lp;
@@ -737,8 +771,17 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         lp = lc + dlit;
                     }
                     const std::uint32_t price = nd.price + lp;
-                    Node& tg = nodes[ni + 1u];
-                    if (tg.tag != static_cast<std::uint16_t>(chunk) || price < tg.price) {
+                    // A literal does not have to be CHEAPER to take the node: the
+                    // original keeps it when it lands within three units plus a
+                    // sixteenth of its own price, and pays for that by decaying the
+                    // cached literal price it just used.
+                    bool wr = !tagged;
+                    if (tagged && price <= tg.price + 3u + (lp >> 4u)) {
+                        const std::uint8_t cv = Rd8(mem, 0x296a0 + lci);
+                        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>(cv - (cv >> 5u)));
+                        wr = true;
+                    }
+                    if (wr) {
                         tg.tag = static_cast<std::uint16_t>(chunk);
                         tg.price = static_cast<std::uint16_t>(price);
                         tg.back = static_cast<std::uint16_t>(ni);
@@ -750,7 +793,9 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         for (int k = 0; k < 4; ++k) tg.rep[k] = nd.rep[k];
                         if (ni + 1u > front) front = ni + 1u;
                     }
+                    }
                 }
+                lit_done:
 
                 // ---- advance
                 const std::uint32_t nx = ni + 1u;

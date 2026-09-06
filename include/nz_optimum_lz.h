@@ -91,6 +91,8 @@ struct OptimumDecision {
 
 class NzOptimumLzDecoder {
 public:
+    // the cost table's price of one bit at probability pf, in the coder's units
+    static std::uint32_t PriceBit(std::uint32_t bit, std::uint32_t pf);
     explicit NzOptimumLzDecoder(std::uint32_t window_capacity);
     // The encoder's side of the same block loop: codes `dec` with the models in
     // their current state (the state advances exactly as a decode would) and
@@ -152,9 +154,8 @@ private:
     // when set, RunBlock pulls the next decision from here instead of a list
     std::function<bool(OptimumDecision&)> feed_;
     // one flush of the DP from the current ring cursor and model state
-    void RefreshPriceCaches(const OptimumDecision& d, std::uint32_t mm, std::uint8_t hist,
-                            std::uint32_t ctxWord, std::uint8_t predB, std::uint8_t am2,
-                            std::uint32_t remain);
+    void StoreLiteralCost(std::uint32_t ctxLow, std::uint8_t lit, std::uint32_t cost);
+    void RefreshMatchPrices(const OptimumDecision& d, std::uint32_t mm, std::uint8_t hist);
     bool ParseNextFlush(std::vector<OptimumDecision>& out);
     void BeginParse(const std::uint8_t* data, std::uint32_t size);
 

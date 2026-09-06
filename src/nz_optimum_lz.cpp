@@ -597,11 +597,6 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                 uVar15 = matchmask | (static_cast<std::uint32_t>(predB) << 24) |
                          (static_cast<std::uint32_t>(am2) << 16);
 
-                // the emitter's price-cache refresh: coding a symbol measures its
-                // real cost and writes it back, so the parser's next flush prices
-                // against what the coder just paid rather than a stale estimate
-                if (feed_) RefreshPriceCaches(cur, uVar15, local_81, local_9c, predB, am2, local_94);
-
                 int dispIdx = static_cast<int>((matchmask & 7u) + static_cast<std::uint32_t>(predB) * 8u);
                 std::uint8_t dat380 = OptimumDat08172380()[local_81];
                 std::uint32_t apmRow = (matchmask & 0xfu) + static_cast<std::uint32_t>(dat380) * 8u;
@@ -695,6 +690,8 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                     ctxC_idx = uv8;
                 }
                 std::uint32_t local_a4 = 0;
+                const std::uint32_t litctx = local_9c & 0xffu;
+                std::uint32_t litcost = 0;
                 local_9c = 0;
                 std::uint32_t local_ac = 4;
                 std::uint32_t uVar10 = ctxC_idx;
@@ -711,6 +708,7 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                                                    uVar10, uVar15b, local_a4 + uVar10 * 2u,
                                                    (static_cast<std::uint32_t>(cur.byte) >> ((7u - 2u * (4u - local_ac)) & 31u)) & 1u, &pFinal1);
                     if (trace) fprintf(stderr, "  bit1=%u pFinal1=%u uVar10=%u uVar15b=%u ctxA=%#x ctxB=%#x\n", bit1, pFinal1, uVar10, uVar15b, ctxA, ctxB);
+                    litcost += PriceBit(bit1, pFinal1);
                     auto [curC1, curD1] = NodeAdvance(bit1, pFinal1, ctxA, ctxB, uVar15b);
                     uVar10 = curC1;
                     uVar15b = curD1;
@@ -722,6 +720,7 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                                                    uVar10, uVar15b, confidByte + uVar10 * 2u,
                                                    (static_cast<std::uint32_t>(cur.byte) >> ((6u - 2u * (4u - local_ac)) & 31u)) & 1u, &pFinal2);
                     if (trace) fprintf(stderr, "  bit2=%u pFinal2=%u uVar10=%u uVar15b=%u ctxA=%#x ctxB=%#x\n", bit2, pFinal2, uVar10, uVar15b, ctxA, ctxB);
+                    litcost += PriceBit(bit2, pFinal2);
 
                     local_ac -= 1;
                     local_9c = bit2 + (bit1 + local_9c * 2u) * 2u;
@@ -740,6 +739,7 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                             Rd8(mem, 0x2968c), Rd8(mem, 0x2968d), Rd8(mem, 0x2968f), Rd8(mem, 0x29690));
                 }
 
+                if (feed_) StoreLiteralCost(litctx, static_cast<std::uint8_t>(local_9c), litcost);
                 base[local_54] = static_cast<std::uint8_t>(local_9c);
                 local_54 += 1;
                 local_94 -= 1;
@@ -762,6 +762,7 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
                 int unit_idx = static_cast<int>(((uVar15 & 7u) * 0x10u + (local_81 & 0xfu)) * 8u);
                 if (O1_DBG_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "REPSEL pos=%u uVar15&7=%u local_81=%#x unit_idx=%d addr=%#x lo=%#x hi=%#x code=%#x\n",
                                                         local_54, uVar15 & 7u, local_81, unit_idx, 0x3d980+unit_idx*2, io.Lo(), io.Hi(), io.Code());
+                if (feed_) RefreshMatchPrices(cur, uVar15, local_81);
                 std::uint32_t b1 = DecodeAdaptive16(io, mem, 0x3d980 + unit_idx * 2, cur.sg == 0u ? 1u : 0u);
                 if (O1_DBG_ENV("NZOPT_TRACE_RS")) fprintf(stderr, "  after B1: b1=%u lo=%#x hi=%#x code=%#x\n", b1, io.Lo(), io.Hi(), io.Code());
                 unit_idx += 1;
