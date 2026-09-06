@@ -216,7 +216,7 @@ CliOptions ParseCli(int argc, char** argv) {
             ok = is_digits(sw.substr(1));
             if (ok && sw.size() > 1u) out.workers = static_cast<unsigned>(std::stoul(sw.substr(1)));
         } else if (sw[0] == 'm') {
-            std::uint64_t dummy = 0; ok = parse_size(sw.substr(1), &dummy);
+            ok = parse_size(sw.substr(1), &out.memory_bytes);
         } else ok = false;
         if (!ok) { out.unknown_switches.push_back(token); return out; }
     }

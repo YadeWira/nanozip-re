@@ -117,8 +117,10 @@ std::uint64_t FinderTableBytes(std::uint32_t window) {
     return static_cast<std::uint64_t>(f.bmask) * 4u + 0x10u;   // FUN_0805c4b0 (no second table below 128 MB)
 }
 
-void State::Init(std::uint32_t window) {
+void State::Init(std::uint32_t window, bool lzhds) {
     win.Init(window);
+    hds.reset();
+    if (lzhds) { hds = std::make_unique<Hds>(); hds->Init(window); }
     finder.Init(window);
     cont = 0;
     tb.Reset();
@@ -126,7 +128,7 @@ void State::Init(std::uint32_t window) {
     tmp.assign(0x10000u + 64u, 0);
     probe_ctx = lzpf_enc::AudioProbe{};
     exe_pos = 4;
-    audio.Configure(8u, 0x10u, 3u);   // FUN_080b1600(ctx+0x40, 8, 0x10, 3, 0)
+    audio.Configure(lzhds ? 0x20u : 8u, 0x10u, 3u);   // FUN_080bf790: FUN_080b1600(ctx+0x40, 8 | 0x20, 0x10, 3, 0)
     image.Configure(2u, 0x10u, 0x10u);   // FUN_08089a70(ctx+0x38800, 0x10, 0x10, 2)
     image.Reset();
 }
@@ -481,7 +483,11 @@ void WriteChunk(State& st, const std::uint8_t* lits, std::uint32_t lit_size, std
     if (coded) flags |= 1u;
     PutVar(out, 0x80010u, lit_size == 0x8000u ? flags : (lit_size + 1u) * 16u + flags);
     if (lit_size != 0x8000u) PutVar(out, 0x8001u - lit_size, out_size - lit_size);
-    if (lit_size < out_size) WriteColumns(st, out);
+    if (lit_size < out_size) {
+        WriteColumns(st, out);
+        // -cD (FUN_080673a0 -> FUN_080bf4b0): the Exp-Golomb side field, one length byte then its bytes
+        if (st.hds) { out.push_back(static_cast<std::uint8_t>(st.hds->ratebits.size())); out.insert(out.end(), st.hds->ratebits.begin(), st.hds->ratebits.end()); }
+    }
     if (coded) out.insert(out.end(), arith.begin(), arith.begin() + static_cast<std::ptrdiff_t>(r));
     else out.insert(out.end(), lits, lits + lit_size);
     if (flags & 8u) out.push_back(text_param);
@@ -692,7 +698,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                         st.win.Slide(len);
                         std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
                         st.win.Append(buf, len);
-                        SparseAppend(st, len);
+                        if (st.hds) HdsAppend(st, len); else SparseAppend(st, len);
                         std::memcpy(st.win.base + st.win.pos, &guard, 4);
                         st.probe_ctx.bytes_done += len;
                         off += len0;
@@ -700,11 +706,15 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                     }
                 }
                 st.image.Reset();   // FUN_080b6170: every chunk that is not an image chunk
-                if (flags == 0u) {
+                if (flags == 0u && 0x1ffu < len) {
                     // LAB_080651a0: the audio decision outside a span, unless a quick
-                    // LZ parse would already keep three quarters of the bytes or less
+                    // LZ parse would already keep three quarters of the bytes or less;
+                    // it sits inside the `0x1ff < len` block: a chunk of 512 bytes or
+                    // less goes straight to the LZ path (a 288-byte tail after an audio
+                    // chunk under -cD, measured)
                     const bool dec = lzpf_enc::AudioDecide(st.probe_ctx, buf, std::min<std::uint32_t>(len, 0x400u), len);
-                    if (dec && !(LzEstimate(st, buf, len) * 4u <= len * 3u)) go_audio = true;
+                    const std::uint32_t est = st.hds ? HdsEstimate(st, buf, len) : LzEstimate(st, buf, len);
+                    if (dec && !(est * 4u <= len * 3u)) go_audio = true;
                 }
             }
         }
@@ -718,7 +728,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                 st.win.Slide(len);
                 std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
                 st.win.Append(buf, len);
-                SparseAppend(st, len);
+                if (st.hds) HdsAppend(st, len); else SparseAppend(st, len);
                 std::memcpy(st.win.base + st.win.pos, &guard, 4);
                 st.probe_ctx.bytes_done += len;
                 off += len0;
@@ -734,11 +744,17 @@ lz_path:
             st.win.Slide(len);
             std::uint32_t guard; std::memcpy(&guard, st.win.base + st.win.pos + len, 4);
             st.win.Append(buf, len);
-            if (len < 0x100u) { SparseAppend(st, len); lit_size = len; }
-            else lit_size = LzEncodeChunk(st, len);
+            if (len < 0x100u) { if (st.hds) HdsAppend(st, len); else SparseAppend(st, len); lit_size = len; }
+            else lit_size = st.hds ? HdsEncodeChunk(st, len) : LzEncodeChunk(st, len);
             std::memcpy(st.win.base + st.win.pos, &guard, 4);
             if (lit_size + 0x10u + (lit_size >> 7u) < len) WriteChunk(st, st.lits.data(), lit_size, len, flags, text_param, rle_side, out);
-            else WriteChunk(st, buf, len, len, flags, text_param, rle_side, out);
+            else {
+                // LAB_08065266: a chunk stored as its bytes re-initialises the -cD
+                // literal model's contexts (vtable slot 4, a no-op for -cd), as the
+                // decoder does for a pure-literal chunk over 255 bytes
+                if (0xffu < len && st.hds) st.hds->ResetCtx();
+                WriteChunk(st, buf, len, len, flags, text_param, rle_side, out);
+            }
             off += len0;
             continue;
         }

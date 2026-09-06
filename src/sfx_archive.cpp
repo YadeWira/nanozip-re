@@ -10786,6 +10786,7 @@ struct EncodeCodec {
     // 2 MB analysis object; the store has just its window.
     std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
         if (p0 == 0u) return window;
+        if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
         if (p0 >= 3u) {
             // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
             // object (FUN_0805d590: window, the finder table, one 0xe0080 token
@@ -10807,7 +10808,7 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
     const std::uint64_t wbuf = options.write_buffer_bytes ? options.write_buffer_bytes : (4ull << 20u);
     if (workers > threads) os << "Warning: number of compressors set is higher than the number of threads!\n";
     os << "Archive: " << options.archive_path << '\n';
-    os << "Threads: " << threads << ", memory: 512 MB";
+    os << "Threads: " << threads << ", memory: " << mb(options.memory_bytes) << " MB";   // the -m budget, half-up MB (-m256k prints 0)
     if (threads > 1u) os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
     os << '\n';
     if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
@@ -10864,7 +10865,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
     if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
-    if (codec.p0 >= 3u && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window)); }
+    if (codec.p0 >= 3u && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
     // The pieces of this range, in the order the reader meets them, then the
     // original's list order: slices prepended, whole files appended. Ghosts (-x
     // matches, unreadable files) take their bytes in the split but store none.
@@ -11234,6 +11235,7 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kLzpf) return RunAddStoreContainer(options, std::move(found), os, add_start, 1u);
     if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
     if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
+    if (options.compressor == Compressor::kLzhds) return RunAddStoreContainer(options, std::move(found), os, add_start, 4u);
     // The compressors not ported yet (-cD, -co, -cO, -cc): refuse. The decode
     // phase's stub writer labelled raw bytes with the codec's byte, an archive
     // the original cannot decode ("code 1024" on a -cD one); nothing is better.

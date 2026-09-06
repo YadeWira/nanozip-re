@@ -16,6 +16,7 @@ set(RECON_SOURCES
     src/nz_lzpf_image_enc.cpp
     src/nz_lzhd_encoder.cpp
     src/nz_lzhd_text.cpp
+    src/nz_lzhds_encoder.cpp
     src/nz_cm.cpp
     src/nz_cd_tokens.cpp
     src/nz_cd_texttransform_dict.cpp

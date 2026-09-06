@@ -50,6 +50,22 @@ struct LpcBigPredictor {
             std::int32_t r = samples[i];
             std::int32_t dec = (std::int32_t)((std::uint32_t)pred + (std::uint32_t)r);
             samples[i] = dec;
+            Step(dec, r);
+        }
+    }
+    // The encoder's side of the same core (FUN_08053220, order >= 9: residual =
+    // sample - prediction, then FUN_080bddc0 with the sample and the residual).
+    void Forward(std::int32_t* samples, std::uint32_t n) {
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::int32_t x = samples[i];
+            const std::int32_t r = (std::int32_t)((std::uint32_t)x - (std::uint32_t)pred);
+            samples[i] = r;
+            Step(x, r);
+        }
+    }
+    // FUN_080bddc0: adapt on the residual's sign, push the decoded sample, predict.
+    void Step(std::int32_t dec, std::int32_t r) {
+        {
             if (r != 0) {
                 std::int16_t* s = S();
                 for (std::uint32_t k = 0; k < order; ++k)

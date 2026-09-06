@@ -45,8 +45,9 @@ struct LpcPlane {
     std::int16_t hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     std::int16_t sign_hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     std::int16_t factors[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    void Configure(std::uint32_t o) { order = o; taps = o >= 8u ? 8u : 4u; Reset(); }
-    void Reset() { pred = 0; shift = 13u; for (int k = 0; k < 8; ++k) { hist[k] = 0; sign_hist[k] = 0; factors[k] = 0; } }
+    nzr::lzpf::LpcBigPredictor big;   // order >= 9 (the -cD planes 0/1, order 32): the decoder's core, run forward
+    void Configure(std::uint32_t o) { order = o; taps = o >= 8u ? 8u : 4u; if (o >= 9u) big.order = o; Reset(); }
+    void Reset() { pred = 0; shift = 13u; for (int k = 0; k < 8; ++k) { hist[k] = 0; sign_hist[k] = 0; factors[k] = 0; } if (order >= 9u) big.Reset(); }
     void Forward(std::int32_t* v, std::uint32_t n);   // FUN_08053220: samples -> residuals
     void StepForward(std::int32_t& v, bool adapt);
 };

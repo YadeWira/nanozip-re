@@ -377,6 +377,7 @@ bool AudioDecide(AudioProbe& pr, const std::uint8_t* block, std::uint32_t len, s
 // FUN_08053220, order < 9: residual = sample - prediction, then the same
 // sign-sign adaptation the decoder runs (LpcPredictor::step) on the sample.
 void LpcPlane::Forward(std::int32_t* v, std::uint32_t n) {
+    if (order >= 9u) { big.shift = shift; big.Forward(v, n); pred = big.pred; return; }   // FUN_08053220's order >= 9 branch
     const std::uint32_t t = taps;
     if (t >= 8u) {
         for (std::uint32_t i = 0; i < n; ++i) StepForward(v[i], true);
@@ -389,6 +390,7 @@ void LpcPlane::Forward(std::int32_t* v, std::uint32_t n) {
 }
 
 void LpcPlane::StepForward(std::int32_t& v, bool adapt) {
+    if (order >= 9u) { big.shift = shift; big.Forward(&v, 1u); pred = big.pred; (void)adapt; return; }
     const std::uint32_t t = taps;
     const std::int32_t x = v;
     v = x - pred;

@@ -78,6 +78,7 @@ struct CliOptions {
     // (0 = auto, not shown); -swapinout / -forceout: the benchmark helpers.
     unsigned threads = 0;
     std::uint64_t read_buffer_bytes = 0;
+    std::uint64_t memory_bytes = 512ull << 20;   // -m: the budget the console reports (default 512 MB)
     std::uint64_t write_buffer_bytes = 0;
     bool swapinout = false;
     bool forceout = false;
