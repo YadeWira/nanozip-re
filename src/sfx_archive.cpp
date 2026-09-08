@@ -11218,11 +11218,20 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
-    EncodeCodec header_codec; header_codec.p0 = p0;
+    // -co block: ceil(input / 64 KB) units of 64 KB, never fewer than 16 nor
+    // more than 17 (the low-budget rule; see the dispatch above).
+    std::uint32_t co_block = 0x100000u;
+    if (p0 == 5u) {
+        std::uint64_t units = (total + 0xffffull) / 0x10000ull;
+        if (units < 16ull) units = 16ull;
+        if (units > 17ull) units = 17ull;
+        co_block = static_cast<std::uint32_t>(units * 0x10000ull);
+    }
+    EncodeCodec header_codec; header_codec.p0 = p0; header_codec.co_block = co_block;
     PrintStoreEncodeHeader(os, options, workers, window, header_codec);
     // one codec state per worker stream (the original's workers own their windows)
     std::vector<EncodeCodec> codecs(workers);
-    for (EncodeCodec& c : codecs) c.p0 = p0;
+    for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block; }
     EncodeStatus status(workers);
     std::uint64_t read_ms = 0, write_ms = 0;
     const auto timed_write = [&](const std::vector<unsigned char>& v) {
@@ -11327,11 +11336,14 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
     if (options.compressor == Compressor::kLzhds) return RunAddStoreContainer(options, std::move(found), os, add_start, 4u);
     if (options.compressor == Compressor::kOptimum1) {
-        // Only the shape whose window and block are known: the 64 KB window and
-        // the 1 MB block a budget of 16 MB or less picks for an input below 1 MB.
-        std::uint64_t bytes = 0;
-        for (const EncodeSource& e : found) bytes += e.size;
-        if (options.memory_bytes <= (16ull << 20u) && bytes < (1ull << 20u))
+        // A budget of 16 MB or less picks a 64 KB window and a block of
+        // ceil(input / 64 KB) units clamped to 16 or 17 -- measured at every
+        // budget from 1 MB to 16 MB and every input from 2 KB to 3 MB. Above that
+        // budget both grow with the input, and the block stops following any
+        // formula at all (a 3 MB input takes 46 units at -m20m, 17 at -m24m, 30
+        // at -m32m), which says it is the reader's buffering that decides -- so
+        // that shape waits on the block driver rather than being guessed at.
+        if (options.memory_bytes <= (16ull << 20u))
             return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
     }
     // The compressors not ported yet (-cD, -co, -cO, -cc): refuse. The decode
