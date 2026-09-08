@@ -8597,6 +8597,28 @@ static bool DecodeOptimumBlockSequence(
         // p14 was set 1 272 times. So this decline covers a bit the encoder
         // expresses elsewhere, not a gap in the port.
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        // NZOPT_DUMP_TT=<dir>: the text transform's input and output for every
+        // block that carries one, as <dir>/ttN.in and .out plus a .flags line. The
+        // input is what the original's encoder produced from the text and the
+        // output is the text itself, so the pair is ground truth for the FORWARD
+        // transform the encoder still needs.
+        static int tt_dump_seq = 0;
+        const char* const tt_dump_dir = NZ_ENV("NZOPT_DUMP_TT");
+        const int tt_dump_n = tt_dump_seq;
+        if (tt_dump_dir != nullptr && tt_enabled) {
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.in", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.flags", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "w")) { std::fprintf(f, "flags=%u tt2=%zu tt16=%zu in=%u\n", tt_flags, tt2_data.size(), tt16_data.size(), cur_size); std::fclose(f); }
+        }
+        // one file per step of the chain, so each transform can be worked on alone
+        const auto tt_step = [&](const char* step) {
+            if (tt_dump_dir == nullptr || !tt_enabled) return;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.%s", tt_dump_dir, tt_dump_n, step);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+        };
         if (tt_enabled && (tt_flags & 0x10u)) {
             std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
             const std::uint32_t n = NzTextTransformNumber(
@@ -8604,6 +8626,7 @@ static bool DecodeOptimumBlockSequence(
                 work.data(), cur_size, tbuf.data(), remaining + (1u << 16));
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("num");
         }
         if (tt_enabled && (tt_flags & 0x08u)) {
             // Non-CM codecs (optimum/lzhd, decparams type != 7) reorder the ASCII
@@ -8628,6 +8651,7 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformDict(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("dict");
         }
         if (tt_enabled && (tt_flags & 0x04u)) {
             // HTML closing-tag restoration (NzTextTransformHtml). Reference
@@ -8636,6 +8660,7 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("html");
         }
         if (tt_enabled && (tt_flags & 0x02u)) {
             // Insert-LF transform (NzTextTransformInsertLf, ported from
@@ -8649,6 +8674,7 @@ static bool DecodeOptimumBlockSequence(
                 work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("lf");
         }
         if (tt_enabled && (tt_flags & 0x20u)) {
             // Escape+run-length repeat transform (NzTextTransformRle, ported
@@ -8660,6 +8686,7 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("rle");
         }
         if (tt_enabled && (tt_flags & 0x40u)) {
             // Chess/PGN transform, between 0x20 and 0x01 in the reference's
@@ -8671,6 +8698,7 @@ static bool DecodeOptimumBlockSequence(
             tbuf.resize(n);
             work.swap(tbuf);
             cur_size = n;
+            tt_step("t6");
         }
         if (tt_enabled && (tt_flags & 0x01u)) {
             // CR/CRLF restoration -- LAST in the reference's chain (after 0x20
@@ -8681,6 +8709,13 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("crlf");
+        }
+        if (tt_dump_dir != nullptr && tt_enabled) {
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.out", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+            ++tt_dump_seq;
         }
         if (tt_enabled) stgmark("tt", work.data(), cur_size);
         if (dece_param) {
