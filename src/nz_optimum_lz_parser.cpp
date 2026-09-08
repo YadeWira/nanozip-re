@@ -687,6 +687,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // its own. The threshold starts at 2, so a 2-byte brand-new distance
                 // is never taken.
                 std::vector<Cand> cands;
+                if (NZ_ENV("NZOPT_PROBES")) std::fprintf(stderr, "[PR] %u %u\n", cur - pos0, remain);
                 F.Find(base, cur, cend, remain, cands, 0x10u);
                 if (trace) {
                     std::fprintf(stderr, "[C] rem=%u ni=%u n=%zu:", chunk - emitted, ni, cands.size());
@@ -806,6 +807,36 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             }
             (void)flushed;
             if (endnode == 0u) endnode = 1u;
+            if (NZ_ENV("NZOPT_FSUM")) {
+                auto crc = [](const void* p2, std::size_t n) {
+                    const std::uint8_t* b = static_cast<const std::uint8_t*>(p2);
+                    std::uint32_t c = 0xffffffffu;
+                    for (std::size_t k = 0; k < n; ++k) {
+                        c ^= b[k];
+                        for (int q = 0; q < 8; ++q) c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+                    }
+                    return ~c;
+                };
+                std::fprintf(stderr, "rem=%u H=%08x C=%08x\n", chunk - emitted,
+                             crc(F.head.data(), F.head.size() * 4u),
+                             crc(F.cache.data(), F.cache.size() * 4u));
+            }
+            if (const char* fd = NZ_ENV("NZOPT_DUMPFIND")) {
+                if ((chunk - emitted) == static_cast<std::uint32_t>(std::atoi(fd))) {
+                    const char* dir = NZ_ENV("NZOPT_DUMPDIR");
+                    std::string b = dir ? dir : "/tmp";
+                    auto wr = [&](const char* nm, const void* p2, std::size_t n) {
+                        std::FILE* f = std::fopen((b + "/mine." + nm).c_str(), "wb");
+                        if (f) { std::fwrite(p2, 1, n, f); std::fclose(f); }
+                    };
+                    wr("head", F.head.data(), F.head.size() * 4u);
+                    wr("cache", F.cache.data(), F.cache.size() * 4u);
+                    wr("tree", F.tree.data(), F.tree.size() * 4u);
+                    std::FILE* f = std::fopen((b + "/mine.meta").c_str(), "w");
+                    if (f) { std::fprintf(f, "shift=%u maskA=%#x headmask=%#x treemask=%#x treesize=%u pos0=%u cur0=%u\n",
+                                          F.shift, F.maskA, F.headmask, F.treemask, F.treesize, pos0, pos0 + emitted); std::fclose(f); }
+                }
+            }
             const char* nodesenv = NZ_ENV("NZOPT_NODES");
             if (nodesenv != nullptr && (chunk - emitted) == static_cast<std::uint32_t>(std::atoi(nodesenv))) {
                 std::fprintf(stderr, "[N] FLUSH front=%u end=%u rem=%u\n", front, endnode, chunk - emitted);
@@ -851,8 +882,12 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             }
             if (adv == 0u) return false;
             if (trace) std::fprintf(stderr, "[PARSE] emitted=%u adv=%u chain=%zu end=%u\n", emitted, adv, chain.size(), endnode);
-            // feed the finder over the bytes the chosen path consumed
-            F.Skip(base, pos0 + emitted, adv);
+            // The bytes a chosen match consumed are NOT fed to the finder. Its
+            // bulk insert only runs when data enters the window, and for a block
+            // handed over whole it never runs at all -- so a position swallowed by
+            // a long match is never inserted, and no later match can start there.
+            // Feeding them here made the hash head hold positions the original
+            // never sees, and the finder then answered with nearer sources.
             F.consumed = emitted + adv;
             if (F.consumed > chunk) return false;
         }
