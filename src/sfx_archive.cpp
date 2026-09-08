@@ -10836,10 +10836,12 @@ struct EncodeCodec {
     // 2 MB analysis object; the store has just its window.
     std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
         if (p0 == 0u) return window;
-        // -co with the smallest window and a 1 MB block reports 18 MB. The figure
-        // is built from the window and the block the way quirk 46 describes, and
-        // deriving it in full waits on the window/block formula itself.
-        if (p0 == 5u) { (void)threads; return 18ull << 20u; }
+        // -co reports 18 MB for both blocks a budget of 16 MB or less can pick
+        // (16 and 17 units of 64 KB), measured on both. It is NOT the decode
+        // console's working set for the same archive, which comes to 13 MB: the
+        // compressor also carries the match finder and the analysis object, and
+        // splitting that difference into its terms waits on the block driver.
+        if (p0 == 5u) { (void)threads; (void)window; return 18ull << 20u; }
         if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
         if (p0 >= 3u) {
             // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
