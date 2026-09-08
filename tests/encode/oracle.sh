@@ -27,8 +27,13 @@ open(f'{d}/empty','w').write('')
 open(f'{d}/tiny','w').write('x')
 open(f'{d}/sub/c.dat','wb').write(bytes((i * 7) % 251 for i in range(12000)))
 open(f'{d}/sub/deep/d.log','w').write('log line\n' * 300)
+# 2 KB of this repository's own source: ordinary prose-like text that the
+# original compresses with the plain LZ shape (no BWT, no text transform), which
+# is the shape `a -co` writes today
+src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) if '__file__' in dir() else '.', 'src/nz_optimum_lz.cpp'), 'rb').read() if False else open('src/nz_optimum_lz.cpp','rb').read()
+open(f'{d}/src2k.txt','wb').write(src[:2000])
 os.chmod(f'{d}/a.txt', 0o644); os.chmod(f'{d}/b.bin', 0o600); os.chmod(f'{d}/sub/c.dat', 0o755)
-for i, f in enumerate(['a.txt','b.bin','empty','tiny','sub/c.dat','sub/deep/d.log']):
+for i, f in enumerate(['a.txt','b.bin','empty','tiny','sub/c.dat','sub/deep/d.log','src2k.txt']):
     t = 1000000000 + i * 86400 * 37
     os.utime(f'{d}/{f}', (t, t))
 # the shapes the container rules were measured on
@@ -246,6 +251,7 @@ CASES=(
   "cd_one|-cd|a.txt"
   "cD_one|-cD|a.txt"
   "co_one|-co|a.txt"
+  "co_src|-co -t1 -m4m|src2k.txt"
   "cO_one|-cO|a.txt"
   "cc_one|-cc|a.txt"
 )

@@ -10776,16 +10776,70 @@ struct EncodeStatus {
 // the read buffer (R/N, half-up MB).
 // What a worker stream compresses with. p0 0 = store; 1/2 = lzpf (-cf/-cF), whose
 // state (window, hash tables) lives in `lz` and is created per stream.
+// `a -co`: the nz_optimum1 blocks of one DATA record. The decoder walks the
+// stream as a chain of segments, each tagged by a varint (bytes<<4)|0 -- and that
+// tag is the DATA record header itself, so one record is one segment. A block is [u32 payload size][payload][descriptor], the
+// descriptor coming AFTER its payload; for a plain LZ block it is decr_param 1,
+// param6 1, the block's output size, the staged check bytes, and five zero flag
+// bytes (param2, param1, param16, text transform, dece).
+//
+// The staged bytes are Fletcher32(stage output) % 255 and the decoder pops them
+// LAST first, so with the two stages a plain LZ block has -- its payload and the
+// LZ output -- they go out as { check(LZ output), check(payload) }.
+static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint32_t block_size,
+                                 const unsigned char* data, std::uint32_t len,
+                                 std::vector<unsigned char>& out) {
+    std::vector<unsigned char> seg;
+    const auto put32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
+    };
+    std::uint32_t off = 0;
+    while (off < len) {
+        const std::uint32_t n = (block_size < len - off) ? block_size : (len - off);
+        const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
+        std::vector<std::uint8_t> payload;
+        if (!co.EncodeBlockParsed(src, n, payload, nullptr)) return false;
+        // A block the parser cannot beat would be stored (param6 zero), which
+        // this writer does not emit yet -- declining keeps a wrong archive from
+        // ever reaching the disk.
+        if (payload.empty() || payload.size() >= n) return false;
+        put32(static_cast<std::uint32_t>(payload.size()));
+        seg.insert(seg.end(), payload.begin(), payload.end());
+        seg.push_back(1u);
+        seg.push_back(1u);
+        put32(n);
+        seg.push_back(2u);
+        seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+        seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        for (int i = 0; i < 5; ++i) seg.push_back(0u);
+        off += n;
+    }
+    // No segment prefix of our own: the type-0 DATA record header the caller
+    // writes around this IS the chain segment's tag, which is why the decoder
+    // walks the segments by reading record headers straight out of the archive.
+    out.insert(out.end(), seg.begin(), seg.end());
+    return true;
+}
+
 struct EncodeCodec {
     unsigned p0 = 0;
     std::unique_ptr<nzr::lzpf_enc::State> lz;
     std::unique_ptr<nzr::lzhd_enc::State> cd;
-    const char* Label() const { return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large" : p0 == 3u ? "nz_lzhd" : "nz_lzhds"; }
+    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;   // the -co engine carries its own encode side
+    std::uint32_t co_block = 0x100000u;
+    const char* Label() const {
+        return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
+             : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : "nz_optimum1";
+    }
     // FUN_0805a110: the working set the Compressor line reports -- the window, the
     // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
     // 2 MB analysis object; the store has just its window.
     std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
         if (p0 == 0u) return window;
+        // -co with the smallest window and a 1 MB block reports 18 MB. The figure
+        // is built from the window and the block the way quirk 46 describes, and
+        // deriving it in full waits on the window/block formula itself.
+        if (p0 == 5u) { (void)threads; return 18ull << 20u; }
         if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
         if (p0 >= 3u) {
             // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
@@ -10860,12 +10914,22 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
         }
         const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
+        if (codec.p0 >= 5u) {
+            // the optimum family adds the block-size byte-float as a third byte
+            const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+            const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
+                                          static_cast<unsigned char>(p1),
+                                          static_cast<unsigned char>(p2)};
+            WriteLegacyRecordHeader(&hdr, 11u, stream, 3u); hdr.insert(hdr.end(), rec, rec + 3);
+        } else {
         const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
         WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
+        }
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
     if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
-    if (codec.p0 >= 3u && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
+    if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
+    if (codec.p0 == 5u && !codec.co) codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
     // The pieces of this range, in the order the reader meets them, then the
     // original's list order: slices prepended, whole files appended. Ghosts (-x
     // matches, unreadable files) take their bytes in the split but store none.
@@ -11038,7 +11102,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         if (chunked) {
             // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
             // 4-byte alignment matters to the side stream's overflow check only)
-            if (codec.p0 >= 3u) {
+            if (codec.p0 == 5u) {
+                if (!OptimumEncodeSegment(*codec.co, codec.co_block, block.data(),
+                                          static_cast<std::uint32_t>(block.size()), payload)) return false;
+            } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
                 std::size_t off = 0;
@@ -11134,6 +11201,11 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         case 2u: reduced = (budget > 0x3ffffffull) ? budget - 0x4000000ull : 0ull; break;
         case 3u: reduced = budget - (budget >> 2u) - (budget >> 4u); break;
         case 4u: reduced = budget - (budget >> 2u) - (budget >> 3u) - (budget >> 4u) - (budget >> 5u); break;
+        // -co: measured at every budget from 1 MB to 16 MB, the window is the
+        // 64 KB floor. Above that it grows with the INPUT rather than the budget
+        // (a 1.16 MB input at -m64m takes a 1.125 MB window), which is why the
+        // dispatch only accepts the small-budget shape for now.
+        case 5u: reduced = 0x10000ull; break;
         default: reduced = budget; break;
     }
     if (reduced > 0xf0000000ull) reduced = 0xf0000000ull;
@@ -11254,6 +11326,14 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
     if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
     if (options.compressor == Compressor::kLzhds) return RunAddStoreContainer(options, std::move(found), os, add_start, 4u);
+    if (options.compressor == Compressor::kOptimum1) {
+        // Only the shape whose window and block are known: the 64 KB window and
+        // the 1 MB block a budget of 16 MB or less picks for an input below 1 MB.
+        std::uint64_t bytes = 0;
+        for (const EncodeSource& e : found) bytes += e.size;
+        if (options.memory_bytes <= (16ull << 20u) && bytes < (1ull << 20u))
+            return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
+    }
     // The compressors not ported yet (-cD, -co, -cO, -cc): refuse. The decode
     // phase's stub writer labelled raw bytes with the codec's byte, an archive
     // the original cannot decode ("code 1024" on a -cD one); nothing is better.
