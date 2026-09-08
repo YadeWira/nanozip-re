@@ -103,8 +103,10 @@ struct NzOptimumLzDecoder::ParserState {
     std::uint32_t lrmask = 0, lrhash = 0;
     bool ready = false;
     // the block being parsed, and how much of it has been handed to the coder
-    const std::uint8_t* src = nullptr;
+    const std::uint8_t* block = nullptr;      // the whole block
+    const std::uint8_t* src = nullptr;        // the chunk being parsed
     std::uint32_t size = 0, consumed = 0, pos0 = 0;
+    bool staged = false;                      // the coder staged this chunk itself
     std::uint32_t rep0[4] = {1, 1, 1, 1};
     std::uint8_t hist0 = 0xff;
     std::uint16_t ctx0 = 0;
@@ -509,11 +511,72 @@ void NzOptimumLzDecoder::RefreshMatchPrices(const OptimumDecision& d, std::uint3
         PriceDistance(mem, T, OptimumDat081724d0(), d.dist - 1u, d.len, false);
 }
 
+// FUN_0806f530's tail: after the ring feed, hand the appended span to the finder.
+// A span that fills the window (or comes within a chunk of it) is inserted as the
+// whole window from position zero; otherwise it is inserted where it landed, split
+// in two when it wrapped past the ring end.
+void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t len) {
+    // Only the encoding side needs the finder, and it costs several megabytes, so
+    // a plain decode does not build one. NZOPT_PARSECHK / NZOPT_RECODE turn it on
+    // so their re-parse sees the same window history the original's parser does.
+    if (!parser_) {
+        if (NZ_ENV("NZOPT_PARSECHK") == nullptr && NZ_ENV("NZOPT_RECODE") == nullptr) return;
+        parser_ = std::make_shared<ParserState>();
+    }
+    ParserState& F = *parser_;
+    F.Init(ring_.capacity, blocksize_);
+    const std::uint32_t cap = ring_.capacity;
+    if (cap == 0u || len == 0u) return;
+    std::uint32_t n = len, from = cursor_before;
+    if (cap <= len + 0x8000u) { n = (len < cap) ? len : cap; from = 0; }
+    if (NZ_ENV("NZOPT_TRACE_FEED"))
+        std::fprintf(stderr, "[FEED] len=%u cursor_before=%u cursor_after=%u -> from=%u n=%u\n",
+                     len, cursor_before, ring_.cursor, from, n);
+    std::uint8_t* const base = ring_.Base();
+    if (from < ring_.cursor) {
+        F.Skip(base, from, n);
+    } else {
+        const std::uint32_t tail = cap - from;
+        if (tail >= n) { F.Skip(base, from, n); }
+        else { F.Skip(base, from, tail); F.Skip(base, 0u, n - tail); }
+    }
+}
+
+bool NzOptimumLzDecoder::ChunkExhausted() const {
+    return !parser_ || parser_->consumed >= parser_->size;
+}
+
+void NzOptimumLzDecoder::BeginChunk(std::uint32_t off, std::uint32_t len,
+                                    std::uint32_t ring_pos, bool reset_reps) {
+    if (!parser_) return;
+    ParserState& F = *parser_;
+    F.src = F.block + off;
+    F.size = len;
+    F.consumed = 0;
+    F.pos0 = ring_pos;
+    F.staged = true;
+    // the coder has already made headroom for exactly this span
+    std::uint8_t* const b0 = ring_.Base();
+    std::memcpy(b0 + ring_pos, F.src, len);
+    const std::uint32_t cap = ring_.capacity;
+    if (reset_reps) F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
+    const std::uint32_t e0 = ring_pos + len;
+    for (int k = 0; k < 4; ++k) {
+        std::uint32_t p = ring_pos - (F.rep0[k] + 1u);
+        if (ring_pos < F.rep0[k] + 1u) p += cap;
+        if (cap <= p || (p < e0 && ring_pos <= p)) F.rep0[k] = 1;
+    }
+    std::uint32_t lrh = 0;
+    for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[ring_pos + i];
+    F.lrhash = lrh;
+}
+
 void NzOptimumLzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
     if (!parser_) parser_ = std::make_shared<ParserState>();
     ParserState& F = *parser_;
     F.Init(ring_.capacity, blocksize_);
-    F.src = data; F.size = size; F.consumed = 0; F.started = false; F.pos0 = 0;
+    F.block = data; F.src = data; F.size = size; F.consumed = 0;
+    F.started = false; F.staged = false; F.pos0 = 0;
     F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
     F.hist0 = 0xff; F.ctx0 = 0;
 }
@@ -547,7 +610,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
     std::uint32_t* const rep0 = F.rep0;
     std::uint8_t& hist0 = F.hist0;
     std::uint16_t& ctx0 = F.ctx0;
-    if (!F.started) {
+    if (!F.started && !F.staged) {
         F.started = true;
         // the coder will call EnsureHeadroom for the same span, so doing it here
         // first keeps the two in step; the whole block goes into the window up

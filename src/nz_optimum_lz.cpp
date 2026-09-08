@@ -356,7 +356,8 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
     std::size_t di = 0;
     OptimumDecision cur{};
     if (dec != nullptr && ndec != 0) cur = dec[0];
-    else if (feed_) { OptimumDecision d{}; if (feed_(d)) cur = d; }
+    // with a feed the first decision of each chunk is fetched after that chunk is
+    // staged, not here -- the parser has nothing to hand over until then
     auto next_dec = [&]() {
         if (dec != nullptr) { ++di; cur = (di < ndec) ? dec[di] : OptimumDecision{}; }
         else if (feed_) { OptimumDecision d{}; cur = feed_(d) ? d : OptimumDecision{}; }
@@ -560,6 +561,10 @@ bool NzOptimumLzDecoder::RunBlock(IO& io, const OptimumDecision* dec, std::size_
             if (ring_.capacity <= p || (p < local_50 && chunk_start <= p))
                 rep[k] = 1;
         }
+
+        // let the parser stage this chunk where the coder will read it
+        if (chunk_begin_) chunk_begin_(local_74, chunk_size, chunk_start, headroom == 0);
+        if (feed_) { OptimumDecision d0{}; cur = feed_(d0) ? d0 : OptimumDecision{}; }
 
         std::uint32_t local_94 = chunk_size;
         std::uint32_t local_54 = chunk_start;
@@ -1145,7 +1150,7 @@ bool NzOptimumLzDecoder::EncodeBlock(const OptimumDecision* dec, std::size_t nde
 bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
                                            std::vector<std::uint8_t>& payload,
                                            std::vector<OptimumDecision>* out_decisions) {
-    if (size == 0u || size > 0x8000u) return false;   // one chunk at a time for now
+    if (size == 0u) return false;
     BeginParse(data, size);
     EncodeIO io;
     std::vector<std::uint16_t> q;
@@ -1155,9 +1160,16 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
     std::size_t pi = 0;
     std::uint32_t produced = 0;
     bool parse_ok = true;
+    chunk_begin_ = [&](std::uint32_t off, std::uint32_t len, std::uint32_t pos, bool rst) {
+        BeginChunk(off, len, pos, rst);
+        pending.clear();
+        pi = 0;
+    };
     feed_ = [&](OptimumDecision& d) -> bool {
         if (produced >= size) return false;   // the block is covered; a clean end
         while (pi >= pending.size()) {
+            // the chunk is covered: the coder starts the next one and stages it
+            if (ChunkExhausted()) return false;
             pending.clear();
             pi = 0;
             if (!ParseNextFlush(pending) || pending.empty()) { parse_ok = false; return false; }
@@ -1169,6 +1181,7 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
     };
     const bool ok = RunBlock(io, nullptr, 0u, tmp.data(), size);
     feed_ = nullptr;
+    chunk_begin_ = nullptr;
     if (!ok || !parse_ok) return false;
     RangeEncodePairs(q, payload);
     return true;
@@ -1201,6 +1214,8 @@ void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len)
     // straddles the ring end: both engines walk the identical position sequence.
     const std::uint32_t cap = ring_.capacity;
     if (cap == 0u || data == nullptr || len == 0u) return;
+    const std::uint32_t cursor_before = ring_.cursor;
+    const std::uint32_t fed = len;
 
     if (len > cap) {
         data += len - cap;
@@ -1220,6 +1235,7 @@ void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len)
     }
     std::memcpy(ring_.Base() + ring_.cursor, data, len);
     ring_.cursor += len;
+    FeedFinder(cursor_before, fed);
 }
 
 }  // namespace optimum

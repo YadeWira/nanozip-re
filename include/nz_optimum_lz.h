@@ -153,9 +153,21 @@ private:
     std::shared_ptr<ParserState> parser_;
     // when set, RunBlock pulls the next decision from here instead of a list
     std::function<bool(OptimumDecision&)> feed_;
+    // installed by the encoding pass; called at the top of every chunk
+    std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, bool)> chunk_begin_;
     // one flush of the DP from the current ring cursor and model state
     void StoreLiteralCost(std::uint32_t ctxLow, std::uint8_t lit, std::uint32_t cost);
     void RefreshMatchPrices(const OptimumDecision& d, std::uint32_t mm, std::uint8_t hist);
+    // Stage one chunk for the parser at the window position the coder is about to
+    // read it from. The engine splits a block into chunks of at most 0x8000 and
+    // the original runs its parser once per chunk, so the two must step together.
+    void BeginChunk(std::uint32_t off, std::uint32_t len, std::uint32_t ring_pos, bool reset_reps);
+    bool ChunkExhausted() const;
+    // The original's window feed also pushes what it appended into the match
+    // finder (FUN_0806f530 -> FUN_08082fa0), which is how a later block's matches
+    // can start inside a stored or filtered block. Called from FeedWindow with the
+    // cursor as it was before the append.
+    void FeedFinder(std::uint32_t cursor_before, std::uint32_t len);
     bool ParseNextFlush(std::vector<OptimumDecision>& out);
     void BeginParse(const std::uint8_t* data, std::uint32_t size);
 
