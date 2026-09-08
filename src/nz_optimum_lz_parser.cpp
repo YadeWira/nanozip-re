@@ -673,6 +673,12 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         tg.sg = static_cast<std::uint8_t>(i + 1u);
                         tg.dist = r + 1u;
                         tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                        // a match taken in one step still carries the context word
+                        // forward, and it is the only thing the next flush starts from
+                        {
+                            const std::uint32_t sp2 = (cur >= r + 1u) ? (cur - (r + 1u)) : (cur + cap - (r + 1u));
+                            tg.ctx = static_cast<std::uint16_t>(At(base, sp2 + len) * 0x100u + At(base, cur + len - 1u));
+                        }
                         for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
                         front = ni + 1u;
                         took_long = true;
@@ -708,6 +714,10 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                             tg.sg = 0u;
                             tg.dist = topdist;
                             tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                            {
+                                const std::uint32_t sp2 = (cur >= topdist) ? (cur - topdist) : (cur + cap - topdist);
+                                tg.ctx = static_cast<std::uint16_t>(At(base, sp2 + toplen) * 0x100u + At(base, cur + toplen - 1u));
+                            }
                             tg.rep[0] = topdist - 1u; tg.rep[1] = nd.rep[0];
                             tg.rep[2] = nd.rep[1]; tg.rep[3] = nd.rep[2];
                             front = ni + 1u;
@@ -848,7 +858,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                     for (int k = 0; k < 0x180; ++k) { std::uint8_t v = Rd8(mem, 0x3e200 + k); if (v != 0xff) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); rs += b; } }
                     std::fprintf(stderr, "[N] distcache=%s\n[N] lencache=%s\n[N] repsel=%s\n", dc.c_str(), lc2.c_str(), rs.c_str());
                 }
-                for (std::uint32_t k = 0; k < 20u; ++k) {
+                for (std::uint32_t k = 0; k < 48u; ++k) {
                     const Node& n = nodes[k];
                     if (n.tag == static_cast<std::uint16_t>(chunk) || k == 0u)
                         std::fprintf(stderr, "[N]   node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u rep=%u,%u,%u,%u\n",
