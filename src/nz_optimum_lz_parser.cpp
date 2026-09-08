@@ -110,7 +110,7 @@ struct NzOptimumLzDecoder::ParserState {
     std::uint16_t ctx0 = 0;
     bool started = false;
 
-    void Init(std::uint32_t W) {
+    void Init(std::uint32_t W, std::uint32_t blocksize) {
         if (ready) return;
         const std::uint32_t u2 = ((W < 0x400u) ? 0u : (W - 0x400u)) + 0x3ffu;
         const std::uint32_t b1 = BitLen1(u2);
@@ -121,9 +121,12 @@ struct NzOptimumLzDecoder::ParserState {
         headmask = (1u << b2) - 1u;
         head.assign(static_cast<std::size_t>(headmask) + 1u, 0u);
         cache.assign(0x10000u * 4u, 0u);
-        // slot 10: the tree buffer is 3 * the block-buffer size (GDB: size = 3 MB
-        // for a 1 MB window), two words per position, wrapped by `treesize`.
-        const std::uint32_t tsz = W * 3u;
+        // slot 10: the tree buffer is three times the BLOCK size, not the window
+        // (a -m4m archive has a 64 KB window and a 1 MB block, and the original's
+        // tree is 3 MB). FUN_0806f440 derives the mask and the size from that byte
+        // count exactly as below. Sizing it from the window made positions past
+        // 24576 collide onto tree slots the original keeps apart.
+        const std::uint32_t tsz = blocksize * 3u;
         treemask = ((1u << (BitLen1(tsz) + 1u)) - 1u) >> 2u;
         treesize = tsz >> 2u;
         tree.assign(treesize + 2u, 0u);
@@ -325,6 +328,11 @@ std::uint32_t PriceDistance(std::uint8_t* mem, const std::uint8_t* T,
             }
         }
     }
+    if (const char* dc = NZ_ENV("NZOPT_DCLS")) {
+        if (cls == static_cast<std::size_t>(std::atoi(dc)))
+            std::fprintf(stderr, "[DF] cls=%zu D=%u len=%u bucket=%u acc=%u cached=%d\n",
+                         cls, D, len, bucket, acc, (int)use_cache);
+    }
     Wr16(mem, cell, static_cast<std::uint16_t>(acc));
     return acc;
 }
@@ -504,7 +512,7 @@ void NzOptimumLzDecoder::RefreshMatchPrices(const OptimumDecision& d, std::uint3
 void NzOptimumLzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
     if (!parser_) parser_ = std::make_shared<ParserState>();
     ParserState& F = *parser_;
-    F.Init(ring_.capacity);
+    F.Init(ring_.capacity, blocksize_);
     F.src = data; F.size = size; F.consumed = 0; F.started = false; F.pos0 = 0;
     F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
     F.hist0 = 0xff; F.ctx0 = 0;
@@ -725,6 +733,17 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         } else {
                             if (ni + toplen > front) front = ni + toplen;
                             const std::uint32_t sel = SelPrice(4u);
+                            // The whole length walk is skipped when the node the top
+                            // length reaches is already within twice the rep-select
+                            // price of this one: nothing shorter could improve on it.
+                            // The frontier and the rep-select cache are still updated,
+                            // but no distance is priced -- which is how the original's
+                            // distance-class cache stays empty where ours filled it.
+                            {
+                                const Node& tgt = nodes[ni + toplen];
+                                if (tgt.tag == static_cast<std::uint16_t>(chunk) &&
+                                    tgt.price <= nd.price + sel * 2u) goto walk_done;
+                            }
                             if (trace) std::fprintf(stderr, "[W] rem=%u ni=%u best=%u thr=%u toplen=%u sel=%u\n",
                                                     chunk - emitted, ni, best, thr, toplen, sel);
                             // walk the length down, switching to the shortest
@@ -740,7 +759,11 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                                 if (c.src != lastsrc) { dprice = PriceDistance(mem, T, D4D0, dist - 1u, L, true); lastsrc = c.src; }
                                 const std::uint32_t bp = nd.price + sel + dprice;
                                 const Node& tgc = nodes[ni + L];
-                                if (tgc.tag == static_cast<std::uint16_t>(chunk) && (dprice >> 3u) + bp >= tgc.price) break;
+                                if (tgc.tag == static_cast<std::uint16_t>(chunk) && (dprice >> 3u) + bp >= tgc.price) {
+                                    if (trace) std::fprintf(stderr, "[B] rem=%u ni=%u L=%u dist=%u dp=%u bp=%u tgp=%u\n",
+                                                            chunk - emitted, ni, L, dist, dprice, bp, (unsigned)tgc.price);
+                                    break;
+                                }
                                 const std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
                                 const std::uint32_t px = bp + LenPrice(L, 4u);
                                 const bool okup = Update(L, 4u, dist, nr, px);
@@ -750,6 +773,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         }
                     }
                 }
+                walk_done:
                 if (took_long) { endnode = front; break; }
 
                 // ---- the literal
@@ -817,19 +841,20 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             }
             (void)flushed;
             if (endnode == 0u) endnode = 1u;
+            if (const char* dc = NZ_ENV("NZOPT_DCLS")) {
+                static std::uint16_t last = 0xffffu;
+                const std::uint16_t v = Rd16(mem, 0x3d848u + static_cast<std::size_t>(std::atoi(dc)) * 2u);
+                if (v != last) { std::fprintf(stderr, "[DC] rem=%u cls=%u\n", chunk - emitted, v); last = v; }
+            }
             if (NZ_ENV("NZOPT_FSUM")) {
-                auto crc = [](const void* p2, std::size_t n) {
-                    const std::uint8_t* b = static_cast<const std::uint8_t*>(p2);
-                    std::uint32_t c = 0xffffffffu;
-                    for (std::size_t k = 0; k < n; ++k) {
-                        c ^= b[k];
-                        for (int q = 0; q < 8; ++q) c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
-                    }
-                    return ~c;
+                auto hsh = [](const std::uint32_t* w, std::size_t n) {
+                    std::uint32_t h = 0x811c9dc5u;
+                    for (std::size_t k = 0; k < n; ++k) h = (h * 0x01000193u) ^ w[k];
+                    return h;
                 };
                 std::fprintf(stderr, "rem=%u H=%08x C=%08x\n", chunk - emitted,
-                             crc(F.head.data(), F.head.size() * 4u),
-                             crc(F.cache.data(), F.cache.size() * 4u));
+                             hsh(F.head.data(), F.head.size()),
+                             hsh(F.cache.data(), F.cache.size()));
             }
             if (const char* fd = NZ_ENV("NZOPT_DUMPFIND")) {
                 if ((chunk - emitted) == static_cast<std::uint32_t>(std::atoi(fd))) {
@@ -839,6 +864,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         std::FILE* f = std::fopen((b + "/mine." + nm).c_str(), "wb");
                         if (f) { std::fwrite(p2, 1, n, f); std::fclose(f); }
                     };
+                    wr("state", mem, mem_.size());
                     wr("head", F.head.data(), F.head.size() * 4u);
                     wr("cache", F.cache.data(), F.cache.size() * 4u);
                     wr("tree", F.tree.data(), F.tree.size() * 4u);

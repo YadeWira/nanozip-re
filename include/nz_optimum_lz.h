@@ -199,6 +199,10 @@ private:
     };
 
     Ring ring_;
+    // The match finder's tree is sized from the archive's BLOCK size. Every
+    // fixture and every archive we encode so far is -m4m, whose block is 1 MB;
+    // when the encoder chooses the block itself it must set this to match.
+    std::uint32_t blocksize_ = 0x100000u;
     std::vector<std::uint8_t> mem_;  // the "compact" subengine's 0x3f700-byte state
 };
 
