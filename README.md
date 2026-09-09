@@ -40,7 +40,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 | Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
 | Real-world corpus, 155 files × 8 codecs | 1240/1240 |
 | Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
-| **Encode**, `a -cn`, `a -cf/-cF`, `a -cd` and `a -cD` against the original's `a` on the same inputs and switches (`tests/encode/oracle.sh`: file order in its four `-s` modes, `-r`, `-sp`, `-x` and unreadable files, `-nt`/`-np`/`-nm`/`-fo`, every checksum kind, block boundaries, 1 MB multi-block inputs, `-pN -t1` worker splits with slices, one-byte and empty inputs; for lzpf: text, random, an ELF, a 700 KB text+random mix, PCM audio as WAV/raw, TIFF/TGA/PGM/BMP images alone and mixed with text and audio; for lzhd and lzhds the same shapes plus block-RLE data, CRLF text, a PGN game, the 16 KB piece rule over seven files and a whole directory tree with an unreadable file in it) | 126/129 archives byte-identical, each read by the other binary, consoles identical once timing figures are removed (the 3 left are the codecs not yet ported); 54 corpus audio files, 64 mixed-type files and 24 images byte-identical under `-cd` and `-cD` as well as under `-cf`/`-cF` |
+| **Encode**, `a -cn`, `a -cf/-cF`, `a -cd` and `a -cD` against the original's `a` on the same inputs and switches (`tests/encode/oracle.sh`: file order in its four `-s` modes, `-r`, `-sp`, `-x` and unreadable files, `-nt`/`-np`/`-nm`/`-fo`, every checksum kind, block boundaries, 1 MB multi-block inputs, `-pN -t1` worker splits with slices, one-byte and empty inputs; for lzpf: text, random, an ELF, a 700 KB text+random mix, PCM audio as WAV/raw, TIFF/TGA/PGM/BMP images alone and mixed with text and audio; for lzhd and lzhds the same shapes plus block-RLE data, CRLF text, a PGN game, the 16 KB piece rule over seven files and a whole directory tree with an unreadable file in it) | 132/135 archives byte-identical, each read by the other binary, consoles identical once timing figures are removed (the 3 left are the two codecs not yet ported and the one `-co` shape whose text transform is not written yet); 54 corpus audio files, 64 mixed-type files and 24 images byte-identical under `-cd` and `-cD` as well as under `-cf`/`-cF` |
 | Release package, 72 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 184/184 hashes |
 | Console matrices, 182 cases, and the pty prompt harness (`tests/parity/`) | 92 byte-identical, 84 differing only in status-line writes (how many `N MB` figures fit depends on the seconds the decode crosses, and the original's footer adds an `IO-out` clause), and 6 real: two are the compression commands the encode phase will bring, four are the documented departures ([quirks 3, 28, 29](docs/ORIGINAL_QUIRKS.md)) |
 | Directory trees: deep paths, symlinks, unreadable files, setuid/sticky modes, UTF-8 and space names, extreme timestamps, `-fo` (`tests/sweep_dirs.sh`) | 16/16 archives extract identically (contents, mode, mtime, links) |
@@ -56,7 +56,7 @@ extraction is the reference, and stdout/stderr/exit status/written trees are com
 
 Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
 it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
-machine. The archive itself is mapped, not copied into the heap. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
+machine. The archive itself is mapped, not copied into the heap, on Windows as well as on Linux. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
 [Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity),
 [Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status),
 [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
@@ -65,9 +65,13 @@ machine. The archive itself is mapped, not copied into the heap. Details: [Decod
 `IO-out` footer figure and the progress redraw count are timing-dependent; a single-stream archive is
 assembled in memory and written after the decode, and a parallel one is written by its worker streams as
 each finishes, like the original, but every worker still holds its whole stream (a 16-stream 2.5 GB
-archive peaks at 6.7 GB of RAM), so the 32-bit builds cannot decode archives above about 1 GB; format
-constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other than 2) are
-ported but unexercised.
+archive peaks at 6.7 GB of RAM), so the 32-bit builds cannot decode archives above about 1 GB and no
+build can address one above 4 GB in 32 bits at all -- an archive this reader cannot hold is now
+reported as `Out of memory!` rather than called corrupt, which is what a user's 4.5 GB archive first
+looked like. Testing a 4.4 GB archive measures 12.6 GB of peak RAM on a 64-bit build, about 3x the
+archive, because the output is assembled in memory; the original streams both ends and has neither
+limit. Format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other
+than 2) are ported but unexercised.
 
 ## Usage
 
