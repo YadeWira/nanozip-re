@@ -1234,11 +1234,17 @@ public:
     ArchiveBytes& operator=(const ArchiveBytes&) = delete;
     bool Open(const std::string& path) {
         Close();
+        oom_ = false;
 #if !defined(_WIN32)
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd >= 0) {
             struct stat st{};
             if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                if (!Addressable(static_cast<std::uint64_t>(st.st_size))) {
+                    ::close(fd);
+                    oom_ = true;
+                    return false;
+                }
                 const std::size_t n = static_cast<std::size_t>(st.st_size);
                 void* m = ::mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
                 if (m != MAP_FAILED) {
@@ -1250,6 +1256,39 @@ public:
             }
             ::close(fd);
         }
+#else
+        // Windows has no mmap, so the archive used to be read into the vector
+        // below -- as much committed memory as the archive is long, which a
+        // 4.5 GB archive cannot get on an ordinary machine. A file mapping
+        // spends address space instead, which a 64-bit build has to spare, and
+        // the pages it touches come and go under the OS's control.
+        {
+            const HANDLE fh = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (fh != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER li{};
+                if (::GetFileSizeEx(fh, &li) && li.QuadPart > 0) {
+                    if (!Addressable(static_cast<std::uint64_t>(li.QuadPart))) {
+                        ::CloseHandle(fh);
+                        oom_ = true;
+                        return false;
+                    }
+                    const HANDLE mh =
+                        ::CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+                    if (mh != nullptr) {
+                        void* m = ::MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+                        ::CloseHandle(mh);
+                        if (m != nullptr) {
+                            ::CloseHandle(fh);
+                            map_ = static_cast<const unsigned char*>(m);
+                            map_n_ = static_cast<std::size_t>(li.QuadPart);
+                            return true;
+                        }
+                    }
+                }
+                ::CloseHandle(fh);
+            }
+        }
 #endif
         std::ifstream input(path, std::ios::binary);
         if (!input) return false;
@@ -1257,19 +1296,55 @@ public:
         const std::streamoff len = input.tellg();
         input.seekg(0, std::ios::beg);
         if (len > 0) {
-            vec_.resize(static_cast<std::size_t>(len));
+            // Reading the archive in is the fallback when it cannot be mapped.
+            // A 32-bit build runs out of address space well before 4 GB and the
+            // resize() below then threw std::length_error straight past main:
+            // a 3 GB archive aborted the process with a C++ terminate message
+            // instead of reporting anything.
+            const std::uint64_t n64 = static_cast<std::uint64_t>(len);
+            if (!Addressable(n64) || n64 > static_cast<std::uint64_t>(vec_.max_size())) {
+                oom_ = true;
+                return false;
+            }
+            try {
+                vec_.resize(static_cast<std::size_t>(len));
+            } catch (const std::exception&) {
+                vec_.clear();
+                vec_.shrink_to_fit();
+                oom_ = true;
+                return false;
+            }
             input.read(reinterpret_cast<char*>(vec_.data()), len);
             if (!input) vec_.resize(static_cast<std::size_t>(input.gcount()));
         }
         return true;
     }
     void Close() {
-#if !defined(_WIN32)
-        if (map_ != nullptr) { ::munmap(const_cast<unsigned char*>(map_), map_n_); map_ = nullptr; map_n_ = 0; }
+        if (map_ != nullptr) {
+#if defined(_WIN32)
+            ::UnmapViewOfFile(const_cast<unsigned char*>(map_));
+#else
+            ::munmap(const_cast<unsigned char*>(map_), map_n_);
 #endif
+            map_ = nullptr;
+            map_n_ = 0;
+        }
         vec_.clear();
         vec_.shrink_to_fit();
     }
+    // Whether this build can hold the whole archive at once. A 32-bit build
+    // cannot above 4 GB: narrowing the length to size_t wraps it, and the header
+    // walk then reads a fraction of the file as if it were the whole archive and
+    // calls a sound archive corrupt. Measured on a 4.4 GB -co archive, where the
+    // 32-bit build reported "Archive corrupted. Error decoding (code 25600)" --
+    // which is how a user's 4.5 GB archive of one video file first surfaced. The
+    // original streams the archive and has no such limit; until this reader does
+    // too, an archive it cannot address is reported, not guessed at.
+    static bool Addressable(std::uint64_t n) {
+        return n <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+    }
+    // The archive is longer than this build can hold.
+    bool oom() const { return oom_; }
     // `off` drops a self-extractor's PE stub without moving a byte.
     ByteView View(std::size_t off = 0u) const {
         const unsigned char* p = map_ != nullptr ? map_ : vec_.data();
@@ -1280,6 +1355,7 @@ public:
 private:
     const unsigned char* map_ = nullptr;
     std::size_t map_n_ = 0;
+    bool oom_ = false;
     std::vector<unsigned char> vec_;
 };
 
@@ -4334,7 +4410,8 @@ bool TryParseLegacyCnArchive(
     input.close();
     ArchiveBytes archive;
     if (!archive.Open(archive_path)) {
-        if (out_error_message != nullptr) *out_error_message = "Cannot open archive!";
+        if (out_error_message != nullptr)
+            *out_error_message = archive.oom() ? "Out of memory!" : "Cannot open archive!";
         return false;
     }
     ByteView bytes = archive.View();
@@ -4439,12 +4516,22 @@ bool TryParseLegacyCnArchive(
     bool saw_data_record = false;
     bool cut_first_data_record = false;
 
-    // No record-count cap: a 2.29 GB -cf container carries 16 streams x ~144 records
-    // (2300+), and an earlier cap of 1024 made the walker stop half-way, so the
-    // parser saw 8 streams and folded the other 8 into one undecodable slice
-    // (declined as corrupt). Every record consumes at least one byte, so `pos`
-    // alone bounds the loop; the guard only rules out a non-advancing iteration.
+    // Every record consumes at least one byte, so `pos` alone bounds the loop --
+    // but "at least one byte" is not enough of a bound on the tables this walk
+    // fills. A record tag of 0x00 reads as type 0, size 0, so a file of zeros
+    // yields one empty data record per byte: on a 4.3 GB one that is 4.3 billion
+    // entries in data_records, tens of GB of them, and the process is killed
+    // before it can call the archive corrupt. An earlier cap of 1024 records was
+    // a real bug (a 2.29 GB -cf container carries 16 streams x ~144 records, and
+    // the walker stopped half-way, so the parser folded 8 streams into one
+    // undecodable slice), so the cap here is set where no archive can reach it:
+    // codecs cut a data record per block, 1 MB at a time in -cf, which puts an
+    // 8 TB archive at 8 million records. Past that the file is not an archive
+    // this reader can walk, and saying so beats being killed.
+    const std::size_t kMaxRecords = 8u * 1024u * 1024u;
+    bool too_many_records = false;
     for (std::size_t guard = 0; guard <= bytes.size() && pos < bytes.size(); ++guard) {
+        if (guard >= kMaxRecords) { too_many_records = true; break; }
         const std::size_t record_begin = pos;
         std::uint64_t r64 = 0u;
         if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) {
@@ -4645,6 +4732,16 @@ bool TryParseLegacyCnArchive(
         else {
             pos += csize;
         }
+    }
+
+    if (too_many_records) {
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] BAIL record budget: %zu records inside %zu bytes\n",
+                         (size_t)kMaxRecords, bytes.size());
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
     }
 
     if (!found_codec || !found_table) {
@@ -9005,19 +9102,15 @@ std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n) {
 }
 
 std::string LegacyProbeMessage(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return "Cannot open archive!";
-    std::vector<unsigned char> bytes;
-    {
-        in.seekg(0, std::ios::end);
-        const std::streamoff len = in.tellg();
-        in.seekg(0, std::ios::beg);
-        if (len > 0) {
-            bytes.resize(static_cast<std::size_t>(len));
-            in.read(reinterpret_cast<char*>(bytes.data()), len);
-            if (!in) bytes.resize(static_cast<std::size_t>(in.gcount()));
-        }
-    }
+    // Only record HEADERS are read here, every payload skipped, so the archive is
+    // mapped instead of copied. It used to be read into a vector in full: 4.3 GB
+    // of memory for a 4.3 GB archive, on top of the mapping the header walk
+    // already holds, which is what actually decided whether a large archive could
+    // be reported on at all -- and on a 32-bit build the resize threw
+    // std::length_error straight past main.
+    ArchiveBytes ab;
+    if (!ab.Open(path)) return ab.oom() ? "Out of memory!" : "Cannot open archive!";
+    const ByteView bytes = ab.View();
     std::size_t pos = 0;
     struct Rec { unsigned type = 0; std::size_t size = 0; unsigned char content[64]; bool have = false; };
     Rec rec;

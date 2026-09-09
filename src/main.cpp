@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <new>
+#include <stdexcept>
 
 int main(int argc, char** argv) {
     using nz::recon::CliOptions;
@@ -91,6 +92,13 @@ int main(int argc, char** argv) {
             rc = 1; break;
     }
     } catch (const std::bad_alloc&) {
+        nz::recon::ClearStatusLine(std::cout);
+        std::cout << "Out of memory!\n";
+        rc = 1;
+    } catch (const std::length_error&) {
+        // A container asked for more than max_size() throws this, not bad_alloc,
+        // and it used to abort the process with a C++ terminate message: a 32-bit
+        // build reading a 3 GB archive it could not map died in vector::resize.
         nz::recon::ClearStatusLine(std::cout);
         std::cout << "Out of memory!\n";
         rc = 1;
