@@ -88,7 +88,9 @@ static bool HistCrlf(const TextHist& h) {
 // FUN_08055150: does the dictionary fit this text? Words are runs after a
 // non-letter; the bucket sizes of their first two letters give the "dictionary
 // richness" the ratio tests read.
-static bool DictFits(const std::uint8_t* p, std::uint32_t n) {
+// Shared with the `-co` detector, which calls it through FUN_08055280 (a bare
+// wrapper) on each half of the block.
+bool DictFits(const std::uint8_t* p, std::uint32_t n) {
     if (n <= 0xfu) return false;
     const std::uint8_t* t0 = Traits0();
     const std::uint8_t* const cont = g_word_tables_built ? Words().cont : kZeroCont;
@@ -124,7 +126,9 @@ done:
 }
 
 // FUN_08057e60: line statistics for the line-RLE decision.
-static bool LineRleFits(const std::uint8_t* src, std::uint32_t n) {
+// Shared with the `-co` detector, which calls it through FUN_08058000 (which
+// pins the terminator to 10 and holds the `< 0x80` guard).
+bool LineRleFits(const std::uint8_t* src, std::uint32_t n) {
     if (n < 0x80u) return false;
     const std::uint8_t term = 10;
     std::uint32_t lines = 0, starts_differ = 1, prefix_sum = 1, ge_count = 0, left = n;

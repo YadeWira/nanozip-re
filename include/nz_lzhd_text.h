@@ -28,4 +28,11 @@ std::uint32_t TextParam14Encode(const std::uint8_t* src, std::uint32_t n, std::u
 std::uint32_t TextDictEncode(const std::uint8_t* src, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap);
 std::uint32_t TextChessEncode(const std::uint8_t* src, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap);
 
+// The two detectors the `-co` driver shares with this one: FUN_08055150 (reached
+// there through the wrapper FUN_08055280) and FUN_08057e60 (through FUN_08058000,
+// which pins the terminator to 10). The chess detector FUN_08058530 is
+// TextChessEncode(buf, n - 0x40, scratch, n) guarded by n >= 0x80.
+bool DictFits(const std::uint8_t* p, std::uint32_t n);
+bool LineRleFits(const std::uint8_t* src, std::uint32_t n);
+
 }  // namespace nzr::lzhd_enc
