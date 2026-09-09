@@ -4451,10 +4451,16 @@ bool TryParseLegacyCnArchive(
             truncated_input = eof_before_decode = true;
             break;
         }
-        auto r = static_cast<std::uint32_t>(r64);
-        unsigned ctype   = r & 0x0fu;
+        // The record tag is (size << 4) | type, so a payload of 256 MB or more
+        // makes it 2^32 or larger. Narrowing it to 32 bits turned a 256 MB data
+        // record's tag into a plain zero -- type 0, size 0 -- and the walk then
+        // read the payload as records: reported by a user on a 4.5 GB archive of
+        // one video file, and reproducible with `a -cn` on any 256 MB input. The
+        // other four record walkers in this file already keep the full width and
+        // only narrow the type nibble, which truncation cannot touch.
+        unsigned ctype   = static_cast<unsigned>(r64) & 0x0fu;
         unsigned cstream = 0u;
-        std::size_t csize = static_cast<std::size_t>(r >> 4u);
+        std::size_t csize = static_cast<std::size_t>(r64 >> 4u);
 
         if (ctype == 15u) {
             if (pos >= bytes.size()) { truncated_input = eof_before_decode = true; break; }
