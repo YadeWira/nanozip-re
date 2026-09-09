@@ -3886,6 +3886,18 @@ bool DecodeLzpfMember(
     // parallel worker decode its record in place instead of copying it out.
     std::size_t input_end = 0u) {
     const std::size_t in_end = (input_end != 0u && input_end <= bytes.size()) ? input_end : bytes.size();
+    // A corrupt header can declare any output size, and the buffer below IS that
+    // size, so an implausible one reached the allocator: ASan aborted with
+    // "allocation size too big" (fuzz case pmf_F_F_flip6, 0xf5593c90c96797 bytes
+    // declared) and a release build reported "Out of memory!", where the original
+    // calls the archive corrupt -- code 4 on that same case. The original never
+    // tries: its output is a fixed ring and it meets the corruption in a block
+    // header instead. This reader assembles the whole output in memory, so an
+    // output it could never hold is undecodable by construction; refusing it as
+    // the corrupt stream it is beats asking the allocator. The ceiling is a flat
+    // 1 TB rather than a ratio of the input, because lzpf legitimately turns a
+    // few KB into hundreds of MB and no ratio is safe.
+    if (total > (std::uint64_t{1} << 40)) return false;
     progress::Scope pscope;
     if (first_block_pos + first_stream_len > in_end) {
         if (!allow_truncated || first_block_pos >= in_end) return false;
