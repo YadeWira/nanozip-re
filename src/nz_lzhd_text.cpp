@@ -57,6 +57,19 @@ struct WordTables {
     }
 };
 const WordTables& Words() { static WordTables w; return w; }
+
+// DAT_08185860: the inverse of the decoder's kReorderAscii, which the dictionary
+// step applies to its own output for every codec but the CM one.
+const std::uint8_t* ReorderAsciiInverse() {
+    static std::uint8_t inv[256];
+    static bool built = false;
+    if (!built) {
+        const std::uint8_t* fwd = nzr::cd::NzCdReorderAscii();
+        for (unsigned c = 0; c < 256u; ++c) inv[fwd[c]] = static_cast<std::uint8_t>(c);
+        built = true;
+    }
+    return inv;
+}
 // FUN_080b7120 runs from the dictionary encoder's initialisation (FUN_08055000 ->
 // FUN_080b7770 -> FUN_080b7210), so until the process has encoded one dictionary
 // chunk the detector FUN_08055150 reads an all-zero continuation table.
@@ -718,13 +731,21 @@ fin:
 
 // ------------------------------------------------------------ FUN_08059060
 std::uint32_t TextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t n, std::uint8_t*& tmp,
-                           std::uint32_t cap, std::uint8_t* applied) {
+                           std::uint32_t cap, std::uint8_t* applied, bool reorder_ascii) {
     std::uint8_t done = 0;
     auto run = [&](std::uint32_t r, std::uint8_t bit) { if (r != 0u) { std::swap(buf, tmp); n = r; done |= bit; } };
     if (bits & 1u) run(TextCrlfEncode(buf, n, tmp, std::min(cap, n + 0x10u)), 1u);
     if (bits & 0x40u) run(TextChessEncode(buf, n, tmp, std::min(cap, n + 0x400u)), 0x40u);
     if (bits & 0x20u) run(TextLineRleEncode(10u, buf, n, tmp, n), 0x20u);
-    if (bits & 8u) run(TextDictEncode(buf, n, tmp, n), 8u);
+    if (bits & 8u) {
+        run(TextDictEncode(buf, n, tmp, n), 8u);
+        // The dictionary's output is then rewritten through the inverse of the
+        // decoder's kReorderAscii, in place, whenever the transformer was built
+        // with reorder_ascii_ set -- which is every codec but the CM one
+        // (decparams type != 7).
+        if ((done & 8u) != 0u && reorder_ascii)
+            for (std::uint32_t i = 0; i < n; ++i) buf[i] = ReorderAsciiInverse()[buf[i]];
+    }
     if (bits & 0x80u) {
         if (done & 8u) run(TextParam14Encode(buf, n, tmp, n), 0x80u);
         else if (done == 0u) return 0u;

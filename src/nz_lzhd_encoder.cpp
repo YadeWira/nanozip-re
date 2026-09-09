@@ -681,7 +681,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                     if (bits != 0u) {
                         std::uint8_t applied = 0;
                         std::uint8_t* b2 = buf; std::uint8_t* t2 = tmpb;
-                        const std::uint32_t r = TextPipeline(bits, b2, len, t2, 0x8040u, &applied);
+                        const std::uint32_t r = TextPipeline(bits, b2, len, t2, 0x8040u, &applied, false);
                         if (r != 0u) { buf = b2; tmpb = t2; len = r; flags = 8u; text_param = applied; }
                         if (const char* dp = std::getenv("NZ_DUMP_LZHD_TEXT")) { if (FILE* f = std::fopen(dp, "ab")) { std::fwrite(buf, 1, len, f); std::fclose(f); } }
                     }

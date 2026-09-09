@@ -5492,6 +5492,7 @@ std::uint32_t NzCdDict(const std::uint8_t* in, std::uint32_t in_size,
 
 // ---- shared with the compressor (nz_lzhd_text.cpp) ----
 const unsigned char* nzr::cd::NzCdCharacterTraits0() { return kCharacterTraits_0; }
+const unsigned char* nzr::cd::NzCdReorderAscii() { return kReorderAscii; }
 // FUN_080b7020: the two per-byte tables of the dictionary's two-letter bucket
 // hash -- 27 * (c - 0x60) for a lower-case first letter, c - 0x60 for a
 // lower-case second letter, 0 otherwise.

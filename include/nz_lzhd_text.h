@@ -19,7 +19,7 @@ std::uint32_t TextDetect(const std::uint8_t* buf, std::uint32_t n, std::uint8_t*
 // applied bits in `*applied`, or 0 when nothing applied or the result is not
 // below `cap` (0x8040).
 std::uint32_t TextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t n, std::uint8_t*& tmp,
-                           std::uint32_t cap, std::uint8_t* applied);
+                           std::uint32_t cap, std::uint8_t* applied, bool reorder_ascii);
 
 // the individual transforms (exposed for tests)
 std::uint32_t TextCrlfEncode(const std::uint8_t* src, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap);
