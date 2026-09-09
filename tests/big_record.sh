@@ -6,9 +6,19 @@
 # "Data corrupted while reading headers!". Reported by a user on a 4.5 GB archive
 # of one video file.
 #
+# Measured blast radius: only the store writes a record that big. The compressing
+# codecs cut a record per block, so their records stay near the block size however
+# large the archive gets -- verified by feeding the 0.12.0 binary a 300 MB archive
+# of each codec, where only -cn failed. Both sides of the boundary are still
+# checked across five codecs, since the walk is shared and a future codec could
+# write one large record.
+#
+# On a 32-BIT build this test is limited to what size_t can address: an archive
+# above 4 GB cannot be parsed at all, because the reader maps it whole. That is a
+# separate, structural gap -- the original streams instead of mapping.
+#
 # The test needs the original binary to build the fixture and about 1.2 GB of
-# scratch, so it is not part of the default suite run. Both sides of the boundary
-# are checked, and every codec, since the walk is shared.
+# scratch, so it is not part of the default suite run.
 #
 #   tests/big_record.sh [workdir]
 set -e
