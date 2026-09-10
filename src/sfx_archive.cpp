@@ -10,6 +10,7 @@
 #include "nz_cd_tokens.h"
 #include "nz_lzhds.h"
 #include "nz_optimum_lz.h"
+#include "nz_optimum_text.h"
 #include "nz_optimum2_lz.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
@@ -10965,21 +10966,63 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
     while (off < len) {
         const std::uint32_t n = (block_size < len - off) ? block_size : (len - off);
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
+
+        // FUN_0808da10's block analysis. The exe filter and the image and audio
+        // blocks are not written yet, so a block that would take one of those
+        // paths declines instead of coming out wrong; the text path is complete:
+        // the detector asks for a mask, the trial gate codes a sample before and
+        // after to decide, and the pipeline transforms the block, whose LZ
+        // payload then codes the TRANSFORMED bytes.
+        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) return false;
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16, scratch(n + 0x2000u, 0);
+        std::uint8_t applied = 0;
+        bool tt_on = false;
+        const std::uint8_t* lz_in = src;
+        std::uint32_t m = n;
+        {
+            bool route = false;
+            const std::uint32_t mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), false, &route);
+            if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, true, false)) {
+                tbuf.assign(src, src + n);
+                tbuf.resize(n + 0x2000u, 0);
+                tmp.assign(n + 0x2000u, 0);
+                std::uint8_t* pa = tbuf.data();
+                std::uint8_t* pb = tmp.data();
+                const std::uint32_t r = nzr::opt_enc::CoTextPipeline(mask, pa, n, pb, block_size + 0x40u,
+                                                                     &applied, &tt2, &tt16, true, false);
+                if (r != 0u) { tt_on = true; lz_in = pa; m = r; }
+            }
+        }
+
         std::vector<std::uint8_t> payload;
-        if (!co.EncodeBlockParsed(src, n, payload, nullptr)) return false;
+        if (!co.EncodeBlockParsed(lz_in, m, payload, nullptr)) return false;
         // A block the parser cannot beat would be stored (param6 zero), which
         // this writer does not emit yet -- declining keeps a wrong archive from
         // ever reaching the disk.
-        if (payload.empty() || payload.size() >= n) return false;
+        if (payload.empty() || payload.size() >= m) return false;
         put32(static_cast<std::uint32_t>(payload.size()));
         seg.insert(seg.end(), payload.begin(), payload.end());
-        seg.push_back(1u);
-        seg.push_back(1u);
-        put32(n);
-        seg.push_back(2u);
-        seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+        seg.push_back(1u);                       // decr_param: LZ
+        seg.push_back(1u);                       // param6: a compressed layer
+        put32(m);                                // size18: the LZ output, i.e. the transformed block
+        // The staged check bytes, one per stage the decoder passes through and
+        // popped last-first: with a text transform the stages are the payload,
+        // the LZ output and the text, so the text's check goes first.
+        seg.push_back(static_cast<unsigned char>(tt_on ? 3u : 2u));
+        if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+        seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
         seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
-        for (int i = 0; i < 5; ++i) seg.push_back(0u);
+        seg.push_back(0u);                       // param2
+        seg.push_back(0u);                       // param1
+        seg.push_back(0u);                       // param16
+        seg.push_back(static_cast<unsigned char>(tt_on ? 1u : 0u));
+        if (tt_on) {
+            seg.push_back(applied);
+            std::vector<std::uint8_t> side;
+            nzr::opt_enc::CoSideStreamBytes(applied, tt2, tt16, &side);   // LEB128 length + bytes, tt2 then tt16
+            seg.insert(seg.end(), side.begin(), side.end());
+        }
+        seg.push_back(0u);                       // dece
         off += n;
     }
     // No segment prefix of our own: the type-0 DATA record header the caller
