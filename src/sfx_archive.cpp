@@ -10955,6 +10955,32 @@ struct EncodeStatus {
 // The staged bytes are Fletcher32(stage output) % 255 and the decoder pops them
 // LAST first, so with the two stages a plain LZ block has -- its payload and the
 // LZ output -- they go out as { check(LZ output), check(payload) }.
+// FUN_0808d7f0: LZ or BWT for this block? A sample of min(n >> 3, 512 KB) is
+// coded both ways -- with a FRESH LZ engine (a new coder object with a 3 MB
+// window, thrown away after) and with the BWT bucket coder -- and LZ is taken
+// only when it comes out strictly smaller. A sample the bucket coder cannot
+// shrink at all makes it "LZ if LZ shrank the sample", else BWT, whose stored
+// form is what an incompressible block becomes.
+static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
+    const std::uint32_t sample = (n >> 3) < 0x80000u ? (n >> 3) : 0x80000u;
+    if (sample == 0u) return true;
+    std::vector<std::uint8_t> lzpay;
+    {
+        nzr::optimum::NzOptimumLzDecoder sampler(0x300000u);
+        if (!sampler.EncodeBlockParsed(data, sample, lzpay, nullptr)) lzpay.clear();
+    }
+    std::uint32_t lz = static_cast<std::uint32_t>(lzpay.size());
+    if (lz == 0u) lz = sample;
+    std::vector<std::uint8_t> bwt(sample + 4u), bpay;
+    NzBwtTransform(data, sample, bwt.data());
+    const std::uint32_t b = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, bpay);
+    if (NZ_ENV("NZOPT_TRACE_TDO"))
+        std::fprintf(stderr, "[tdo] kind n=%u sample=%u lz=%u bwt=%u -> %s\n", n, sample, lz, b,
+                     (b == 0u ? (lz < sample) : (lz < b)) ? "LZ" : "BWT");
+    if (b == 0u) return lz < sample;
+    return lz < b;
+}
+
 static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len,
                                  std::vector<unsigned char>& out) {
@@ -10995,23 +11021,51 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         }
 
         std::vector<std::uint8_t> payload;
-        if (!co.EncodeBlockParsed(lz_in, m, payload, nullptr)) return false;
-        // A block the parser cannot beat would be stored (param6 zero), which
-        // this writer does not emit yet -- declining keeps a wrong archive from
-        // ever reaching the disk.
-        if (payload.empty() || payload.size() >= m) return false;
-        put32(static_cast<std::uint32_t>(payload.size()));
-        seg.insert(seg.end(), payload.begin(), payload.end());
-        seg.push_back(1u);                       // decr_param: LZ
-        seg.push_back(1u);                       // param6: a compressed layer
-        put32(m);                                // size18: the LZ output, i.e. the transformed block
-        // The staged check bytes, one per stage the decoder passes through and
-        // popped last-first: with a text transform the stages are the payload,
-        // the LZ output and the text, so the text's check goes first.
-        seg.push_back(static_cast<unsigned char>(tt_on ? 3u : 2u));
-        if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
-        seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
-        seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        const bool lz_kind = OptimumBlockIsLz(lz_in, m);
+        if (lz_kind) {
+            if (!co.EncodeBlockParsed(lz_in, m, payload, nullptr)) return false;
+            // A block the parser cannot beat would be stored (param6 zero), which
+            // this writer does not emit yet -- declining keeps a wrong archive from
+            // ever reaching the disk.
+            if (payload.empty() || payload.size() >= m) return false;
+            put32(static_cast<std::uint32_t>(payload.size()));
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(1u);                       // decr_param: LZ
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the LZ output, i.e. the transformed block
+            // The staged check bytes, one per stage the decoder passes through and
+            // popped last-first: with a text transform the stages are the payload,
+            // the LZ output and the text, so the text's check goes first.
+            seg.push_back(static_cast<unsigned char>(tt_on ? 3u : 2u));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        } else {
+            // A BWT block: the transformed bytes through the forward BWT and the
+            // bucket coder. Its stages are the payload, the bucket coder's input
+            // (the BWT output), the block after the inverse BWT and the text.
+            // params 14 and 15 (the LZ77 passes over the BWT) only run when no
+            // text transform applied, which is not written yet -- nor is the
+            // stored form of a block the bucket coder cannot shrink.
+            std::vector<std::uint8_t> bwt(m + 4u);
+            const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
+            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, 0x600487u, payload);
+            if (psz == 0u || !tt_on) return false;
+            put32(psz);
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(0u);                       // decr_param: BWT
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the BWT's size, i.e. the transformed block
+            seg.push_back(4u);
+            seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+            seg.push_back(0u);                       // param7
+            put32(primary);                          // bwt_start_pos
+            seg.push_back(0u);                       // param14
+            seg.push_back(0u);                       // param15
+        }
         seg.push_back(0u);                       // param2
         seg.push_back(0u);                       // param1
         seg.push_back(0u);                       // param16
