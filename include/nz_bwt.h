@@ -26,6 +26,10 @@
 // untouched) when bwt_pos is out of range for this block, rather than reading
 // out of bounds the way the reference does.
 bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos);
+// Forward Burrows-Wheeler transform of `in` (n bytes) into `out` (n bytes), for
+// the encoder: returns the bwt_start_pos the decoder needs. Rotation sort by
+// prefix doubling; canonical output.
+uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out);
 // Threads used by the inverse BWT walk on large blocks (0 = hardware default).
 void NzBwtSetThreadCount(unsigned n);
 

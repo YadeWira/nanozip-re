@@ -93,10 +93,11 @@ uint32_t NzTextTransformInsertLf(const uint8_t* side, uint32_t side_len,
 // The FORWARD insert-LF pass (FUN_080587f0), the `-co` family's encoder side of
 // the transform above. Flattens every gate-passing line feed of `in` to a space
 // in `out` (byte-count-preserving, so out_cap >= in_size) and codes the
-// decisions into `*side`, which is cleared first and holds at most `side_cap`
-// bytes -- the room the block's aux stream has left. Returns in_size, or 0 when
-// the pass declines: fewer than one line feed per 20 bytes, or the side stream
-// would not fit. Parameters are the original's hardcoded 40/96/4.
+// decisions into `*side`, which is cleared first. `side_cap` is the room the
+// block's aux stream has (measured 4 299 161 under -m4m); the original's writer
+// stops at half of it (FUN_080b82b0). Returns in_size, or 0 when the pass
+// declines: fewer than one line feed per 20 bytes, or the side stream reached
+// that half. Parameters are the original's hardcoded 40/96/4.
 // Requires NzCmInitAll() to have run.
 uint32_t NzTextTransformInsertLfEncode(const uint8_t* in, uint32_t in_size,
                                        uint8_t* out, uint32_t out_cap,

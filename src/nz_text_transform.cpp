@@ -693,7 +693,9 @@ uint32_t NzTextTransformInsertLfEncode(const uint8_t* in, uint32_t in_size,
     side->clear();
     ArithEncLf enc;
     enc.side = side;
-    enc.cap = side_cap;
+    // FUN_080b82b0 sets the writer's end at base + cap/2: the pass may use at
+    // most half the room the aux stream has, and declines when it reaches it.
+    enc.cap = side_cap >> 1;
     // Header byte: bit 0 says the line-length window is spelled out, the rest is
     // the hard minimum doubled. With the hardcoded 40/96 the window is the
     // default and the byte is 0x08.

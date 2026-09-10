@@ -10,6 +10,7 @@
 // output has to round-trip through the decoder back to the text.
 #include "nz_text_transform.h"
 #include "nz_texttransform_num.h"
+#include "nz_bwt.h"
 #include "nz_lzhd_text.h"
 #include "nz_cd_texttransform_dict.h"
 #include "nz_cm.h"
@@ -155,9 +156,28 @@ void NumCase(const NumGolden& g) {
     Check(g.name, what, m == n && std::memcmp(back.data(), buf.data(), n) == 0);
 }
 
+// The forward BWT (the trial gate's first step), against FUN_0805d1e0 captured
+// at its call and return in FUN_0808f8e0 on the gate's 3750-byte sample of each
+// fixture: the output by size and FNV, and the primary index it returns.
+struct BwtGolden { const char* name; std::string (*make)(std::uint32_t); std::uint32_t n; std::uint64_t fnv; std::uint32_t primary; };
+const BwtGolden kBwt[] = {
+    {"source", MakeSource, 3750u, 0xc62520aacc938d64ull, 216u},
+    {"markup", MakeMarkup, 3750u, 0x04cdfda58278660dull, 865u},
+};
+void BwtCase(const BwtGolden& g) {
+    const std::string s = g.make(30000u);
+    std::vector<std::uint8_t> in(s.begin(), s.begin() + g.n), out(g.n + 4u);
+    const std::uint32_t primary = NzBwtTransform(in.data(), g.n, out.data());
+    Check(g.name, "bwt output is the original's", Fnv(out.data(), g.n) == g.fnv);
+    Check(g.name, "bwt primary index is the original's", primary == g.primary);
+    std::vector<std::uint8_t> back(out.begin(), out.begin() + g.n);
+    Check(g.name, "bwt round trip", NzBwtUntransform(back.data(), g.n, primary) && back == in);
+}
+
 }  // namespace
 
 int main() {
+    for (const BwtGolden& g : kBwt) BwtCase(g);
     NzCmInitAll();   // kModelInterpolation: every model below reads it
     for (const NumGolden& g : kNum) NumCase(g);
     for (const HtmlGolden& g : kHtml) HtmlCase(g);

@@ -792,6 +792,63 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// The FORWARD Burrows-Wheeler transform, for the encoder: sort the n cyclic
+// rotations of `in`, write the byte before each rotation's start, and return
+// the row the unrotated block landed on -- which is exactly what
+// NzBwtUntransform takes back. The output is canonical, so any correct
+// rotation sort produces the original's bytes; this one is prefix doubling
+// with two counting sorts per round, O(n log n), early out once every rank is
+// distinct. Rotations that are byte-for-byte equal (a periodic block) stay in
+// index order, and the row of rotation 0 is reported.
+// ---------------------------------------------------------------------------
+uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
+    if (n == 0u) return 0;
+    if (n == 1u) { out[0] = in[0]; return 0; }
+    std::vector<uint32_t> sa(n), tmp(n), rank(n), rank2(n), cnt;
+    bool distinct = false;
+    {   // round 0: by the first byte
+        cnt.assign(257u, 0u);
+        for (uint32_t i = 0; i < n; ++i) ++cnt[in[i] + 1u];
+        for (uint32_t c = 1; c <= 256u; ++c) cnt[c] += cnt[c - 1u];
+        for (uint32_t i = 0; i < n; ++i) sa[cnt[in[i]]++] = i;
+        uint32_t r = 0;
+        rank[sa[0]] = 0;
+        for (uint32_t j = 1; j < n; ++j) {
+            if (in[sa[j]] != in[sa[j - 1u]]) ++r;
+            rank[sa[j]] = r;
+        }
+        distinct = (r + 1u == n);
+    }
+    for (uint32_t k = 1; !distinct && k < n; k <<= 1) {
+        // sort by (rank[i], rank[i + k]) with two stable counting passes
+        cnt.assign(n + 1u, 0u);
+        for (uint32_t i = 0; i < n; ++i) ++cnt[rank[(i + k) % n] + 1u];
+        for (uint32_t c = 1; c <= n; ++c) cnt[c] += cnt[c - 1u];
+        for (uint32_t i = 0; i < n; ++i) tmp[cnt[rank[(i + k) % n]]++] = i;
+        cnt.assign(n + 1u, 0u);
+        for (uint32_t i = 0; i < n; ++i) ++cnt[rank[i] + 1u];
+        for (uint32_t c = 1; c <= n; ++c) cnt[c] += cnt[c - 1u];
+        for (uint32_t j = 0; j < n; ++j) { const uint32_t i = tmp[j]; sa[cnt[rank[i]]++] = i; }
+        uint32_t r = 0;
+        rank2[sa[0]] = 0;
+        for (uint32_t j = 1; j < n; ++j) {
+            const uint32_t a = sa[j], b = sa[j - 1u];
+            if (rank[a] != rank[b] || rank[(a + k) % n] != rank[(b + k) % n]) ++r;
+            rank2[a] = r;
+        }
+        rank.swap(rank2);
+        distinct = (r + 1u == n);
+    }
+    uint32_t primary = 0;
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint32_t i = sa[j];
+        if (i == 0u) primary = j;
+        out[j] = in[(i + n - 1u) % n];
+    }
+    return primary;
+}
+
 // BwtDecodeInput (reference NZ.cpp:591). The BWT output is split into 256
 // buckets keyed by leading symbol; each bucket's (in_bytes, out_bytes) pair is
 // stored as a backwards varint pair at the tail of the payload, with runs of
