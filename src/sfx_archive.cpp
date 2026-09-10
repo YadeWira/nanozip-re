@@ -8726,6 +8726,16 @@ static bool DecodeOptimumBlockSequence(
             if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
             std::snprintf(nm, sizeof(nm), "%s/tt%d.flags", tt_dump_dir, tt_dump_n);
             if (FILE* f = std::fopen(nm, "w")) { std::fprintf(f, "flags=%u tt2=%zu tt16=%zu in=%u\n", tt_flags, tt2_data.size(), tt16_data.size(), cur_size); std::fclose(f); }
+            // The two side streams as well: the forward insert-LF and number
+            // passes have to reproduce them byte for byte, not just their sizes.
+            if (!tt2_data.empty()) {
+                std::snprintf(nm, sizeof(nm), "%s/tt%d.tt2", tt_dump_dir, tt_dump_n);
+                if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tt2_data.data(), 1, tt2_data.size(), f); std::fclose(f); }
+            }
+            if (!tt16_data.empty()) {
+                std::snprintf(nm, sizeof(nm), "%s/tt%d.tt16", tt_dump_dir, tt_dump_n);
+                if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tt16_data.data(), 1, tt16_data.size(), f); std::fclose(f); }
+            }
         }
         // one file per step of the chain, so each transform can be worked on alone
         const auto tt_step = [&](const char* step) {

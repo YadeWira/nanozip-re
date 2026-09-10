@@ -119,3 +119,12 @@ add_executable(test_co_textdetect
 target_include_directories(test_co_textdetect PRIVATE include)
 find_package(Threads REQUIRED)
 target_link_libraries(test_co_textdetect PRIVATE Threads::Threads)
+
+# The -co text transforms' forward passes against the original's side streams
+# and per-step output, on the same generated fixtures.
+add_executable(test_co_texttransform
+    tests/test_co_texttransform.cpp
+    ${RECON_SOURCES_NO_MAIN}
+)
+target_include_directories(test_co_texttransform PRIVATE include)
+target_link_libraries(test_co_texttransform PRIVATE Threads::Threads)

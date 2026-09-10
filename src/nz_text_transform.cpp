@@ -1,6 +1,7 @@
 #include "nz_text_transform.h"
 #include "nz_extab.h"
 #include <algorithm>
+#include <vector>
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
@@ -635,6 +636,141 @@ uint32_t NzTextTransformInsertLf(const uint8_t* side, uint32_t side_len,
 }
 
 // ---------------------------------------------------------------------------
+// The FORWARD insert-LF pass (FUN_080587f0), for the `-co` family's encoder.
+//
+// The mirror of the decoder above, model for model: the same 1024-entry
+// context array, the same three chained interpolation stages, the same update
+// rules, driven from the other side by a carry-less range ENCODER. Its one
+// decision per gate-passing space-or-LF is "this byte is a line feed in the
+// text", and every line feed that passes the gate is flattened to a space --
+// there is no search and no cost decision. The parameters are the ones
+// FUN_080b82b0 hardcodes before every call (40, 96, hard minimum 4), so the
+// side stream's first byte is always 0x08.
+//
+// Transcribed against the original's own output: the coded stream AND the
+// 31-byte side stream of a 30000-byte oracle block come out byte for byte.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ArithEncLf {
+    uint32_t lo = 0, hi = 0xffffffffu;
+    std::vector<uint8_t>* side = nullptr;
+    uint32_t cap = 0;
+    // Past the cap the bytes are dropped, and the caller declines the pass: the
+    // original writes into the room its aux stream has left and gives up when
+    // that runs out.
+    void Put(uint8_t b) { if (side->size() < cap) side->push_back(b); }
+    void Encode(bool bit, uint32_t model) {   // `model` is the 16-bit interpolation
+        const uint32_t mid = lo + ((hi - lo) >> 12) * (model >> 4);
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) {
+            Put(static_cast<uint8_t>(hi >> 24));
+            hi = (hi << 8) | 0xffu;
+            lo <<= 8;
+        }
+    }
+    void Flush() { Put(static_cast<uint8_t>(hi >> 24)); }
+};
+
+}  // namespace
+
+uint32_t NzTextTransformInsertLfEncode(const uint8_t* in, uint32_t in_size,
+                                       uint8_t* out, uint32_t out_cap,
+                                       std::vector<uint8_t>* side, uint32_t side_cap) {
+    if (in_size < 0x10u || out_cap < in_size || side == nullptr) return 0;
+    const uint32_t line_len_min = 40u, line_len_max = 96u, line_len_min_hard = 4u;
+
+    uint16_t x_arr[1024];
+    Memset32Lf(x_arr, 0x80008000u, sizeof(x_arr) / 4);
+    InterpolateLutLf<64, 14> lut_1; lut_1.Initialize(0x13B, 0x13A);
+    InterpolateLutLf<8, 11> lut_2;  lut_2.Initialize(0x199, 0x198);
+    InterpolateLutLf<128, 11> lut_3; lut_3.Initialize(0x199, 0x198);
+
+    uint8_t linelen_hist[32];
+    memset(linelen_hist, 70, sizeof(linelen_hist));
+    uint32_t linelen_sum = 70u * 32u, linelen_pos = 0;
+
+    side->clear();
+    ArithEncLf enc;
+    enc.side = side;
+    enc.cap = side_cap;
+    // Header byte: bit 0 says the line-length window is spelled out, the rest is
+    // the hard minimum doubled. With the hardcoded 40/96 the window is the
+    // default and the byte is 0x08.
+    const bool nondefault = !(line_len_min == 0x28u && line_len_max == 0x60u);
+    enc.Put(static_cast<uint8_t>((nondefault ? 1u : 0u) + line_len_min_hard * 2u));
+    if (nondefault) {
+        enc.Put(static_cast<uint8_t>(line_len_min));
+        enc.Put(static_cast<uint8_t>(line_len_max - 1u - line_len_min));
+    }
+
+    uint32_t decisions = 1;             // local_1c1c: one more than the LFs coded
+    const uint8_t* p = in;
+    uint8_t* o = out;
+    const uint8_t* line_start = in;
+    uint8_t c = 0, prev = 0;
+    uint32_t rem = in_size;
+    for (;;) {
+        do {
+            prev = c;
+            c = *p++;
+            *o++ = c;
+        } while (--rem && (c > 32u || (c != 10u && c != 32u)));
+
+        if (rem == 0u) {
+            enc.Flush();
+            // Too few line feeds worth coding, or no room for the side stream:
+            // the pass is declined and the caller keeps the text as it was.
+            if (in_size / decisions < 0x14u) return 0;
+            if (side->size() >= enc.cap) return 0;
+            return static_cast<uint32_t>(o - out);
+        }
+
+        const uint32_t linelen = static_cast<uint32_t>(p - line_start);
+        if (linelen < line_len_min_hard || rem <= 1u ||
+            !kCharacterTraits_12[*p] || !kCharacterTraits_14[prev]) {
+            if (c != 0x20u) line_start = p;
+            continue;
+        }
+
+        uint32_t wl = 1;
+        while (wl < rem && !kCharacterTraits_9[p[wl - 1]]) wl++;
+
+        const uint32_t x_ix =
+            (static_cast<uint32_t>(kLineLengthToMdl[(linelen + wl - ((linelen_sum + 16u) >> 5)) & 0x7Fu]) << 7) |
+            kPrevCharToMdl[prev] | kNextCharToMdl[*p];
+        uint16_t* x_ptr = &x_arr[x_ix];
+        uint16_t *lut2_ptr, *lut1_ptr, *lut3_ptr;
+        uint32_t v = lut_2.Get(*x_ptr, x_ix >> 7, &lut2_ptr);
+        v = lut_1.Get(v, std::min<uint32_t>((linelen - line_len_min_hard) >> 1, 63u), &lut1_ptr);
+        v = lut_3.Get(v, x_ix & 0x3Fu, &lut3_ptr);
+
+        const bool is_lf = (c != 0x20u);
+        *x_ptr = static_cast<uint16_t>(*x_ptr + ((0x10000u * is_lf + 8u - *x_ptr) >> 4));
+        *lut2_ptr = static_cast<uint16_t>(*lut2_ptr + ((0x100FEu * is_lf - *lut2_ptr) >> 8));
+        *lut1_ptr = static_cast<uint16_t>(*lut1_ptr + ((0x1003Eu * is_lf - *lut1_ptr) >> 6));
+        *lut3_ptr = static_cast<uint16_t>(*lut3_ptr + ((0x100FEu * is_lf - *lut3_ptr) >> 8));
+        enc.Encode(is_lf, v);
+
+        if (is_lf) {
+            ++decisions;
+            o[-1] = 0x20u;                 // the line feed leaves the text
+            line_start = p;
+            if (linelen >= line_len_min && linelen <= line_len_max) {
+                const uint32_t x = ++linelen_pos & 0x1Fu;
+                linelen_sum += linelen - linelen_hist[x];
+                linelen_hist[x] = static_cast<uint8_t>(linelen);
+            }
+        } else if (c != 0x20u) {
+            line_start = p;
+        }
+        // Whatever was coded, the next position's predecessor is the space now
+        // standing in the coded text (local_1bfd = 0x20 in the original).
+        c = 0x20u;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tt bit 0x01 -- TransformText_CR_to_CRLF (reference NZ_TextTransforms.cpp:402).
 // Faithful transcription, including the deliberate one-byte output slack the
 // reference's `out_size++` budget implies (see the header comment): the budget
@@ -825,6 +961,132 @@ struct HtmlTransformer {
         }
     }
 
+    // The FORWARD pass, FUN_08056080, transcribed over the same state. Where the
+    // decoder expands "</" from the tag on top of its stack, this pass removes
+    // the name of a closing tag that matches that top, and spells every other
+    // "</" as "<//" -- the decoder's escape -- after unwinding its stack the
+    // way EraseTag will. Opening tags are pushed by the same rules as AddTag
+    // (never br/int/var/img/meta, never a tag the recent ring holds, never a
+    // self-closing one), so the two stacks stay in step byte for byte.
+    void PushTag(const uint8_t* tag, uint32_t taglen) {
+        stack_count_ += (stack_count_ < 0x80u);
+        taglens_[stack_count_] = (uint8_t)taglen;
+        std::memcpy(tagnames_[stack_count_], tag, taglen);
+    }
+    // joined_r0x0805624e: pop towards a closing tag, retiring every short tag
+    // passed over into the recent ring.
+    void Unwind(const uint8_t* tag, uint32_t taglen) {
+        size_t i = stack_count_;
+        while (i != 0u) {
+            const uint32_t curlen = taglens_[i];
+            if (curlen == taglen && std::memcmp(tagnames_[i], tag, taglen) == 0) break;
+            if (curlen < 5u) {
+                const uint32_t t = GetTagShort(tagnames_[i], curlen);
+                if (!IsRecentTag(t)) rtag_[rtag_pos_++ & 0x3u] = t;
+            }
+            stack_count_ = --i;
+        }
+    }
+    uint32_t Encode(const uint8_t* in, uint32_t n, uint8_t* out, uint32_t out_cap) {
+        if (n < 0x10u || out_cap < 9u) return 0;
+        uint8_t* const guard = out + out_cap - 8u;
+        uint8_t* o = out;
+        const uint8_t* p = in;
+        if (!(out < guard)) return 0;
+        for (;;) {
+            // Copy through to and including the next '<', within the room left.
+            const uint32_t room = (uint32_t)(guard - o);
+            const uint32_t chunk = (n < room) ? n : room;
+            uint32_t left = chunk;
+            uint8_t b;
+            do { b = *p++; *o++ = b; } while (--left && b != '<');
+            n = left + (n - chunk);
+            if (n == 0u) break;
+            if (guard <= o) return 0;
+            b = *p++;
+            --n;
+            *o++ = b;
+            if (b == '/') {
+                const uint8_t* const tag = p;        // the name after "</"
+                // The name's length: leading tag characters, at most 16.
+                uint32_t len = 0;
+                if (kCharTraitHtml[tag[0]]) {
+                    uint32_t t = 0;
+                    for (;;) {
+                        len = t;
+                        if (n <= t) break;
+                        len = t + 1u;
+                        if (len == 16u) break;
+                        if (!kCharTraitHtml[tag[len]]) break;
+                        t = len;
+                    }
+                    bool escape = false;
+                    if (len < 4u) {
+                        // A short tag that the decoder would never have stacked
+                        // is spelled out; only a stackable one is looked for.
+                        if (len == 0u) escape = true;
+                        else {
+                            const uint32_t t2 = GetTagShort(tag, len);
+                            escape = IsRecentTag(t2) || IsPredefinedTag(t2);
+                        }
+                    }
+                    if (!escape) {
+                        if (n == len) escape = true;
+                        else if (tag[len] != '>') { Unwind(tag, len); escape = true; }
+                        else {
+                            const size_t sc = stack_count_;
+                            const bool top = taglens_[sc] == len &&
+                                             std::memcmp(tagnames_[sc], tag, len) == 0 &&
+                                             !(len + 1u < n && tag[len + 1u] == '/');
+                            if (!top) { Unwind(tag, len); escape = true; }
+                            else {
+                                // The decoder will write this name and its '>'
+                                // from its stack: neither goes into the stream.
+                                p += len + 1u;
+                                n -= len + 1u;
+                                if (n == 0u) break;
+                                stack_count_ -= (stack_count_ != 0u);
+                                if (guard <= o) return 0;
+                                continue;
+                            }
+                        }
+                    }
+                    (void)escape;
+                }
+                *o++ = '/';                          // "<//": a literal "</"
+            } else if (kCharTraitHtml[b]) {
+                const uint8_t* const tag = p - 1;    // the name starts at b
+                const uint32_t cap2 = (n < 15u) ? n : 15u;
+                uint32_t k = 0;
+                while (k < cap2 && kCharTraitHtml[p[k]]) ++k;
+                const uint32_t tl = k + 1u;
+                if (tl < 3u) {
+                    const uint32_t t = GetTagShort(tag, tl);
+                    if (!IsRecentTag(t) && !IsPredefinedTag(t)) PushTag(tag, tl);
+                } else {
+                    // Find the '>' within 32 bytes to tell a self-closing tag.
+                    const uint32_t bound = (n < 0x21u) ? n : 0x20u;
+                    uint32_t j = k;
+                    if (k < bound && p[k] != '>') {
+                        uint32_t j2 = tl;
+                        for (;;) { j = j2; if (!(j < bound && tag[j + 1u] != '>')) break; j2 = j + 1u; }
+                    }
+                    if (tag[j] != '/') {
+                        if (tl == 3u) {
+                            const uint32_t t = GetTagShort(tag, 3u);
+                            if (!IsRecentTag(t) && !IsPredefinedTag(t)) PushTag(tag, 3u);
+                        } else {
+                            PushTag(tag, tl);
+                        }
+                    }
+                }
+            }
+            if (n == 0u) break;
+            if (guard <= o) return 0;
+        }
+        return (o < guard) ? (uint32_t)(o - out) : 0u;
+    }
+
     uint32_t Decode(const uint8_t* in, uint32_t in_size, uint8_t* out, uint32_t allocated) {
         uint8_t* const out_org = out;
         uint8_t* const out_end = out + allocated;
@@ -865,4 +1127,12 @@ uint32_t NzTextTransformHtml(const uint8_t* in, uint32_t in_size,
     if (in_size == 0u || out_cap == 0u) return 0;
     HtmlTransformer t;
     return t.Decode(in, in_size, out, out_cap);
+}
+
+uint32_t NzTextTransformHtmlEncode(const uint8_t* in, uint32_t in_size,
+                                   uint8_t* out, uint32_t out_cap) {
+    // FUN_08059060 zeroes the state (FUN_080b7c00) before every call, so each
+    // block starts with an empty stack and an empty recent ring.
+    HtmlTransformer t;
+    return t.Encode(in, in_size, out, out_cap);
 }
