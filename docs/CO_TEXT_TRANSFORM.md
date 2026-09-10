@@ -307,9 +307,20 @@ The LZ kind can be stored too (the parser giving up), and the decoder handles it
 -- a stored LZ block feeds the window and then COLD-STARTS the model. The writer
 does not emit that form yet; it declines instead.
 
+Two things had to be fixed before large BWT blocks worked at all. The bucket
+coder's rank walk had been ported from the reference's ENCODER, which uses a
+fixed threshold where its own decoder's grows by one per entry passed; the two
+agree only while the rank list's positions are strictly increasing, and above
+roughly 18 KB of rank data they stop agreeing and the coded gap goes negative
+(see [quirk 70](ORIGINAL_QUIRKS.md)). And a BWT block's pre-post-filter bytes
+have to be fed to the LZ ENGINE's window as well as the decoder's -- a BWT block
+never goes through the engine, so without that the next LZ block codes its
+matches against a window the decoder will not have.
+
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
-files, **58 of 62** executables and DLLs and **172 of 180** mixed corpus files.
-Not written yet: param15, the stored LZ form, image and audio blocks, the
-multi-threaded bucket layout, and budgets above 16 MB. Three files are an
+files, **58 of 62** executables and DLLs and **174 of 180** mixed corpus files,
+and over all 289 of them it now declines NOTHING. Not written yet: param15 (3 of
+the 10 remaining differences), the stored LZ form, image and audio blocks, the
+multi-threaded bucket layout, and budgets above 16 MB. The other 7 are an
 LZ-engine divergence on binary data, unrelated to the block analysis.

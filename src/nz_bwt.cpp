@@ -1091,19 +1091,50 @@ struct BwtBucketEncoder {
         return (uint32_t)(enc.cur - arith);
     }
 
+    // The rank the DECODER will land on for a given `upper_bits`, reading the
+    // array as it stands: the shifts it performs never touch an entry it has
+    // still to read (the by-8 loop writes P[k..k+7] and next reads P[k+16], the
+    // by-1 loop writes P[k] and next reads P[k+2]), so the walk can be done
+    // without moving anything.
+    static uint32_t DecoderRank(const uint8_t* P, const uint32_t* C, uint32_t ub) {
+        uint32_t k = 1, new_c = ub + 8u;
+        for (; k + 8u <= 255u && new_c >= C[P[k + 8u]] && k != 249u; k += 8u, new_c += 8u) {}
+        new_c = ub + k;
+        for (; k + 1u <= 255u && new_c >= C[P[k + 1u]] && k != 255u; k += 1u, new_c += 1u) {}
+        return k;
+    }
+
     // FUN_0806cc70's move: P[0] leaves, everything with a next occurrence before
     // `next` closes up, and the symbol lands at rank k with C[sym] = next.
+    //
+    // The reference encoder walks with a FIXED threshold (`next`) while its
+    // decoder's grows by one per entry passed (`new_c += 1`). The two agree
+    // whenever C is strictly increasing along P, which is the ordinary case and
+    // why the reference works -- but our encoder reaches block shapes where it
+    // is not, and there the fixed threshold walks too far and the coded delta
+    // underflows (measured: delta = -9 with only 2 positions of room, on a
+    // 18 685-byte bucket). What has to be reproduced is the rank the DECODER
+    // will choose, which is the fixed point of `k = DecoderRank(next - k)`.
+    // The reference's own answer is that fixed point whenever C is monotone, so
+    // this is identical on every stream the reference itself produces.
     static uint32_t Reinsert(uint8_t* P, uint32_t* C, uint32_t next, uint8_t sym) {
         P[0] = P[1];
         uint32_t k = 1;
         for (; k + 8u != 0xf9u; k += 8u) {
             if (next < C[P[k + 8u]]) break;
-            std::memmove(P + k, P + k + 1u, 8);
         }
         for (; k + 1u != 0xffu; ++k) {
             if (next < C[P[k + 1u]]) break;
-            P[k] = P[k + 1u];
         }
+        // The map guess -> DecoderRank(next - guess) is non-increasing, and the
+        // fixed-threshold answer is an upper bound, so this descends to the
+        // fixed point; it is reached on the first try whenever C is monotone.
+        for (uint32_t iter = 0; iter < 256u; ++iter) {
+            const uint32_t kk = DecoderRank(P, C, next - k);
+            if (kk == k) break;
+            k = kk;
+        }
+        if (k > 1u) std::memmove(P + 1u, P + 2u, k - 1u);
         P[k] = sym;
         C[sym] = next;
         return k;

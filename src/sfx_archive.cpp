@@ -11125,6 +11125,9 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                 if (!verifier.DecodeBlock(payload.data(), static_cast<std::uint32_t>(payload.size()),
                                           chk.data(), m) ||
                     std::memcmp(chk.data(), lz_in, m) != 0) {
+                    if (NZ_ENV("NZOPT_TRACE_TDO"))
+                        std::fprintf(stderr, "[TDOENC] decline: LZ block does not read back (m=%u payload=%zu)\n",
+                                     m, payload.size());
                     return false;
                 }
             }
@@ -11195,6 +11198,12 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                     seg.insert(seg.end(), p14side.begin(), p14side.end());
                 }
                 seg.push_back(0u);                   // param15
+                // The window carries every block's pre-post-filter bytes, not
+                // just the LZ ones (reference `mem->data += size`), and a BWT
+                // block never goes through the LZ engine -- so feed BOTH the
+                // encoder and the verifier, or the next LZ block codes its
+                // matches against a window the decoder will not have.
+                co.FeedWindow(pre_p14, pre_p14_len);
                 verifier.FeedWindow(pre_p14, pre_p14_len);
                 goto block_tail;
             }
@@ -11208,12 +11217,17 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                 std::vector<std::uint8_t> chk(m);
                 if (!NzBwtDecodeInput(payload.data(), psz, m, chk.data()) ||
                     std::memcmp(chk.data(), bwt.data(), m) != 0) {
+                    if (NZ_ENV("NZOPT_TRACE_TDO"))
+                        std::fprintf(stderr, "[TDOENC] decline: BWT payload does not read back (m=%u psz=%u)\n",
+                                     m, psz);
                     return false;
                 }
             }
             // A BWT block does not run through the LZ engine, but its
             // pre-post-filter bytes still enter the window a later LZ block can
-            // match into (reference `mem->data += size`).
+            // match into (reference `mem->data += size`) -- so the ENCODER needs
+            // them as much as the verifier does.
+            co.FeedWindow(pre_p14, pre_p14_len);
             verifier.FeedWindow(pre_p14, pre_p14_len);
             put32(psz);
             seg.insert(seg.end(), payload.begin(), payload.end());
