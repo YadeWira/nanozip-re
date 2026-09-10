@@ -174,3 +174,29 @@ rules that a forward dictionary pass gets wrong without being told:
 The word itself is never searched for: it is always the maximal leading run of letters
 in the chunk, an exact lookup, and the dictionary wins unconditionally whenever the
 word's case shape can be expressed.
+
+
+## Status (2026-09-09, night)
+
+Everything above is ported and the writer uses it:
+
+- the detector (`CoTextFlags`) matches the original's requested mask on 180 corpus
+  files and the eight oracle inputs, read out of the original with GDB;
+- the forward passes insert-LF, html and number are byte-exact on every oracle
+  pair (6, 28 and 45 pairs, side streams included);
+- the trial gate is what it says: FUN_0805d1e0 (the BWT) and FUN_0806c350 (the
+  BWT bucket coder) on the sample before and after, and both are ported
+  (`NzBwtTransform`, `NzBwtEncodeInput`, identical on every capture). Under -t1
+  the bucket coder writes ONE bucket; the per-symbol split is the multi-threaded
+  layout, not written yet;
+- the number step's second-half trial uses FUN_08052ec0's estimate (context sort,
+  move-to-front, optimal prefix code length), ported as `CoEntropyEstimate`;
+- FUN_0808d7f0 then picks LZ or BWT for the block on a min(n >> 3, 512 KB)
+  sample coded both ways with a fresh LZ engine, LZ only when strictly smaller.
+
+`a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
+oracle inputs (three of them BWT blocks) and on 38 of 47 corpus XML/HTML/SVG
+files. Not written yet: the exe filter path, image and audio blocks, the param2
+and param1 attempts and the param14/param15 passes that run when no text
+transform applied, the stored form of a block nothing shrinks, the multi-threaded
+bucket layout, and budgets above 16 MB.
