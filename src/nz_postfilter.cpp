@@ -3,6 +3,7 @@
 #include "nz_env.h"
 #include "nz_postfilter.h"
 #include <cstring>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 
@@ -33,6 +34,58 @@ struct ArithDec {
         return flag;
     }
     bool Read(uint32_t model) { return ReadNoShift(model >> 4); }
+};
+
+// ---------------------------------------------------------------------------
+// The ENCODER side of the u32 RLE, i.e. param2 (FUN_0808ff20 -> FUN_080902e0 ->
+// FUN_080901e0), for the -co family's compressor. It is the same shape as the
+// byte-wise collapse the BWT bucket coder uses, over 32-bit words and with the
+// threshold the decoder's DecodeU32 reads: SIX words equal to the one before
+// them open a run, the rest of the run is written as BSR(L) further copies --
+// the class DecodeInt's bit tree needs -- and L itself goes into an arithmetic
+// side stream of its own. The trailing n & 3 bytes are copied verbatim.
+// ---------------------------------------------------------------------------
+struct ArithEnc {
+    uint32_t lo = 0, hi = 0xffffffffu;
+    uint8_t* cur = nullptr;
+    uint8_t* end = nullptr;
+    bool overflow = false;
+    void Put(uint8_t b) { if (cur < end) *cur++ = b; else overflow = true; }
+    void Encode(bool bit, uint32_t p12) {
+        const uint32_t mid = lo + ((hi - lo) >> 12) * p12;
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) { Put((uint8_t)(hi >> 24)); hi = (hi << 8) | 0xffu; lo <<= 8; }
+    }
+    void EncodeModel(bool bit, uint32_t model16) { Encode(bit, model16 >> 4); }
+    void EncodeRaw(uint32_t v, uint32_t nbits) { while (nbits--) Encode(((v >> nbits) & 1u) != 0u, 0x800u); }
+    void Flush() { Put((uint8_t)(hi >> 24)); }
+};
+
+struct BwtRleSideEnc {
+    ArithEnc enc;
+    uint16_t model_[32];
+    BwtRleSideEnc(uint8_t* base, uint8_t* end) {
+        enc.cur = base; enc.end = end;
+        for (uint32_t i = 0; i < 32u; ++i) model_[i] = 0x8000u;
+    }
+    // The inverse of BwtRleExpander::DecodeInt: `x` is the class the byte stream
+    // carries, L the run length it has to yield back.
+    void EncodeInt(uint32_t L, uint32_t x) {
+        const uint32_t k = x < 4u ? x : 4u;
+        const uint32_t n = 1u << k;
+        const uint32_t xx = x + (x == 0u);
+        const uint32_t high = (xx > 4u) ? (L >> (xx - 4u)) : L;
+        const uint32_t nflags = (x == 0u) ? 1u : k;
+        uint32_t i = 1;
+        for (uint32_t j = 0; j < nflags; ++j) {
+            const bool flag = ((high >> (nflags - 1u - j)) & 1u) != 0u;
+            uint16_t* m = &model_[i + n];
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((0x80u - *m + ((uint32_t)flag << 16)) >> 8));
+            i = i * 2u + flag;
+        }
+        if (xx > 4u) enc.EncodeRaw(L & ((1u << (xx - 4u)) - 1u), xx - 4u);
+    }
 };
 
 struct BwtRleExpander {
@@ -142,6 +195,50 @@ struct BwtRleExpander {
 };
 
 }  // namespace
+
+// FUN_0808ff20: the whole param2 attempt. Returns the collapsed size (always a
+// multiple of 4 plus the n & 3 tail) with the run lengths in `*side`, or 0 when
+// the side stream ran out of the room it was given.
+uint32_t NzPostfilterParam2Encode(const uint8_t* in, uint32_t in_size,
+                                  uint8_t* out, uint32_t out_cap,
+                                  std::vector<uint8_t>* side, uint32_t side_cap) {
+    if (in_size == 0u || out_cap < in_size || side == nullptr) return 0;
+    side->assign(side_cap, 0);
+    BwtRleSideEnc sw(side->data(), side->data() + side_cap);
+    const uint32_t nwords = in_size >> 2;
+    auto ld = [](const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; };
+    auto st = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+
+    const uint8_t* p = in;
+    const uint8_t* const wend = in + nwords * 4u;
+    uint8_t* o = out;
+    uint32_t prev = 0;                       // the phantom zero the decoder starts from
+    while (p < wend) {
+        uint32_t v = ld(p); p += 4; st(o, v); o += 4;
+        if (v != prev) { prev = v; continue; }
+        // five more equal words (six with the one above) open a run
+        uint32_t equal = 1;
+        while (equal < 6u && p < wend) {
+            v = ld(p); p += 4; st(o, v); o += 4;
+            if (v != prev) break;
+            ++equal;
+        }
+        if (equal < 6u) { prev = v; continue; }
+        const uint8_t* q = p;
+        while (q < wend && ld(q) == prev) q += 4;
+        const uint32_t L = (uint32_t)((q - p) / 4);
+        p = q;
+        uint32_t cls = 0;
+        if (L > 1u) { uint32_t t = L >> 1; do { ++cls; st(o, prev); o += 4; t >>= 1; } while (t != 0u); }
+        sw.EncodeInt(L, cls);
+    }
+    sw.enc.Flush();
+    if (sw.enc.overflow) { side->clear(); return 0; }
+    side->resize((size_t)(sw.enc.cur - side->data()));
+    // FUN_080902e0's tail: the bytes below the last whole word are copied as they are
+    for (const uint8_t* t = wend; t < in + in_size; ++t) *o++ = *t;
+    return (uint32_t)(o - out);
+}
 
 bool NzBwtRleDecodeU32(const uint8_t* model_data, uint32_t model_len,
                        const uint8_t* in, uint32_t in_size,

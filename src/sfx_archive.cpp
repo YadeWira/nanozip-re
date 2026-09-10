@@ -11036,6 +11036,28 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             }
         }
 
+        // param2 (FUN_0808ff20), which the driver attempts only when NO text
+        // transform applied: collapse runs of six or more equal 32-bit words,
+        // the run lengths to a side stream. Taken only when the side stream plus
+        // the collapsed size beat the input by more than min(n >> 7, 2 KB).
+        std::vector<std::uint8_t> p2buf, p2side;
+        bool p2_on = false;
+        const std::uint8_t* pre_p2 = lz_in;
+        std::uint32_t pre_p2_len = m;
+        if (!tt_on) {
+            p2buf.assign(m + 0x40u, 0);
+            std::vector<std::uint8_t> side;
+            const std::uint32_t r = NzPostfilterParam2Encode(lz_in, m, p2buf.data(), m + 0x40u,
+                                                             &side, nzr::opt_enc::kCoAuxStreamBytes);
+            const std::uint32_t slack = ((m >> 7u) < 0x800u) ? (m >> 7u) : 0x800u;
+            if (r != 0u && static_cast<std::uint64_t>(side.size()) + r < m - slack) {
+                p2side = side;
+                p2_on = true;
+                lz_in = p2buf.data();
+                m = r;
+            }
+        }
+
         std::vector<std::uint8_t> payload;
         const bool lz_kind = OptimumBlockIsLz(lz_in, m);
         if (lz_kind) {
@@ -11052,8 +11074,9 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             // The staged check bytes, one per stage the decoder passes through and
             // popped last-first: with a text transform the stages are the payload,
             // the LZ output and the text, so the text's check goes first.
-            seg.push_back(static_cast<unsigned char>(tt_on ? 3u : 2u));
+            seg.push_back(static_cast<unsigned char>(2u + (tt_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
             if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
         } else {
@@ -11082,7 +11105,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             seg.push_back(0u);                       // param14
             seg.push_back(0u);                       // param15
         }
-        seg.push_back(0u);                       // param2
+        seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
+        if (p2_on) {
+            put32(static_cast<std::uint32_t>(p2side.size()));
+            seg.insert(seg.end(), p2side.begin(), p2side.end());
+        }
         seg.push_back(0u);                       // param1
         seg.push_back(0u);                       // param16
         seg.push_back(static_cast<unsigned char>(tt_on ? 1u : 0u));
