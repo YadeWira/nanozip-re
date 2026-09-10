@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // NanoZip decr_param == 0 ("BWT") block decoding, ported from the community
 // reference decoder (nzdec_v0 NZ.cpp: BwtUntransform / BwtDecodeInput /
@@ -30,6 +31,12 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos);
 // the encoder: returns the bwt_start_pos the decoder needs. Rotation sort by
 // prefix doubling; canonical output.
 uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out);
+// The BWT bucket encoder (FUN_0806c350): codes `bwt` (n bytes of BWT output)
+// into the payload NzBwtDecodeInput reads. `cap` is the caller's room (the -co
+// trial gate passes 0x600487). Returns the payload size, or 0 when the payload
+// would not be below n (the original then stores the block).
+uint32_t NzBwtEncodeInput(const uint8_t* bwt, uint32_t n, uint32_t cap, std::vector<uint8_t>& out,
+                          unsigned threads = 1u);
 // Threads used by the inverse BWT walk on large blocks (0 = hardware default).
 void NzBwtSetThreadCount(unsigned n);
 

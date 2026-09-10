@@ -849,6 +849,494 @@ uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
     return primary;
 }
 
+// ---------------------------------------------------------------------------
+// The BWT bucket ENCODER (FUN_0806c350 and its per-bucket coder FUN_0806d370 /
+// FUN_0806cc70 / FUN_0806e050), for the -co family's compressor: the mirror of
+// NzBwtDecodeInput and BwtUnpackInput above, over the same models, tables and
+// framing. It is what the -co trial gate compresses its sample with (before
+// and after the text transform, comparing the two sizes) and what a BWT block's
+// payload is.
+//
+// Per bucket (one per leading symbol of the sorted rotations, i.e. one per
+// byte value, a contiguous slice of the BWT output):
+//   - 8 bytes or fewer: stored raw (FUN_0806d780 never hands them to the coder).
+//   - the RLE pre-pass (FUN_0808fe30), kept only if it saves bytes;
+//   - the rank coder (FUN_0806cc70): the symbol set, the C table of first
+//     occurrences and the B table of exhaustion points through the adaptive
+//     integer model, then one move-to-front rank per run, whose raw bits go to
+//     a separate MSB-first bit stream -- kept only if arith + bits beats the
+//     data by more than 0x200 bytes;
+//   - otherwise the pre-pass output alone, or the bucket raw.
+// The bucket stream is [pp data][bits][arith][varints: bits+1 or 0, pp side
+// bytes, size - pp size], and the payload is the buckets in symbol order
+// followed by their [in][out] table, empties as [extra empties][0] and raw
+// buckets as [0][count]. FUN_0806c350 returns the payload size, or 0 when it is
+// not below the input (the caller then stores).
+//
+// The original queues its decisions and codes them in a batch; coding them as
+// they arise gives the same bytes, so this does that.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The range ENCODER the decoders' ArithDec reads: 12-bit probability of a one,
+// carry-less, the top byte leaving as soon as the two bounds agree on it.
+struct BwtArithEnc {
+    uint32_t lo = 0, hi = 0xffffffffu;
+    uint8_t* cur; uint8_t* end;
+    bool overflow = false;
+    void Put(uint8_t b) { if (cur < end) *cur++ = b; else overflow = true; }
+    void Encode(bool bit, uint32_t p12) {
+        const uint32_t mid = lo + ((hi - lo) >> 12) * p12;
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) { Put((uint8_t)(hi >> 24)); hi = (hi << 8) | 0xffu; lo <<= 8; }
+    }
+    void EncodeModel(bool bit, uint32_t model16) { Encode(bit, model16 >> 4); }
+    void EncodeRaw(uint32_t v, uint32_t nbits) {   // p = 1/2 decisions, MSB first
+        while (nbits--) Encode(((v >> nbits) & 1u) != 0u, 0x800u);
+    }
+    void Flush() { Put((uint8_t)(hi >> 24)); }
+};
+
+// The MSB-first bit stream BitReader fetches as big-endian words (FUN_0806e050's
+// writer, flushed byte-wise by FUN_080b2030).
+struct BwtBitWriter {
+    uint8_t* base; uint8_t* cur; uint8_t* end;
+    uint32_t buf = 0, count = 0;
+    bool overflow = false;
+    void Put(uint32_t v, uint32_t nb) {
+        if (nb == 0u) return;
+        if (count + nb <= 32u) { buf = (buf << nb) | v; count += nb; return; }
+        const uint32_t fit = 32u - count;          // bits that complete the word
+        const uint32_t rest = nb - fit;
+        const uint32_t word = (buf << fit) | (v >> rest);
+        if (cur + 4 <= end) { const uint32_t w = bswap32(word); std::memcpy(cur, &w, 4); cur += 4; }
+        else overflow = true;
+        buf = v & bitmask(rest);
+        count = rest;
+    }
+    void Flush() {                                  // FUN_080b2030
+        while (count != 0u) {
+            if (cur >= end) { overflow = true; return; }
+            if (count < 8u) { *cur++ = (uint8_t)(buf << (8u - count)); count = 0; }
+            else { count -= 8u; *cur++ = (uint8_t)(buf >> count); }
+        }
+    }
+    uint32_t Bytes() const { return (uint32_t)(cur - base); }
+};
+
+// FUN_080b1e70: a varint written forward, the FIRST byte carrying the 0x80 flag,
+// which BackwardsByteStream::ReadBackwardsVarint reads from the tail.
+void PutTableVarint(std::vector<uint8_t>& out, uint32_t v) {
+    if (v < 0x80u) { out.push_back((uint8_t)(v | 0x80u)); return; }
+    out.push_back((uint8_t)((v & 0x7fu) | 0x80u));
+    v >>= 7;
+    while (v >= 0x80u) { out.push_back((uint8_t)(v & 0x7fu)); v >>= 7; }
+    out.push_back((uint8_t)v);
+}
+
+// WriteSomeValue: the inverse of ReadSomeValue, step for step.
+void WriteSomeValue(BwtArithEnc& enc, uint32_t value, uint32_t n) {
+    uint32_t sum1 = 0, numbits;
+    for (;;) {
+        if (n == 1u) return;
+        numbits = 1;
+        uint32_t mm = (n - 1u) >> 1;
+        if (mm == 0u) break;
+        while (mm >>= 1) numbits++;
+        n &= (1u << numbits) - 1u;
+        if (!n) { numbits++; break; }
+        const bool flag = (value - sum1) >= (1u << numbits);
+        enc.EncodeModel(flag, n << (15u - numbits));
+        if (!flag) break;
+        sum1 += (1u << numbits);
+    }
+    enc.EncodeRaw(value - sum1, numbits);
+}
+
+// The inverse of BwtIntModel::Read.
+struct BwtIntModelEnc {
+    uint32_t bits_to_read_ = 31;
+    uint16_t model_[32];
+    BwtIntModelEnc() { for (uint32_t i = 0; i != 32u; ++i) model_[i] = 0x8000u; }
+    void Write(BwtArithEnc& enc, uint32_t v) {
+        const uint32_t nb = v ? BSR(v) : 0u;
+        for (uint32_t i = 0; i < nb; ++i) {
+            enc.EncodeModel(true, model_[i]);
+            model_[i] = (uint16_t)(model_[i] + ((65536u + 8u - model_[i]) >> 4));
+        }
+        if (nb != bits_to_read_) {
+            enc.EncodeModel(false, model_[nb]);
+            model_[nb] = (uint16_t)(model_[nb] + ((8u - model_[nb]) >> 4));
+        }
+        const uint32_t res = nb ? (1u << nb) : 0u;
+        enc.EncodeRaw(v - res, nb + (nb == 0u));
+    }
+};
+
+// One bucket's rank coder: BwtUnpackInput::Decode run backwards over the data,
+// every decision known.
+struct BwtBucketEncoder {
+    uint16_t model_a_[6146];
+    uint16_t model_b_[512];
+    BwtUnpackInput::ModelC model_c_[256];
+
+    // Returns the arithmetic stream's size (0 = declined: it overflowed), with the
+    // raw rank bits in `bits`.
+    uint32_t Encode(const uint8_t* d, uint32_t n, uint8_t* arith, uint32_t arith_cap,
+                    BwtBitWriter& bits) {
+        if (n == 0u) return 0;
+        BwtArithEnc enc; enc.cur = arith; enc.end = arith + arith_cap;
+
+        // The symbol set in first-appearance order, and C = first occurrences.
+        uint32_t C[256], B[256];
+        uint8_t P[256];
+        bool seen[256] = {false};
+        uint32_t ents_used = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t c = d[i];
+            if (!seen[c]) { seen[c] = true; C[c] = i; P[ents_used++] = c; }
+        }
+        {   // ReadSomeValue's shrinking alphabet, from the writer's side
+            uint8_t perm[256];
+            for (uint32_t i = 0; i < 256u; ++i) perm[i] = (uint8_t)i;
+            uint32_t end_idx = 256;
+            uint32_t left = n;
+            for (uint32_t j = 0; j < ents_used; ++j) {
+                uint32_t cur_idx = 0;
+                while (perm[cur_idx] != P[j]) ++cur_idx;
+                WriteSomeValue(enc, cur_idx, end_idx + (end_idx != 256u));
+                perm[cur_idx] = perm[--end_idx];
+                --left;
+                if (end_idx == 0u || left == 0u) break;
+            }
+            // The decoder keeps reading while symbols and bytes remain: the set
+            // ends with the terminator, the index equal to the count left.
+            if (end_idx != 0u && left != 0u) WriteSomeValue(enc, end_idx, end_idx + 1u);
+        }
+        if (ents_used < 256u) BwtUnpackInput::FillUp(n, ents_used, P, C);
+
+        BwtIntModelEnc int_model;
+        for (uint32_t j = 1; j < ents_used; ++j) {
+            const uint32_t prev = C[P[j - 1u]];
+            const uint32_t range = j + n - ents_used - prev;
+            int_model.bits_to_read_ = range ? BSR(range) : 0u;
+            int_model.Write(enc, C[P[j]] - prev - 1u);
+        }
+
+        // B: the run count at which each symbol runs out, in the order they do.
+        // Found by walking the runs the way the decoder will emit them.
+        uint32_t nb_ = 0;
+        {
+            uint32_t Cw[256]; uint8_t Pw[256];
+            std::memcpy(Cw, C, sizeof(Cw)); std::memcpy(Pw, P, sizeof(Pw));
+            uint32_t used = ents_used, runs = 0;
+            uint32_t pos = 0;
+            while (used != 0u) {
+                const uint8_t sym = Pw[0];
+                const uint32_t run_end = (used > 1u) ? Cw[Pw[1]] : n;
+                pos = run_end;
+                ++runs;
+                // next occurrence of sym at or after run_end
+                uint32_t next = pos;
+                while (next < n && d[next] != sym) ++next;
+                if (next >= n) {
+                    B[nb_++] = runs - 1u;
+                    --used;
+                    BwtUnpackInput::MoveUpItem(Pw, Cw, n, used);
+                    continue;
+                }
+                Reinsert(Pw, Cw, next, sym);
+            }
+        }
+        int_model.bits_to_read_ = (n - ents_used) != 0u ? BSR(n - ents_used) : 0u;
+        for (uint32_t bi = 0, prev = 0; bi != ents_used; ++bi) {
+            int_model.Write(enc, B[bi] - prev);
+            prev = B[bi] + 1u;
+        }
+
+        // The ranks.
+        std::memset(model_c_, 0, sizeof(model_c_));
+        for (uint32_t i = 0; i != 6146u; ++i) model_a_[i] = 0x8002u;
+        for (uint32_t i = 0; i != 512u; ++i) model_b_[i] = 0x8000u;
+        uint32_t used = ents_used;
+        for (;;) {
+            const uint8_t sym = P[0];
+            const uint32_t run_end = (used > 1u) ? C[P[1]] : n;
+            uint32_t next = run_end;
+            while (next < n && d[next] != sym) ++next;
+            if (next >= n) {
+                if (--used == 0u) break;
+                BwtUnpackInput::MoveUpItem(P, C, n, used);
+                continue;
+            }
+            // context, as the decoder computes it before it moves anything
+            const uint32_t hash1 = (uint32_t)(C[P[4]] - C[P[1]] < 4u) +
+                                   (uint32_t)(C[P[3]] - C[P[1]] < 3u) +
+                                   kSomeLut2[(C[P[2]] + ~C[P[1]]) & 0xffu];
+            const uint32_t hash2 = hash1 * 2u + (uint32_t)(C[P[1]] - C[P[0]] < 2u);
+            BwtUnpackInput::ModelC* c_ptr = &model_c_[sym];
+            const uint32_t c_shifted = (c_ptr->x + 0x80u) >> 8;
+            const uint32_t ctx = (uint32_t)(c_ptr->x != 0u) + (uint32_t)(c_shifted > 0x800u) +
+                                 kSomeLut[std::min<uint32_t>(c_shifted, 0x17Fu)];
+            // move sym to its new rank; delta is what the decoder adds back
+            const uint32_t k = Reinsert(P, C, next, sym);
+            const uint32_t delta = (next - C[P[0]]) - k;
+            CodeRank(enc, bits, sym, hash2, ctx, delta);
+            const uint32_t y = (3u * c_ptr->y + 5u * c_ptr->x + 259u) >> 3;
+            c_ptr->y = y;
+            c_ptr->x = (delta * 1024u + 12u * y + 8u) >> 4;
+        }
+        enc.Flush();
+        if (enc.overflow) return 0;
+        return (uint32_t)(enc.cur - arith);
+    }
+
+    // FUN_0806cc70's move: P[0] leaves, everything with a next occurrence before
+    // `next` closes up, and the symbol lands at rank k with C[sym] = next.
+    static uint32_t Reinsert(uint8_t* P, uint32_t* C, uint32_t next, uint8_t sym) {
+        P[0] = P[1];
+        uint32_t k = 1;
+        for (; k + 8u != 0xf9u; k += 8u) {
+            if (next < C[P[k + 8u]]) break;
+            std::memmove(P + k, P + k + 1u, 8);
+        }
+        for (; k + 1u != 0xffu; ++k) {
+            if (next < C[P[k + 1u]]) break;
+            P[k] = P[k + 1u];
+        }
+        P[k] = sym;
+        C[sym] = next;
+        return k;
+    }
+
+    // FUN_0806e050: one rank. a_flag says "delta is zero"; otherwise the unary
+    // length of delta - 1 through model_a, its second-highest bit through
+    // model_b, and the rest raw.
+    void CodeRank(BwtArithEnc& enc, BwtBitWriter& bits, uint8_t /*sym*/, uint32_t hash2,
+                  uint32_t ctx, uint32_t delta) {
+        uint16_t* a_ptr = &model_a_[0x20u * hash2 + 0x200u * ctx];
+        const bool a_flag = (delta == 0u);
+        {
+            const uint32_t a = *a_ptr;
+            enc.EncodeModel(a_flag, a);
+            const uint32_t rate = a & 0xfu;
+            *a_ptr = (uint16_t)(rate + (rate <= 6u) +
+                (((((uint32_t)a_flag * 65536u + 0x40u - a) >> rate) + a) & 0xfff0u));
+        }
+        if (a_flag) return;
+        const uint32_t v = delta - 1u;
+        // unary: one flag per bit of v above the lowest, capped at 31
+        uint32_t ik = 0;
+        {
+            uint32_t rest = v;
+            for (;;) {
+                ++a_ptr;
+                rest >>= 1;
+                const bool more = (rest != 0u);
+                const uint32_t a = *a_ptr;
+                enc.EncodeModel(more, a);
+                const uint32_t rate = a & 0xfu;
+                *a_ptr = (uint16_t)(rate + (rate <= 7u) +
+                    (((((uint32_t)more * 65536u + 0x80u - a) >> rate) + a) & 0xfff0u));
+                if (!more) break;
+                if (++ik == 31u) break;
+            }
+        }
+        const uint32_t nbits = ik + (ik == 0u);            // bits of v below its top one
+        const uint32_t shifted = v << ((32u - nbits) & 31u); // v's top bit at bit 31...
+        const bool b_flag = ((int32_t)shifted < 0);
+        uint16_t* b_ptr = &model_b_[ik * 16u + hash2];
+        enc.EncodeModel(b_flag, *b_ptr);
+        *b_ptr = (uint16_t)(*b_ptr + ((((uint32_t)b_flag << 16) + 512u - *b_ptr) >> 10));
+        if (ik > 1u) bits.Put((shifted << 1) >> ((32u - (nbits - 1u)) & 31u), nbits - 1u);
+    }
+};
+
+}  // namespace
+
+namespace {
+
+// The RLE pre-pass (FUN_0808fe30 -> FUN_08090100), the inverse of
+// BwtRleExpander::Decode1: three equal bytes in a row are written as they are,
+// the run beyond them (L more) as BSR(L) further copies -- the class the
+// decoder turns back into DecodeInt's bit-tree -- with L itself coded into a
+// side stream of its own. The comparison starts against a phantom zero, as the
+// decoder's does. Returns the collapsed size, 0 when the side stream ran out of
+// its room.
+struct BwtRleSideEnc {
+    BwtArithEnc enc;
+    uint16_t model_[32];
+    BwtRleSideEnc(uint8_t* base, uint8_t* end) { enc.cur = base; enc.end = end; for (uint32_t i = 0; i < 32u; ++i) model_[i] = 0x8000u; }
+    // DecodeInt backwards: `x` is the class, L the value it has to yield.
+    void EncodeInt(uint32_t L, uint32_t x) {
+        const uint32_t k = x < 4u ? x : 4u;
+        const uint32_t n = 1u << k;
+        const uint32_t xx = x + (x == 0u);
+        const uint32_t high = (xx > 4u) ? (L >> (xx - 4u)) : L;   // what the tree codes
+        uint32_t i = 1;
+        // the tree reads k flags (one for x = 0), MSB of `high` below its top bit first
+        const uint32_t nflags = (x == 0u) ? 1u : k;
+        for (uint32_t j = 0; j < nflags; ++j) {
+            const bool flag = ((high >> (nflags - 1u - j)) & 1u) != 0u;
+            uint16_t* m = &model_[i + n];
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((0x80u - *m + ((uint32_t)flag << 16)) >> 8));
+            i = i * 2u + flag;
+        }
+        if (xx > 4u) enc.EncodeRaw(L & bitmask(xx - 4u), xx - 4u);
+    }
+};
+
+uint32_t BwtRleCollapse(const uint8_t* in, uint32_t n, uint8_t* out, BwtRleSideEnc& side) {
+    if (n == 0u) return 0;
+    const uint8_t* p = in;
+    const uint8_t* const end = in + n;
+    uint8_t* o = out;
+    uint32_t prev = 0;                               // the phantom zero
+    while (p < end) {
+        const uint8_t c = *p++;
+        *o++ = c;
+        if (c != prev) { prev = c; continue; }
+        // a pair: the third byte is written whatever it is
+        if (p >= end) break;
+        const uint8_t c1 = *p++;
+        *o++ = c1;
+        if (c1 != c) { prev = c1; continue; }
+        // three in a row: count the rest of the run
+        const uint8_t* q = p;
+        while (q < end && *q == c) ++q;
+        const uint32_t L = (uint32_t)(q - p);
+        p = q;
+        uint32_t x = 0;
+        if (L > 1u) { uint32_t t = L >> 1; do { ++x; *o++ = c; t >>= 1; } while (t != 0u); }
+        side.EncodeInt(L, x);
+        prev = c;
+    }
+    side.enc.Flush();
+    if (side.enc.overflow) return 0;
+    return (uint32_t)(o - out);
+}
+
+// FUN_0806d370: one bucket's stream, or empty when the bucket is stored raw.
+// `alloc` is the room FUN_0806c350 gave the bucket.
+void BwtEncodeBucket(const uint8_t* data, uint32_t cnt, uint32_t alloc, std::vector<uint8_t>& stream) {
+    stream.clear();
+    if (cnt <= 8u) return;
+    // the pre-pass: its side stream has `cnt` bytes of room
+    std::vector<uint8_t> ppout(cnt + 8u), ppside(cnt + 8u);
+    BwtRleSideEnc side(ppside.data(), ppside.data() + cnt);
+    uint32_t pp = BwtRleCollapse(data, cnt, ppout.data(), side);
+    const uint32_t aux = (uint32_t)(side.enc.cur - ppside.data());
+    const bool use_pp = (pp != 0u) && (aux + pp < cnt);
+    const uint8_t* body = use_pp ? ppout.data() : data;
+    const uint32_t size = use_pp ? pp : cnt;
+    const uint32_t room = use_pp ? alloc - aux : alloc;
+    // the rank coder: bits area past the work array, arith output at body + size
+    const uint32_t hdr = (((size + 0x400u) + 3u) & ~3u) + size * 4u;
+    bool ranked = false;
+    std::vector<uint8_t> bitsbuf, arith;
+    uint32_t asz = 0, bsz = 0;
+    if (room > hdr) {
+        bitsbuf.assign(room - hdr + 8u, 0);
+        arith.assign(size + 8u, 0);
+        BwtBitWriter bits; bits.base = bits.cur = bitsbuf.data(); bits.end = bitsbuf.data() + (room - hdr);
+        BwtBucketEncoder be;
+        asz = be.Encode(body, size, arith.data(), size, bits);
+        bits.Flush();
+        bsz = bits.Bytes();
+        ranked = (asz != 0u) && !bits.overflow && (asz + bsz + 0x200u < size);
+        static const bool force = (NZ_ENV("NZOPT_BWTENC_FORCE") != nullptr);
+        if (force && asz != 0u && !bits.overflow) ranked = true;
+        if (BwtTrace())
+            std::fprintf(stderr, "[BWTENC] count=%u pp=%u aux=%u use_pp=%d arith=%u bits=%u -> %s\n",
+                         cnt, pp, aux, (int)use_pp, asz, bsz, ranked ? "ranked" : (use_pp ? "pp only" : "raw"));
+    }
+    if (!ranked && !use_pp) return;                  // stored raw
+    if (use_pp) stream.insert(stream.end(), ppside.data(), ppside.data() + aux);
+    if (ranked) {
+        stream.insert(stream.end(), bitsbuf.data(), bitsbuf.data() + bsz);
+        stream.insert(stream.end(), arith.data(), arith.data() + asz);
+        PutTableVarint(stream, bsz + 1u);
+    } else {
+        stream.insert(stream.end(), body, body + size);
+        PutTableVarint(stream, 0);
+    }
+    if (use_pp) PutTableVarint(stream, aux);
+    PutTableVarint(stream, cnt - (use_pp ? pp : 0u));
+}
+
+}  // namespace
+
+// FUN_0806c350 with FUN_0806d370's per-bucket decisions. `cap` is the room the
+// caller has (the gate passes 0x600487); it shapes the per-bucket allocations
+// whose overflow makes a bucket fall back. Returns the payload size written to
+// `out`, or 0 when the payload would not be below `n`.
+uint32_t NzBwtEncodeInput(const uint8_t* bwt, uint32_t n, uint32_t cap, std::vector<uint8_t>& out,
+                          unsigned threads) {
+    out.clear();
+    if (n < 8u) return 0;
+    if (cap < n * 5u + 0x41000u) return 0;
+    // Single-threaded (DAT_08183620 == 0, every -t1 run) the whole block is ONE
+    // bucket, symbol 0; the split by leading symbol is the multi-threaded
+    // layout and is not written yet.
+    uint32_t count[256] = {0};
+    if (threads <= 1u) {
+        count[0] = n;
+    } else {
+        return 0;
+    }
+    uint32_t nonempty = 0;
+    for (uint32_t c = 0; c < 256u; ++c) nonempty += (count[c] != 0u);
+
+    // FUN_0806c350's per-bucket room: what is left of `cap` beyond five bytes per
+    // input byte, shared out among the buckets still to come.
+    uint32_t alloc[256] = {0};
+    {
+        uint32_t room = cap - n * 5u, left = nonempty;
+        for (uint32_t c = 0; c < 256u; ++c) {
+            if (count[c] == 0u) continue;
+            const uint32_t share = room / left;
+            --left;
+            alloc[c] = (share + count[c] * 5u) & ~7u;
+            room -= share;
+        }
+    }
+
+    std::vector<uint8_t> streams, stream;
+    uint32_t coded[256] = {0};                      // 0 = stored raw
+    const uint8_t* src = bwt;
+    for (uint32_t c = 0; c < 256u; ++c) {
+        const uint32_t cnt = count[c];
+        if (cnt == 0u) continue;
+        const uint8_t* data = src;
+        src += cnt;
+        BwtEncodeBucket(data, cnt, alloc[c], stream);
+        if (stream.empty()) { streams.insert(streams.end(), data, data + cnt); continue; }
+        coded[c] = (uint32_t)stream.size();
+        streams.insert(streams.end(), stream.begin(), stream.end());
+    }
+
+    // The bucket table, in symbol order, read back from the tail.
+    std::vector<uint8_t> table;
+    for (uint32_t c = 0; c < 256u; ) {
+        if (count[c] == 0u) {
+            uint32_t extra = 0;
+            while (c + 1u + extra < 256u && count[c + 1u + extra] == 0u) ++extra;
+            PutTableVarint(table, extra);
+            PutTableVarint(table, 0);
+            c += 1u + extra;
+            continue;
+        }
+        PutTableVarint(table, coded[c]);
+        PutTableVarint(table, count[c]);
+        ++c;
+    }
+    out.swap(streams);
+    out.insert(out.end(), table.begin(), table.end());
+    if (out.size() >= n) { out.clear(); return 0; }
+    return (uint32_t)out.size();
+}
+
 // BwtDecodeInput (reference NZ.cpp:591). The BWT output is split into 256
 // buckets keyed by leading symbol; each bucket's (in_bytes, out_bytes) pair is
 // stored as a backwards varint pair at the tail of the payload, with runs of

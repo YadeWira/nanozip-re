@@ -8470,12 +8470,19 @@ static bool DecodeOptimumBlockSequence(
         const bool bwt_raw = (decr_param == 0u && param6 == 0u);
         if (!stored_block && (!param6 || out_size == 0u)) continue;
 
-        if (const char* dpp = NZ_ENV("NZOPT_DUMP_PAYLOAD")) {
-            FILE* f = fopen(dpp, "wb");
-            fwrite(payload, 1, payload_size, f);
-            fclose(f);
-            fprintf(stderr, "[TDO] dumped payload (%u bytes) to %s, out_size=%u\n",
-                    payload_size, dpp, out_size);
+        // NZOPT_DUMP_PAYLOAD=<path>: every block's raw payload as <path>.N, with
+        // its descriptor fields on stderr. A BWT block (decr_param 0) also gets
+        // <path>.N.bwt, the bucket decoder's output -- the byte string the bucket
+        // ENCODER has to turn back into <path>.N, which is how it is verified.
+        static int payload_dump_seq = 0;
+        const char* const dpp = NZ_ENV("NZOPT_DUMP_PAYLOAD");
+        const int payload_dump_n = payload_dump_seq++;
+        if (dpp != nullptr) {
+            char nm[600];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dpp, payload_dump_n);
+            if (FILE* f = fopen(nm, "wb")) { fwrite(payload, 1, payload_size, f); fclose(f); }
+            fprintf(stderr, "[TDO] dumped payload #%d (%u bytes) to %s: decr_param=%u param6=%u out_size=%u\n",
+                    payload_dump_n, payload_size, nm, decr_param, param6, out_size);
         }
 
         std::vector<std::uint8_t> work;
@@ -8497,6 +8504,11 @@ static bool DecodeOptimumBlockSequence(
                 if (!bdi_ok) { nzr::derr::SetAt(fail_code(3u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 cur_size = out_size;
                 stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
+                if (dpp != nullptr) {
+                    char nm[600];
+                    std::snprintf(nm, sizeof(nm), "%s.%d.bwt", dpp, payload_dump_n);
+                    if (FILE* f = fopen(nm, "wb")) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                }
             }
             const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
             if (NZ_ENV("NZOPT_TRACE_TDO")) {

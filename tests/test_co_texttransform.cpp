@@ -174,9 +174,34 @@ void BwtCase(const BwtGolden& g) {
     Check(g.name, "bwt round trip", NzBwtUntransform(back.data(), g.n, primary) && back == in);
 }
 
+// The BWT bucket coder (FUN_0806c350), the trial gate's second step: the BWT of
+// each fixture's 3750-byte sample coded as the original codes it under -t1 --
+// one bucket, the RLE pre-pass, the rank coder -- pinned by size and FNV against
+// FUN_0806c350's payload captured at its call and return in the gate, and
+// round-tripped through NzBwtDecodeInput.
+struct BucketGolden { const char* name; std::string (*make)(std::uint32_t); std::uint32_t n, payload_n; std::uint64_t fnv; };
+const BucketGolden kBucket[] = {
+    {"source", MakeSource, 3750u, 548u, 0x009a41af1d1a5532ull},
+    {"markup", MakeMarkup, 3750u, 462u, 0x300b27808960648full},
+    {"prose",  MakeProse,  3750u, 532u, 0x7dc2acf6c90f5ffcull},
+};
+void BucketCase(const BucketGolden& g) {
+    const std::string s = g.make(30000u);
+    std::vector<std::uint8_t> in(s.begin(), s.begin() + g.n), bwt(g.n + 4u), payload, back(g.n + 64u);
+    NzBwtTransform(in.data(), g.n, bwt.data());
+    const std::uint32_t r = NzBwtEncodeInput(bwt.data(), g.n, 0x600487u, payload);
+    char what[96];
+    std::snprintf(what, sizeof(what), "bucket payload is %u bytes (want %u)", r, g.payload_n);
+    Check(g.name, what, r == g.payload_n);
+    Check(g.name, "bucket payload is the original's", r != 0u && Fnv(payload.data(), r) == g.fnv);
+    Check(g.name, "bucket payload decodes back", r != 0u && NzBwtDecodeInput(payload.data(), r, g.n, back.data()) &&
+          std::memcmp(back.data(), bwt.data(), g.n) == 0);
+}
+
 }  // namespace
 
 int main() {
+    for (const BucketGolden& g : kBucket) BucketCase(g);
     for (const BwtGolden& g : kBwt) BwtCase(g);
     NzCmInitAll();   // kModelInterpolation: every model below reads it
     for (const NumGolden& g : kNum) NumCase(g);
