@@ -11167,7 +11167,37 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
             const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, 0x600487u, payload);
-            if (psz == 0u) return false;
+            if (psz == 0u) {
+                // STORED: the bucket coder could not get under the BWT string's
+                // own size, so the block carries it raw. param6 == 0, and then
+                // there is NO size18 field at all -- the block expands to
+                // exactly its payload size. Its stage list loses one entry with
+                // it, since the payload IS the BWT output.
+                put32(m);
+                seg.insert(seg.end(), bwt.begin(), bwt.begin() + m);
+                seg.push_back(0u);                   // decr_param: BWT
+                seg.push_back(0u);                   // param6: stored
+                seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                         (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
+                                                         (p14_on ? 1u : 0u)));
+                if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+                if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+                if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
+                // NOTE: param7 exists only when param6 is set. A stored block
+                // goes straight from the staged bytes to bwt_start_pos.
+                put32(primary);                      // bwt_start_pos
+                seg.push_back(static_cast<unsigned char>(p14_on ? 1u : 0u));
+                if (p14_on) {
+                    put32(static_cast<std::uint32_t>(p14side.size()));
+                    seg.insert(seg.end(), p14side.begin(), p14side.end());
+                }
+                seg.push_back(0u);                   // param15
+                verifier.FeedWindow(pre_p14, pre_p14_len);
+                goto block_tail;
+            }
             {
                 // The bucket coder is the one stage whose output this writer
                 // cannot check against the reference block by block, and it has
@@ -11212,6 +11242,7 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             }
             seg.push_back(0u);                       // param15
         }
+    block_tail:
         seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
         if (p2_on) {
             put32(static_cast<std::uint32_t>(p2side.size()));

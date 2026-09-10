@@ -294,9 +294,22 @@ the LZ payload through a second engine kept in the decoder's role, the BWT
 payload through `NzBwtDecodeInput` -- and a decline removes the partial file and
 says so.
 
+## Stored blocks (param6 == 0)
+
+When the bucket coder cannot get under the BWT string's own size the block is
+written STORED: `param6 = 0`, the payload IS the raw BWT string, and **there is
+no size18 field at all** -- the block expands to exactly its payload size. Its
+stage list loses one entry with it, since the payload and the BWT output are the
+same bytes. One more field disappears: **param7 exists only when param6 is set**,
+so a stored block goes straight from the staged bytes to `bwt_start_pos`.
+
+The LZ kind can be stored too (the parser giving up), and the decoder handles it
+-- a stored LZ block feeds the window and then COLD-STARTS the model. The writer
+does not emit that form yet; it declines instead.
+
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
-files and on **55 of 62** executables and DLLs. Not written yet: param15, image
-and audio blocks, the stored form of a block nothing shrinks, the multi-threaded
-bucket layout, and budgets above 16 MB. Two executables are an LZ-engine
-divergence on binary data, unrelated to the block analysis.
+files, **58 of 62** executables and DLLs and **172 of 180** mixed corpus files.
+Not written yet: param15, the stored LZ form, image and audio blocks, the
+multi-threaded bucket layout, and budgets above 16 MB. Three files are an
+LZ-engine divergence on binary data, unrelated to the block analysis.
