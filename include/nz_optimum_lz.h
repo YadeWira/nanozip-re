@@ -148,6 +148,15 @@ public:
     bool EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
                            std::vector<std::uint8_t>& payload,
                            std::vector<OptimumDecision>* out_decisions);
+
+    // Build the match finder NOW, before any block is parsed. The finder costs
+    // several megabytes, so a plain decode never builds one and FeedWindow's
+    // push into it is skipped while it is absent -- which is exactly wrong for
+    // an encoder whose FIRST block is a BWT block: its bytes would enter the
+    // window without entering the hash, and the LZ block after it could never
+    // find a match reaching back into them. Call this once on the encoding
+    // engine right after it is constructed.
+    void EnableParser();
 private:
     struct ParserState;
     std::shared_ptr<ParserState> parser_;

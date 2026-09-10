@@ -8632,7 +8632,32 @@ static bool DecodeOptimumBlockSequence(
                 }
             } else {
             work.resize(out_size);
+            // NZOPT_DUMP_DEC=<path>: one line per decision of every LZ block, so
+            // the reference's own parse can be diffed against ours (the encoder
+            // dumps the same format under the same variable). The decoder's list
+            // ACCUMULATES over the stream, so a block's own decisions are the
+            // tail after the previous block's count -- the encoder's are per
+            // block. tdo/lzcap/cmpdec.py lines the two up.
+            constexpr bool kCanRecord =
+                std::is_same_v<OptimumDecoder, nzr::optimum::NzOptimumLzDecoder>;
+            const char* const ddp = kCanRecord ? NZ_ENV("NZOPT_DUMP_DEC") : nullptr;
+            if constexpr (kCanRecord) { if (ddp != nullptr) dec.RecordDecisions(true); }
             const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
+            if constexpr (kCanRecord) if (ddp != nullptr) {
+                static int dec_blk = 0;
+                if (FILE* df = fopen(ddp, "a")) {
+                    const auto& ds = dec.LastDecisions();
+                    fprintf(df, "# block %d out_size=%u payload=%u ndec=%zu\n",
+                            dec_blk, out_size, payload_size, ds.size());
+                    for (const auto& d : ds) {
+                        if (d.is_literal) fprintf(df, "L %u\n", (unsigned)d.byte);
+                        else fprintf(df, "M %u %u %u\n", (unsigned)d.sg, d.len, d.dist);
+                    }
+                    fclose(df);
+                }
+                ++dec_blk;
+                dec.RecordDecisions(false);
+            }
             if (!decode_block_ok) {
                 // A failing block's PARTIAL output is where the interesting
                 // boundary is: its correct prefix ends exactly at the first
@@ -10958,7 +10983,7 @@ struct EncodeStatus {
 // LAST first, so with the two stages a plain LZ block has -- its payload and the
 // LZ output -- they go out as { check(LZ output), check(payload) }.
 // FUN_0808d7f0: LZ or BWT for this block? A sample of min(n >> 3, 512 KB) is
-// coded both ways -- with a FRESH LZ engine (a new coder object with a 3 MB
+// coded both ways -- with a FRESH LZ engine (a new coder object with a 1 MB
 // window, thrown away after) and with the BWT bucket coder -- and LZ is taken
 // only when it comes out strictly smaller. A sample the bucket coder cannot
 // shrink at all makes it "LZ if LZ shrank the sample", else BWT, whose stored
@@ -10968,7 +10993,13 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
     if (sample == 0u) return true;
     std::vector<std::uint8_t> lzpay;
     {
-        nzr::optimum::NzOptimumLzDecoder sampler(0x300000u);
+        // 1 MB, read out of the running binary: its ring descriptor says
+        // 0x100000 and its match finder is sized from the same number (shift 20,
+        // mask 0xfffff). The window decides the finder's tag width, so a 3 MB
+        // one -- which is the TREE's size, not the window's -- makes the chain
+        // walk confirm different entries and the sample come out a few bytes
+        // off, which is enough to flip a block from LZ to BWT.
+        nzr::optimum::NzOptimumLzDecoder sampler(0x100000u);
         if (!sampler.EncodeBlockParsed(data, sample, lzpay, nullptr)) lzpay.clear();
     }
     std::uint32_t lz = static_cast<std::uint32_t>(lzpay.size());
@@ -11114,7 +11145,22 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         // LZ-or-BWT flag it would set is left true, so the block goes LZ.
         const bool lz_kind = exe_on ? true : OptimumBlockIsLz(lz_in, m);
         if (lz_kind) {
-            if (!co.EncodeBlockParsed(lz_in, m, payload, nullptr)) return false;
+            std::vector<nzr::optimum::OptimumDecision> our_dec;
+            const char* const edp = NZ_ENV("NZOPT_DUMP_DEC");
+            if (!co.EncodeBlockParsed(lz_in, m, payload, edp ? &our_dec : nullptr)) return false;
+            if (edp != nullptr) {
+                static int enc_blk = 0;
+                if (FILE* df = fopen(edp, "a")) {
+                    fprintf(df, "# block %d out_size=%u payload=%zu ndec=%zu\n",
+                            enc_blk, m, payload.size(), our_dec.size());
+                    for (const auto& d : our_dec) {
+                        if (d.is_literal) fprintf(df, "L %u\n", (unsigned)d.byte);
+                        else fprintf(df, "M %u %u %u\n", (unsigned)d.sg, d.len, d.dist);
+                    }
+                    fclose(df);
+                }
+                ++enc_blk;
+            }
             // A block the parser cannot beat would be stored (param6 zero), which
             // this writer does not emit yet -- declining keeps a wrong archive from
             // ever reaching the disk.
@@ -11400,6 +11446,9 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
     if (codec.p0 == 5u && !codec.co) {
         codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+        // The finder has to exist before the first FeedWindow, or a leading BWT
+        // block's bytes reach the window without reaching the hash.
+        codec.co->EnableParser();
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     // The pieces of this range, in the order the reader meets them, then the

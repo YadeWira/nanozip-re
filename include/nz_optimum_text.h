@@ -63,8 +63,7 @@ constexpr std::uint32_t kCoAuxStreamBytes = 4299161u;
 // FUN_08052ec0: the entropy estimate the number step's trial compares. `before4`
 // is the four bytes preceding `buf` (nullptr = zeros) and `after` the byte past
 // its end, both of which the original reads.
-std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n, const std::uint8_t* before4,
-                                std::uint8_t after);
+std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n);
 
 // FUN_08059060 for this family: the whole chain in the original's order, with the
 // dictionary's inverse ASCII reorder (`reorder_ascii`, true for -co/-cO) and

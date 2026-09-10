@@ -317,10 +317,42 @@ have to be fed to the LZ ENGINE's window as well as the decoder's -- a BWT block
 never goes through the engine, so without that the next LZ block codes its
 matches against a window the decoder will not have.
 
+### What the match finder needs besides the tree
+
+Three pieces of the finder were missing and each of them cost whole files.
+
+**The window feed has to reach the hash.** When bytes enter the window without
+going through the LZ engine -- a BWT block's output, a stored block -- the
+original pushes them into the hash head and the 2-byte cache as well
+(`FUN_0806f530` -> `FUN_08082fa0`, the bulk insert; the binary tree is left
+alone). Our `FeedWindow` calls `FeedFinder` for exactly that, but the finder is
+several megabytes and a plain decode does not build one, so it was skipped
+whenever the parser did not exist yet -- which is the case for the FIRST block of
+a segment. `EnableParser()` builds it up front on the encoding engine.
+
+**The long-range matcher is a second index, and it was not wired up.** The bt4
+tree walk stops after 16 chain steps, so a far source is out of its reach however
+long the match would be. Beside it the original keeps one slot per 256-byte
+window position, keyed by a rolling hash of the next 256 bytes
+(`h = h * 0x104070b + b[cur+0x100] - K^256 * b[cur]`, advanced once per parsed
+position) and tagged with that hash's top ten bits; the slot is written only at
+positions that are a multiple of 256, and read before it is written, so it names
+where a similar 256-byte region was last seen. Its candidate is appended after
+the tree's and only when it is longer than everything the tree found, so the list
+stays sorted by length. Without it `FUNCLOCK.EXE` codes a literal where the
+original codes a 270-byte match at distance 1852.
+
+**The block-kind sampler's window is 1 MB, not 3 MB.** The sampler
+(`OptimumBlockIsLz`) builds a throw-away engine, and its window decides the
+finder's shift and tag width; 3 MB is the size of the TREE, not of the window.
+With the wrong one the chain walk confirms different entries and the sample comes
+out a few bytes off, which is enough to flip a block from LZ to BWT.
+
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
-files, **58 of 62** executables and DLLs and **174 of 180** mixed corpus files,
-and over all 289 of them it now declines NOTHING. Not written yet: param15 (3 of
-the 10 remaining differences), the stored LZ form, image and audio blocks, the
-multi-threaded bucket layout, and budgets above 16 MB. The other 7 are an
-LZ-engine divergence on binary data, unrelated to the block analysis.
+files, **62 of 62** executables and DLLs and **176 of 180** mixed corpus files --
+**285 of 289** -- and over all 289 of them it declines NOTHING. Not written yet:
+param15 (3 of the 4 remaining differences), the stored LZ form, image and audio
+blocks, the multi-threaded bucket layout, and budgets above 16 MB. The fourth is
+[quirk 72](ORIGINAL_QUIRKS.md): the original's parser tree is scratch another
+coder writes over between blocks, and ours is not.

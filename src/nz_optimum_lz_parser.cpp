@@ -132,9 +132,15 @@ struct NzOptimumLzDecoder::ParserState {
         treemask = ((1u << (BitLen1(tsz) + 1u)) - 1u) >> 2u;
         treesize = tsz >> 2u;
         tree.assign(treesize + 2u, 0u);
-        // FUN_08059b20 for the long-range hash: (window-1)>>6, one bit more.
-        const std::uint32_t q = (W - 1u) >> 6u;
-        const std::uint32_t bits = (q != 0u ? BitLen1(q) : 0u) + 1u;
+        // FUN_08059b20 takes a bit count and allocates 2^bits slots. Read out of
+        // the running binary at -m4m, BOTH finders -- the sampler's (window 1 MB)
+        // and the parser's (window 64 KB) -- carry mask 0x7ffff, so the table is
+        // not sized from the window at all; its bit count comes from a field of
+        // the codec object this port does not model. 2^19 is what the -co encoder
+        // runs with, and the table only decides how often two 256-byte regions
+        // collide onto one slot, so a table of the wrong size answers with far
+        // matches the original never sees.
+        const std::uint32_t bits = 19u;
         lr.assign(static_cast<std::size_t>(1u) << bits, 0u);
         lrmask = (1u << bits) - 1u;
         ready = true;
@@ -515,6 +521,11 @@ void NzOptimumLzDecoder::RefreshMatchPrices(const OptimumDecision& d, std::uint3
 // A span that fills the window (or comes within a chunk of it) is inserted as the
 // whole window from position zero; otherwise it is inserted where it landed, split
 // in two when it wrapped past the ring end.
+void NzOptimumLzDecoder::EnableParser() {
+    if (!parser_) parser_ = std::make_shared<ParserState>();
+    parser_->Init(ring_.capacity, blocksize_);
+}
+
 void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t len) {
     // Only the encoding side needs the finder, and it costs several megabytes, so
     // a plain decode does not build one. NZOPT_PARSECHK / NZOPT_RECODE turn it on
@@ -592,7 +603,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
     std::uint8_t* const mem = mem_.data();
     const std::uint32_t cap = ring_.capacity;
     const std::uint8_t* const D380 = OptimumDat08172380();
-    const std::uint8_t* const D4D0 = OptimumDat081724d0(); (void)LRO;
+    const std::uint8_t* const D4D0 = OptimumDat081724d0();
     const bool trace = (NZ_ENV("NZOPT_TRACE_PARSE") != nullptr);
 
     struct Node {
@@ -636,6 +647,16 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
         const std::uint32_t cend = pos0 + chunk;
         const std::uint32_t emitted = F.consumed;
         {
+            // The long-range hash is rebuilt from the 256 bytes at the position
+            // this flush starts from (0x0807289f: it reads the ring descriptor's
+            // own cursor, which the coder has already advanced past everything
+            // emitted so far), and then rolls forward one byte per node below.
+            {
+                std::uint32_t lrh = 0;
+                for (std::uint32_t i = 0; i < 0x100u; ++i)
+                    lrh = lrh * 0x104070bu + base[pos0 + emitted + i];
+                F.lrhash = lrh;
+            }
             const std::uint32_t remain0 = chunk - emitted;
             for (auto& n : nodes) n.tag = 0;
             nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
@@ -765,11 +786,102 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // is never taken.
                 std::vector<Cand> cands;
                 if (NZ_ENV("NZOPT_PROBES")) std::fprintf(stderr, "[PR] %u %u\n", cur - pos0, remain);
+                // NZOPT_PROBE_STATE=<n>: write the whole finder -- head, tree,
+                // 2-byte cache and the ring -- to <NZOPT_PROBE_STATE_OUT>.<name>
+                // just before the n-th Find call of the run, counting every
+                // instance (the block-kind sampler's parses included, which is
+                // how the numbering lines up with a breakpoint on the original's
+                // FUN_08073ca0). Diffing the four against the original localises
+                // a divergence to the state or to the walk.
+                if (const char* fs = NZ_ENV("NZOPT_PROBE_STATE")) {
+                    static int nstate = 0;
+                    if (++nstate == std::atoi(fs)) {
+                        auto wr = [&](const char* nm, const void* q, std::size_t nb) {
+                            char path[256];
+                            std::snprintf(path, sizeof path, "%s.%s",
+                                          NZ_ENV("NZOPT_PROBE_STATE_OUT") ? NZ_ENV("NZOPT_PROBE_STATE_OUT") : "state", nm);
+                            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(q, 1, nb, f); std::fclose(f); }
+                        };
+                        wr("head", F.head.data(), F.head.size() * 4u);
+                        wr("tree", F.tree.data(), F.tree.size() * 4u);
+                        wr("cache", F.cache.data(), F.cache.size() * 4u);
+                        wr("ring", base, ring_.storage.size());
+                        std::fprintf(stderr, "[STATE] cur=%u dumped\n", cur);
+                    }
+                }
                 F.Find(base, cur, cend, remain, cands, 0x10u);
+                // NZOPT_PROBE_AT=<offset in the block>: dump the finder's answer at
+                // exactly one position, for diffing a single divergence against the
+                // original without a trace of the whole parse. NZOPT_PROBE_AT=all
+                // dumps every position instead, as "@<ring position> cs=<the four
+                // 2-byte cache slots> <len>/<distance>...", which is the form a
+                // breakpoint on the original's FUN_08073ca0 can be made to print.
+                static const char* const probe_at = NZ_ENV("NZOPT_PROBE_AT");
+                if (probe_at != nullptr && probe_at[0] != 'a' &&
+                    (cur - pos0) == static_cast<std::uint32_t>(std::atoi(probe_at))) {
+                    std::fprintf(stderr, "[PROBE] off=%u remain=%u thr=%u n=%zu:",
+                                 cur - pos0, remain, thrv, cands.size());
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " {len=%u dist=%u}", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
                 if (trace) {
                     std::fprintf(stderr, "[C] rem=%u ni=%u n=%zu:", chunk - emitted, ni, cands.size());
                     for (const Cand& cc : cands) std::fprintf(stderr, " {src=%u len=%u}", cc.src - pos0, cc.len);
                     std::fprintf(stderr, "\n");
+                }
+                // ---- the long-range matcher (0x08072099 and 0x08072cfe). The
+                // bt4 walk above is capped at 16 chain steps, so a far source is
+                // out of its reach however long the match would be; this second
+                // index answers exactly that case. One slot per 256-byte window
+                // position, keyed by a rolling hash of the next 256 bytes and
+                // tagged with that hash's top ten bits, written only at
+                // positions that are a multiple of 256. Its candidate is
+                // appended after the tree's, and only when it is longer than
+                // everything the tree found -- the list stays sorted by length,
+                // so cands.back() is still the top.
+                {
+                    const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
+                    const std::uint32_t lidx = F.lrhash & F.lrmask;
+                    const std::uint32_t prev = F.lr[lidx];
+                    const std::uint32_t tag = F.lrhash & 0xffc00000u;
+                    if ((cur & 0xffu) == 0u) F.lr[lidx] = tag + (cur >> 8u);
+                    if ((prev & 0xffc00000u) == tag) {
+                        const std::uint32_t lsrc = (prev & 0x3fffffu) << 8u;
+                        // avail = min(winsize - src, remain), both unsigned and
+                        // left to wrap exactly as the sbb/and/add does
+                        const std::uint32_t w = F.winsize - lsrc;
+                        const std::uint32_t avail = (remain < w) ? remain : w;
+                        // the compare runs BEFORE the count is checked, so an
+                        // avail of zero still answers 1 on a matching byte
+                        std::uint32_t a = 0;
+                        for (;;) {
+                            if (base[lsrc + a] != base[cur + a]) break;
+                            ++a;
+                            if (avail <= a) break;
+                        }
+                        if (bestf < a) cands.push_back({a, lsrc});
+                    }
+                    F.lrhash = F.lrhash * 0x104070bu + base[cur + 0x100u] - LRO[base[cur]];
+                }
+                if (probe_at != nullptr && probe_at[0] == 'a') {
+                    const std::uint32_t w16 = static_cast<std::uint32_t>(base[cur]) |
+                                              (static_cast<std::uint32_t>(base[cur + 1u]) << 8u);
+                    const std::uint32_t* const csd = &F.cache[static_cast<std::size_t>(w16) * 4u];
+                    std::fprintf(stderr, "@%u cs=%u,%u,%u,%u", cur,
+                                 csd[0] & F.maskA, csd[1] & F.maskA, csd[2] & F.maskA, csd[3] & F.maskA);
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " %u/%u", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
+                if (probe_at != nullptr && probe_at[0] != 'a' &&
+                    (cur - pos0) == static_cast<std::uint32_t>(std::atoi(probe_at))) {
+                    std::fprintf(stderr, "[PROBE+LR] n=%zu top={len=%u dist=%u}\n", cands.size(),
+                                 cands.empty() ? 0u : cands.back().len,
+                                 cands.empty() ? 0u : ((cur >= cands.back().src) ? (cur - cands.back().src)
+                                                                                 : (cur + cap - cands.back().src)));
                 }
                 const std::uint32_t thr = thrv;
                 if (!cands.empty() && cands.back().len > thr) {

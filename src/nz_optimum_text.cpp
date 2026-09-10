@@ -276,21 +276,25 @@ std::uint32_t HuffmanCost(const std::uint32_t* hist, std::uint32_t* nsyms_out) {
     return static_cast<std::uint32_t>(total);
 }
 
-std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::uint8_t* before4,
-                            std::uint8_t after) {
-    // key bytes: data[i-1..i-4] with the four bytes before the chunk supplying i < 4
-    auto at = [&](std::int64_t i) -> std::uint32_t {
-        if (i < 0) return before4[4 + i];
-        if (i >= static_cast<std::int64_t>(n)) return after;
-        return d[i];
-    };
-    auto key = [&](std::uint32_t i) -> std::uint32_t {   // the LE word at buf + i = data[i-4..i-1]
-        return at(static_cast<std::int64_t>(i) - 4) | (at(static_cast<std::int64_t>(i) - 3) << 8) |
-               (at(static_cast<std::int64_t>(i) - 2) << 16) | (at(static_cast<std::int64_t>(i) - 1) << 24);
+std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n) {
+    // FUN_080522c0 + FUN_08052df0 + FUN_0805d000, and the offsets are the
+    // original's own: the caller hands a pointer, and the bytes actually
+    // measured start FOUR past it. For position p in [0, n):
+    //   sort key byte   d[p + 4]      (the counting sort's bucket)
+    //   context         d[p .. p+3]   read as one little-endian word, so the
+    //                                 byte just before the key byte is the most
+    //                                 significant -- an order-4 context sort
+    //   coded byte      d[p + 5]      the byte after the key byte
+    // So `d` is read from d[0] to d[n + 4] inclusive; the caller must have
+    // those five bytes. Nothing is substituted at either end -- the original
+    // reads whatever memory is there and the callers give it slack.
+    auto key = [&](std::uint32_t p) -> std::uint32_t {
+        return static_cast<std::uint32_t>(d[p]) | (static_cast<std::uint32_t>(d[p + 1u]) << 8) |
+               (static_cast<std::uint32_t>(d[p + 2u]) << 16) | (static_cast<std::uint32_t>(d[p + 3u]) << 24);
     };
     std::vector<std::uint16_t> sorted(n);
     std::uint32_t cnt[257] = {0};
-    for (std::uint32_t i = 0; i < n; ++i) ++cnt[d[i]];
+    for (std::uint32_t i = 0; i < n; ++i) ++cnt[d[i + 4u]];
     std::uint32_t cum[257];
     cum[0] = 0;
     for (unsigned c = 0; c < 256u; ++c) cum[c + 1u] = cum[c] + cnt[c];
@@ -298,10 +302,15 @@ std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::u
     {
         std::uint32_t fill[256];
         for (unsigned c = 0; c < 256u; ++c) fill[c] = cum[c + 1u];
-        for (std::uint32_t i = n; i-- > 0;) sorted[--fill[d[i]]] = static_cast<std::uint16_t>(i);
+        for (std::uint32_t i = n; i-- > 0;) sorted[--fill[d[i + 4u]]] = static_cast<std::uint16_t>(i);
     }
-    // FUN_080522c0's comb sort per bucket, gap sequence g = g*10/13 down to 1,
-    // finishing with the bubble passes it runs until nothing moves
+    // FUN_080522c0's comb sort per bucket, gap sequence g = g*10/13 down to 1
+    // with the 9/10 -> 11 clamp, and it sorts each bucket DESCENDING by the
+    // context word: the compare swaps when the earlier entry is the SMALLER
+    // one. Sorting them the other way round is still a group-by-context, so it
+    // leaves the rank-0 count almost unchanged and only shifts the tail of the
+    // MTF histogram -- which is why it survived until one number-transform
+    // trial came down to 133 parts in 156000.
     for (unsigned c = 0; c < 256u; ++c) {
         const std::uint32_t lo = cum[c], sz = cum[c + 1u] - lo;
         if (sz < 2u) continue;
@@ -316,7 +325,7 @@ std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::u
             }
             swapped = false;
             for (std::uint32_t i = 0; i + gap < sz; ++i) {
-                if (key(a[i + gap]) < key(a[i])) { std::swap(a[i], a[i + gap]); swapped = true; }
+                if (key(a[i]) < key(a[i + gap])) { std::swap(a[i], a[i + gap]); swapped = true; }
             }
         }
     }
@@ -325,7 +334,7 @@ std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::u
     for (unsigned i = 0; i < 256u; ++i) mtf[i] = static_cast<std::uint8_t>(i);
     std::uint32_t hist[256] = {0};
     for (std::uint32_t i = 0; i < n; ++i) {
-        const std::uint8_t b = static_cast<std::uint8_t>(at(static_cast<std::int64_t>(sorted[i]) + 1));
+        const std::uint8_t b = d[static_cast<std::uint32_t>(sorted[i]) + 5u];
         unsigned r = 0;
         while (mtf[r] != b) ++r;
         for (unsigned k = r; k > 0; --k) mtf[k] = mtf[k - 1u];
@@ -334,24 +343,21 @@ std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::u
     }
     std::uint32_t nsyms = 0;
     const std::uint32_t bits = HuffmanCost(hist, &nsyms);
+    if (std::getenv("NZOPT_TRACE_HIST")) {
+        std::fprintf(stderr, "[hist] n=%u bits=%u nsyms=%u:", n, bits, nsyms);
+        for (unsigned c = 0; c < 256u; ++c) if (hist[c]) std::fprintf(stderr, " %u:%u", c, hist[c]);
+        std::fprintf(stderr, "\n");
+    }
     return (bits >> 3) + (nsyms >> 1);
 }
 
 }  // namespace
 
-std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n, const std::uint8_t* before4,
-                                std::uint8_t after) {
+std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n) {
     std::uint32_t total = 0;
-    const std::uint8_t zeros[4] = {0, 0, 0, 0};
-    const std::uint8_t* prev = before4 ? before4 : zeros;
-    std::uint8_t prevbuf[4];
     while (n != 0u) {
         const std::uint32_t len = (n > 0x10000u) ? 0x10000u : n;
-        const std::uint8_t next = (n > len) ? buf[len] : after;
-        total += EstimateChunk(buf, len, prev, next);
-        // the next chunk's four preceding bytes are this one's last four
-        for (int i = 0; i < 4; ++i) prevbuf[i] = (len >= 4u - i) ? buf[len - 4u + i] : prev[i];
-        prev = prevbuf;
+        total += EstimateChunk(buf, len);
         buf += len;
         n -= len;
     }
@@ -398,10 +404,13 @@ std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32
         const std::uint32_t t = NzTextTransformNumberEncode(buf + half, len, tmp, len, &side, kCoAuxStreamBytes);
         bool go = (t == 0u);
         if (!go) {
-            const std::uint32_t est_in = CoEntropyEstimate(buf + half, len, buf + half - 4, (half + len < n) ? buf[half + len] : 0u);
-            const std::uint32_t est_out = CoEntropyEstimate(tmp, t, nullptr, 0u);
+            const std::uint32_t est_in = CoEntropyEstimate(buf + half, len);
+            const std::uint32_t est_out = CoEntropyEstimate(tmp, t);
             const std::uint32_t aux = static_cast<std::uint32_t>(side.size());
             go = ((est_out + aux) * 0x20u < est_in * 0x21u) || (est_out <= est_in && aux < 0x200u);
+            if (std::getenv("NZOPT_TRACE_TDO"))
+                std::fprintf(stderr, "[tdo] num n=%u half=%u len=%u t=%u est_in=%u est_out=%u aux=%u go=%d\n",
+                             n, half, len, t, est_in, est_out, aux, (int)go);
         }
         if (go) {
             const std::uint32_t r = NzTextTransformNumberEncode(buf, n, tmp, n, &side, kCoAuxStreamBytes);
