@@ -194,9 +194,43 @@ Everything above is ported and the writer uses it:
 - FUN_0808d7f0 then picks LZ or BWT for the block on a min(n >> 3, 512 KB)
   sample coded both ways with a fresh LZ engine, LZ only when strictly smaller.
 
+## The two post-filters that run when no text transform applied
+
+When the block took no text transform the driver attempts, in this order,
+**param1** (FUN_0806e7a0) and then **param2** (FUN_0808ff20). The block header
+carries them the other way round -- param2's flag and side stream first -- which
+is also the order the decoder undoes them in, so the naming inverts between the
+writer and the reader.
+
+- **param2** is the u32 run collapse (`NzPostfilterParam2Encode`): six or more
+  equal 32-bit words open a run, the run lengths go to an arithmetic-coded side
+  stream and the sub-word tail is copied verbatim. Accepted only when
+  `side + out < n - min(n >> 7, 0x800)`.
+- **param1** is the encoder of `AddBytesFilter`, our decoder's delta filter
+  (`NzOptimumParam1Encode`, `src/nz_optimum_param1.cpp`). It walks the block
+  keeping three distinct-count models over a 512-entry window -- the raw bytes
+  and the bytes delta-coded against two candidate offsets, each hashed to a
+  9-bit context -- and every 100 qualifying bytes it re-evaluates. Candidate
+  offsets are proposed from a 1024-entry ring of recent same-byte distances
+  (1..255); the offset a mode is using is never replaced while it is in use.
+  When a delta model stops beating the raw one the run is turned into a region:
+  a 256-byte window slid backwards over it picks the position where the delta
+  alphabet is smallest (FUN_0806e690), the region is grown backwards and
+  forwards for as long as the delta stays profitable (FUN_0806e3c0), and it is
+  kept only if **three independent tests agree** -- the delta alphabet is at
+  least ~14 % smaller, an order-2 LZP scored through Huffman code lengths is
+  cheaper on the delta, and a positional sort plus MTF run-length entropy is
+  cheaper too -- and, for offsets above 0x13, only if the region is not mostly
+  exact repeats at that offset (which the LZ pass would code better). Accepted
+  regions are written as `(offset, start, length - 8)` triples into a bit stream
+  read back by `AddBytesFilter::DecodeOne`, terminated by a zero offset. The
+  whole filter is kept only when the side stream stayed under half its 0x1000
+  budget, at least one region was emitted, and (over 0x3ff bytes) the filtered
+  block has fewer distinct order-2.5 contexts than the original.
+  See [quirks 61-63](ORIGINAL_QUIRKS.md) for what it measures wrong.
+
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
-oracle inputs (three of them BWT blocks) and on 38 of 47 corpus XML/HTML/SVG
-files. Not written yet: the exe filter path, image and audio blocks, the param2
-and param1 attempts and the param14/param15 passes that run when no text
-transform applied, the stored form of a block nothing shrinks, the multi-threaded
-bucket layout, and budgets above 16 MB.
+oracle inputs (three of them BWT blocks) and on **47 of 47** corpus XML/HTML/SVG
+files. Not written yet: the exe filter path, image and audio blocks, the
+param14/param15 passes, the stored form of a block nothing shrinks, the
+multi-threaded bucket layout, and budgets above 16 MB.

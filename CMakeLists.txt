@@ -18,6 +18,7 @@ set(RECON_SOURCES
     src/nz_lzhd_text.cpp
     src/nz_optimum_text.cpp
     src/nz_optimum_seg.cpp
+    src/nz_optimum_param1.cpp
     src/nz_lzhds_encoder.cpp
     src/nz_cm.cpp
     src/nz_cd_tokens.cpp
@@ -129,3 +130,11 @@ add_executable(test_co_texttransform
 )
 target_include_directories(test_co_texttransform PRIVATE include)
 target_link_libraries(test_co_texttransform PRIVATE Threads::Threads)
+
+# param1 (the -co AddBytes delta filter): encoder <-> decoder round trip.
+add_executable(test_co_param1
+    tests/test_co_param1.cpp
+    ${RECON_SOURCES_NO_MAIN}
+)
+target_include_directories(test_co_param1 PRIVATE include)
+target_link_libraries(test_co_param1 PRIVATE Threads::Threads)
