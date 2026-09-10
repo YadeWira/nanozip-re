@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -172,6 +173,40 @@ struct Two {
         for (size_t j = 0; j != 8; ++j) recent_numbers_[j].Initialize();
     }
 };
+
+// The range ENCODER the forward pass drives, the mirror of ArithDec: the same
+// 12-bit split of the interval, the same carry-less renormalisation, the top
+// byte leaving as soon as both bounds agree on it. Bytes go to the block's aux
+// stream; past `cap` they are dropped and the pass declines at the end.
+struct ArithEnc {
+    u32 lo = 0, hi = 0xffffffffu;
+    std::vector<u8>* side = nullptr;
+    u32 cap = 0;
+    void Put(u8 b) { if (side->size() < cap) side->push_back(b); }
+    void Encode(bool bit, u32 model) {   // `model` is the 16-bit interpolation
+        const u32 mid = lo + ((hi - lo) >> 12) * (model >> 4);
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) { Put((u8)(hi >> 24)); hi = (hi << 8) | 0xffu; lo <<= 8; }
+    }
+    void Flush() { Put((u8)(hi >> 24)); }
+};
+
+// DAT_081b2f60, the encoder-only class table FUN_080b8300 builds at run time
+// (dumped from the original): the hex letters by case, and the three joiners a
+// decimal number may run across.
+static const u8* HexClass() {
+    static u8 t[256];
+    static bool built = false;
+    if (!built) {
+        memset(t, 0, sizeof(t));
+        for (int c = 'A'; c <= 'F'; ++c) t[c] = 1;
+        for (int c = 'a'; c <= 'f'; ++c) t[c] = 2;
+        t[(u8)'-'] = t[(u8)'.'] = t[(u8)':'] = 4;
+        built = true;
+    }
+    return t;
+}
+static inline bool IsDigit(u32 b) { return (u32)(b - '0') <= 9u; }
 
 struct TextTransformNumber {
     ArithDec adec_;
@@ -377,6 +412,255 @@ struct TextTransformNumber {
         return true;
     }
 
+    // ------------------------------------------------------------------ forward
+    // FUN_08058580 and its two coders, FUN_08056c20 (decimal) and FUN_08057800
+    // (hexadecimal), over the same models as Decode_1 and Decode_0: every
+    // context, probability and update is the decoder's, only the bit is known
+    // instead of read. The pass is size-preserving: a decimal digit becomes '0',
+    // each character of a hexadecimal run becomes '1' (lowercase) or '2'
+    // (uppercase), and everything else is copied. All the information goes to
+    // the side stream.
+    ArithEnc enc_;
+
+    // FUN_08056b00: is the digit at p[-1] part of a hexadecimal run? Looks back
+    // over at most seven hex letters (never before `lower`, the start of the
+    // current copied segment) and forward over digits and letters. A run needs
+    // at least four characters, at least one letter, a single case, and at most
+    // eight characters -- a ninth ends the matter with 0, not with a cut.
+    // Returns (letters before the digit) << 8 | run length * 2 | (1 if uppercase).
+    static u32 HexRun(const u8* p, const u8* lower, const u8* end) {
+        const u8* hc = HexClass();
+        u32 back = 0;
+        const u8* q = p - 2;
+        if (lower <= q && (hc[*q] & 3u)) {
+            const u8* lim = p - 9;
+            if (lim < lower) lim = lower;
+            do { --q; ++back; if (q < lim) break; } while (hc[*q] & 3u);
+        }
+        const u8* start = q + 1;
+        if (!(start < end)) return 0;
+        u32 len = 0, cls = 0;
+        bool letter = false;
+        for (;;) {
+            const u32 b = start[len];
+            if (!IsDigit(b)) {
+                if ((hc[b] & 3u) == 0u) break;
+                if (len == 8u) return 0;
+                ++len; cls |= hc[b] & 3u; letter = true;
+                if (end <= start + len) break;
+                continue;
+            }
+            if (len == 8u) return 0;
+            ++len;
+            if (!(start + len < end)) break;
+        }
+        if (!letter || len < 4u) return 0;
+        if (cls == 3u) return 0;
+        return (cls & 1u) + len * 2u + back * 0x100u;
+    }
+
+    // FUN_08057800: the hexadecimal run starting at *in_ptr.
+    void Encode_0(u8** out_ptr, const u8** in_ptr, const u8* in_end, u8 marker) {
+        const u8* hc = HexClass();
+        const u8* in = *in_ptr;
+        u8* out = *out_ptr;
+        u32 nd = 0, value = 0;
+        while (in < in_end) {
+            const u32 b = *in++;
+            if (IsDigit(b)) { *out++ = marker; value = value * 16u + (b - '0'); ++nd; }
+            else if (hc[b] & 3u) { *out++ = marker; value = value * 16u + ((b - 'A' < 26u) ? b - 0x37u : b - 0x57u); ++nd; }
+            else { *out++ = (u8)b; break; }   // the byte that ends the run is copied here
+        }
+        *in_ptr = in;
+        const u32 slot = nd - 1u;
+        u32 idx = 0;
+        while (idx != 0x40u && two_.recent_numbers_[slot].recent[idx] != value) ++idx;
+        const bool notfound = (idx == 0x40u);
+        u16* m = &two_.recent_or_num_model_[slot];
+        enc_.Encode(notfound, *m);
+        *m = (u16)(*m + ((((u32)notfound << 16) + 8u - *m) >> 4));
+        if (!notfound) {
+            two_.recent_numbers_[slot].Get(idx);          // move to the front, as the decoder will
+            u32 node = 1;
+            for (int k = 5; k >= 0; --k) {
+                const u32 bit = (idx >> k) & 1u;
+                u16* rm = &two_.recent_model_[node];
+                enc_.Encode(bit != 0u, *rm);
+                *rm = (u16)(*rm + ((bit * 65536u + 8u - *rm) >> 4));
+                node = node * 2u + bit;
+            }
+            *out_ptr = out;
+            return;
+        }
+        two_.recent_numbers_[slot].Insert(value);
+        u32 number_low = 1;
+        u16* big = &two_.big_number_model_[slot * 32u + 4u * nd - 1u];
+        for (int k = (int)(nd * 4u) - 1; k >= 0; --k, --big) {
+            const u32 bit = (value >> k) & 1u;
+            u32 v; u8* small = nullptr;
+            if (number_low >= 0x1000u) v = *big;
+            else { small = &two_.small_number_model_[slot * 4096u + number_low]; v = (u32)(*small) << 8; }
+            u16* inner;
+            const u32 pr = two_.number_model_.Get(v, (u32)k, &inner);
+            enc_.Encode(bit != 0u, pr);
+            *inner = (u16)(*inner + ((bit * 0x1007eu - *inner) >> 7));
+            if (number_low >= 0x1000u) *big = (u16)(*big + ((8u - *big + bit * 65536u) >> 4));
+            else { *small = (u8)(*small + ((4u - *small + bit * 256u) >> 3)); number_low = number_low * 2u + bit; }
+        }
+        *out_ptr = out;
+    }
+
+    // FUN_08056c20: the decimal number whose first digit is `digit`, *in_ptr
+    // just past it. Digits are gathered across '-', '.' and ':' into one value
+    // of up to nine digits, and predicted from the context of the byte before
+    // and the byte after; a wrong or unscored prediction codes the number by
+    // recency or by binary search over its digit-count range.
+    void Encode_1(u8** out_ptr, const u8** in_ptr, const u8* in_end, u32 digit) {
+        const u8* hc = HexClass();
+        const u8* in = *in_ptr;
+        u8* out = *out_ptr;
+        u32 prev = in[-2];
+        if (prev == ' ') prev = in[-3];
+        u32 nz = 0, value = digit - '0', last = digit;
+        *out++ = '0';
+        while (in < in_end) {
+            const u32 b = *in++;
+            last = b;
+            if (IsDigit(b)) { ++nz; *out++ = '0'; value = (b - '0') + value * 10u; if (nz == 8u) break; }
+            else { *out++ = (u8)b; if ((hc[b] & 4u) == 0u) break; }
+        }
+        *in_ptr = in;
+        u32 d = last;
+        if (d == ' ' && in < in_end) d = *in;
+        if (IsDigit(d) || (hc[d] & 3u)) d = '1';
+        const u32 hash8 = kDecpDigitHash[d] + (kDecpDigitHash[prev] << 4);
+        const u32 hash10 = (d ^ (8u * prev)) & 0x3ffu;
+        One::Hash& ctx = one_.digit_context_hash_[hash10 * 8u + nz];
+        const u32 score = ctx.score;
+        const i32 delta = ctx.delta;
+        const u32 pred = ctx.pred + (u32)delta;
+        const bool predicted = (value == pred);
+        const u32 is_predicted = predicted ? 1u : 0u;
+        if (score != 0u) {
+            u32 ba = (u32)std::abs(delta);
+            if (ba > 1u) ba = 2u + ((ba - 2u) ? BSR(ba - 2u) : 0u);
+            const u32 min7 = std::min<u32>((delta < 0) + 2u * ba, 7u);
+            const u32 min3 = std::min<u32>(min7, 3u);
+            u32 vb = score - 1u;
+            if (vb > 7u) vb = kDecpCompactTable[vb] + 8u;
+            const u32 d_idx = min3 + (vb << 2) + (hash8 << 6) + (nz << 14);
+            const u32 d_value = Get4bit(one_.model_d_, d_idx);
+            u16 *c_ptr = &one_.model_c_[d_value], *b_ptr, *a_ptr;
+            const u32 b_value = one_.model_b_.Get(*c_ptr, min7, &b_ptr);
+            const u32 a_value = one_.model_a_.Get(b_value, min3 + vb * 4u + nz * 64u, &a_ptr);
+            enc_.Encode(predicted, a_value);
+            *a_ptr = (u16)(*a_ptr + ((is_predicted * 0x1001eu - *a_ptr) >> 5));
+            *b_ptr = (u16)(*b_ptr + ((is_predicted * 0x10006u - *b_ptr) >> 3));
+            *c_ptr = (u16)(*c_ptr + ((is_predicted * 0x10000u - *c_ptr + 32u) >> 6));
+            one_.model_d_[d_idx >> 1] = (u8)(one_.model_d_[d_idx >> 1]
+                - (i32)((u32)(-(i32)(((u32)0x10 * is_predicted - d_value) >> 1)) << (4 * (d_idx & 1))));
+        }
+        if (!predicted || score == 0u) {
+            u32 upper = kDigitMultipliers[nz];
+            bool coded = false;
+            if (nz >= 4u) {
+                u32 idx = 0;
+                while (idx != 0x80u && one_.recent_numbers_[nz - 4u].recent[idx] != value) ++idx;
+                const bool notfound = (idx == 0x80u);
+                u16* me = &one_.model_e_[hash8 + nz * 256u];
+                enc_.Encode(notfound, *me);
+                *me = (u16)(*me + ((((u32)notfound << 16) + 8u - *me) >> 4));
+                if (!notfound) {
+                    one_.recent_numbers_[nz - 4u].Get(idx);
+                    u32 node = 1;
+                    for (int k = 6; k >= 0; --k) {
+                        const u32 bit = (idx >> k) & 1u;
+                        u16* fm = &one_.model_f_[node];
+                        enc_.Encode(bit != 0u, *fm);
+                        *fm = (u16)(*fm + ((bit * 65536u + 8u - *fm) >> 4));
+                        node = node * 2u + bit;
+                    }
+                    coded = true;
+                } else {
+                    one_.recent_numbers_[nz - 4u].Insert(value);
+                }
+            }
+            if (!coded) {
+                u32 number_low = 1, lower = 0, ii = 0, mid;
+                const u32 mj_upper = ((hash8 & 1u) + 8u * nz + ((hash8 >> 3) & 6u)) * 8192u;
+                while ((mid = (lower + upper) >> 1) > lower) {
+                    u16* mp; u32 mjv = 0;
+                    if (number_low >= 0x2000u) mp = &one_.model_big_[ii - 13u + 19u * nz];
+                    else { mjv = Get4bit(one_.model_j_, mj_upper + number_low); mp = &one_.model_small_[mjv]; }
+                    u16 *hp, *gp;
+                    u32 v = one_.model_h_.Get(*mp, hash8 * 32u + ii, &hp);
+                    v = one_.model_g_.Get(v, nz * 32u + ii, &gp);
+                    const u32 bit = (value < mid) ? 1u : 0u;
+                    enc_.Encode(bit != 0u, v);
+                    *gp = (u16)(*gp + ((0x1003Eu * bit - *gp) >> 6));
+                    *hp = (u16)(*hp + ((0x1003Eu * bit - *hp) >> 6));
+                    if (number_low >= 0x2000u) {
+                        *mp = (u16)(*mp + ((0x10000u * bit - *mp + 8u) >> 4));
+                    } else {
+                        *mp = (u16)(*mp + ((0x10000u * bit - *mp + 32u) >> 6));
+                        const u32 mj_idx = mj_upper + number_low;
+                        one_.model_j_[mj_idx >> 1] = (u8)(one_.model_j_[mj_idx >> 1]
+                            - (i32)((u32)(-(i32)((22u * bit - mjv) >> 3)) << (4 * (mj_idx & 1))));
+                        number_low = number_low * 2u + bit;
+                    }
+                    if (!bit) lower = mid; else upper = mid;
+                    ++ii;
+                }
+            }
+        }
+        if (score == 0u) ctx.delta = (i8)(value - ctx.pred);
+        ctx.pred = value;
+        ctx.score = (u8)((predicted || score == 0u) ? score + (is_predicted & (score < 255u)) : score >> 1);
+        *out_ptr = out;
+    }
+
+    // FUN_08058580. `side_cap` is the room the aux stream has; the original's
+    // writer stops at half of it, and the pass declines unless it wrote more
+    // than four bytes and stayed under that half.
+    u32 Encode(const u8* in, u32 n, u8* out, u32 out_cap, std::vector<u8>* side, u32 side_cap) {
+        if (n <= 9u || out_cap < n || side == nullptr) return 0;
+        one_.Initialize();
+        two_.Initialize();
+        side->clear();
+        enc_ = ArithEnc();
+        enc_.side = side;
+        enc_.cap = side_cap >> 1;
+        const u8* p = in;
+        const u8* const end = in + n;
+        u8* o = out;
+        o[0] = p[0]; o[1] = p[1];
+        p += 2; o += 2;
+        const u8* seg = p;                       // where the current copied run began
+        while (p < end) {
+            u32 b;
+            for (;;) {
+                b = *p++;
+                if (IsDigit(b)) break;
+                *o++ = (u8)b;
+                if (end <= p) goto finish;
+            }
+            const u32 r = HexRun(p, seg, end);
+            if (r == 0u) {
+                Encode_1(&o, &p, end, b);
+            } else {
+                const u32 back = r >> 8;
+                p = p - 1 - back;                // the run starts at its first letter
+                o -= back;                       // whose copies are replaced by markers
+                Encode_0(&o, &p, end, (r & 1u) ? (u8)'2' : (u8)'1');
+            }
+            seg = p;
+        }
+    finish:
+        enc_.Flush();
+        if (!(side->size() < enc_.cap && side->size() > 4u)) return 0;
+        return (u32)(o - out);
+    }
+
     u32 Decode(const u8* in_ptr, u32 in_size, u8* out_ptr, u8* out_limit) {
         if (in_size <= 9) return 0;
         out_end_ = out_limit;
@@ -405,6 +689,16 @@ struct TextTransformNumber {
 };
 
 }  // namespace
+
+uint32_t NzTextTransformNumberEncode(const uint8_t* in, uint32_t in_size,
+                                     uint8_t* out, uint32_t out_cap,
+                                     std::vector<uint8_t>* side, uint32_t side_cap) {
+    TextTransformNumber* t = new (std::nothrow) TextTransformNumber();
+    if (!t) return 0;
+    uint32_t n = t->Encode(in, in_size, out, out_cap, side, side_cap);
+    delete t;
+    return n;
+}
 
 uint32_t NzTextTransformNumber(const uint8_t* side, uint32_t side_len,
                                const uint8_t* in, uint32_t in_size,
