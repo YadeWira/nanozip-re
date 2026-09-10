@@ -194,6 +194,43 @@ Everything above is ported and the writer uses it:
 - FUN_0808d7f0 then picks LZ or BWT for the block on a min(n >> 3, 512 KB)
   sample coded both ways with a fresh LZ engine, LZ only when strictly smaller.
 
+## dece, the exe filter (the first thing the analysis tries)
+
+Before the text detector runs at all, FUN_0808da10 scores the block with the
+same exe metric the lzpf family uses (`ExeMetric(block) / ((n >> 12) + 1)`) and,
+when it is non-zero, hands the block to **dece** (FUN_08090360) -- the encoder
+of `NzExeFilter`, our decoder's x86 CALL/JMP un-relativiser.
+
+It walks the block and at every `e8` (CALL), `e9` (JMP) and `0f 8x` (Jcc) whose
+32-bit displacement fits in 25 bits it computes the absolute-ish target
+`displacement + run-relative position of the displacement field`, then codes a
+decision instead of the four displacement bytes:
+
+- **mode 0** -- leave the instruction alone (the displacement is too large, or
+  the instruction does not fit in the block);
+- **mode 1** -- the target is in a recent-target cache: 3 entries for calls, 256
+  for jumps, both move-to-front. The slot index is arithmetic-coded;
+- **mode 2** -- a new target: for a jump the displacement goes through an
+  offset model, for a call the target goes raw (4 big-endian bytes) into a side
+  area.
+
+A transformed CALL also swallows a following `83 c4 xx` (`add esp, imm8`), whose
+immediate goes to a second side area -- one byte per transformed call, zero when
+there was no add-esp. The block therefore comes out SMALLER (4 bytes per
+transformed instruction, 3 more per add-esp), and the two side areas are
+appended to it in that order, which is exactly what the decoder's
+`in_end -= num_call_offs * 4 + num_call` expects. The block's `dece` field
+carries the arithmetic stream plus the two counts as varints the decoder reads
+backwards off its tail.
+
+The recent-target caches and the base persist across a RUN of consecutive
+filtered blocks and reset as soon as a block goes unfiltered -- the same state
+rule the decoder documents, driven here by FUN_080b98a0 / FUN_080b98e0 on the
+codec object's own state. When the filter is kept, the analysis skips the text
+detector entirely and the block goes down the LZ path (FUN_0808d7f0 is never
+called on a filtered block and its LZ-or-BWT flag is left true), but param1 and
+param2 are still attempted. See [quirks 64-66](ORIGINAL_QUIRKS.md).
+
 ## The two post-filters that run when no text transform applied
 
 When the block took no text transform the driver attempts, in this order,
@@ -230,7 +267,9 @@ writer and the reader.
   See [quirks 61-63](ORIGINAL_QUIRKS.md) for what it measures wrong.
 
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
-oracle inputs (three of them BWT blocks) and on **47 of 47** corpus XML/HTML/SVG
-files. Not written yet: the exe filter path, image and audio blocks, the
-param14/param15 passes, the stored form of a block nothing shrinks, the
-multi-threaded bucket layout, and budgets above 16 MB.
+oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
+files and on **51 of 62** executables and DLLs. Not written yet: image and audio
+blocks, the param14/param15 passes (four of the eleven remaining executables),
+the stored form of a block nothing shrinks (two more), the multi-threaded bucket
+layout, and budgets above 16 MB. The last two executables are an LZ-engine
+divergence on binary data, unrelated to the block analysis.

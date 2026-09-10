@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 // dece post-filter: x86 CALL/JMP address un-relativiser, ported from the
 // community reference decoder (nzdec_v0 NZ_x86.cpp, ExeFilter).
@@ -59,4 +60,52 @@ class NzExeFilter {
  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// The ENCODER of the same filter: `dece` of the -co family's compressor
+// (reference FUN_08090360, called from the block analysis FUN_0808da10 when
+// the exe metric fires).
+//
+// It walks the block and, at every CALL (0xe8), JMP (0xe9) and Jcc
+// (0x0f 0x8x) whose 32-bit displacement fits in 25 bits, replaces the
+// displacement with an arithmetic-coded decision: the target is either in a
+// recent-target cache (a slot index) or new (written raw to a side area). The
+// displacement bytes leave the payload, which is why the filtered block is
+// SMALLER than the input and the decoder's output grows.
+//
+// Output layout, exactly what NzExeFilter::Decode expects:
+//     [filtered instruction bytes][one add-esp byte per transformed call]
+//     [4 big-endian bytes per NEW call target]
+// and `side` gets the arithmetic stream followed by two varints (the two
+// counts, which the decoder reads backwards off the tail).
+//
+// STATE LIFETIME: same rule as the decoder. One instance per stream, Encode()
+// per block; Advance(n) with the block's UNFILTERED size after a block the
+// filter was kept on, Reset() on any block it was not.
+class NzExeFilterEnc {
+ public:
+    NzExeFilterEnc();
+    ~NzExeFilterEnc();
+
+    NzExeFilterEnc(const NzExeFilterEnc&) = delete;
+    NzExeFilterEnc& operator=(const NzExeFilterEnc&) = delete;
+
+    // The reference's side-stream budget for this filter: a fixed 0x108001
+    // bytes of which only the first half may be written (measured at
+    // FUN_08090360's descriptor, identical at every -m).
+    static const std::uint32_t kSideCap = 0x108001u;
+
+    void Reset();                       // FUN_080b98a0
+    void Advance(std::uint32_t n);      // FUN_080b98e0: base = (base + n) & 0x7fffff
+
+    // Returns the filtered length, or 0 when the reference would decline.
+    // `out` and `side` are cleared and filled; `in` must not be `out`.
+    std::uint32_t Encode(const std::uint8_t* in, std::uint32_t n,
+                         std::vector<std::uint8_t>* out,
+                         std::vector<std::uint8_t>* side);
+
+ private:
+    struct EncImpl;
+    std::unique_ptr<EncImpl> impl_;
 };

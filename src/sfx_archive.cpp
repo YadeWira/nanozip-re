@@ -11001,6 +11001,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         out.insert(out.end(), seg.begin(), seg.end());
         seg.clear();
     };
+    // The dece filter's run state: the recent-target caches and the base
+    // persist across a RUN of consecutive filtered blocks and reset as soon as
+    // a block goes unfiltered (reference FUN_080b98a0 / FUN_080b98e0 on the
+    // codec object's own state at obj+0x90).
+    NzExeFilterEnc exe_enc;
     std::uint32_t off = 0;
     while (off < len) {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
@@ -11010,19 +11015,38 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         // stays whole.
         const std::uint32_t n = nzr::opt_enc::CoBlockLength(src, len - off, block_size);
 
-        // FUN_0808da10's block analysis. The exe filter and the image and audio
-        // blocks are not written yet, so a block that would take one of those
-        // paths declines instead of coming out wrong; the text path is complete:
-        // the detector asks for a mask, the trial gate codes a sample before and
-        // after to decide, and the pipeline transforms the block, whose LZ
-        // payload then codes the TRANSFORMED bytes.
-        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) return false;
+        // FUN_0808da10's block analysis. The image and audio blocks are not
+        // written yet, so a block that would take one of those paths declines
+        // instead of coming out wrong; the exe and text paths are complete.
+        //
+        // dece (the exe filter, FUN_08090360) comes FIRST and, when it is kept,
+        // the analysis skips the text detector entirely and the block goes down
+        // the LZ path (the reference never calls FUN_0808d7f0 on a filtered
+        // block, and its LZ-or-BWT flag is left true).
+        std::vector<std::uint8_t> exe_buf, exe_side;
+        bool exe_on = false;
+        const std::uint8_t* exe_out = src;
+        std::uint32_t exe_len = n;
+        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) {
+            const std::uint32_t r = exe_enc.Encode(src, n, &exe_buf, &exe_side);
+            if (r != 0u) {
+                exe_on = true;
+                exe_out = exe_buf.data();
+                exe_len = r;
+                exe_enc.Advance(n);
+            } else {
+                exe_enc.Reset();
+            }
+        } else {
+            exe_enc.Reset();
+        }
+
         std::vector<std::uint8_t> tbuf, tmp, tt2, tt16, scratch(n + 0x2000u, 0);
         std::uint8_t applied = 0;
         bool tt_on = false;
-        const std::uint8_t* lz_in = src;
-        std::uint32_t m = n;
-        {
+        const std::uint8_t* lz_in = exe_out;
+        std::uint32_t m = exe_len;
+        if (!exe_on) {
             bool route = false;
             const std::uint32_t mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), false, &route);
             if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, true, false)) {
@@ -11075,7 +11099,9 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         }
 
         std::vector<std::uint8_t> payload;
-        const bool lz_kind = OptimumBlockIsLz(lz_in, m);
+        // A dece block never reaches FUN_0808d7f0 in the reference: the
+        // LZ-or-BWT flag it would set is left true, so the block goes LZ.
+        const bool lz_kind = exe_on ? true : OptimumBlockIsLz(lz_in, m);
         if (lz_kind) {
             if (!co.EncodeBlockParsed(lz_in, m, payload, nullptr)) return false;
             // A block the parser cannot beat would be stored (param6 zero), which
@@ -11090,8 +11116,9 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             // The staged check bytes, one per stage the decoder passes through and
             // popped last-first: with a text transform the stages are the payload,
             // the LZ output and the text, so the text's check goes first.
-            seg.push_back(static_cast<unsigned char>(2u + (tt_on ? 1u : 0u) +
+            seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
                                                      (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
             if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
             if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
             if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
@@ -11141,7 +11168,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             nzr::opt_enc::CoSideStreamBytes(applied, tt2, tt16, &side);   // LEB128 length + bytes, tt2 then tt16
             seg.insert(seg.end(), side.begin(), side.end());
         }
-        seg.push_back(0u);                       // dece
+        seg.push_back(static_cast<unsigned char>(exe_on ? 1u : 0u));
+        if (exe_on) {
+            put32(static_cast<std::uint32_t>(exe_side.size()));
+            seg.insert(seg.end(), exe_side.begin(), exe_side.end());
+        }
         flush_block();
         off += n;
     }

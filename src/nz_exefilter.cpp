@@ -50,6 +50,33 @@ struct ArithDec {
     bool Read(uint32_t model) { return ReadNoShift(model >> 4); }
 };
 
+// The encoder side of the same range coder (reference: the inlined coder in
+// FUN_08090c00 / FUN_08090de0 / FUN_08091100). `end` is the descriptor's limit
+// (base + cap/2); past it the reference keeps coding and drops the bytes.
+struct ArithEnc {
+    uint32_t lo = 0, hi = 0xffffffffu;
+    uint8_t* cur = nullptr;
+    uint8_t* end = nullptr;
+    void Put(uint8_t b) { if (cur < end) *cur++ = b; }
+    void Encode(bool bit, uint32_t p12) {
+        const uint32_t mid = lo + ((hi - lo) >> 12) * p12;
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) { Put((uint8_t)(hi >> 24)); hi = (hi << 8) | 0xffu; lo <<= 8; }
+    }
+    void EncodeModel(bool bit, uint32_t model16) { Encode(bit, model16 >> 4); }
+    void Flush() { Put((uint8_t)(hi >> 24)); }
+};
+
+// FUN_080b1e70, the varint the decoder's ReadBackwardsVarint undoes: the FIRST
+// byte carries the low 7 bits with 0x80 set, the rest the higher bits without.
+static void PutBackwardsVarint(std::vector<uint8_t>* out, uint32_t v) {
+    if (v < 0x80u) { out->push_back((uint8_t)(v | 0x80u)); return; }
+    out->push_back((uint8_t)((v & 0x7fu) | 0x80u));
+    v >>= 7;
+    while (v >= 0x80u) { out->push_back((uint8_t)(v & 0x7fu)); v >>= 7; }
+    out->push_back((uint8_t)v);
+}
+
 // BackwardsByteStream (nz.h): the two counts sit at the tail of the side
 // stream and are read backwards; whatever is left in front is the arith stream.
 struct BackwardsByteStream {
@@ -120,6 +147,27 @@ struct ExeModeModel {
         history_ = (history_ + count) & 0xFu;
         return count;
     }
+
+    // FUN_08090c00, the inverse of Get: the flag is "the value is not reached
+    // yet", so 0 costs one bit, 1 two and 2 two.
+    void Put(ArithEnc* aenc, uint32_t context, uint32_t value) {
+        history_ *= 4u;
+        uint32_t count = 0;
+        for (;;) {
+            uint16_t* model_a_ptr = &model_a_[4u * context + count];
+            uint16_t* model_b_ptr = nullptr;
+            const uint32_t b_value =
+                ExeInterpolateModel<8>(model_b_, *model_a_ptr, history_ + count, &model_b_ptr);
+            const bool flag = (value != count);
+            aenc->Encode(flag, b_value);
+            *model_a_ptr = (uint16_t)(*model_a_ptr +
+                ((((uint32_t)flag * 0x10000u) + 8u - *model_a_ptr) >> 4));
+            *model_b_ptr = (uint16_t)(*model_b_ptr +
+                ((((uint32_t)flag * 0x1000eu) - *model_b_ptr) >> 4));
+            if (!flag || ++count == 2u) break;
+        }
+        history_ = (history_ + value) & 0xFu;
+    }
 };
 
 struct ExeOffsetModel {
@@ -173,6 +221,47 @@ struct ExeOffsetModel {
         *out_value = isign ^ result;
         return true;
     }
+
+    // FUN_08090de0. The reference stops the bit-count unary at 30 where the
+    // decoder's loop would still read a flag at 30 -- unreachable, since the
+    // caller only offers displacements that fit in 25 bits (bsr <= 23).
+    void Put(ArithEnc* aenc, uint32_t type, uint32_t value) {
+        const uint32_t isign = (uint32_t)((int32_t)value >> 31);
+        const bool sign = (isign != 0u);
+        uint16_t* model_c_ptr = &model_c_[type];
+        aenc->EncodeModel(sign, *model_c_ptr);
+        *model_c_ptr = (uint16_t)(*model_c_ptr +
+            ((((uint32_t)sign * 0x10000u) + 8u - *model_c_ptr) >> 4));
+
+        const uint32_t mag = isign ^ value;
+        uint32_t nbits = 0xffffffffu;
+        uint32_t rest = mag;
+        for (;;) {
+            ++nbits;
+            if (nbits == 30u) break;
+            uint16_t* model_a_ptr = &model_a_[nbits];
+            rest >>= 1;
+            const bool flag = (rest != 0u);
+            aenc->EncodeModel(flag, *model_a_ptr);
+            *model_a_ptr = (uint16_t)(*model_a_ptr +
+                ((((uint32_t)flag * 0x10000u) + 4u - *model_a_ptr) >> 3));
+            if (!flag) break;
+        }
+
+        const uint32_t count = nbits + (nbits == 0u ? 1u : 0u);
+        const uint32_t model_base = 62u * nbits;
+        uint32_t bits = mag << ((32u - count) & 31u);
+        uint32_t last = isign & 1u;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint16_t* model_b_ptr = &model_b_[model_base + last + i * 2u];
+            const bool flag = ((int32_t)bits < 0);
+            bits <<= 1;
+            aenc->EncodeModel(flag, *model_b_ptr);
+            *model_b_ptr = (uint16_t)(*model_b_ptr +
+                ((((uint32_t)flag * 0x10000u) + 8u - *model_b_ptr) >> 4));
+            last = flag ? 1u : 0u;
+        }
+    }
 };
 
 struct ExeJumpRecentModel {
@@ -205,6 +294,38 @@ struct ExeJumpRecentModel {
             result = result * 2u + flag;
         } while (--nbits);
         return result;
+    }
+
+    // FUN_08091100. Note the polarity: here the unary flag means STOP, the
+    // opposite of ExeOffsetModel's.
+    void Put(ArithEnc* aenc, uint32_t slot) {
+        uint32_t nbits = 0xffffffffu;
+        uint32_t rest = slot;
+        for (;;) {
+            ++nbits;
+            if (nbits == 7u) break;
+            uint16_t* model_a_ptr = &model_a_[nbits];
+            rest >>= 1;
+            const bool flag = (rest == 0u);
+            aenc->EncodeModel(flag, *model_a_ptr);
+            *model_a_ptr = (uint16_t)(*model_a_ptr +
+                ((((uint32_t)flag * 0x10000u) + 8u - *model_a_ptr) >> 4));
+            if (flag) break;
+        }
+        const uint32_t model_base = 1u << nbits;
+        uint32_t result = (nbits != 0u) ? 1u : 0u;
+        uint32_t count = nbits + (nbits == 0u ? 1u : 0u);
+        uint32_t bits = slot << ((32u - count) & 31u);
+        for (;;) {
+            uint16_t* model_b_ptr = &model_b_[model_base + result];
+            const bool flag = ((int32_t)bits < 0);
+            bits <<= 1;
+            aenc->EncodeModel(flag, *model_b_ptr);
+            *model_b_ptr = (uint16_t)(*model_b_ptr +
+                ((((uint32_t)flag * 0x10000u) + 8u - *model_b_ptr) >> 4));
+            if (--count == 0u) return;
+            result = (flag ? 1u : 0u) + result * 2u;
+        }
     }
 };
 
@@ -411,7 +532,11 @@ struct NzExeFilter::Impl {
         }
 
         const uint32_t produced = (uint32_t)(out - out_org);
-        carry += produced;   // this run's output position advances
+        // FUN_080b98e0 masks the accumulated base to 23 bits; a run whose
+        // output passes 8 MB therefore restarts its reference frame, and a
+        // decoder that does not mask would disagree with the compressor's
+        // recent-target cache from that point on.
+        carry = (carry + produced) & 0x7fffffu;
         *out_size = produced;
         return true;
     }
@@ -427,4 +552,239 @@ bool NzExeFilter::Decode(const std::uint8_t* side, std::uint32_t side_len,
                          std::uint32_t* out_size) {
     if (out_size == nullptr) return false;
     return impl_->Decode(side, side_len, in, in_size, out, out_cap, out_size);
+}
+
+
+// ---------------------------------------------------------------------------
+// The encoder (reference FUN_08090360). Its decisions are: which of the three
+// instruction shapes this byte starts, whether the displacement is small
+// enough to touch, and whether the resulting target is already in a recent
+// cache. Everything else is bookkeeping the decoder mirrors exactly.
+// ---------------------------------------------------------------------------
+namespace {
+
+// (&DAT_081b3180)[b] & 8 -- dumped from a live process: set for 0x80..0x89
+// and 0x8c..0x8f, i.e. exactly the Jcc rel32 opcodes, which is the predicate
+// the decoder already spells out.
+static inline bool IsJccSecondByte(uint8_t b) {
+    return (b & 0xF0u) == 0x80u && !(b >= 0x8Au && b <= 0x8Bu);
+}
+
+static inline uint32_t LoadU32LE(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// (disp >> 24) + 1 < 2 unsigned, i.e. the sign-extended top byte is 0 or -1:
+// a displacement that fits in 25 bits.
+static inline bool DispFits(int32_t disp) {
+    return (uint32_t)((disp >> 24) + 1) < 2u;
+}
+
+}  // namespace
+
+struct NzExeFilterEnc::EncImpl {
+    uint32_t recent_call[3];
+    uint32_t recent_jump[256];
+    uint32_t carry;
+
+    EncImpl() { Reset(); }
+
+    void Reset() {                                     // FUN_080b98a0
+        for (uint32_t i = 0; i != 3u; ++i) recent_call[i] = i;
+        for (uint32_t i = 0; i != 256u; ++i) recent_jump[i] = i;
+        carry = 0;
+    }
+    void Advance(uint32_t n) { carry = (carry + n) & 0x7fffffu; }   // FUN_080b98e0
+
+    uint32_t Encode(const uint8_t* in, uint32_t n,
+                    std::vector<uint8_t>* out_v, std::vector<uint8_t>* side_v) {
+        out_v->clear();
+        side_v->clear();
+        if (n == 0u) return 0;
+
+        auto m = std::unique_ptr<ExeModels>(new ExeModels());
+
+        // The reference reads up to 4 bytes past the block when it looks at a
+        // displacement before checking that the instruction fits (and one past
+        // it for the byte after a trailing 0x0f); in the compressor those bytes
+        // are the rest of its own block allocation. A zero-padded copy gives
+        // the same answer without touching memory we do not own.
+        std::vector<uint8_t> padded((size_t)n + 8u, 0);
+        std::memcpy(padded.data(), in, n);
+        const uint8_t* const base = padded.data();
+        const uint8_t* const in_end = base + n;
+
+        // Room for the worst case: every transformed call with a NEW target
+        // costs the payload 4 bytes but adds 1 add-esp byte and 4 target
+        // bytes, so the total can exceed n by one byte per such call (at most
+        // one per five input bytes). The reference writes into its own block
+        // buffer and relies on that buffer's slack.
+        out_v->assign((size_t)n + (size_t)n / 4u + 64u, 0);
+        // The two raw areas the reference carves out of the scratch past the
+        // block buffers: the add-esp bytes get n/8 (overflowing it is what
+        // makes the filter decline), the call targets whatever follows.
+        const uint32_t addesp_cap = ((n >> 3) + 3u) & ~3u;
+        std::vector<uint8_t> addesp((size_t)addesp_cap + (size_t)n / 4u + 8u, 0);
+        std::vector<uint8_t> offs((size_t)n + 8u, 0);
+
+        std::vector<uint8_t> side;
+        side.assign(kSideCap >> 1, 0);
+        ArithEnc aenc;
+        aenc.cur = side.data();
+        aenc.end = side.data() + (kSideCap >> 1);
+
+        const uint8_t* p = base;
+        uint8_t* o = out_v->data();
+        uint8_t* ae = addesp.data();
+        uint8_t* of = offs.data();
+        bool addesp_overflow = false;
+
+        for (;;) {
+            if (p >= in_end) break;
+            const uint32_t prev = (p > base) ? (uint32_t)p[-1] : 0u;
+            const uint8_t* const at = p;
+            const uint8_t b = *p++;
+            *o++ = b;
+
+            if (b == 0xe8u) {
+                const int32_t disp = (int32_t)LoadU32LE(p);
+                const uint32_t target =
+                    (uint32_t)disp + carry + (uint32_t)(p - base);
+                if (DispFits(disp) && at + 8 <= in_end) {
+                    uint32_t slot = 3;
+                    if (target == recent_call[0]) slot = 0;
+                    else if (target == recent_call[1]) slot = 1;
+                    else if (target == recent_call[2]) slot = 2;
+                    p += 4;
+                    m->call_mode.Put(&aenc, prev, slot == 3u ? 2u : 1u);
+                    uint8_t sp = 0;
+                    if (p[0] == 0x83u && p[1] == 0xc4u && p[2] != 0u) { sp = p[2]; p += 3; }
+                    if (ae < addesp.data() + addesp.size()) *ae = sp;
+                    ++ae;
+                    if (ae > addesp.data() + addesp_cap) addesp_overflow = true;
+                    if (slot == 3u) {
+                        const uint32_t t1 = recent_call[1];
+                        recent_call[1] = recent_call[0];
+                        recent_call[2] = t1;
+                        recent_call[0] = target;
+                        of[0] = (uint8_t)(target >> 24); of[1] = (uint8_t)(target >> 16);
+                        of[2] = (uint8_t)(target >> 8);  of[3] = (uint8_t)target;
+                        of += 4;
+                    } else {
+                        if (slot != 0u) {
+                            for (uint32_t k = slot; k != 0u; --k) recent_call[k] = recent_call[k - 1u];
+                            recent_call[0] = target;
+                        }
+                        m->call_recent.Put(&aenc, prev, slot);
+                    }
+                } else {
+                    m->call_mode.Put(&aenc, prev, 0);
+                }
+            } else if (b == 0xe9u) {
+                const int32_t disp = (int32_t)LoadU32LE(p);
+                const uint32_t target =
+                    (uint32_t)disp + carry + (uint32_t)(p - base);
+                if (DispFits(disp) && at + 5 <= in_end) {
+                    p += 4;
+                    uint32_t slot = 0x100;
+                    if (target == recent_jump[0]) slot = 0;
+                    else {
+                        for (uint32_t k = 1; k != 0x100u; ++k)
+                            if (target == recent_jump[k]) { slot = k; break; }
+                    }
+                    if (slot != 0x100u) {
+                        m->jump_mode.Put(&aenc, prev, 1);
+                        if (slot != 0u) {
+                            for (uint32_t k = slot; k != 0u; --k) recent_jump[k] = recent_jump[k - 1u];
+                            recent_jump[0] = target;
+                        }
+                        m->jump_recent.Put(&aenc, slot);
+                    } else {
+                        m->jump_mode.Put(&aenc, prev, 2);
+                        for (uint32_t k = 255; k != 0u; --k) recent_jump[k] = recent_jump[k - 1u];
+                        recent_jump[0] = target;
+                        m->jump_offset.Put(&aenc, 0, (uint32_t)disp);
+                    }
+                } else {
+                    m->jump_mode.Put(&aenc, prev, 0);
+                }
+            } else if (b == 0x0fu) {
+                const uint8_t b2 = *p;                 // the over-read above
+                if (IsJccSecondByte(b2)) {
+                    if (p >= in_end) break;            // nothing but the 0x0f left
+                    const uint32_t lo4 = b2 & 0xfu;
+                    *o++ = b2;
+                    ++p;                               // both opcode bytes consumed
+                    const int32_t disp = (int32_t)LoadU32LE(p);
+                    const uint32_t target =
+                        (uint32_t)disp + carry + (uint32_t)(p - base);
+                    const uint32_t ctx = (prev >> 4) ^ (uint32_t)(b2 & 0xf0u);
+                    if (DispFits(disp) && at + 6 <= in_end) {
+                        p += 4;
+                        uint32_t slot = 0x100;
+                        if (target == recent_jump[0]) slot = 0;
+                        else {
+                            for (uint32_t k = 1; k != 0x100u; ++k)
+                                if (target == recent_jump[k]) { slot = k; break; }
+                        }
+                        if (slot != 0x100u) {
+                            m->jcc_mode[lo4].Put(&aenc, ctx, 1);
+                            if (slot != 0u) {
+                                for (uint32_t k = slot; k != 0u; --k)
+                                    recent_jump[k] = recent_jump[k - 1u];
+                                recent_jump[0] = target;
+                            }
+                            m->jump_recent.Put(&aenc, slot);
+                        } else {
+                            m->jcc_mode[lo4].Put(&aenc, ctx, 2);
+                            for (uint32_t k = 255; k != 0u; --k)
+                                recent_jump[k] = recent_jump[k - 1u];
+                            recent_jump[0] = target;
+                            m->jump_offset.Put(&aenc, lo4 + 1u, (uint32_t)disp);
+                        }
+                    } else {
+                        m->jcc_mode[lo4].Put(&aenc, ctx, 0);
+                    }
+                }
+            }
+        }
+
+        // The reference declines when the add-esp area ran into the call-target
+        // area (its own writes have already corrupted the targets by then; we
+        // just take the decision).
+        if (addesp_overflow) return 0;
+
+        aenc.Flush();
+        const uint32_t n_addesp = (uint32_t)(ae - addesp.data());
+        const uint32_t n_offs = (uint32_t)(of - offs.data());
+        const uint32_t body = (uint32_t)(o - out_v->data());
+
+        std::memcpy(out_v->data() + body, addesp.data(), n_addesp);
+        std::memcpy(out_v->data() + body + n_addesp, offs.data(), n_offs);
+        out_v->resize((size_t)body + n_addesp + n_offs);
+
+        const uint32_t used = (uint32_t)(aenc.cur - side.data());
+        side.resize(used);
+        PutBackwardsVarint(&side, n_addesp - (n_offs >> 2));
+        PutBackwardsVarint(&side, n_offs >> 2);
+        // Reaching the descriptor's limit is an "Internal error" abort in the
+        // reference (FUN_08048370 right here). Unreachable in practice -- half
+        // of 0x108001 bytes of arithmetic stream is far more than a block can
+        // produce -- so decline instead of aborting.
+        if (side.size() >= (size_t)(kSideCap >> 1)) return 0;
+        *side_v = std::move(side);
+        return body + n_addesp + n_offs;
+    }
+};
+
+NzExeFilterEnc::NzExeFilterEnc() : impl_(new EncImpl()) {}
+NzExeFilterEnc::~NzExeFilterEnc() = default;
+void NzExeFilterEnc::Reset() { impl_->Reset(); }
+void NzExeFilterEnc::Advance(std::uint32_t n) { impl_->Advance(n); }
+std::uint32_t NzExeFilterEnc::Encode(const std::uint8_t* in, std::uint32_t n,
+                                     std::vector<std::uint8_t>* out,
+                                     std::vector<std::uint8_t>* side) {
+    if (in == nullptr || out == nullptr || side == nullptr) return 0;
+    return impl_->Encode(in, n, out, side);
 }

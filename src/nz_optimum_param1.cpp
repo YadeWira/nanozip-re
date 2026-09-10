@@ -882,15 +882,21 @@ bool NzOptimumParam1Encode(const std::uint8_t* data, std::uint32_t n,
     if (n <= 0x107u) return false;
 
     // The reference runs over the codec's own block buffer, so its window
-    // probes (the 512-byte look-ahead in FUN_0806e3c0, the +5 read in
-    // FUN_080525b0) can reach past the block into the rest of that allocation,
-    // which is zero on a fresh buffer. A padded copy reproduces that without
-    // reading memory we do not own.
-    std::vector<std::uint8_t> padded(static_cast<std::size_t>(n) + 0x1000u, 0);
-    std::memcpy(padded.data(), data, n);
+    // probes reach outside the block into the rest of that allocation, which
+    // is zero on a fresh buffer. A copy padded on BOTH sides reproduces that
+    // without reading memory we do not own:
+    //   * behind, up to 255 bytes: the very first bytes of a block are
+    //     delta-coded against `data[-offsetA]` / `data[-offsetB]`, and the two
+    //     offsets are 1 and 2 only until the first re-evaluation;
+    //   * ahead, the 512-byte look-ahead in FUN_0806e3c0 (which always scans
+    //     FORWARD, even when it was called to extend backwards) and the
+    //     `data[index + 5]` read in FUN_080525b0.
+    static const std::size_t kFrontPad = 0x100u;
+    std::vector<std::uint8_t> padded(kFrontPad + static_cast<std::size_t>(n) + 0x1000u, 0);
+    std::memcpy(padded.data() + kFrontPad, data, n);
 
     Driver d;
-    d.data = padded.data();
+    d.data = padded.data() + kFrontPad;
     d.n = n;
     d.out = out->data();
     d.bits.assign(0x40000u, 0);
