@@ -12,6 +12,7 @@
 // tt_encoder_missing.c (FUN_080550c0). Policy: docs/CO_TEXT_TRANSFORM.md.
 #pragma once
 #include <cstdint>
+#include <vector>
 
 namespace nzr::opt_enc {
 
@@ -53,5 +54,37 @@ bool CoDigitDotFits(const std::uint8_t* buf, std::uint32_t n);
 // from that route, which is what `-cc` suppresses.
 std::uint32_t CoTextFlags(const std::uint8_t* buf, std::uint32_t n, std::uint8_t* scratch,
                           bool cm, bool* number_route);
+
+// The aux stream's room, read out of the original's object under GDB at every
+// -m from 2m to 64m: the side streams of insert-LF and the number pass may use
+// half of it.
+constexpr std::uint32_t kCoAuxStreamBytes = 4299161u;
+
+// FUN_08052ec0: the entropy estimate the number step's trial compares. `before4`
+// is the four bytes preceding `buf` (nullptr = zeros) and `after` the byte past
+// its end, both of which the original reads.
+std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n, const std::uint8_t* before4,
+                                std::uint8_t after);
+
+// FUN_08059060 for this family: the whole chain in the original's order, with the
+// dictionary's inverse ASCII reorder (`reorder_ascii`, true for -co/-cO) and
+// the number step's second-half trial. `buf`/`tmp` are swapped as steps land.
+// Returns the new size and the applied bits, or 0; the two side streams come
+// back in `tt2` and `tt16`.
+std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t n, std::uint8_t*& tmp,
+                             std::uint32_t cap, std::uint8_t* applied, std::vector<std::uint8_t>* tt2,
+                             std::vector<std::uint8_t>* tt16, bool reorder_ascii, bool cm);
+
+// FUN_080b8910: the side streams as the block carries them -- a LEB128 length
+// and the bytes, tt2 then tt16, each only when its bit applied. Appends to
+// `out`, returns the bytes appended.
+std::uint32_t CoSideStreamBytes(std::uint8_t applied, const std::vector<std::uint8_t>& tt2,
+                                const std::vector<std::uint8_t>& tt16, std::vector<std::uint8_t>* out);
+
+// FUN_0808f8e0: does the transform pay? Codes a sample of min(n >> 3, 128 KB)
+// with the BWT bucket coder as it is and after the pipeline (plus the side
+// streams), and accepts only when the transformed sample codes smaller by more
+// than a thousandth. Returns true to apply.
+bool CoTrialGate(const std::uint8_t* buf, std::uint32_t n, std::uint32_t mask, bool reorder_ascii, bool cm);
 
 }  // namespace nzr::opt_enc

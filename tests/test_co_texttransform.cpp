@@ -11,6 +11,7 @@
 #include "nz_text_transform.h"
 #include "nz_texttransform_num.h"
 #include "nz_bwt.h"
+#include "nz_optimum_text.h"
 #include "nz_lzhd_text.h"
 #include "nz_cd_texttransform_dict.h"
 #include "nz_cm.h"
@@ -198,15 +199,44 @@ void BucketCase(const BucketGolden& g) {
           std::memcmp(back.data(), bwt.data(), g.n) == 0);
 }
 
+// The whole path on the generated fixtures, against what the original wrote
+// into its block descriptors for them (`a -co -t1 -m4m`, read back with
+// NZOPT_TRACE_TDO / NZOPT_DUMP_TT): the mask the detector asks for, the trial
+// gate's verdict, the bits that applied, the transformed size and both side
+// streams' sizes.
+struct PathGolden { const char* name; std::string (*make)(std::uint32_t); unsigned mask, applied; std::uint32_t out_n, tt2_n, tt16_n; };
+const PathGolden kPath[] = {
+    {"source", MakeSource, 0x1eu, 0x1au, 17110u, 8u, 184u},
+    {"markup", MakeMarkup, 0x0eu, 0x0eu, 17451u, 3u, 0u},
+    {"prose",  MakeProse,  0x0cu, 0x08u, 14108u, 0u, 0u},
+    {"dotted", MakeDotted, 0x1cu, 0x18u, 17450u, 0u, 1725u},
+};
+void PathCase(const PathGolden& g) {
+    const std::string s = g.make(30000u);
+    const std::uint32_t n = 30000u;
+    std::vector<std::uint8_t> a(n + 0x2000u, 0), b(n + 0x2000u, 0), scratch(n + 0x2000u, 0);
+    std::memcpy(a.data(), s.data(), n);
+    bool route = false;
+    const std::uint32_t mask = nzr::opt_enc::CoTextFlags(a.data(), n, scratch.data(), false, &route);
+    Check(g.name, "path: the mask the detector asks for", mask == g.mask);
+    Check(g.name, "path: the trial gate accepts", nzr::opt_enc::CoTrialGate(a.data(), n, mask, true, false));
+    std::uint8_t* pa = a.data(); std::uint8_t* pb = b.data(); std::uint8_t applied = 0;
+    std::vector<std::uint8_t> tt2, tt16;
+    const std::uint32_t r = nzr::opt_enc::CoTextPipeline(mask, pa, n, pb, n + 0x40u, &applied, &tt2, &tt16, true, false);
+    Check(g.name, "path: the bits that applied", applied == g.applied);
+    Check(g.name, "path: the transformed size", r == g.out_n);
+    Check(g.name, "path: the side streams' sizes", tt2.size() == g.tt2_n && tt16.size() == g.tt16_n);
+}
+
 }  // namespace
 
 int main() {
+    NzCmInitAll();   // kModelInterpolation: every model below reads it, so before anything
+    for (const PathGolden& g : kPath) PathCase(g);
     for (const BucketGolden& g : kBucket) BucketCase(g);
     for (const BwtGolden& g : kBwt) BwtCase(g);
-    NzCmInitAll();   // kModelInterpolation: every model below reads it
     for (const NumGolden& g : kNum) NumCase(g);
     for (const HtmlGolden& g : kHtml) HtmlCase(g);
-    NzCmInitAll();
     for (const LfGolden& g : kLf) {
         InsertLfCase(g, g.size >> 3u, g.side_probe);
         InsertLfCase(g, g.size, g.side_full);

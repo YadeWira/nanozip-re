@@ -2,6 +2,9 @@
 #include "nz_optimum_text.h"
 #include "nz_lzhd_text.h"
 #include "nz_cd_texttransform_dict.h"
+#include "nz_text_transform.h"
+#include "nz_texttransform_num.h"
+#include "nz_bwt.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -233,6 +236,228 @@ std::uint32_t CoTextFlags(const std::uint8_t* buf, std::uint32_t n, std::uint8_t
         std::fprintf(stderr, "[tdo] n=%u s9d=%u s19=%u mean=%u dedup=%u flags=0x%02x route=%d\n",
                      n, o.s9d, o.s19, o.meanline, o.dedup, flags, (int)route);
     return flags;
+}
+
+
+// ------------------------------------------------------------ FUN_08052ec0
+// The entropy estimate the number step's trial compares: per chunk of at most
+// 64 KB, sort the positions by their byte and then by the four bytes before it
+// (FUN_080522c0: a counting sort, then a comb sort inside each byte's bucket
+// keyed on the preceding four bytes as one little-endian word), take the byte
+// after each sorted position, move-to-front code that (FUN_08052df0), and price
+// the ranks with the length of an optimal prefix code over their histogram
+// (FUN_0805d000: sum of length * count, in bytes, plus half the symbol count).
+// The original reads the four bytes before the buffer and the one after it;
+// `before` and `after` supply them (zero when the caller has nothing there).
+namespace {
+
+std::uint32_t HuffmanCost(const std::uint32_t* hist, std::uint32_t* nsyms_out) {
+    std::vector<std::uint32_t> w;
+    for (unsigned c = 0; c < 256u; ++c) if (hist[c]) w.push_back(hist[c]);
+    *nsyms_out = static_cast<std::uint32_t>(w.size());
+    if (w.empty()) return 0;
+    if (w.size() == 1u) return w[0];                 // FUN_0805cbe0 gives the lone symbol length 1
+    // Every optimal prefix code has the same total length: the sum of the
+    // internal node weights of any Huffman tree (Moffat/Katajainen in place).
+    std::sort(w.begin(), w.end());
+    std::uint64_t total = 0;
+    std::size_t leaf = 0, node = 0;
+    std::vector<std::uint64_t> merged;
+    for (std::size_t made = 0; made + 1u < w.size(); ++made) {
+        std::uint64_t a, b;
+        auto take = [&]() -> std::uint64_t {
+            if (node < merged.size() && (leaf >= w.size() || merged[node] < w[leaf])) return merged[node++];
+            return w[leaf++];
+        };
+        a = take(); b = take();
+        merged.push_back(a + b);
+        total += a + b;
+    }
+    return static_cast<std::uint32_t>(total);
+}
+
+std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n, const std::uint8_t* before4,
+                            std::uint8_t after) {
+    // key bytes: data[i-1..i-4] with the four bytes before the chunk supplying i < 4
+    auto at = [&](std::int64_t i) -> std::uint32_t {
+        if (i < 0) return before4[4 + i];
+        if (i >= static_cast<std::int64_t>(n)) return after;
+        return d[i];
+    };
+    auto key = [&](std::uint32_t i) -> std::uint32_t {   // the LE word at buf + i = data[i-4..i-1]
+        return at(static_cast<std::int64_t>(i) - 4) | (at(static_cast<std::int64_t>(i) - 3) << 8) |
+               (at(static_cast<std::int64_t>(i) - 2) << 16) | (at(static_cast<std::int64_t>(i) - 1) << 24);
+    };
+    std::vector<std::uint16_t> sorted(n);
+    std::uint32_t cnt[257] = {0};
+    for (std::uint32_t i = 0; i < n; ++i) ++cnt[d[i]];
+    std::uint32_t cum[257];
+    cum[0] = 0;
+    for (unsigned c = 0; c < 256u; ++c) cum[c + 1u] = cum[c] + cnt[c];
+    // the counting sort walks the data from the end, so ties keep position order
+    {
+        std::uint32_t fill[256];
+        for (unsigned c = 0; c < 256u; ++c) fill[c] = cum[c + 1u];
+        for (std::uint32_t i = n; i-- > 0;) sorted[--fill[d[i]]] = static_cast<std::uint16_t>(i);
+    }
+    // FUN_080522c0's comb sort per bucket, gap sequence g = g*10/13 down to 1,
+    // finishing with the bubble passes it runs until nothing moves
+    for (unsigned c = 0; c < 256u; ++c) {
+        const std::uint32_t lo = cum[c], sz = cum[c + 1u] - lo;
+        if (sz < 2u) continue;
+        std::uint16_t* a = sorted.data() + lo;
+        std::uint32_t gap = sz;
+        bool swapped = true;
+        while (gap > 1u || swapped) {
+            gap = (gap * 10u) / 13u;
+            if (gap < 11u) {
+                gap += (gap == 0u);
+                if (gap >= 9u) gap = 11u;
+            }
+            swapped = false;
+            for (std::uint32_t i = 0; i + gap < sz; ++i) {
+                if (key(a[i + gap]) < key(a[i])) { std::swap(a[i], a[i + gap]); swapped = true; }
+            }
+        }
+    }
+    // the byte after each sorted position, move-to-front coded
+    std::uint8_t mtf[256];
+    for (unsigned i = 0; i < 256u; ++i) mtf[i] = static_cast<std::uint8_t>(i);
+    std::uint32_t hist[256] = {0};
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint8_t b = static_cast<std::uint8_t>(at(static_cast<std::int64_t>(sorted[i]) + 1));
+        unsigned r = 0;
+        while (mtf[r] != b) ++r;
+        for (unsigned k = r; k > 0; --k) mtf[k] = mtf[k - 1u];
+        mtf[0] = b;
+        ++hist[r];
+    }
+    std::uint32_t nsyms = 0;
+    const std::uint32_t bits = HuffmanCost(hist, &nsyms);
+    return (bits >> 3) + (nsyms >> 1);
+}
+
+}  // namespace
+
+std::uint32_t CoEntropyEstimate(const std::uint8_t* buf, std::uint32_t n, const std::uint8_t* before4,
+                                std::uint8_t after) {
+    std::uint32_t total = 0;
+    const std::uint8_t zeros[4] = {0, 0, 0, 0};
+    const std::uint8_t* prev = before4 ? before4 : zeros;
+    std::uint8_t prevbuf[4];
+    while (n != 0u) {
+        const std::uint32_t len = (n > 0x10000u) ? 0x10000u : n;
+        const std::uint8_t next = (n > len) ? buf[len] : after;
+        total += EstimateChunk(buf, len, prev, next);
+        // the next chunk's four preceding bytes are this one's last four
+        for (int i = 0; i < 4; ++i) prevbuf[i] = (len >= 4u - i) ? buf[len - 4u + i] : prev[i];
+        prev = prevbuf;
+        buf += len;
+        n -= len;
+    }
+    return total;
+}
+
+// ------------------------------------------------------------ FUN_08059060, -co
+std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t n, std::uint8_t*& tmp,
+                             std::uint32_t cap, std::uint8_t* applied, std::vector<std::uint8_t>* tt2,
+                             std::vector<std::uint8_t>* tt16, bool reorder_ascii, bool cm) {
+    using namespace nzr::lzhd_enc;
+    std::uint8_t done = 0;
+    tt2->clear();
+    tt16->clear();
+    auto run = [&](std::uint32_t r, std::uint8_t bit) { if (r != 0u) { std::swap(buf, tmp); n = r; done |= bit; } };
+    if (bits & 1u) run(TextCrlfEncode(buf, n, tmp, std::min(cap, n + 0x10u)), 1u);
+    if (bits & 0x40u) run(TextChessEncode(buf, n, tmp, std::min(cap, n + 0x400u)), 0x40u);
+    if (bits & 0x20u) run(TextLineRleEncode(10u, buf, n, tmp, n), 0x20u);
+    if (bits & 0x02u) {
+        std::vector<std::uint8_t> side;
+        const std::uint32_t r = NzTextTransformInsertLfEncode(buf, n, tmp, n, &side, kCoAuxStreamBytes);
+        if (r != 0u) { *tt2 = side; run(r, 0x02u); }
+    }
+    if (bits & 0x04u) run(NzTextTransformHtmlEncode(buf, n, tmp, n), 0x04u);
+    if (bits & 0x08u) {
+        const std::uint32_t r = TextDictEncode(buf, n, tmp, n);
+        if (r != 0u) {
+            run(r, 0x08u);
+            if (reorder_ascii) {
+                static std::uint8_t inv[256];
+                static bool built = false;
+                if (!built) { const unsigned char* f = nzr::cd::NzCdReorderAscii(); for (unsigned c = 0; c < 256u; ++c) inv[f[c]] = (std::uint8_t)c; built = true; }
+                for (std::uint32_t i = 0; i < n; ++i) buf[i] = inv[buf[i]];
+            }
+        }
+    }
+    if ((bits & 0x10u) && (done & 0x40u) == 0u) {
+        // The trial on the second half: worth it when the estimate of the coded
+        // half plus its side bytes beats the estimate of the plain half by more
+        // than 1/32, or does not lose and the side stream is small.
+        const std::uint32_t half = n >> 1;
+        const std::uint32_t len = (half > 0x10000u) ? 0x10000u : half;
+        std::vector<std::uint8_t> side;
+        const std::uint32_t t = NzTextTransformNumberEncode(buf + half, len, tmp, len, &side, kCoAuxStreamBytes);
+        bool go = (t == 0u);
+        if (!go) {
+            const std::uint32_t est_in = CoEntropyEstimate(buf + half, len, buf + half - 4, (half + len < n) ? buf[half + len] : 0u);
+            const std::uint32_t est_out = CoEntropyEstimate(tmp, t, nullptr, 0u);
+            const std::uint32_t aux = static_cast<std::uint32_t>(side.size());
+            go = ((est_out + aux) * 0x20u < est_in * 0x21u) || (est_out <= est_in && aux < 0x200u);
+        }
+        if (go) {
+            const std::uint32_t r = NzTextTransformNumberEncode(buf, n, tmp, n, &side, kCoAuxStreamBytes);
+            if (r != 0u) { *tt16 = side; run(r, 0x10u); }
+        }
+    }
+    if (bits & 0x80u) {
+        if (done & 8u) run(TextParam14Encode(buf, n, tmp, n), 0x80u);
+        else if (done == 0u) return 0u;
+    } else if (done == 0u) return 0u;
+    if (!(n < cap)) return 0u;
+    (void)cm;
+    *applied = done;
+    return n;
+}
+
+// ------------------------------------------------------------ FUN_080b8910
+std::uint32_t CoSideStreamBytes(std::uint8_t applied, const std::vector<std::uint8_t>& tt2,
+                                const std::vector<std::uint8_t>& tt16, std::vector<std::uint8_t>* out) {
+    auto varint = [&](std::uint32_t v) {   // FUN_080b8560: LEB128, low bits first
+        while (v >= 0x80u) { out->push_back(static_cast<std::uint8_t>((v & 0x7fu) | 0x80u)); v >>= 7; }
+        out->push_back(static_cast<std::uint8_t>(v));
+    };
+    const std::size_t start = out->size();
+    if (applied & 0x02u) { varint(static_cast<std::uint32_t>(tt2.size())); out->insert(out->end(), tt2.begin(), tt2.end()); }
+    if (applied & 0x10u) { varint(static_cast<std::uint32_t>(tt16.size())); out->insert(out->end(), tt16.begin(), tt16.end()); }
+    return static_cast<std::uint32_t>(out->size() - start);
+}
+
+// ------------------------------------------------------------ FUN_0808f8e0
+bool CoTrialGate(const std::uint8_t* buf, std::uint32_t n, std::uint32_t mask, bool reorder_ascii, bool cm) {
+    const std::uint32_t sample = (n >> 3) < 0x20000u ? (n >> 3) : 0x20000u;
+    std::vector<std::uint8_t> bwt(sample + 4u), payload;
+    // baseline: the sample as it is, or its own size when it does not compress
+    NzBwtTransform(buf, sample, bwt.data());
+    std::uint32_t baseline = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, payload);
+    if (baseline == 0u) baseline = sample;
+    // candidate: the sample through the pipeline, plus its side streams
+    std::uint32_t candidate = sample;
+    std::vector<std::uint8_t> a(sample + 0x1000u), b(sample + 0x1000u), tt2, tt16, side;
+    std::memcpy(a.data(), buf, sample);
+    std::uint8_t* pa = a.data();
+    std::uint8_t* pb = b.data();
+    std::uint8_t applied = 0;
+    const std::uint32_t t = CoTextPipeline(mask, pa, sample, pb, 0x100040u, &applied, &tt2, &tt16, reorder_ascii, cm);
+    if (t != 0u) {
+        bwt.assign(t + 4u, 0);
+        NzBwtTransform(pa, t, bwt.data());
+        const std::uint32_t c = NzBwtEncodeInput(bwt.data(), t, 0x600487u, payload);
+        if (c != 0u) candidate = c + CoSideStreamBytes(applied, tt2, tt16, &side);
+    }
+    const bool refuse = baseline <= candidate + (candidate >> 10);
+    if (std::getenv("NZOPT_TRACE_TDO"))
+        std::fprintf(stderr, "[tdo] gate n=%u sample=%u mask=0x%02x baseline=%u candidate=%u (%s, applied=0x%02x)\n",
+                     n, sample, mask, baseline, candidate, refuse ? "REFUSED" : "accepted", applied);
+    return !refuse;
 }
 
 }  // namespace nzr::opt_enc
