@@ -11,6 +11,7 @@
 #include "nz_lzhds.h"
 #include "nz_optimum_lz.h"
 #include "nz_optimum_text.h"
+#include "nz_optimum_seg.h"
 #include "nz_optimum2_lz.h"
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
@@ -10982,16 +10983,31 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 }
 
 static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint32_t block_size,
-                                 const unsigned char* data, std::uint32_t len,
+                                 const unsigned char* data, std::uint32_t len, unsigned stream,
                                  std::vector<unsigned char>& out) {
+    // One type-0 DATA record PER BLOCK: the record header is the chain segment's
+    // tag, so a stream of N blocks is N records, not one. Walking a two-block
+    // archive the original wrote shows exactly that -- 2 type-0 records where a
+    // single wrapping record would have made 1, three bytes of header apart.
     std::vector<unsigned char> seg;
     const auto put32 = [&](std::uint32_t v) {
         for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
     };
+    const auto flush_block = [&]() {
+        std::vector<unsigned char> hdr;
+        WriteLegacyRecordHeader(&hdr, 0u, stream, seg.size());
+        out.insert(out.end(), hdr.begin(), hdr.end());
+        out.insert(out.end(), seg.begin(), seg.end());
+        seg.clear();
+    };
     std::uint32_t off = 0;
     while (off < len) {
-        const std::uint32_t n = (block_size < len - off) ? block_size : (len - off);
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
+        // FUN_0808d0b0 decides the block's length before anything looks at it:
+        // an order-1 entropy split over what it buffered, capped at the block
+        // size. A 68 KB HTML file becomes two blocks this way while a 148 KB one
+        // stays whole.
+        const std::uint32_t n = nzr::opt_enc::CoBlockLength(src, len - off, block_size);
 
         // FUN_0808da10's block analysis. The exe filter and the image and audio
         // blocks are not written yet, so a block that would take one of those
@@ -11077,12 +11093,9 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             seg.insert(seg.end(), side.begin(), side.end());
         }
         seg.push_back(0u);                       // dece
+        flush_block();
         off += n;
     }
-    // No segment prefix of our own: the type-0 DATA record header the caller
-    // writes around this IS the chain segment's tag, which is why the decoder
-    // walks the segments by reading record headers straight out of the archive.
-    out.insert(out.end(), seg.begin(), seg.end());
     return true;
 }
 
@@ -11370,8 +11383,9 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
             // 4-byte alignment matters to the side stream's overflow check only)
             if (codec.p0 == 5u) {
+                // writes its own records, one per block
                 if (!OptimumEncodeSegment(*codec.co, codec.co_block, block.data(),
-                                          static_cast<std::uint32_t>(block.size()), payload)) return false;
+                                          static_cast<std::uint32_t>(block.size()), stream, payload)) return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
@@ -11383,9 +11397,14 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 }
             }
         }
-        const std::vector<unsigned char>& data = chunked ? payload : block;
-        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
-        out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), data.begin(), data.end());
+        if (chunked && codec.p0 == 5u) {
+            // already framed, one record per block
+            out.insert(out.end(), payload.begin(), payload.end());
+        } else {
+            const std::vector<unsigned char>& data = chunked ? payload : block;
+            std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
+            out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), data.begin(), data.end());
+        }
         written = block_end;
         status.BlockDone(os, stream, block.size());
         if (total == 0u) break;

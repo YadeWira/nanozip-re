@@ -17,6 +17,7 @@ set(RECON_SOURCES
     src/nz_lzhd_encoder.cpp
     src/nz_lzhd_text.cpp
     src/nz_optimum_text.cpp
+    src/nz_optimum_seg.cpp
     src/nz_lzhds_encoder.cpp
     src/nz_cm.cpp
     src/nz_cd_tokens.cpp
