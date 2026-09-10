@@ -11,7 +11,7 @@ set -u
 W=${1:-/tmp/nzre_sfx_exe}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ORIG=${NZ_ORIG:-$HERE/../linux32/nz}
-OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OURS=${NZ_RECON:-$HERE/bin/nz-re}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 [ -x "$OURS" ] || { echo "FAIL: no $OURS"; exit 1; }
 

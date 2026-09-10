@@ -1,6 +1,6 @@
 #!/bin/bash
 # switch/command matrix: ORIG vs OURS, fresh dir per case; captures out/err/exit + file tree with mode+mtime
-OUT=$1; HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OUT=$1; HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 P=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}; FX=$OUT/fx; rm -rf $OUT; mkdir -p $FX
 cp $P/m_o.nz $FX/multi.nz; cp $P/s_o.nz $FX/single.nz; cp $P/m_n.nz $FX/store.nz
 run() { name=$1; shift

@@ -2,7 +2,7 @@
 # damaged PARALLEL containers: original vs ours, files written (size+sha) and report lines
 W=${W:-/tmp/nzre_corrupt_pf}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
-ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 PKG=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 [ -d "$PKG" ] || { echo "SKIP: no fixtures in $PKG (run tests/parity/make_fixtures.sh)"; exit 0; }

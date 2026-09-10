@@ -76,10 +76,10 @@ than 2) are ported but unexercised.
 ## Usage
 
 ```
-nz_recon x -y archive.nz        # extract (-y: overwrite without asking)
-nz_recon l archive.nz           # list
-nz_recon t archive.nz           # test: decode and verify, write nothing
-nz_recon x -y -oout/ archive.nz # into a directory; -sp strips paths; -x<glob> excludes
+nz-re x -y archive.nz        # extract (-y: overwrite without asking)
+nz-re l archive.nz           # list
+nz-re t archive.nz           # test: decode and verify, write nothing
+nz-re x -y -oout/ archive.nz # into a directory; -sp strips paths; -x<glob> excludes
 ```
 
 Switches, messages, prompts and the exit status follow the original exactly (exit status is always 0,
@@ -98,7 +98,7 @@ as in the original). Environment variables, all optional:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Produces `bin/nz_recon`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -Iinclude -static -pthread -o nz_recon src/*.cpp` (and the mingw-w64 equivalents for Windows). The 32-bit builds add `-m32 -msse2`: the SSE2 paths (audio predictor, `-cO` mixer) are compiled only when the target has SSE2, and on a 137 MB mixed tar that is a 19 % shorter `-cO` decode for a Pentium 4-class minimum (the original needed MMX).
+Produces `bin/nz-re`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows). The 32-bit builds add `-m32 -msse2`: the SSE2 paths (audio predictor, `-cO` mixer) are compiled only when the target has SSE2, and on a 137 MB mixed tar that is a 19 % shorter `-cO` decode for a Pentium 4-class minimum (the original needed MMX).
 
 ## Tests
 

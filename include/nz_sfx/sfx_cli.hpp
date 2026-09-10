@@ -100,7 +100,7 @@ void PrintBanner(std::ostream& os);
 //
 // The original writes its status lines over one another with a 79-space clear,
 // and formats every byte count with a SPACE as the thousands separator. Both are
-// reproduced here so `nz_recon`'s output can be diffed against `nz`'s directly.
+// reproduced here so `nz-re`'s output can be diffed against `nz`'s directly.
 
 // "9 000", "2 546 000" -- space-separated groups of three, as the original prints
 // every byte count.

@@ -22,7 +22,7 @@
 #
 #   tests/big_record.sh [workdir]
 set -e
-BIN=${BIN:-bin/nz_recon}
+BIN=${BIN:-bin/nz-re}
 ORIG=${ORIG:-../linux32/nz}
 W=${1:-/tmp/nzre_bigrec}
 [ -x "$BIN" ] || { echo "no $BIN -- build first"; exit 1; }

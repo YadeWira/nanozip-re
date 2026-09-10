@@ -117,7 +117,7 @@ Counts in a classification run (86 samples):
 - `aa850` (only): 10
 - `aa850 -> a9a250 -> a9d370`: 2
 
-Cross-check with `nz_recon` without bridges (`NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`):
+Cross-check with `nz-re` without bridges (`NZ_DISABLE_EXTRACT_BRIDGE=1 NZ_DISABLE_GDB_BRIDGE=1`):
 
 - `aa850` (only) path: `t/x` without `[compat]`;
 - `a9d370` path: `t/x` without `[compat]`;

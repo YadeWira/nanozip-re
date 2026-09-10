@@ -5,7 +5,7 @@
 # sizes AND contents (what a faithful replica must achieve). Usage: corrupt_compare_all.sh [workdir] [tags...]
 W=${1:-/tmp/nzre_corrupt_all}; shift; TAGS=${*:-"n c o Ou d Du f Fu"}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
-ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-${OURS:-$HERE/bin/nz_recon}}
+ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-${OURS:-$HERE/bin/nz-re}}
 # Fixtures: tests/parity/make_fixtures.sh builds them with the original.
 PKG=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }

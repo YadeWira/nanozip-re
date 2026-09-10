@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: matrix.sh <outdir>  -- runs each case with ORIG and OURS in fresh dirs, saves out/err/exit
-OUT=$1; HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OUT=$1; HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 P=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}; FX=$OUT/fx; rm -rf $OUT; mkdir -p $FX
 # Every fixture is built here with the ORIGINAL, so a clean clone can run this.
 cp $P/m_o.nz $FX/multi.nz; cp $P/pf_o.nz $FX/par.nz

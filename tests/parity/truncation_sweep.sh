@@ -3,10 +3,10 @@
 # at 19 points per codec: one byte before the first data record's payload, at it, +4, +5 (the
 # reader/decoder boundary, quirk 51) and at 15 percentages of the payload. Prints the corruption line
 # of `t` from both and counts the identical ones. Every line starting with X is a difference.
-# Usage: NZ_ORIG (default ../linux32/nz), NZ_RECON (default bin/nz_recon), NZ_PKG (default the package).
+# Usage: NZ_ORIG (default ../linux32/nz), NZ_RECON (default bin/nz-re), NZ_PKG (default the package).
 OUT=${1:-/tmp/nzre_trunc_sweep.txt}; : > "$OUT"
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
-ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 PKG=${NZ_PKG:-$HOME/.cache/nzre_tools/release_verify_pkg/arc}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 W=$(mktemp -d /tmp/nzre_trsw.XXXXXX); trap 'rm -rf "$W"' EXIT

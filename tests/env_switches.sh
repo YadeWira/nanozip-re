@@ -12,7 +12,7 @@ set -u
 W=${1:-/tmp/nzre_env_switches}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ORIG=${NZ_ORIG:-$HERE/../linux32/nz}
-OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OURS=${NZ_RECON:-$HERE/bin/nz-re}
 [ -x "$OURS" ] || { echo "FAIL: no $OURS"; exit 1; }
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 

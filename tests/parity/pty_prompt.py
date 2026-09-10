@@ -7,12 +7,12 @@ For each key sequence: fresh dir under /tmp/nzre_pty/<case>/<who>/ with a pre-ex
 The original re-prints the prompt forever on EOF; the cap turns that into a bounded sample.
 
 usage: pty_prompt.py [ARCHIVE=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}/m_o.nz]
-env:   OURS=path to nz_recon (default dev tree bin)
+env:   OURS=path to nz-re (default dev tree bin)
 """
 import os, pty, select, signal, subprocess, sys, time, hashlib
 
 ORIG = os.environ.get('NZ_ORIG', '../linux32/nz')
-OURS = os.environ.get('OURS', os.environ.get('NZ_RECON', 'bin/nz_recon'))
+OURS = os.environ.get('OURS', os.environ.get('NZ_RECON', 'bin/nz-re'))
 ARC = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}/m_o.nz')
 ROOT = '/tmp/nzre_pty'
 CAP = 256 * 1024

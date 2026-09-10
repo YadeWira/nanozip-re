@@ -15,7 +15,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NATIVE="${RECON_ROOT}/bin/nz_recon"
+NATIVE="${RECON_ROOT}/bin/nz-re"
 # linux32/nz is the primary RE reference and the only legacy binary that runs on
 # modern hosts (linux64/nz, the 2011 static x86-64 build, segfaults here).
 LEGACY="${RECON_ROOT}/../linux32/nz"

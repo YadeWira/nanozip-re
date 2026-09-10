@@ -18,7 +18,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NATIVE="${RECON_ROOT}/bin/nz_recon"
+NATIVE="${RECON_ROOT}/bin/nz-re"
 LEGACY="${RECON_ROOT}/../linux32/nz"
 [[ -n "${NZ_LEGACY_ORACLE:-}" ]] && LEGACY="${NZ_LEGACY_ORACLE}"
 
@@ -244,7 +244,7 @@ done
 upass=0; ufail=0
 UDIR="${WORK}/userenv"
 mkdir -p "$UDIR"
-cp "$NATIVE" "$UDIR/nz_recon"
+cp "$NATIVE" "$UDIR/nz-re"
 for m in "${METHODS[@]}"; do
   arc="${WORK}/ue_${m}.nz"; rm -f "$arc"
   if ! ( cd "$WORK" && "$LEGACY" a -y -"$m" "$arc" ${SHAPE_FILES[small3]} ) >/dev/null 2>&1; then
@@ -253,7 +253,7 @@ for m in "${METHODS[@]}"; do
   od="${WORK}/ueo_${m}"; nd="${WORK}/uen_${m}"
   rm -rf "$od" "$nd"; mkdir -p "$od" "$nd"
   ( cd "$od" && "$LEGACY" x -y -fo "$arc" ) >/dev/null 2>&1
-  ( cd "$nd" && env -i PATH=/usr/bin:/bin HOME="$UDIR" "$UDIR/nz_recon" x -y "$arc" ) >/dev/null 2>&1
+  ( cd "$nd" && env -i PATH=/usr/bin:/bin HOME="$UDIR" "$UDIR/nz-re" x -y "$arc" ) >/dev/null 2>&1
   if [[ -z "$(find "$od" -type f | head -1)" ]]; then continue; fi
   if [[ "$(tree_content_sig "$od")" == "$(tree_content_sig "$nd")" ]]; then
     upass=$((upass+1))

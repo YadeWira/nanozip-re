@@ -2,7 +2,7 @@
 # a Windows machine (the attribute restore does not survive wine).
 #
 # Put nz_orig32.exe / nz_orig64.exe (the original 0.09a Windows binaries) and
-# nz_recon_i686.exe / nz_recon_x86_64.exe (this port, cross-built) in one
+# nz-re_i686.exe / nz-re_x86_64.exe (this port, cross-built) in one
 # directory and run:  pwsh -NoProfile -File windows_vm_check.ps1 -Dir <that dir>
 #
 # It archives a tree whose files carry every attribute combination with the
@@ -12,7 +12,7 @@
 param([string]$Dir = "C:\Users\ia\nzre_wo")
 Set-Location $Dir
 $ErrorActionPreference = "Continue"
-$orig = ".\nz_orig32.exe"; $ours32 = ".\nz_recon_i686.exe"; $ours64 = ".\nz_recon_x86_64.exe"
+$orig = ".\nz_orig32.exe"; $ours32 = ".\nz-re_i686.exe"; $ours64 = ".\nz-re_x86_64.exe"
 # fixtures, with attributes set natively on Windows
 if (Test-Path src) { Remove-Item -Recurse -Force src }
 New-Item -ItemType Directory -Force -Path src\sub | Out-Null

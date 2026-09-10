@@ -25,7 +25,7 @@
 # The fixtures are SPARSE, so the disk cost is nil however large they look.
 # BIN32=<a 32-bit build> adds the two cases only a 32-bit build can reach.
 set -e
-BIN=${BIN:-bin/nz_recon}
+BIN=${BIN:-bin/nz-re}
 W=${1:-/tmp/nzre_huge}
 [ -x "$BIN" ] || { echo "no $BIN -- build first"; exit 1; }
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")

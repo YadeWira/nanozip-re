@@ -4,12 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-RECON_BIN="${RECON_ROOT}/bin/nz_recon"
+RECON_BIN="${RECON_ROOT}/bin/nz-re"
 if [[ ! -x "${RECON_BIN}" ]]; then
-  RECON_BIN="${RECON_ROOT}/build-release/nz_recon"
+  RECON_BIN="${RECON_ROOT}/build-release/nz-re"
 fi
 if [[ ! -x "${RECON_BIN}" ]]; then
-  echo "error: nz_recon not found (expected bin/nz_recon or build-release/nz_recon)" >&2
+  echo "error: nz-re not found (expected bin/nz-re or build-release/nz-re)" >&2
   exit 1
 fi
 

@@ -549,7 +549,7 @@ void PrintBanner(std::ostream& os) {
 }
 
 void PrintUsage(const char* program_name, std::ostream& os) {
-    const char* prog = (program_name != nullptr) ? program_name : "nz_recon";
+    const char* prog = (program_name != nullptr) ? program_name : "nz-re";
     os << "\nusage: " << prog << " <command> [-<opt_1>...-<opt_n>] <archive_file> <files...>\n";
     os << "e.g. " << prog << " a -cO -m1.2g backup document1.txt document2.txt\n\n";
 

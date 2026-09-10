@@ -38,18 +38,18 @@ set(RECON_SOURCES
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
-add_executable(nz_recon ${RECON_SOURCES})
-add_executable(nz_sfx_recon ${RECON_SOURCES})
+add_executable(nz-re ${RECON_SOURCES})
+add_executable(nz-re-sfx ${RECON_SOURCES})
 
-target_include_directories(nz_recon PRIVATE include)
-target_include_directories(nz_sfx_recon PRIVATE include)
+target_include_directories(nz-re PRIVATE include)
+target_include_directories(nz-re-sfx PRIVATE include)
 
 if(MSVC)
-    target_compile_options(nz_recon PRIVATE /W4)
-    target_compile_options(nz_sfx_recon PRIVATE /W4)
+    target_compile_options(nz-re PRIVATE /W4)
+    target_compile_options(nz-re-sfx PRIVATE /W4)
 else()
-    target_compile_options(nz_recon PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(nz_sfx_recon PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(nz-re PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(nz-re-sfx PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Optional unit-test binary for the lzpf arith primitives.

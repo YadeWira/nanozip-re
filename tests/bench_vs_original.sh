@@ -3,7 +3,7 @@
 #
 #   tests/bench_vs_original.sh build  <corpus_root> <workdir>   # ~140 MB mixed tar from a sample collection
 #   tests/bench_vs_original.sh compress <workdir>               # the original compresses it in 6 codecs (-p1)
-#   tests/bench_vs_original.sh run <workdir> [results.txt]      # `t` wall time, original vs bin/nz_recon
+#   tests/bench_vs_original.sh run <workdir> [results.txt]      # `t` wall time, original vs bin/nz-re
 #
 # Needs the original at ../linux32/nz or $NZ_LEGACY_ORACLE. The tar is ~205 real
 # files (text, documents, images, executables, audio, music, fonts, 3-D) picked
@@ -11,7 +11,7 @@
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 NZ=${NZ_LEGACY_ORACLE:-$here/../linux32/nz}
-OURS=${OURS:-$here/bin/nz_recon}
+OURS=${OURS:-$here/bin/nz-re}
 cmd=${1:-}; shift || true
 case "$cmd" in
   build)

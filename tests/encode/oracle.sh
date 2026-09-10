@@ -8,11 +8,11 @@
 # cares about (an empty file, a subdirectory, a file given twice, distinct mtimes and modes).
 #
 # usage: tests/encode/oracle.sh [workdir] [case-name-filter]
-#   NZ_ORIG (default ../linux32/nz), NZ_RECON (default bin/nz_recon)
+#   NZ_ORIG (default ../linux32/nz), NZ_RECON (default bin/nz-re)
 set -u
 W=${1:-/tmp/nzre_encode_oracle}; FILTER=${2:-}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
-ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 rm -rf "$W"; mkdir -p "$W"
 

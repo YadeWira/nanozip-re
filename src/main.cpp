@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     }
 
     if (options.show_usage) {
-        nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz_recon", std::cout);
+        nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz-re", std::cout);
         return 0;
     }
 
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
             nz::recon::PrintAdvancedHelp(std::cout); break;
         case Command::kUnknown:
         default:
-            nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz_recon", std::cout);
+            nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz-re", std::cout);
             rc = 1; break;
     }
     } catch (const std::bad_alloc&) {

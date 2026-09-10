@@ -26,7 +26,7 @@ set -u
 W=${1:-/tmp/nzre_win_orig}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ORIG32=${NZ_ORIG:-$HERE/../linux32/nz}
-OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OURS=${NZ_RECON:-$HERE/bin/nz-re}
 WIN_ORIG=${NZ_WIN_ORIG:-/tmp/nzre_orig_dl/win32}/nz.exe
 command -v wine >/dev/null 2>&1 || { echo "SKIP: no wine"; exit 0; }
 [ -f "$WIN_ORIG" ] || { echo "SKIP: no Windows original at $WIN_ORIG"; exit 0; }
@@ -83,7 +83,7 @@ for spec in n:-cn c:-cc d:-cd Du:-cD f:-cf Fu:-cF o:-co Ou:-cO; do
 done
 
 # The console of OUR Windows build against the Windows original, if one is built.
-for exe in "$W/../nzre_win/nz_recon_i686.exe" "$HERE/bin/nz_recon.exe"; do
+for exe in "$W/../nzre_win/nz-re_i686.exe" "$HERE/bin/nz-re.exe"; do
   [ -f "$exe" ] || continue
   for tag in n c f o; do
     for cmd in l t; do

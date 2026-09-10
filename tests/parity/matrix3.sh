@@ -5,7 +5,7 @@
 # saves out/err/exit and a tree listing (mode mtime size type path). Compare with matrix3_diff.sh.
 OUT=$1; [[ -n $OUT ]] || { echo "usage: matrix3.sh <outdir>"; exit 1; }
 case $OUT in /tmp/nzre_*) ;; *) echo "outdir must be under /tmp/nzre_* (the 32-bit original cannot open /tmp/claude-*)"; exit 1;; esac
-HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-${OURS:-$HERE/bin/nz_recon}}
+HERE=$(cd "$(dirname "$0")/../.." && pwd); ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-${OURS:-$HERE/bin/nz-re}}
 P=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}; FX3=/tmp/nzre_fx3; FXO=~/.cache/nzre_tools/cli_parity/fixtures
 rm -rf "$OUT"; mkdir -p "$OUT/fx"; FX=$OUT/fx
 cp $P/m_o.nz $FX/multi.nz; cp $P/m_n.nz $FX/store.nz

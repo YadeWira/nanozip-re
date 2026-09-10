@@ -9068,7 +9068,7 @@ static bool TryDecodeLegacyOptimum(
 // The original's decode banner and summary. It writes each status line over the
 // previous one with a 79-space clear, reports the thread count it would use, names
 // the compressor with its working-set size, and closes with a throughput line plus
-// an IO line. Reproduced here so `nz_recon`'s console output diffs against `nz`'s.
+// an IO line. Reproduced here so `nz-re`'s console output diffs against `nz`'s.
 // The working-set figure the original prints beside the compressor name. Ours is
 // this port's own allocation for that engine -- the original's number comes from its
 // own budgeting (it reports 13 MB where this engine allocates 0.3 MB), so this is

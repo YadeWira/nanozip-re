@@ -75,8 +75,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--recon-bin",
-        default="work/reconstruccion/bin/nz_recon",
-        help="path to nz_recon binary",
+        default="work/reconstruccion/bin/nz-re",
+        help="path to nz-re binary",
     )
     ap.add_argument(
         "--max-samples",
@@ -92,7 +92,7 @@ def main() -> int:
 
     recon_bin = Path(args.recon_bin)
     if not recon_bin.is_file():
-        fallback = Path("work/reconstruccion/build-release/nz_recon")
+        fallback = Path("work/reconstruccion/build-release/nz-re")
         if fallback.is_file():
             recon_bin = fallback
         else:

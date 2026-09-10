@@ -7,7 +7,7 @@
 # run is resumable: rerun the same command and only missing pairs are done. Progress:
 #   wc -l /tmp/nzre_sweep/results.tsv ; tests/sweep_report.py /tmp/nzre_sweep/results.tsv
 # Extra environment is passed through (NZ_METHODS, NZ_DIR_MODE, NZ_TIMEOUT, NZ_MAX_FIXTURE).
-# Do NOT rebuild bin/nz_recon while shards run (it invents failures).
+# Do NOT rebuild bin/nz-re while shards run (it invents failures).
 set -uo pipefail
 CORPUS=${1:-/tmp/nzre_corpus}
 SHARDS=${2:-8}

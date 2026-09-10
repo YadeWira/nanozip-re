@@ -13,7 +13,7 @@ set -u
 W=${1:-/tmp/nzre_cksum}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ORIG=${NZ_ORIG:-$HERE/../linux32/nz}
-OURS=${NZ_RECON:-$HERE/bin/nz_recon}
+OURS=${NZ_RECON:-$HERE/bin/nz-re}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 rm -rf "$W" && mkdir -p "$W/src/sub"
 # One input of every shape the codecs care about: text, binary, tiny, empty.

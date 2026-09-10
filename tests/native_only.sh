@@ -5,7 +5,7 @@
 set -uo pipefail
 
 RECON_ROOT="/home/omega/Escritorio/Git/nanozip/work/reconstruccion"
-NATIVE="${RECON_ROOT}/bin/nz_recon"
+NATIVE="${RECON_ROOT}/bin/nz-re"
 LEGACY="${RECON_ROOT}/../linux64/nz"
 
 if [[ ! -x "$NATIVE" ]]; then echo "FATAL: native bin missing"; exit 1; fi
