@@ -414,7 +414,14 @@ std::uint32_t TextDictEncode(const std::uint8_t* src0, std::uint32_t n, std::uin
         while (letters < 15u && (t0[wbuf[letters]] & 1u)) ++letters;
         sep = wbuf[letters];
         src += letters + 1u;
-        if (letters == 15u) { sep = wbuf[14]; --src; letters = 14u; }   // the original's 15-letter quirk
+        // A run of 15 letters or more is never looked up: the original takes 14
+        // of them as the word and writes them RAW (LAB_08055590), the 15th as the
+        // separator, and the continuation copy carries the rest -- case flips
+        // and all -- so a long word is spelled out where a shorter one would
+        // have been coded. Taking the 14-letter prefix to the dictionary instead
+        // coded "reorganization" out of "reorganizations".
+        bool long_run = false;
+        if (letters == 15u) { --src; letters = 14u; long_run = true; }
         flip = false; capital = false;
         if (letters != 0u) {
             p9 = out;
@@ -466,6 +473,12 @@ dispatch:
             {
                 // 4..14 letters: bucket by the last two, keys back to front
                 const std::uint32_t L = letters;
+                if (long_run) {
+                    sep = wbuf[14];                  // the 15th letter, after any case flip
+                    std::memcpy(p9, wbuf, 16);
+                    p10 = p9 + L + 1u; out = p9 + L;
+                    goto write_sep;
+                }
                 std::uint32_t k1 = 0, k2 = 0, low = 0;
                 for (std::uint32_t k = 0; k < 6u && L >= 3u + k; ++k) { const std::uint32_t v = static_cast<std::uint32_t>(D.f60[wbuf[L - 3u - k]]) << (25u - 5u * k); k1 |= v; if (k >= 2u) low |= v; }
                 for (std::uint32_t k = 0; k < 6u && L >= 9u + k; ++k) k2 |= static_cast<std::uint32_t>(D.f60[wbuf[L - 9u - k]]) << (25u - 5u * k);
