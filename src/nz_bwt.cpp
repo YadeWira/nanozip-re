@@ -1604,7 +1604,7 @@ bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
         }
         out -= 2;
 
-        uint32_t repmatch_index = 0;
+        uint32_t repmatch_index = 0, trace_slot = 0;
         for (; repmatch_index != 4u; repmatch_index++) {
             uint16_t* mp = &model_a[repmatch_index];
             const bool flag_a = adec.Read(*mp);
@@ -1634,6 +1634,7 @@ bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
             repmatch[0] = offset;
             matchlen = Param1415LenDecoder::Decode(&adec, model_b, model_c, 1u) + 7u;
         } else {
+            trace_slot = repmatch_index;
             offset = repmatch[repmatch_index - 1u];
             if (repmatch_index != 1u) {
                 for (; repmatch_index != 1u; repmatch_index--)
@@ -1643,6 +1644,10 @@ bool NzBwtParam14(const uint8_t* model_data, uint32_t model_len,
             matchlen = Param1415LenDecoder::Decode(&adec, model_b + 32, model_c, 3u) + 7u;
         }
 
+        if (NZ_ENV("NZOPT_TRACE_P14") != nullptr)
+            std::fprintf(stderr, "P14 pos=%ld len=%u off=%u slot=%u rep=[%u,%u,%u,%u]\n",
+                         (long)(out - out_org), matchlen, offset, trace_slot,
+                         repmatch[0], repmatch[1], repmatch[2], repmatch[3]);
         if (offset == 0u || offset > (uint32_t)(out - out_org)) {
             BWT_FAIL("param14: offset %u out of range (emitted %ld)\n",
                      offset, (long)(out - out_org));
@@ -1756,4 +1761,359 @@ bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
         out += (uint32_t)need;
         in += 4;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The param14 ENCODER (reference FUN_080bb3a0 -> FUN_080b9990). Its format is
+// NzBwtParam14 above, read backwards; what is new here is the search: a hash
+// chain with an adaptive probe budget, four repeat-offset slots, and a rarity
+// gate that vetoes a match whose bytes are too common to be worth a tag.
+// ---------------------------------------------------------------------------
+namespace {
+
+inline uint32_t P14Load32(const uint8_t* p) {
+    uint32_t v; std::memcpy(&v, p, 4); return v;
+}
+inline uint32_t P14Hash(uint32_t v) { return ((v >> 0x13) ^ v); }
+
+// Both thresholds live in one .bss table the reference fills at start-up; the
+// second index is simply six further along. Generated, not embedded:
+// verified 249/249 and 250/250 against a dump from a live process.
+inline uint32_t P14Threshold(uint32_t len) {          // DAT_081b3280[len]
+    return (len < 5u) ? 0u : (len - 3u) * (len - 3u) * ((len - 5u) / 3u);
+}
+inline uint32_t P14SkipLen(uint32_t len) {            // DAT_081b36a0[len]
+    return (len < 6u) ? 1u : ((len - 4u) / 2u);
+}
+const uint32_t kP14RarityCut = 15059u;                // DAT_081b37a0
+
+struct P14Encoder {
+    const uint8_t* in = nullptr;
+    uint32_t n = 0;
+    uint32_t hash_mask = 0, chain_mask = 0, off_mask = 0, tag_mask = 0;
+    std::vector<uint32_t> head, chain;
+    uint32_t budget = 0;                              // st[8]
+    const uint16_t* stats = nullptr;
+
+    BwtArithEnc enc;
+    uint16_t model_a[4], model_b[64], model_c[256], model_d[32];
+
+    void InsertHash(uint32_t pos) {
+        const uint32_t v = P14Load32(in + pos);
+        const uint32_t h = P14Hash(v) & hash_mask;
+        const uint32_t old = head[h];
+        head[h] = pos | (v & tag_mask);
+        chain[pos & chain_mask] = old;
+    }
+
+    // FUN_080bc490: the offset's bit count through model_d, then its low bits raw.
+    void PutOffset(uint32_t value) {
+        uint32_t nbits = 0xffffffffu, rest = value;
+        for (;;) {
+            ++nbits;
+            if (nbits == 31u) break;
+            uint16_t* m = &model_d[nbits];
+            rest >>= 1;
+            const bool flag = (rest != 0u);
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((((uint32_t)flag << 16) + 8u - *m) >> 4));
+            if (!flag) break;
+        }
+        uint32_t count = nbits + (nbits == 0u ? 1u : 0u);
+        uint32_t bits = value << ((32u - count) & 31u);
+        do {
+            enc.Encode(((int32_t)bits < 0), 0x800u);
+            bits <<= 1;
+        } while (--count);
+    }
+
+    // The inverse of Param1415LenDecoder::Decode.
+    void PutLen(uint32_t value, uint16_t* model_hi, uint32_t lo_accum_init) {
+        uint32_t lenbits = 0, rest = value;
+        for (;;) {
+            uint16_t* m = &model_hi[lenbits];
+            rest >>= 1;
+            const bool flag = (rest != 0u);
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((((uint32_t)flag << 16) + 8u - *m) >> 4));
+            if (!flag) break;
+            ++lenbits;
+        }
+        const uint32_t base = lenbits * 8u;
+        uint32_t tree_bits, n_low;
+        if (lenbits >= 2u) { tree_bits = 2u; n_low = lenbits - 2u; }
+        else { tree_bits = (lenbits == 0u) ? 1u : lenbits; n_low = 0u; }
+        uint32_t bits = value << ((32u - (lenbits ? lenbits : 1u)) & 31u);
+        uint32_t accum = lo_accum_init;
+        for (uint32_t i = 0; i < tree_bits; ++i) {
+            const bool flag = ((int32_t)bits < 0);
+            bits <<= 1;
+            uint16_t* m = &model_c[base + accum];
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((((uint32_t)flag << 16) + 8u - *m) >> 4));
+            accum = accum * 2u + (flag ? 1u : 0u);
+        }
+        for (uint32_t i = 0; i < n_low; ++i) {
+            enc.Encode(((int32_t)bits < 0), 0x800u);
+            bits <<= 1;
+        }
+    }
+
+    uint32_t Run(uint8_t* out, uint32_t out_cap, uint8_t* side, uint32_t side_limit);
+};
+
+}  // namespace
+
+void NzBwtParam14Stats(const uint8_t* data, uint32_t n, std::vector<uint16_t>* stats) {
+    stats->assign(0x40000u, 0);
+    if (n < 4u) return;
+    for (uint32_t i = 0; i + 3u < n; ++i)
+        (*stats)[P14Hash(P14Load32(data + i)) & 0x3ffffu] += 1u;
+}
+
+namespace {
+
+uint32_t P14Encoder::Run(uint8_t* out, uint32_t out_cap, uint8_t* side, uint32_t side_limit) {
+    (void)out_cap;
+    enc.cur = side; enc.end = side + side_limit;
+    enc.lo = 0; enc.hi = 0xffffffffu; enc.overflow = false;
+    for (uint32_t i = 0; i != 4u; ++i) model_a[i] = 0x8000u;
+    for (uint32_t i = 0; i != 64u; ++i) model_b[i] = 0x8000u;
+    for (uint32_t i = 0; i != 256u; ++i) model_c[i] = 0x8000u;
+    for (uint32_t i = 0; i != 32u; ++i) model_d[i] = 0x8000u;
+
+    // The reference keeps the four repeat offsets NEGATED, so `inp + rep[i]`
+    // is the candidate source; they start at -1.
+    int32_t rep[4] = {-1, -1, -1, -1};
+
+    const uint8_t* const in_end = in + n;
+    uint8_t* const out_lim = out + n - 0x10;
+    const uint8_t* inp = in;
+    uint8_t* outp = out;
+    uint32_t prev16 = 0;
+
+    if (inp < in_end && outp < out_lim) {
+        InsertHash(0);
+        const uint8_t first = *inp++;
+        *outp++ = first;
+        prev16 = first;
+
+        while (inp < in_end && outp < out_lim) {
+            if (prev16 == 0xfef1u && *inp < 2u) *outp++ = 1u;
+
+            const uint32_t rem = (uint32_t)(in_end - inp);
+            const uint32_t pos = (uint32_t)(inp - in);
+            const uint32_t v = P14Load32(inp);
+            const uint32_t tag = v & tag_mask;
+            const uint32_t h = P14Hash(v) & hash_mask;
+            uint32_t link = head[h];
+            head[h] = pos | tag;
+            chain[pos & chain_mask] = link;
+
+            uint32_t match_len = 0, slot = 4, score = 0;
+            uint32_t cand = link & off_mask;
+
+            if (cand < pos && tag == (link & tag_mask)) {
+                const uint32_t budget_old = budget;
+                budget += (budget < 8u) ? 1u : 0u;
+                const uint8_t* p = in + cand;
+                if (P14Load32(p) == v && rem > 3u) {
+                    uint32_t probes = (budget_old >> 2) + 1u;
+                    uint32_t best = 0, best_dist = 0, cur = 0;
+                    for (;;) {                                   // outer
+                        cur = 4u;
+                        while (cur < rem && p[cur] == inp[cur]) ++cur;
+                        if (cur <= best) {
+                            --probes;
+                            cur = best;
+                            if (probes == 0u) { match_len = best; slot = best_dist + 4u; score = best * 4u; break; }
+                            goto walk;
+                        }
+                        {
+                            const uint32_t adj = (best > 6u) ? ((cur - best) & 3u) : 0u;
+                            budget = (adj + budget) & 0x3ffu;
+                            if (cur > 0x40u) probes -= probes >> 1;
+                            best_dist = (uint32_t)(inp - p);
+                            if (cur > 0x80u) { slot = best_dist + 4u; score = cur * 4u; match_len = cur; break; }
+                        }
+                        for (;;) {                               // inner
+                            --probes;
+                            best = cur;
+                            if (probes == 0u) { match_len = best; slot = best_dist + 4u; score = best * 4u; goto decided; }
+                        walk:
+                            link = chain[link & chain_mask];
+                            cand = link & off_mask;
+                            if (cand >= pos) { slot = best_dist + 4u; score = cur * 4u; match_len = cur; goto decided; }
+                            if (tag != (link & tag_mask)) {
+                                budget -= budget >> 4;
+                                slot = best_dist + 4u; score = cur * 4u; match_len = cur; goto decided;
+                            }
+                            p = in + cand;
+                            if (P14Load32(p + cur - 3u) == P14Load32(inp + cur - 3u)) break;
+                        }
+                        best = cur;
+                        if (v != P14Load32(p)) {
+                            budget >>= 1;
+                            slot = best_dist + 4u; score = cur * 4u; match_len = cur;
+                            goto decided;
+                        }
+                    }
+                }
+            }
+        decided:
+            // The four repeat slots: a two-byte probe, then extend.
+            {
+                uint32_t packed = 0, rep_score = 4u;
+                for (uint32_t i = 0; i != 4u; ++i) {
+                    const uint8_t* rp = inp + rep[i];
+                    if (rp < in || (uint16_t)(rp[0] | (rp[1] << 8)) != (uint16_t)(inp[0] | (inp[1] << 8)))
+                        continue;
+                    uint32_t k = 1;
+                    do { ++k; if (rem <= k) break; } while (rp[k] == inp[k]);
+                    packed = i + k * 4u;
+                    rep_score = packed + 4u;
+                    break;
+                }
+                if (score <= rep_score) { slot = packed & 3u; match_len = packed >> 2; }
+            }
+
+            uint32_t rarity = 0;
+            bool take = false;
+            // NZOPT_TRACE_P14POS logs EVERY evaluated position, which is what
+            // diffing against a GDB log of the reference's own decisions needs;
+            // NZOPT_TRACE_P14 logs only the matches it emits.
+            const char* dbg = NZ_ENV("NZOPT_TRACE_P14POS");
+            if (match_len > 6u) {
+                if (match_len > 0xfeu) {
+                    take = true;
+                } else {
+                    for (uint32_t i = 0; i != match_len; ++i)
+                        rarity += stats[P14Hash(P14Load32(inp + i)) & 0x3ffffu];
+                    take = (rarity < P14Threshold(match_len)) ||
+                           (slot < 4u && rarity < P14Threshold(match_len + 6u));
+                }
+            }
+
+            if (dbg != nullptr)
+                std::fprintf(stderr, "EV len=%u slot=%u p=%u\n", match_len, slot, pos);
+            if (take) {
+                const uint32_t tr_off = slot > 3u ? (slot - 4u) : (uint32_t)(-rep[slot]);
+                const uint32_t tr_slot = slot > 3u ? 0u : slot + 1u;
+                const long tr_pos = (long)(inp - in);
+                // The reference feeds the chain for offsets 1..len-1 inclusive;
+                // stopping one short silently reorders every later chain walk.
+                for (uint32_t i = 1; i < match_len; ++i) InsertHash(pos + i);
+                inp += match_len;
+                *outp++ = 0xfeu; *outp++ = 0xf1u; *outp++ = 0u;
+                if (slot > 3u) {
+                    const uint32_t dist = slot - 4u;
+                    uint16_t* m = &model_a[0];
+                    enc.EncodeModel(true, *m);
+                    *m = (uint16_t)(*m + ((0x10000u + 4u - *m) >> 3));
+                    PutOffset(dist);
+                    PutLen(match_len - 7u, model_b, 1u);
+                    rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0];
+                    rep[0] = -(int32_t)dist;
+                } else {
+                    uint16_t* m = &model_a[0];
+                    enc.EncodeModel(false, *m);
+                    *m = (uint16_t)(*m + ((4u - *m) >> 3));
+                    for (uint32_t i = 1; i <= 3u; ++i) {
+                        const bool flag = (slot == i - 1u);
+                        uint16_t* mm = &model_a[i];
+                        enc.EncodeModel(flag, *mm);
+                        *mm = (uint16_t)(*mm + ((((uint32_t)flag << 16) + 4u - *mm) >> 3));
+                        if (flag) break;
+                    }
+                    const int32_t keep = rep[slot];
+                    for (uint32_t i = slot; i != 0u; --i) rep[i] = rep[i - 1u];
+                    rep[0] = keep;
+                    PutLen(match_len - 7u, model_b + 32, 3u);
+                }
+                if (NZ_ENV("NZOPT_TRACE_P14") != nullptr)
+                    std::fprintf(stderr, "P14 pos=%ld len=%u off=%u slot=%u rep=[%u,%u,%u,%u]\n",
+                                 tr_pos, match_len, tr_off, tr_slot,
+                                 (uint32_t)(-rep[0]), (uint32_t)(-rep[1]),
+                                 (uint32_t)(-rep[2]), (uint32_t)(-rep[3]));
+                prev16 = 0;
+                continue;
+            }
+
+            // No match: copy `skip` literal bytes, keeping the hash chain fed.
+            uint32_t skip;
+            if (rarity < kP14RarityCut) {
+                skip = P14SkipLen(match_len);
+            } else {
+                skip = match_len - 1u;
+                budget -= budget >> 2;
+            }
+            uint8_t b = *inp;
+            for (;;) {
+                ++inp;
+                prev16 = ((prev16 & 0xffu) << 8) | b;
+                *outp++ = b;
+                if (--skip == 0u) break;
+                InsertHash((uint32_t)(inp - in));
+                if (inp >= in_end || outp >= out_lim) goto finish;
+                if (prev16 == 0xfef1u && *inp < 2u) { *outp++ = 1u; }
+                b = *inp;
+            }
+        }
+    }
+finish:
+    enc.Flush();
+    if (!(enc.cur < enc.end)) return 0;
+    const uint32_t side_len = (uint32_t)(enc.cur - side);
+    const uint32_t body = (uint32_t)(outp - out);
+    if (!(out + body + side_len < out_lim)) return 0;
+    return body;
+}
+
+}  // namespace
+
+uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
+                            const std::vector<uint16_t>& stats,
+                            std::vector<uint8_t>* out,
+                            std::vector<uint8_t>* side,
+                            uint32_t side_cap) {
+    out->clear();
+    side->clear();
+    if (in == nullptr || n < 0x80u || stats.size() < 0x40000u) return 0;
+
+    P14Encoder e;
+    e.in = in;
+    e.n = n;
+    e.stats = stats.data();
+
+    // FUN_080bb3a0's setup: the offset mask covers the block, the hash is
+    // sized from n/2 with a floor of 2^19 entries.
+    const uint32_t nm1 = n - 1u;
+    const uint32_t hi = nm1 ? (31u - (uint32_t)__builtin_clz(nm1)) : 0u;
+    e.off_mask = (1u << ((hi + 1u) & 31u)) - 1u;
+    e.tag_mask = ~e.off_mask;
+    const uint32_t half = n >> 1;
+    const uint32_t hb = half ? (31u - (uint32_t)__builtin_clz(half)) : 0u;
+    const uint32_t bits = (hb + 1u > 0x14u) ? hb : 0x13u;
+    e.hash_mask = (1u << bits) - 1u;
+    e.chain_mask = (1u << (bits - 1u)) - 1u;
+    e.head.assign((size_t)e.hash_mask + 1u, 0);
+    e.chain.assign((size_t)e.chain_mask + 1u, 0);
+    // The reference's hash table is scratch past the block buffer's 2n mark and
+    // is never cleared, so it arrives holding whatever that memory last had
+    // (22 211 live entries on the first call of a run, measured). It does not
+    // matter: a stale entry still has to pass the position and tag checks and
+    // then a four-byte verification, so it can only ever name a real match --
+    // seeding ours from a dump of the reference's own table changes nothing.
+    e.budget = 0;
+
+    // The reference writes into the block buffer's tail and copies back; the
+    // acceptance test is `filtered + side < n - 0x10`, so n is room enough.
+    out->assign((size_t)n + 0x20u, 0);
+    side->assign(side_cap, 0);
+    const uint32_t r = e.Run(out->data(), (uint32_t)out->size(),
+                             side->data(), side_cap >> 1);
+    if (r == 0u) { out->clear(); side->clear(); return 0; }
+    out->resize(r);
+    side->resize((size_t)(e.enc.cur - side->data()));
+    return r;
 }

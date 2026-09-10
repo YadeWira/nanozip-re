@@ -10985,20 +10985,25 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 
 static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
-                                 std::vector<unsigned char>& out) {
+                                 std::vector<unsigned char>& out, std::uint32_t window_cap) {
     // One type-0 DATA record PER BLOCK: the record header is the chain segment's
     // tag, so a stream of N blocks is N records, not one. Walking a two-block
     // archive the original wrote shows exactly that -- 2 type-0 records where a
     // single wrapping record would have made 1, three bytes of header apart.
     std::vector<unsigned char> seg;
+    // Blocks accumulate here and are committed to `out` only when the WHOLE
+    // segment succeeded: any decline past the first block would otherwise
+    // leave a truncated stream in the archive, which reads as corruption
+    // rather than as the refusal it is.
+    std::vector<unsigned char> emitted;
     const auto put32 = [&](std::uint32_t v) {
         for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
     };
     const auto flush_block = [&]() {
         std::vector<unsigned char> hdr;
         WriteLegacyRecordHeader(&hdr, 0u, stream, seg.size());
-        out.insert(out.end(), hdr.begin(), hdr.end());
-        out.insert(out.end(), seg.begin(), seg.end());
+        emitted.insert(emitted.end(), hdr.begin(), hdr.end());
+        emitted.insert(emitted.end(), seg.begin(), seg.end());
         seg.clear();
     };
     // The dece filter's run state: the recent-target caches and the base
@@ -11006,6 +11011,12 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
     // a block goes unfiltered (reference FUN_080b98a0 / FUN_080b98e0 on the
     // codec object's own state at obj+0x90).
     NzExeFilterEnc exe_enc;
+    // A second engine in the decoder's role, fed exactly what the real decoder
+    // will be fed, so every block this segment writes is proved readable before
+    // it is committed. The -co engine is newly reaching block shapes it was
+    // never exercised on (an LZ block after a BWT block, for one), and an
+    // archive our own decoder cannot read must never reach the disk.
+    nzr::optimum::NzOptimumLzDecoder verifier(window_cap);
     std::uint32_t off = 0;
     while (off < len) {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
@@ -11108,6 +11119,15 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             // this writer does not emit yet -- declining keeps a wrong archive from
             // ever reaching the disk.
             if (payload.empty() || payload.size() >= m) return false;
+            {
+                // prove the block reads back before committing it
+                std::vector<std::uint8_t> chk(m);
+                if (!verifier.DecodeBlock(payload.data(), static_cast<std::uint32_t>(payload.size()),
+                                          chk.data(), m) ||
+                    std::memcmp(chk.data(), lz_in, m) != 0) {
+                    return false;
+                }
+            }
             put32(static_cast<std::uint32_t>(payload.size()));
             seg.insert(seg.end(), payload.begin(), payload.end());
             seg.push_back(1u);                       // decr_param: LZ
@@ -11126,28 +11146,70 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
         } else {
             // A BWT block: the transformed bytes through the forward BWT and the
-            // bucket coder. Its stages are the payload, the bucket coder's input
-            // (the BWT output), the block after the inverse BWT and the text.
-            // params 14 and 15 (the LZ77 passes over the BWT) only run when no
-            // text transform applied, which is not written yet -- nor is the
-            // stored form of a block the bucket coder cannot shrink.
+            // bucket coder.
+            //
+            // When no text transform applied, TWO more passes run first, in
+            // this order: param15 (an LZ77 whose matches are absolute offsets
+            // into the whole accumulated stream) and then param14 (an LZ77 over
+            // the block, matches tagged in the byte stream). param14 is
+            // written; param15 is not, so a block the reference would have
+            // taken it on comes out valid but different.
+            std::vector<std::uint8_t> p14buf, p14side;
+            bool p14_on = false;
+            const std::uint8_t* pre_p14 = lz_in;
+            std::uint32_t pre_p14_len = m;
+            if (!tt_on) {
+                std::vector<std::uint16_t> stats;
+                NzBwtParam14Stats(lz_in, m, &stats);
+                const std::uint32_t r = NzBwtParam14Encode(lz_in, m, stats, &p14buf, &p14side);
+                if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
+            }
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
             const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, 0x600487u, payload);
-            if (psz == 0u || !tt_on) return false;
+            if (psz == 0u) return false;
+            {
+                // The bucket coder is the one stage whose output this writer
+                // cannot check against the reference block by block, and it has
+                // a known size-dependent defect (buckets over ~18 KB of rank
+                // data). Verify the payload decodes back to the bytes it was
+                // made from and decline if it does not: a block that cannot be
+                // read must never reach the disk.
+                std::vector<std::uint8_t> chk(m);
+                if (!NzBwtDecodeInput(payload.data(), psz, m, chk.data()) ||
+                    std::memcmp(chk.data(), bwt.data(), m) != 0) {
+                    return false;
+                }
+            }
+            // A BWT block does not run through the LZ engine, but its
+            // pre-post-filter bytes still enter the window a later LZ block can
+            // match into (reference `mem->data += size`).
+            verifier.FeedWindow(pre_p14, pre_p14_len);
             put32(psz);
             seg.insert(seg.end(), payload.begin(), payload.end());
             seg.push_back(0u);                       // decr_param: BWT
             seg.push_back(1u);                       // param6: a compressed layer
             put32(m);                                // size18: the BWT's size, i.e. the transformed block
-            seg.push_back(4u);
-            seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            // [raw] + one per applied transform + [payload], the same rule the
+            // LZ branch follows: raw, the text output, param14's output, the
+            // BWT's output, the payload.
+            seg.push_back(static_cast<unsigned char>(3u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
+                                                     (p14_on ? 1u : 0u)));
+            if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
             seg.push_back(0u);                       // param7
             put32(primary);                          // bwt_start_pos
-            seg.push_back(0u);                       // param14
+            seg.push_back(static_cast<unsigned char>(p14_on ? 1u : 0u));
+            if (p14_on) {
+                put32(static_cast<std::uint32_t>(p14side.size()));
+                seg.insert(seg.end(), p14side.begin(), p14side.end());
+            }
             seg.push_back(0u);                       // param15
         }
         seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
@@ -11176,11 +11238,13 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
         flush_block();
         off += n;
     }
+    out.insert(out.end(), emitted.begin(), emitted.end());
     return true;
 }
 
 struct EncodeCodec {
     unsigned p0 = 0;
+    std::uint32_t co_window = 0;
     std::unique_ptr<nzr::lzpf_enc::State> lz;
     std::unique_ptr<nzr::lzhd_enc::State> cd;
     std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;   // the -co engine carries its own encode side
@@ -11289,7 +11353,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     }
     if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
     if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
-    if (codec.p0 == 5u && !codec.co) codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+    if (codec.p0 == 5u && !codec.co) {
+        codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+        codec.co_window = static_cast<std::uint32_t>(window);
+    }
     // The pieces of this range, in the order the reader meets them, then the
     // original's list order: slices prepended, whole files appended. Ghosts (-x
     // matches, unreadable files) take their bytes in the split but store none.
@@ -11465,7 +11532,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             if (codec.p0 == 5u) {
                 // writes its own records, one per block
                 if (!OptimumEncodeSegment(*codec.co, codec.co_block, block.data(),
-                                          static_cast<std::uint32_t>(block.size()), stream, payload)) return false;
+                                          static_cast<std::uint32_t>(block.size()), stream, payload,
+                                          codec.co_window)) return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
@@ -11593,6 +11661,17 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         if (units > 17ull) units = 17ull;
         co_block = static_cast<std::uint32_t>(units * 0x10000ull);
     }
+    // A compressor that cannot yet write some block shape declines mid-stream.
+    // Leaving the prologue on disk turns a refusal into an archive that reads
+    // as "Data corrupted while reading headers!", so remove the partial file
+    // and say plainly what happened.
+    const auto decline = [&]() -> int {
+        out.close();
+        std::error_code ec;
+        fs::remove(out_path, ec);
+        os << "This compressor cannot yet write this input; no archive was created.\n";
+        return 1;
+    };
     EncodeCodec header_codec; header_codec.p0 = p0; header_codec.co_block = co_block;
     PrintStoreEncodeHeader(os, options, workers, window, header_codec);
     // one codec state per worker stream (the original's workers own their windows)
@@ -11622,7 +11701,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
     if (workers == 1u) {
         std::vector<unsigned char> body;
-        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0])) return 1;
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0])) return decline();
         timed_write(body);
     } else {
         std::vector<unsigned char> body;
@@ -11630,7 +11709,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         {
             const auto r = range_of(workers - 1u);
             std::vector<unsigned char> h;
-            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms, codecs[workers - 1u])) return 1;
+            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms, codecs[workers - 1u])) return decline();
             // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
             std::vector<unsigned char> hdr_only;
             if (ckmode != ChecksumMode::kNone) {
@@ -11649,19 +11728,19 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             // block -- table, stamps, checksums, an empty DATA -- comes AFTER
             // every header, worker 0's included (measured with -p2 and -p3).
             if (k == workers - 1u && total == 0u) continue;
-            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k])) return 1;
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k])) return decline();
             timed_write(body);
         }
         {
             const auto r = range_of(0u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0])) return 1;
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0])) return decline();
             timed_write(body);
         }
         if (total == 0u) {
             const auto r = range_of(workers - 1u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u])) return 1;
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u])) return decline();
             timed_write(body);
         }
     }

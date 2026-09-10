@@ -266,10 +266,37 @@ writer and the reader.
   block has fewer distinct order-2.5 contexts than the original.
   See [quirks 61-63](ORIGINAL_QUIRKS.md) for what it measures wrong.
 
+## param14 and param15, the two BWT-only passes
+
+When a BWT block took no text transform, two more LZ77 passes run before the
+forward BWT, in this order: **param15** (matches named as absolute offsets into
+the whole accumulated stream) and then **param14** (matches over the block
+itself). Decoding undoes them the other way round, right after the inverse BWT.
+param15 appears in 3 of 289 corpus inputs and is not written; param14 appears in
+20 and is.
+
+**param14** (`NzBwtParam14Encode`, next to its decoder in `src/nz_bwt.cpp`) tags
+its matches in the BYTE stream -- `0xfe 0xf1` followed by a zero selector -- and
+codes offset and length in an arithmetic side stream with four repeat-offset
+slots; a literal `0xfe 0xf1` followed by a byte under 2 is escaped with a
+selector of 1. Matches come from a hash chain with an adaptive probe budget, and
+a match is only taken when a rarity model agrees: a table counts how often each
+hashed four-byte context occurs in the block, and the sum across the candidate
+must fall under a length-indexed threshold. See
+[quirks 67-68](ORIGINAL_QUIRKS.md).
+
+Writing it exposed two defects of our own, both fixed: the bucket coder fails on
+buckets above roughly 18 KB of rank data (this was the first time the writer
+produced a BWT block that large), and a mid-stream decline used to leave the
+archive's prologue on disk, so a refusal read as `Data corrupted while reading
+headers!`. Both block kinds are now proved readable before they are committed --
+the LZ payload through a second engine kept in the decoder's role, the BWT
+payload through `NzBwtDecodeInput` -- and a decline removes the partial file and
+says so.
+
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
-files and on **51 of 62** executables and DLLs. Not written yet: image and audio
-blocks, the param14/param15 passes (four of the eleven remaining executables),
-the stored form of a block nothing shrinks (two more), the multi-threaded bucket
-layout, and budgets above 16 MB. The last two executables are an LZ-engine
+files and on **55 of 62** executables and DLLs. Not written yet: param15, image
+and audio blocks, the stored form of a block nothing shrinks, the multi-threaded
+bucket layout, and budgets above 16 MB. Two executables are an LZ-engine
 divergence on binary data, unrelated to the block analysis.

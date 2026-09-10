@@ -83,3 +83,30 @@ bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
                   const uint8_t* window_base, size_t window_len,
                   uint8_t* out, uint32_t out_cap, uint32_t* out_size,
                   uint32_t window_cap = 0u);
+
+// ---------------------------------------------------------------------------
+// The ENCODER of param14 (reference FUN_080bb3a0 -> FUN_080b9990, called from
+// the -co block analysis after the two BWT-only passes' input is settled and
+// before the forward BWT).
+//
+// It is an LZ77 pass over the block that names its matches with a two-byte
+// escape tag in the BYTE stream (0xfe 0xf1 followed by a zero selector) and
+// codes offset and length in an arithmetic side stream, with four
+// repeat-offset slots. A literal 0xfe 0xf1 followed by a byte below 2 is
+// escaped by inserting a selector of 1.
+//
+// A match is only taken when a rarity model agrees: `stats` counts, over the
+// block, how often each hashed four-byte context occurs, and the sum of those
+// counts across the candidate match must fall under a length-indexed
+// threshold. Build it with NzBwtParam14Stats over the SAME bytes the reference
+// feeds it (FUN_08054ad0, called on the block before param15 runs).
+//
+// Returns the filtered length, or 0 when the reference would decline (a block
+// under 0x80 bytes, or a side stream that overflowed half its budget).
+void NzBwtParam14Stats(const uint8_t* data, uint32_t n, std::vector<uint16_t>* stats);
+
+uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
+                            const std::vector<uint16_t>& stats,
+                            std::vector<uint8_t>* out,
+                            std::vector<uint8_t>* side,
+                            uint32_t side_cap = 0x80000u);
