@@ -313,6 +313,40 @@ std::uint32_t FinalizeFletcher32(
     return ((s1 & 0xffffu) << 16u) | (s2 & 0xffffu);
 }
 
+// A checksum computed over bytes that arrive in pieces. The primitives above
+// are all incremental already; this only carries their state so a slice can be
+// verified while it streams to disk instead of after its whole buffer exists.
+// Feeding it one buffer in one Update gives exactly ComputeBufferChecksum.
+struct ChecksumStream {
+    ChecksumMode mode = ChecksumMode::kNone;
+    std::uint32_t c16 = 0xffffu;
+    std::uint32_t c32 = 0xffffffffu;
+    std::uint32_t f1 = 0, f2 = 0;
+    std::uint8_t f32_pending = 0;
+    bool f32_has_pending = false;
+    void Reset(ChecksumMode m) { *this = ChecksumStream(); mode = m; }
+    void Update(const unsigned char* data, std::size_t n) {
+        if (n == 0u) return;
+        switch (mode) {
+            case ChecksumMode::kCrc16: c16 = UpdateCrc16(c16, data, n); break;
+            case ChecksumMode::kCrc32: c32 = UpdateCrc32(c32, data, n); break;
+            case ChecksumMode::kFletcher16: UpdateFletcher16(&f1, &f2, data, n); break;
+            case ChecksumMode::kFletcher32: UpdateFletcher32(&f1, &f2, &f32_pending, &f32_has_pending, data, n); break;
+            case ChecksumMode::kNone: break;
+        }
+    }
+    std::uint32_t Finish() const {
+        switch (mode) {
+            case ChecksumMode::kNone: return 0u;
+            case ChecksumMode::kCrc16: return (c16 ^ 0xffffu) & 0xffffu;
+            case ChecksumMode::kCrc32: return c32 ^ 0xffffffffu;
+            case ChecksumMode::kFletcher16: return ((f2 & 0xffu) << 8u) | (f1 & 0xffu);
+            case ChecksumMode::kFletcher32: return FinalizeFletcher32(f1, f2, f32_pending, f32_has_pending);
+        }
+        return 0u;
+    }
+};
+
 bool ComputeFileChecksum(const fs::path& path, ChecksumMode mode, std::uint32_t* out_checksum) {
     if (out_checksum == nullptr) {
         return false;
@@ -1875,6 +1909,12 @@ struct Stream {
     // this offset is the plain case. 0 = unknown, which keeps the shifted form.
     std::uint64_t last_record_start = 0;
     bool have_last_record = false;
+    // Incremental path (StreamWrite): the decoder hands over each block instead
+    // of one buffer at the end, so the stream's whole output never exists.
+    bool incremental = false;
+    std::uint64_t produced = 0;                 // bytes handed over so far
+    std::vector<ChecksumStream> sck;            // one per slice, fed as bytes pass
+    std::vector<std::pair<std::size_t, std::uint32_t>> pending_bad;  // slice index, computed value
 };
 enum class Policy { kProduced, kGroup, kStore };
 // What a worker of each codec reports when its stream ends early without a
@@ -2098,6 +2138,76 @@ inline void StreamBegin(std::size_t k) {
     if (!s.slices.empty() && !s.entered_any) { s.entered_any = true; s.entered_group = 1; CreateLocked(e, s.slices.front().entry, lk); }
 }
 
+// Put stream k back to its start so it can be decoded again. The sink writes at
+// absolute file offsets, so re-running a stream rewrites exactly the same byte
+// ranges -- what a retry produces replaces what the abandoned attempt wrote. Used
+// when the fast per-chunk decode turns out not to suit an archive and the slower
+// concatenated one has to run instead; the files already created stay created,
+// which is what they would have been anyway.
+inline void StreamRewind(std::size_t k) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (e.mismatches >= s.pending_bad.size()) e.mismatches -= s.pending_bad.size();
+    s.pending_bad.clear();
+    s.produced = 0;
+    s.flushed = 0;
+    s.sck.clear();
+    for (Slice& sl : s.slices) sl.checked = false;
+}
+
+// A worker hands over the next `n` bytes of stream k, in order. Only for
+// Policy::kProduced, where a stream flushes everything it has produced and there
+// is no unit held back -- so writing as the bytes arrive is byte-for-byte the
+// same decision StreamEnd would make, and the stream's whole output need never
+// exist. Slice checksums are accumulated here and REPORTED in StreamEnd, in
+// slice order, so the console output does not depend on block boundaries.
+inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) {
+    if (n == 0u) return;
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (e.policy != Policy::kProduced) return;   // kGroup/kStore keep the buffered path
+    s.incremental = true;
+    if (s.sck.size() != s.slices.size()) {
+        s.sck.resize(s.slices.size());
+        for (std::size_t i = 0; i < s.slices.size(); ++i) s.sck[i].Reset(s.slices[i].cmode);
+    }
+    const std::uint64_t from = s.produced;
+    std::uint64_t to = from + n;
+    if (to > s.total) to = s.total;               // the caller overran its declared size
+    struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
+    std::vector<Piece> pieces;
+    for (std::size_t i = 0; i < s.slices.size(); ++i) {
+        Slice& sl = s.slices[i];
+        if (sl.len == 0u) continue;
+        const std::uint64_t a = std::max(sl.spos, from);
+        const std::uint64_t b = std::min(sl.spos + sl.len, to);
+        if (a < b) {
+            CreateLocked(e, sl.entry, lk);
+            FileState& f = *e.files[sl.entry];
+            const unsigned char* src = buf + (a - from);
+            s.sck[i].Update(src, static_cast<std::size_t>(b - a));
+            if (f.write_it && f.fd >= 0)
+                pieces.push_back({&f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a)});
+        }
+        if (!sl.checked && to >= sl.spos + sl.len) {
+            sl.checked = true;
+            if (sl.has_cksum && e.opt->checksum != ChecksumMode::kNone) {
+                const std::uint32_t got = s.sck[i].Finish();
+                if (got != sl.cval) { ++e.mismatches; s.pending_bad.emplace_back(i, got); }
+            }
+        }
+    }
+    s.produced = to;
+    s.flushed = std::max(s.flushed, to);
+    e.committed = e.committed || !pieces.empty();
+    lk.unlock();
+    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
+}
+
 // A worker ends stream k. `buf` holds its output (produced bytes valid), `ok` =
 // the stream decoded completely (the slice checksums may still disagree),
 // `clean_end` = it stopped early without a status. Flushes per policy, creates
@@ -2111,6 +2221,13 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     std::unique_lock<std::mutex> lk(e.mu);
     if (!e.published || k >= e.streams.size()) return;
     Stream& s = e.streams[k];
+    // The stream streamed its output through StreamWrite: `buf` is not its whole
+    // output (it may be null), everything it produced is already on disk, and the
+    // slice checksums were accumulated as the bytes went past. Only the ending
+    // logic below -- the status, the group the cursor stands in, the empty files
+    // and the mismatch lines -- still has to run.
+    const bool inc = s.incremental;
+    if (inc) { produced = s.produced; received = produced; }
     if (produced > s.total) produced = s.total;
     if (received > produced) received = produced;
     std::uint64_t flush_to = produced;
@@ -2151,7 +2268,9 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
     std::vector<Piece> pieces;
     std::vector<std::pair<const Slice*, std::uint32_t>> bad;
+    for (const auto& pb : s.pending_bad) bad.emplace_back(&s.slices[pb.first], pb.second);
     for (Slice& sl : s.slices) {
+        if (inc) break;
         const std::uint64_t a = std::max(sl.spos, s.flushed);
         const std::uint64_t b = std::min(sl.spos + sl.len, flush_to);
         if (sl.len == 0u) continue;
@@ -4414,6 +4533,36 @@ bool DecodeLzpfMember(
     return false;
 }
 
+// Where DecodeOptimumBlockSequence puts each decoded block.
+//
+// This used to be a plain `std::vector<unsigned char>*` that grew to hold the
+// WHOLE stream output -- 280 MB per worker on a 4.5 GB archive, times every
+// worker in flight, which is most of why this reader needed 8.9 GB where the
+// original needs 278 MB. The sequence only ever APPENDS to it and asks for its
+// size (param15's match sources come from the decoder's ring, not from here --
+// see the param15 note in TryDecodeLegacyOptimum), so a consumer can take each
+// block and drop it. `size()` keeps meaning "output produced so far", which is
+// what the post-filter output caps are measured against.
+class OptimumOut {
+public:
+    explicit OptimumOut(std::vector<unsigned char>* v)
+        : vec_(v), total_(v != nullptr ? v->size() : 0u) {}
+    explicit OptimumOut(std::function<void(const unsigned char*, std::size_t)> sink)
+        : sink_(std::move(sink)) {}
+    std::size_t size() const { return static_cast<std::size_t>(total_); }
+    void Append(const unsigned char* p, std::size_t n) {
+        if (n == 0u) return;
+        if (vec_ != nullptr) vec_->insert(vec_->end(), p, p + n);
+        else sink_(p, n);
+        total_ += n;
+    }
+    bool streaming() const { return vec_ == nullptr; }
+private:
+    std::vector<unsigned char>* vec_ = nullptr;
+    std::function<void(const unsigned char*, std::size_t)> sink_;
+    std::uint64_t total_ = 0;
+};
+
 // Forward declaration: defined further below (near TryDecodeLegacyOptimum,
 // which it was extracted from), but also needed here by the -co parallel-
 // container branch inside TryParseLegacyCnArchive. Templated on the decoder
@@ -4431,12 +4580,12 @@ static bool DecodeOptimumBlockSequence(
     nzr::audio::NzAudioPred& audio,
     nzr::audio::NzImageModel& image,
     NzExeFilter& exe,
-    // The accumulated PRE-post-filter output of every non-audio block so far
-    // (the reference's mem->data_org..mem->data). param15's absolute offsets
-    // index THIS stream, not the final output: param1 (the delta filter)
-    // rewrites almost every byte, so a param15 match sourced from the final
-    // output copies the wrong bytes into the block AND into the LZ window.
-    std::vector<unsigned char>* out_data);
+    // Everything the stream has produced so far, as a count plus a sink for the
+    // new bytes (see OptimumOut). param15's absolute offsets index the decoder's
+    // RING, not this: param1 (the delta filter) rewrites almost every byte, so a
+    // param15 match sourced from the final output copies the wrong bytes into the
+    // block AND into the LZ window.
+    OptimumOut* out_data);
 
 // Per-codec profiles of the two side models the optimum family carries.
 // Audio (GDB-read at FUN_080a5330's entry): the decoder object's flag byte is
@@ -6340,14 +6489,15 @@ bool TryParseLegacyCnArchive(
                                     nzr::audio::NzImageModel img;
                                     ConfigureOptimumModels(method_p0, aud, img);
                                     NzExeFilter exe;
+                                    OptimumOut ow(dst);
                                     if (method_p0 == 5u) {
                                         nzr::optimum::NzOptimumLzDecoder dec(wcap);
                                         return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                          out_size, dec, aud, img, exe, dst);
+                                                                          out_size, dec, aud, img, exe, &ow);
                                     }
                                     nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
                                     const bool r = DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                              out_size, dec, aud, img, exe, dst);
+                                                                              out_size, dec, aud, img, exe, &ow);
                                     return r;
                                 },
                                 &assembled, psink::Available(), psink::Policy::kProduced, 0u,
@@ -6589,11 +6739,11 @@ bool TryParseLegacyCnArchive(
                         // doesn't vary per stream), so pick it once here rather
                         // than duplicating the per-stream loop body per type.
                         std::function<bool(const unsigned char*, std::size_t, std::size_t,
-                                            std::uint64_t, std::vector<unsigned char>*)> decode_seq;
+                                            std::uint64_t, OptimumOut*)> decode_seq;
                         if (method_p0 == 5u) {
                             decode_seq = [popt_window_capacity](
                                 const unsigned char* raw, std::size_t b, std::size_t e,
-                                std::uint64_t hint, std::vector<unsigned char>* out) {
+                                std::uint64_t hint, OptimumOut* out) {
                                 nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
                                 nzr::audio::NzImageModel simg;
@@ -6604,7 +6754,7 @@ bool TryParseLegacyCnArchive(
                         } else {
                             decode_seq = [popt_window_capacity](
                                 const unsigned char* raw, std::size_t b, std::size_t e,
-                                std::uint64_t hint, std::vector<unsigned char>* out) {
+                                std::uint64_t hint, OptimumOut* out) {
                                 nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
                                 nzr::audio::NzAudioPred saud;
                                 nzr::audio::NzImageModel simg;
@@ -6613,6 +6763,42 @@ bool TryParseLegacyCnArchive(
                                 return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         }
+                        // A per-stream decoder whose state (ring, audio, image and exe
+                        // filter) persists across CALLS, so the stream's chunk
+                        // records can be decoded one at a time straight out of the
+                        // mapped archive instead of being concatenated into one
+                        // buffer first. Measured on a real 1.6 GB -co container:
+                        // every type-0 record holds exactly one block (467 records,
+                        // 467 blocks, every record boundary is a block start), which
+                        // is what our own writer emits too -- but an archive where a
+                        // block straddles two records would fail here, so the caller
+                        // rewinds the stream and falls back to the concatenated
+                        // path rather than calling such an archive corrupt.
+                        struct StreamDecoder {
+                            std::function<bool(std::size_t, std::size_t, std::uint64_t, OptimumOut*)> run;
+                        };
+                        const unsigned char* const raw_base = bytes.data();
+                        const auto make_stream_decoder = [popt_window_capacity, method_p0, raw_base]() {
+                            StreamDecoder sd;
+                            auto aud = std::make_shared<nzr::audio::NzAudioPred>();
+                            auto img = std::make_shared<nzr::audio::NzImageModel>();
+                            ConfigureOptimumModels(method_p0, *aud, *img);
+                            auto exe = std::make_shared<NzExeFilter>();
+                            if (method_p0 == 5u) {
+                                auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(popt_window_capacity);
+                                sd.run = [dec, aud, img, exe, raw_base](std::size_t b, std::size_t e,
+                                                                        std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(raw_base, b, e, hint, *dec, *aud, *img, *exe, out);
+                                };
+                            } else {
+                                auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(popt_window_capacity);
+                                sd.run = [dec, aud, img, exe, raw_base](std::size_t b, std::size_t e,
+                                                                        std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(raw_base, b, e, hint, *dec, *aud, *img, *exe, out);
+                                };
+                            }
+                            return sd;
+                        };
                         bool use_sink = psink::Available();
                         std::vector<unsigned char> assembled(
                             use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
@@ -6651,9 +6837,16 @@ bool TryParseLegacyCnArchive(
                         // writes its own disjoint slice of `assembled`.
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             POptStream& s = *plist[idx];
+                            // With the sink the stream's output goes straight to
+                            // the files a block at a time and is dropped -- this
+                            // buffer is only for the assemble-in-memory path.
+                            // Holding every worker's whole output at once is what
+                            // made a 4.5 GB archive cost 8.9 GB of resident memory
+                            // where the original holds 278 MB.
                             std::vector<unsigned char> slice;
-                            slice.reserve(static_cast<std::size_t>(s.osz));
+                            if (!use_sink) slice.reserve(static_cast<std::size_t>(s.osz));
                             bool sok = true;
+                            std::uint64_t streamed = 0;
                             if (use_sink) {
                                 psink::StreamBegin(idx);
                                 if (s.chunks.size() > 1u) {
@@ -6662,25 +6855,61 @@ bool TryParseLegacyCnArchive(
                                     psink::SetLastRecordStart(idx, off);
                                 }
                             }
+                            const auto make_out = [&]() {
+                                return use_sink
+                                    ? OptimumOut([idx, &streamed, &s](const unsigned char* p, std::size_t n) {
+                                          // Never hand over more than the slice declares:
+                                          // the tail of an overrunning block is dropped
+                                          // exactly as the buffered path's resize did.
+                                          if (streamed >= s.osz) return;
+                                          const std::uint64_t room = s.osz - streamed;
+                                          const std::size_t take = n < room ? n : static_cast<std::size_t>(room);
+                                          psink::StreamWrite(idx, p, take);
+                                          streamed += take;
+                                      })
+                                    : OptimumOut(&slice);
+                            };
+                            OptimumOut ow = make_out();
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
-                                sok = decode_seq(bytes.data(), c.first, c.first + c.second, s.osz, &slice);
+                                sok = decode_seq(bytes.data(), c.first, c.first + c.second, s.osz, &ow);
                             } else {
-                                std::vector<unsigned char> concat;
-                                std::size_t clen = 0;
-                                for (const auto& c : s.chunks) clen += c.second;
-                                concat.reserve(clen);
-                                for (const auto& c : s.chunks)
-                                    concat.insert(concat.end(),
-                                                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
-                                sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &slice);
+                                // Fast path: one record at a time, straight out of
+                                // the mapped archive. Concatenating them first cost a
+                                // copy of the stream's whole compressed payload --
+                                // ~100 MB per worker on this container, every worker
+                                // at once.
+                                StreamDecoder sd = make_stream_decoder();
+                                sok = true;
+                                for (const auto& c : s.chunks) {
+                                    if (!sd.run(c.first, c.first + c.second, s.osz, &ow)) { sok = false; break; }
+                                }
+                                if (!sok || ow.size() != s.osz) {
+                                    // Not one whole block per record after all (or a
+                                    // genuinely bad stream): start the stream over
+                                    // with everything concatenated, which is what the
+                                    // reader did before. Rewinding puts the sink's
+                                    // cursor back, and re-running rewrites the same
+                                    // absolute file ranges.
+                                    if (use_sink) { psink::StreamRewind(idx); streamed = 0; }
+                                    slice.clear();
+                                    nzr::derr::Clear();
+                                    ow = make_out();
+                                    std::vector<unsigned char> concat;
+                                    std::size_t clen = 0;
+                                    for (const auto& c : s.chunks) clen += c.second;
+                                    concat.reserve(clen);
+                                    for (const auto& c : s.chunks)
+                                        concat.insert(concat.end(),
+                                                      bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
+                                                      bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                    sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &ow);
+                                }
                             }
                             if (use_sink) {
-                                const bool okd = sok && slice.size() == s.osz;
-                                if (slice.size() > s.osz) slice.resize(static_cast<std::size_t>(s.osz));
+                                const bool okd = sok && ow.size() == s.osz;
                                 const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
-                                psink::StreamEnd(idx, slice.data(), slice.size(), okd, clean);
+                                psink::StreamEnd(idx, nullptr, streamed, okd, clean);
                                 return okd;
                             }
                             if (!sok || slice.size() != s.osz) return false;
@@ -8037,8 +8266,8 @@ static bool TryDecodeLegacyCm(
             // immediately after.
             std::vector<std::uint8_t> tbuf(remaining + 16u);
             const std::uint32_t expanded = NzTextTransformDict(
-                work.data(), cur_size, tbuf.data(), remaining);
-            if (expanded == 0) { ok = false; break; }
+                work.data(), cur_size, tbuf.data(), static_cast<std::uint32_t>(tbuf.size()));
+            if (expanded == 0 || expanded > remaining) { ok = false; break; }
             tbuf.resize(expanded);
             work.swap(tbuf);
             cur_size = expanded;
@@ -8295,7 +8524,7 @@ static bool DecodeOptimumBlockSequence(
     nzr::audio::NzAudioPred& audio,
     nzr::audio::NzImageModel& image,
     NzExeFilter& exe,
-    std::vector<unsigned char>* out_data) {
+    OptimumOut* out_data) {
     progress::Scope pscope;
     std::size_t pos = blocks_begin;
     const std::size_t stream_end = blocks_end;
@@ -8366,7 +8595,7 @@ static bool DecodeOptimumBlockSequence(
                             payload_size, audio_out_size, iused);
                 }
                 if (iused == 0u) { nzr::derr::SetAt(2u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-                out_data->insert(out_data->end(), ibuf.begin(), ibuf.end());
+                out_data->Append(ibuf.data(), ibuf.size());
                 progress::Add(ibuf.size());
                 continue;
             }
@@ -8386,7 +8615,7 @@ static bool DecodeOptimumBlockSequence(
                         payload_size, audio_out_size, aok ? 1 : 0);
             }
             if (!aok) { nzr::derr::SetAt(16u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+            out_data->Append(abuf.data(), abuf.size());
                 progress::Add(abuf.size());
             continue;
         }
@@ -8923,11 +9152,36 @@ static bool DecodeOptimumBlockSequence(
             std::snprintf(nm, sizeof(nm), "%s/tt%d.%s", tt_dump_dir, tt_dump_n, step);
             if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
         };
+        // Text-transform scratch. `remaining` -- the whole rest of the stream's
+        // output -- is a correct cap but a ruinous allocation: the FIRST block of
+        // a 281 MB worker stream took 281 MB of zero-filled scratch, and sixteen
+        // workers ran at once, which is most of what kept this reader at 8.5 GB
+        // where the original holds 278 MB. Start from a block-proportional
+        // capacity and fall back to the full cap only when the transform says it
+        // did not fit. A transform returns 0 both for bad data and for no room,
+        // so the retry is what makes the small first try safe: no valid block can
+        // be lost by it, whatever the real expansion bound turns out to be.
+        const auto tt_scratch = [&](std::vector<std::uint8_t>* buf, std::uint32_t slack,
+                                    const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run)
+                                -> std::uint32_t {
+            std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
+            if (want > remaining) want = remaining;
+            std::uint32_t cap = static_cast<std::uint32_t>(want);
+            buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+            std::uint32_t n = run(buf->data(), cap);
+            if (n == 0u && cap < remaining) {
+                cap = remaining;
+                buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+                n = run(buf->data(), cap);
+            }
+            return n;
+        };
         if (tt_enabled && (tt_flags & 0x10u)) {
-            std::vector<std::uint8_t> tbuf(remaining + (1u << 16));
-            const std::uint32_t n = NzTextTransformNumber(
-                tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
-                work.data(), cur_size, tbuf.data(), remaining + (1u << 16));
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 1u << 16, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformNumber(tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                                             work.data(), cur_size, o, cap + (1u << 16));
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("num");
@@ -8951,8 +9205,10 @@ static bool DecodeOptimumBlockSequence(
             // NzTextTransformDict call site above (CopyDictEntWithCase's
             // intentional fixed-width over-write needs caller-provided
             // headroom past the logical output size).
-            std::vector<std::uint8_t> tbuf(remaining + 16u);
-            const std::uint32_t n = NzTextTransformDict(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 16u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformDict(work.data(), cur_size, o, cap + 16u);
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("dict");
@@ -8960,8 +9216,10 @@ static bool DecodeOptimumBlockSequence(
         if (tt_enabled && (tt_flags & 0x04u)) {
             // HTML closing-tag restoration (NzTextTransformHtml). Reference
             // order puts 0x04 after the 0x08 dictionary and before 0x02.
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformHtml(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("html");
@@ -8986,8 +9244,10 @@ static bool DecodeOptimumBlockSequence(
             // byte post-filter, no side-channel data, order-independent of
             // the entropy coder (verified against real -co archives whose
             // literal payload didn't warrant the word dictionary).
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformRle(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("rle");
@@ -8996,8 +9256,10 @@ static bool DecodeOptimumBlockSequence(
             // Chess/PGN transform, between 0x20 and 0x01 in the reference's
             // dispatch order. Not in the community reference at all (its body
             // is assert(0)); decoded from (input, output) pairs plus the binary.
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransform6(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransform6(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9009,8 +9271,10 @@ static bool DecodeOptimumBlockSequence(
             // and 0x40). One byte of slack: the reference's output budget is
             // out_cap + 1 and it writes that extra byte before noticing the
             // overrun (see NzTextTransformCrToCrLf's header comment).
-            std::vector<std::uint8_t> tbuf(static_cast<std::size_t>(remaining) + 1u);
-            const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 1u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformCrToCrLf(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("crlf");
@@ -9052,7 +9316,7 @@ static bool DecodeOptimumBlockSequence(
                     stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
         }
         if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        out_data->Append(work.data(), cur_size);
         progress::Add(cur_size);
         nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -9157,12 +9421,14 @@ static bool TryDecodeLegacyOptimum(
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
         decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
+            OptimumOut ow(out);
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
         decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
+            OptimumOut ow(out);
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
         };
     }
 
@@ -9367,16 +9633,39 @@ std::string LegacyProbeMessage(const std::string& path) {
     return std::string(buf);
 }
 
-// Stage timer for the big-archive profile (NZ_VERBOSE_NATIVE): "+delta (total)".
+// Resident and peak-resident megabytes, for the stage profile. Linux only;
+// every other platform reports 0 and the stage line just omits the figures.
+static void StageRssMb(long* rss_mb, long* peak_mb, long* data_mb = nullptr) {
+    *rss_mb = 0; *peak_mb = 0; if (data_mb) *data_mb = 0;
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (f == nullptr) return;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        long kb = 0;
+        if (std::sscanf(line, "VmRSS: %ld kB", &kb) == 1) *rss_mb = kb / 1024;
+        else if (std::sscanf(line, "VmHWM: %ld kB", &kb) == 1) *peak_mb = kb / 1024;
+        else if (data_mb != nullptr && std::sscanf(line, "VmData: %ld kB", &kb) == 1) *data_mb = kb / 1024;
+    }
+    std::fclose(f);
+#endif
+}
+
+// Stage timer AND memory for the big-archive profile (NZ_VERBOSE_NATIVE):
+// "+delta (total)  rss=N MB peak=N MB". The memory column is what the streaming
+// work is measured against -- the original holds 278 MB decoding a 4.5 GB output,
+// so a stage whose rss climbs with the OUTPUT rather than the window is a bug.
 void StageMark(const char* what) {
     static const bool on = (NZ_ENV("NZ_VERBOSE_NATIVE") != nullptr);
     if (!on) return;
     static const auto t0 = std::chrono::steady_clock::now();
     static auto last = t0;
     const auto now = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "[time] %-20s +%6.2fs  (t=%6.2fs)\n", what,
+    long rss = 0, peak = 0, dat = 0;
+    StageRssMb(&rss, &peak, &dat);
+    std::fprintf(stderr, "[time] %-20s +%6.2fs  (t=%6.2fs)  rss=%5ld MB peak=%5ld MB anon=%5ld MB\n", what,
                  std::chrono::duration<double>(now - last).count(),
-                 std::chrono::duration<double>(now - t0).count());
+                 std::chrono::duration<double>(now - t0).count(), rss, peak, dat);
     last = now;
 }
 

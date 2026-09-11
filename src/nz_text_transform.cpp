@@ -157,8 +157,19 @@ static uint8_t* FormatIP(uint32_t ip, uint8_t* out) {
 // Returns decoded size (stripping trailing space), 0 on error.
 uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
                              uint8_t* out, uint32_t allocated) {
-    (void)allocated;
     const uint8_t* out_org = out;
+    // This transform used to ignore `allocated` entirely and write as far as the
+    // input told it to, which is why every caller had to hand it a buffer sized
+    // from the whole REMAINING OUTPUT of the stream -- 281 MB per worker on a
+    // 4.5 GB archive, zero-filled, times every worker in flight. Each write is
+    // now checked for exactly the room it needs. NOTE the contract: `allocated`
+    // is the SIZE OF THE BUFFER, not the logical output cap -- CopyDictEntWithCase
+    // writes a fixed 8 or 16 bytes per multi-byte dict word even when the word is
+    // shorter, and the last block writes a trailing space one past its logical
+    // length, so callers hand over a buffer with slack and the checks below are
+    // against that buffer's real end. The caller compares the RETURNED length
+    // against its own cap. On valid input none of these can fire.
+    uint8_t* const out_end = out + allocated;
     if (in_size <= 1 || in[in_size - 1] != 0x20u)
         return 0;
 
@@ -196,6 +207,7 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
                         }
                     }
                     if (in >= in_end) break;
+                    if (out_end - out < 16) return 0;   // "255.255.255.255"
                     out = FormatIP(ip, out);
                     c = *in++;
                 }
@@ -240,6 +252,7 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
                 wp = InsertMidDict(wp, b - 128u);
             }
             uint32_t wl = static_cast<uint32_t>((buf + 6 + 6 + 2) - wp);
+            if (static_cast<std::uint32_t>(out_end - out) < wl) return 0;
             out += wl;
             CopyDictEntWithCase(out - wl, wp, wl, case_mode);
         } else {
@@ -251,6 +264,7 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
             } else {
                 in++;
                 uint32_t out32 = dict32;
+                if (out_end - out < 4) return 0;
                 memcpy(out, &out32, 4);
                 uint8_t* old_out = out;
                 out += (dict32 >> 24);
@@ -265,11 +279,13 @@ uint32_t NzTextTransformDict(const uint8_t* in, uint32_t in_size,
         }
 
     output_next_char:
+        if (out >= out_end) return 0;
         *out++ = static_cast<uint8_t>(c);
         if (kCharacterTraits_1[c]) {
             if (in >= in_end) break;
             for (;;) {
                 c = *in++;
+                if (out >= out_end) return 0;
                 *out++ = static_cast<uint8_t>(c);
                 if (!kCharacterTraits_1[c]) break;
                 if (case_mode == 2)
