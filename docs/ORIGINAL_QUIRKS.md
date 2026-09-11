@@ -125,6 +125,25 @@ with 0, 2^1 … 2^31, 0.
   11/16 of it for `-cd`, 17/32 for `-cD`, and for `-cF` the budget minus 64 MB, so every `-cF`
   run under `-m64m` gets a 64 KB window (and `-m70m` a 6 MB one). Rounding is to the nearest
   representable value, so `-cf -m300k` uses a 320 KB window.
+- **`-m` is divided by the worker count before anything else looks at it**: `FUN_0804cec0` is
+  called once per worker with the budget AND the input already divided, so `-cf -t2 -m8m` gets a
+  4 MB window, not 8 MB. The divisor is the number of WORKERS, not the `-t` value: a single `.wav`
+  at `-t4` is media-heavy, so one worker takes the whole budget, while the same bytes under a
+  non-media name get a quarter of it.
+- **`-co`'s 64 KB window floor is applied after the block size has already been computed**: the
+  block rule consumes the UNFLOORED window, which is zero for any budget at or under 16 MB. That
+  zero makes `window - 1` underflow to `0xffffffff`, whose `bsr` is 31, which reserves a full
+  1 GB; the reserve then drives the available space negative, it is masked to zero, the quotient
+  is zero, and the 1 MB floor plus one byte-float step is what finally lands -- 17 units of 64 KB.
+  So the familiar "small budgets always give a 1 114 112-byte block" is not a special case for
+  small budgets at all: it is one uniform formula reading a window that has not been floored yet.
+- **The `-co` block size is stored one byte-float step BELOW what the codec uses**: the archive
+  holds `bf_enc(block) - 1` and every reader decodes `bf_dec(byte + 1)`, and the writer itself
+  rounds to the NEAREST representable size (ties up) before taking that step. Rounding down
+  instead -- "the next representable value above" -- gives the right answer only when the block
+  happens to be representable, and lands one step low otherwise.
+- **A `-co` block at or above 16 MB is never stepped up**: the step is applied only to a block
+  that is both below the input and below 16 MB, so the two regimes meet with a discontinuity.
 - **The version string is a record**: an archive begins with a type-14 record holding
   `NanoZip 0.09 alpha` and a type-30 record holding the byte 9; the "incompatible version"
   message reports that byte divided by 100.

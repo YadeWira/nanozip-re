@@ -11977,37 +11977,63 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // a sixteenth and a thirty-second for -cD (17/32); both sides capped at
     // 0xf0000000. Under 64 KB the window is 64 KB. (Measured: -cd -m1m -> 704 KB,
     // -cD -m1m -> 576 KB, -cf -m300k -> 320 KB, the rounding being to the nearest.)
-    const std::uint64_t budget = options.memory_bytes;
+    // FUN_0804cec0 is called once per worker, and BOTH the budget and the input
+    // arrive already divided by the worker count. Measured: the same 48 MB of
+    // bytes at -t4 gets a 64 MB budget under a .wav name (media-heavy, so one
+    // worker) and 16 MB under a non-media name (four workers). Not dividing it
+    // wrote a 8 MB window where the original writes 4 MB at -cf -t2 -m8m.
+    const std::uint64_t budget = options.memory_bytes / (workers ? workers : 1u);
     std::uint64_t reduced;
     switch (p0) {
         case 2u: reduced = (budget > 0x3ffffffull) ? budget - 0x4000000ull : 0ull; break;
         case 3u: reduced = budget - (budget >> 2u) - (budget >> 4u); break;
         case 4u: reduced = budget - (budget >> 2u) - (budget >> 3u) - (budget >> 4u) - (budget >> 5u); break;
-        // -co: measured at every budget from 1 MB to 16 MB, the window is the
-        // 64 KB floor. Above that it grows with the INPUT rather than the budget
-        // (a 1.16 MB input at -m64m takes a 1.125 MB window), which is why the
-        // dispatch only accepts the small-budget shape for now.
-        case 5u: reduced = 0x10000ull; break;
+        // -co (0x0804d5e9): half of whatever the budget has left over 16 MB.
+        // There is deliberately NO 64 KB floor here: the original applies that
+        // floor to the STORED window at the very end of FUN_0804cec0, after the
+        // block has been computed, and the block rule below consumes the
+        // unfloored value -- which is 0 for any budget at or under 16 MB, and
+        // that zero is what produces the 16/17-unit blocks seen down there.
+        case 5u: reduced = (budget > (16ull << 20u)) ? (budget - (16ull << 20u)) >> 1u : 0ull; break;
         default: reduced = budget; break;
     }
     if (reduced > 0xf0000000ull) reduced = 0xf0000000ull;
     const std::uint64_t cap = std::min<std::uint64_t>(per, 0xf0000000ull);
     const std::uint64_t basis = std::min(reduced, cap);
-    std::uint64_t window = (basis < 0x8000u) ? 0x10000u : LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
-    if (window < 0x10000u) window = 0x10000u;
+    const std::uint64_t window_raw = LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
+    std::uint64_t window = (window_raw < 0x10000u) ? 0x10000u : window_raw;   // the floor, applied LAST
 
     const fs::path out_path = ResolveArchivePath(options);
     if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
-    // -co block: ceil(input / 64 KB) units of 64 KB, never fewer than 16 nor
-    // more than 17 (the low-budget rule; see the dispatch above).
+    // -co block: FUN_0804cec0, 0x0804d63a .. 0x0804d787. Two reserves are taken
+    // off the budget on top of a flat 1 MB, the rest is split five ways with the
+    // window, and the result is rounded to a byte-float and then stepped once.
+    // Validated against the original on a grid of inputs (0.75 MB .. 48 MB, plus
+    // deliberately non-representable sizes) crossed with budgets of 4 .. 512 MB.
     std::uint32_t co_block = 0x100000u;
     if (p0 == 5u) {
-        std::uint64_t units = (total + 0xffffull) / 0x10000ull;
-        if (units < 16ull) units = 16ull;
-        if (units > 17ull) units = 17ull;
-        co_block = static_cast<std::uint32_t>(units * 0x10000ull);
+        const std::uint64_t w = window_raw;                      // NOT floored to 64 KB
+        const std::uint32_t wm1 = static_cast<std::uint32_t>(w - 1u);   // w == 0 -> 0xffffffff
+        unsigned e = 31u; while (e != 0u && ((wm1 >> e) & 1u) == 0u) --e;   // bsr
+        const std::uint64_t h1 = 4ull << (e > 3u ? e - 3u : 0u);
+        const std::uint64_t w32 = w >> 5u;
+        const std::uint64_t u2 = (w32 > 0x7ffffull) ? (w32 - 1u) : 0x7ffffull;
+        unsigned e2 = 63u; while (e2 != 0u && ((u2 >> e2) & 1u) == 0u) --e2;
+        const std::uint64_t h2 = 4ull << (e2 + 1u);
+        const std::uint64_t over = (budget > (16ull << 20u)) ? budget - (16ull << 20u) : 0ull;
+        const std::uint64_t sub = (1ull << 20u) + h1 + h2;
+        const std::uint64_t a = (over > sub) ? over - sub : 0ull;     // the sign mask at 0x0804d715
+        // 64-bit UNSIGNED: when the reserves leave less than one window, this
+        // wraps to something astronomical and the input below is what caps it.
+        const std::uint64_t num = a - w;
+        std::uint64_t b = std::min<std::uint64_t>(num / 5ull, per);
+        if (b < (1ull << 20u)) b = 1ull << 20u;                       // 0x0804d769
+        b = LegacyByteFloatDecode(LegacyByteFloatEncode(b));          // 0x0804d778
+        // 0x0804d486: only a block below the input AND below 16 MB is stepped up.
+        if (b < per && b <= 0xffffffull) b = LegacyByteFloatDecode(LegacyByteFloatEncode(b) + 1u);
+        co_block = static_cast<std::uint32_t>(b);
     }
     // A compressor that cannot yet write some block shape declines mid-stream.
     // Leaving the prologue on disk turns a refusal into an archive that reads
@@ -12128,20 +12154,16 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
     if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
     if (options.compressor == Compressor::kLzhds) return RunAddStoreContainer(options, std::move(found), os, add_start, 4u);
-    if (options.compressor == Compressor::kOptimum1) {
-        // A budget of 16 MB or less picks a 64 KB window and a block of
-        // ceil(input / 64 KB) units clamped to 16 or 17 -- measured at every
-        // budget from 1 MB to 16 MB and every input from 2 KB to 3 MB. Above that
-        // budget both grow with the input, and the block stops following any
-        // formula at all (a 3 MB input takes 46 units at -m20m, 17 at -m24m, 30
-        // at -m32m), which says it is the reader's buffering that decides -- so
-        // that shape waits on the block driver rather than being guessed at.
-        if (options.memory_bytes <= (16ull << 20u))
-            return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
-    }
-    // The compressors not ported yet (-cD, -co, -cO, -cc): refuse. The decode
-    // phase's stub writer labelled raw bytes with the codec's byte, an archive
-    // the original cannot decode ("code 1024" on a -cD one); nothing is better.
+    // -co at any budget. The window and block rules were read out of
+    // FUN_0804cec0 and validated against the original on a grid of inputs and
+    // budgets; see RunAddStoreContainer. The 16 MB gate that used to sit here
+    // made the plainest invocation a user can type (`nz a out.nz file`, no
+    // switches) refuse outright, which was the most visible 1:1 divergence left.
+    if (options.compressor == Compressor::kOptimum1)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
+    // The compressors not ported yet (-cO, -cc): refuse. The decode phase's stub
+    // writer labelled raw bytes with the codec's byte, an archive the original
+    // cannot decode ("code 1024" on a -cD one); nothing is better.
     os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF or -cd.\n";
     return 1;
     {
