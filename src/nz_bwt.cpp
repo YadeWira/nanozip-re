@@ -2102,6 +2102,203 @@ finish:
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// The param15 ENCODER (reference FUN_08083570). The other BWT-only pass: it
+// runs BEFORE param14 on a BWT block that took no text transform, and codes
+// long matches against the LZ engine's RING through the long-range index the
+// window feed keeps -- one slot per 256 bytes of ring, `tag | (pos >> 8)` with a
+// 10-bit tag of the 256-byte rolling hash. The pass READS that index and never
+// writes it; its own 256-byte hash runs over the block being coded.
+//
+// Per position: look the hash up; on a tag hit, compare the block against the
+// ring at `slot * 256` for up to min(cap - src, bytes left). A match of 8 or
+// more that passes the rarity gate (for lengths under 255: the sum of the
+// param14 stats over the matched positions must stay under a per-length
+// threshold) and, before the ring has wrapped, lies inside the filled part of
+// the ring (truncated to it if it must stay above 7) is coded as
+//     fe f0  ~src(4 bytes, big-endian)  len-8 (arithmetic side stream)
+// and the hash rolls over the consumed bytes (recomputed from scratch past 63).
+// Otherwise a run of literals goes out -- skip[len] of them when the rarity sum
+// is under 6577, else len - len/4 -- each rolling the hash by one, with a `00`
+// escape after a literal `fe f0`. The output must stay under n - 8 and the side
+// stream under half its capacity, or the pass reports 0 and the block goes on
+// without it. Tables are the generated ones the live binary carries:
+// threshold ((n-5)/3)*(n-5)^2 + 16, skip max(1, (n-4)/2), scalar 6577.
+namespace {
+
+struct P15Tables {
+    uint32_t thr[256];
+    uint8_t skip[256];
+    P15Tables() {
+        for (uint32_t n = 0; n < 256u; ++n) {
+            thr[n] = (n >= 5u) ? ((n - 5u) / 3u) * (n - 5u) * (n - 5u) + 16u : 16u;
+            const int32_t sk = ((int32_t)n - 4) / 2;
+            skip[n] = (uint8_t)(sk < 1 ? 1 : sk);
+        }
+    }
+};
+const P15Tables& P15T() { static const P15Tables t; return t; }
+
+// DAT_08171d40: b * K^256, what leaves the 256-byte rolling window (the parser
+// keeps its own copy; the pass needs one here too).
+const uint32_t* P15LrOut() {
+    static uint32_t t[256];
+    static bool done = false;
+    if (!done) {
+        uint32_t k = 1;
+        for (int i = 0; i < 0x100; ++i) k *= 0x104070bu;
+        uint32_t v = 0;
+        for (int i = 0; i < 256; ++i) { t[i] = v; v += k; }
+        done = true;
+    }
+    return t;
+}
+
+}  // namespace
+
+uint32_t NzBwtParam15Encode(const uint8_t* in, uint32_t n,
+                            const std::vector<uint16_t>& stats,
+                            const uint32_t* lr_table, uint32_t lr_mask,
+                            const uint8_t* ring, uint32_t ring_cap,
+                            uint32_t ring_fill, bool ring_scrolled,
+                            std::vector<uint8_t>* out, std::vector<uint8_t>* side,
+                            uint32_t side_cap) {
+    out->clear();
+    side->clear();
+    if (n == 0u || in == nullptr || lr_table == nullptr || ring == nullptr || stats.size() < 0x40000u) return 0;
+    const uint8_t* const in_end = in + n;
+    // the output may not reach n - 8, and the side stream may use half its room
+    std::vector<uint8_t> obuf(n + 16u);
+    uint8_t* o = obuf.data();
+    uint8_t* const o_lim = obuf.data() + n - 8u;
+    std::vector<uint8_t> sbuf(side_cap);
+    BwtArithEnc enc;
+    enc.cur = sbuf.data(); enc.end = sbuf.data() + (side_cap >> 1);
+    uint16_t model_a[64], model_b[256];
+    for (uint32_t i = 0; i != 64u; ++i) model_a[i] = 0x8000u;
+    for (uint32_t i = 0; i != 256u; ++i) model_b[i] = 0x8000u;
+    const uint32_t* const LRO = P15LrOut();
+    const P15Tables& T = P15T();
+    const uint16_t* const st = stats.data();
+
+    uint32_t h = 0;
+    for (uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + in[i];   // reads past a short block, as the original does
+    uint32_t pair = 0;   // the last two bytes emitted, for the fe f0 escape
+
+    // the length coder shape shared with param14 (PutLen's inverse is Param1415LenDecoder)
+    auto put_len = [&](uint32_t value) {
+        uint32_t lenbits = 0, rest = value;
+        for (;;) {
+            uint16_t* m = &model_a[32u + lenbits];
+            rest >>= 1;
+            const bool flag = (rest != 0u);
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((((uint32_t)flag << 16) + 8u - *m) >> 4));
+            if (!flag) break;
+            ++lenbits;
+        }
+        const uint32_t base = lenbits * 8u;
+        uint32_t tree_bits, n_low;
+        if (lenbits >= 2u) { tree_bits = 2u; n_low = lenbits - 2u; }
+        else { tree_bits = (lenbits == 0u) ? 1u : lenbits; n_low = 0u; }
+        uint32_t bits = value << ((32u - (lenbits ? lenbits : 1u)) & 31u);
+        uint32_t accum = 3u;
+        for (uint32_t i = 0; i < tree_bits; ++i) {
+            const bool flag = ((int32_t)bits < 0);
+            bits <<= 1;
+            uint16_t* m = &model_b[base + accum];
+            enc.EncodeModel(flag, *m);
+            *m = (uint16_t)(*m + ((((uint32_t)flag << 16) + 8u - *m) >> 4));
+            accum = accum * 2u + (flag ? 1u : 0u);
+        }
+        for (uint32_t i = 0; i < n_low; ++i) {
+            enc.Encode(((int32_t)bits < 0), 0x800u);
+            bits <<= 1;
+        }
+    };
+
+    bool stopped = false;
+    while (in < in_end && o < o_lim && !stopped) {
+        const uint32_t slot = lr_table[h & lr_mask];
+        uint32_t len = 0, rarity = 0;
+        bool matched = false, force_one = false;
+        uint32_t src = 0;
+        if ((h & 0xffc00000u) == (slot & 0xffc00000u)) {
+            src = (slot & 0x3fffffu) * 256u;
+            const uint32_t avail = ring_cap - src;
+            const uint32_t left = (uint32_t)(in_end - in);
+            const uint32_t lim = avail < left ? avail : left;
+            while (len < lim && in[len] == ring[src + len]) ++len;
+            if (len >= 8u) {
+                bool ok = true;
+                if (len < 0xffu) {
+                    for (uint32_t i = 0; i < len; ++i) {
+                        uint32_t w; std::memcpy(&w, in + i, 4);
+                        rarity += st[((w >> 19) ^ w) & 0x3ffffu];
+                    }
+                    if (T.thr[len] <= rarity) ok = false;
+                }
+                if (ok && !ring_scrolled) {
+                    // Before the first wrap only the filled part of the ring is
+                    // real: a source past it is one literal and nothing else
+                    // (no skip run), a match running past it is cut to the fill
+                    // and kept only if that leaves more than 7 bytes.
+                    if (src < ring_fill && (len + src <= ring_fill || (len = ring_fill - src, len > 7u))) { /* keep */ }
+                    else { ok = false; force_one = true; }
+                }
+                matched = ok;
+            } else {
+                rarity = 0;
+            }
+        }
+        if (matched) {
+            // roll the hash over what the match consumes
+            if (len < 0x40u) {
+                for (uint32_t i = 0; i < len; ++i) h = h * 0x104070bu + in[i + 0x100u] - LRO[in[i]];
+            } else {
+                h = 0;
+                for (uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + in[len + i];
+            }
+            in += len;
+            *o++ = 0xfeu; *o++ = 0xf0u;
+            const uint32_t enc_src = ~src;
+            *o++ = (uint8_t)(enc_src >> 24); *o++ = (uint8_t)(enc_src >> 16);
+            *o++ = (uint8_t)(enc_src >> 8);  *o++ = (uint8_t)enc_src;
+            put_len(len - 8u);
+            pair = 0;
+        } else {
+            const uint32_t count0 = force_one ? 1u
+                                  : (rarity < 6577u) ? (uint32_t)T.skip[len] : (len - (len >> 2));
+            uint32_t count = count0;
+            for (;;) {
+                h = h * 0x104070bu + in[0x100] - LRO[in[0]];
+                const uint8_t c = *in++;
+                pair = ((pair & 0xffu) << 8) | c;
+                *o++ = c;
+                if (--count == 0u) break;
+                if (in >= in_end || o >= o_lim) { stopped = true; break; }
+                if (pair == 0xfef0u) { *o++ = 0u; }
+            }
+            if (stopped) break;
+        }
+        if (in >= in_end || o >= o_lim) break;
+        if (pair == 0xfef0u) { *o++ = 0u; }
+    }
+    // one flush byte, then the verdict: kept only if output + side stay under n - 8
+    // FUN_08083570's tail: the side cursor never passes its limit (bytes past it
+    // are dropped, not flagged), so a stream that ever filled up fails here --
+    // the flush byte needs room, and room must still be left after it.
+    if (enc.overflow || !(enc.cur < enc.end)) return 0;
+    enc.Put((uint8_t)(enc.hi >> 24));
+    if (!(enc.cur < enc.end)) return 0;
+    const uint32_t side_n = (uint32_t)(enc.cur - sbuf.data());
+    const uint32_t out_n = (uint32_t)(o - obuf.data());
+    if (!(o + side_n < o_lim)) return 0;
+    out->assign(obuf.data(), obuf.data() + out_n);
+    side->assign(sbuf.data(), sbuf.data() + side_n);
+    return out_n;
+}
+
 uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
                             const std::vector<uint16_t>& stats,
                             std::vector<uint8_t>* out,

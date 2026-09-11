@@ -275,6 +275,43 @@ itself). Decoding undoes them the other way round, right after the inverse BWT.
 param15 appears in 3 of 289 corpus inputs and is not written; param14 appears in
 20 and is.
 
+### param15 on the writing side (2026-09-11)
+
+`NzBwtParam15Encode` (reference `FUN_08083570`). It runs on a BWT block that took no
+text transform, BEFORE param14 and AFTER param1/param2 -- the encode order is the
+decode chain inverted, so the bytes it sees are already post-param1. It matches the
+block against the LZ engine's RING through the long-range index the window feed
+maintains, which the pass only ever READS:
+
+- per position, look up `lr[h & mask]` with the 256-byte rolling hash; a tag hit
+  (top ten bits) names a source at `slot * 256`;
+- compare up to `min(ring_cap - src, bytes left)`; 8 bytes or more is a candidate;
+- under 255 bytes it must pass the rarity gate -- the sum of the shared param14
+  stats over the matched positions below `((n-5)/3)*(n-5)^2 + 16`;
+- before the ring has ever wrapped, a source past the filled part is refused and a
+  match running past it is cut to the fill, kept only if more than 7 bytes remain;
+- accepted: `fe f0`, the one's-complement source as four big-endian bytes, and
+  `len - 8` through param14's length coder into the arithmetic side stream;
+- refused: a run of literals -- `max(1, (len-4)/2)` of them when the rarity sum is
+  under 6577, else `len - len/4` -- each rolling the hash one byte, with a `00`
+  escape after a literal `fe f0`.
+
+The pass reports 0 (and the block goes on without it) when the output would reach
+`n - 8`, when the side stream fills half its 4 KB, or right after a model reset
+(`codec+0x3f738`, which the window feed clears -- `WindowResetPending()` here).
+
+Two things the window feed had to grow for it: the long-range index is now
+maintained over every fed span (the same `tag | (pos >> 8)` stores at 256-aligned
+positions the original writes in `FUN_0806f530`), and the block's ORIGINAL bytes go
+to the window after param15 has looked at it and before param14 rewrites it.
+
+Validated against the original's own pass, captured with `tdo/p15cap/cap_p15_full.py`
+(break `*0x08083570`, return `*0x0808f257`, dumping in/out/side plus the live ring
+and the 2 MB index): both calls of `087_Plouff_20Slides.gif_` reproduce the output
+and the side stream byte for byte, and so does the first call of
+`081_AWSOFTWA.PLA_`. `tdo/drv/p15_drv` replays a capture offline;
+`NZOPT_DUMP_P15ENC=<dir>` dumps ours in the same layout.
+
 **param15's offsets are ring positions**, and the decoder must resolve them against the
 LZ engine's ring, not against a flat accumulation of the same bytes. The encoder's
 long-range index keeps one slot per 256 bytes of the ring (every offset ever observed
@@ -364,9 +401,19 @@ out a few bytes off, which is enough to flip a block from LZ to BWT.
 
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
-files, **62 of 62** executables and DLLs and **176 of 180** mixed corpus files --
-**285 of 289** -- and over all 289 of them it declines NOTHING. Not written yet:
-param15 (3 of the 4 remaining differences), the stored LZ form, image and audio
-blocks, the multi-threaded bucket layout, and budgets above 16 MB. The fourth is
-[quirk 72](ORIGINAL_QUIRKS.md): the original's parser tree is scratch another
-coder writes over between blocks, and ours is not.
+files, **62 of 62** executables and DLLs and **178 of 180** mixed corpus files --
+**287 of 289** -- and over all 289 of them it declines NOTHING. Not written yet:
+the stored LZ form, image and audio blocks, the multi-threaded bucket layout, and
+budgets above 16 MB.
+
+The two that remain are both traced. One is [quirk 72](ORIGINAL_QUIRKS.md): the
+original's parser tree is scratch another coder writes over between blocks, and
+ours is not. The other, `081_AWSOFTWA.PLA_`, is param1's front padding: the
+reference runs its region search over the codec's shared block buffer, so the
+`data[-1]`/`data[-2]` probes at a block's very start read whatever the previous
+operation left there (measured: the previous block's bytes, dword-reversed by the
+BWT's in-place pass), while this port pads with zeros. Three of that file's ~1117
+region decisions come out with a distinct-count one higher, which flips param1 on
+for a block the original leaves alone -- and since param1 runs BEFORE param15 on
+the writing side, param15 then sees different bytes and declines where the
+original matched. The param15 pass itself is byte-exact on that file's other call.

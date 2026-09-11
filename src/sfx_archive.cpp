@@ -11396,15 +11396,79 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             // the block, matches tagged in the byte stream). param14 is
             // written; param15 is not, so a block the reference would have
             // taken it on comes out valid but different.
-            std::vector<std::uint8_t> p14buf, p14side;
-            bool p14_on = false;
+            std::vector<std::uint8_t> p14buf, p14side, p15buf, p15side;
+            bool p14_on = false, p15_on = false;
+            // The block's own bytes: what the window is fed and what the param15
+            // stage check covers. Captured before either pass swaps lz_in.
+            const std::uint8_t* const blk = lz_in;
+            const std::uint32_t blk_len = m;
             const std::uint8_t* pre_p14 = lz_in;
             std::uint32_t pre_p14_len = m;
             if (!tt_on) {
+                // FUN_0808da10: the rarity stats are built ONCE over the block's
+                // original bytes and serve both passes -- param14 later runs on
+                // param15's output with the same table.
                 std::vector<std::uint16_t> stats;
-                NzBwtParam14Stats(lz_in, m, &stats);
-                const std::uint32_t r = NzBwtParam14Encode(lz_in, m, stats, &p14buf, &p14side);
+                NzBwtParam14Stats(blk, blk_len, &stats);
+                // param15 first (FUN_08083570), skipped only right after a model
+                // reset (codec+0x3f738, see WindowResetPending); on a fresh window
+                // it simply finds nothing and reports 0. The pass reads up to 256
+                // bytes past the block -- the bytes that follow it in the
+                // original's input buffer -- so hand it those where they exist
+                // and zeros where the segment ends.
+                if (!co.WindowResetPending() && co.LongRangeTable() != nullptr) {
+                    std::vector<std::uint8_t> padded(static_cast<std::size_t>(blk_len) + 0x200u, 0u);
+                    std::memcpy(padded.data(), blk, blk_len);
+                    const std::size_t after_off = static_cast<std::size_t>(off) + blk_len;
+                    if (after_off < len) {
+                        const std::size_t tail = std::min<std::size_t>(0x200u, len - after_off);
+                        std::memcpy(padded.data() + blk_len, reinterpret_cast<const std::uint8_t*>(data) + after_off, tail);
+                    }
+                    const std::uint32_t r15 = NzBwtParam15Encode(padded.data(), blk_len, stats,
+                                                                 co.LongRangeTable(), co.LongRangeMask(),
+                                                                 co.WindowBase(), co.WindowCapacity(),
+                                                                 co.WindowFill(), co.WindowScrolled(),
+                                                                 &p15buf, &p15side, 0x1000u);
+                    // NZOPT_DUMP_P15ENC=<dir>: the pass's inputs and outputs and the
+                    // engine state it read, in the layout tdo/p15cap captures from
+                    // the original, so the two can be diffed call by call.
+                    if (const char* dd = NZ_ENV("NZOPT_DUMP_P15ENC")) {
+                        static int call_no = 0; ++call_no;
+                        char path[512];
+                        auto wr = [&](const char* what, const void* q, std::size_t nb) {
+                            std::snprintf(path, sizeof path, "%s/%03d.%s", dd, call_no, what);
+                            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(q, 1, nb, f); std::fclose(f); }
+                        };
+                        wr("in", blk, blk_len);
+                        wr("out", p15buf.data(), p15buf.size());
+                        wr("side", p15side.data(), p15side.size());
+                        wr("win", co.WindowBase(), co.WindowCapacity());
+                        wr("tbl", co.LongRangeTable(), (static_cast<std::size_t>(co.LongRangeMask()) + 1u) * 4u);
+                        std::fprintf(stderr, "[P15ENC] call=%d n=%u -> r=%u side=%zu fill=%u scrolled=%d\n",
+                                     call_no, blk_len, r15, p15side.size(), co.WindowFill(), (int)co.WindowScrolled());
+                    }
+                    if (r15 != 0u) { p15_on = true; lz_in = p15buf.data(); m = r15; pre_p14 = lz_in; pre_p14_len = m; }
+                }
+                // vtable+0x0c: the window takes the block's ORIGINAL bytes, after
+                // param15 has looked and before anything else -- both engines.
+                co.FeedWindow(blk, blk_len);
+                verifier.FeedWindow(blk, blk_len);
+                // param14 loads a 32-bit word per position (P14Load32) and
+                // compares candidates at `cur - 3`, so it reads up to three bytes
+                // past the last one it counts. In the reference that is the
+                // middle of the codec's own block buffer and lands on its own
+                // memory; here the input is an exactly-sized vector (param15's
+                // output) or the caller's segment, and the read runs off the end
+                // -- ASan finds it on five of the 289 corpus inputs, at three
+                // different sites in the search. The slack is the caller's to
+                // provide, exactly as it is for param1's front padding.
+                std::vector<std::uint8_t> p14in(static_cast<std::size_t>(m) + 0x10u, 0u);
+                std::memcpy(p14in.data(), lz_in, m);
+                const std::uint32_t r = NzBwtParam14Encode(p14in.data(), m, stats, &p14buf, &p14side);
                 if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
+            } else {
+                co.FeedWindow(blk, blk_len);
+                verifier.FeedWindow(blk, blk_len);
             }
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
@@ -11421,10 +11485,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                 seg.push_back(0u);                   // param6: stored
                 seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
                                                          (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
-                                                         (p14_on ? 1u : 0u)));
+                                                         (p15_on ? 1u : 0u) + (p14_on ? 1u : 0u)));
                 if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
                 if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
                 if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+                if (p15_on) seg.push_back(static_cast<unsigned char>(StageCheck255(blk, blk_len)));
                 if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
                 seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
                 seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
@@ -11436,14 +11501,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                     put32(static_cast<std::uint32_t>(p14side.size()));
                     seg.insert(seg.end(), p14side.begin(), p14side.end());
                 }
-                seg.push_back(0u);                   // param15
-                // The window carries every block's pre-post-filter bytes, not
-                // just the LZ ones (reference `mem->data += size`), and a BWT
-                // block never goes through the LZ engine -- so feed BOTH the
-                // encoder and the verifier, or the next LZ block codes its
-                // matches against a window the decoder will not have.
-                co.FeedWindow(pre_p14, pre_p14_len);
-                verifier.FeedWindow(pre_p14, pre_p14_len);
+                seg.push_back(static_cast<unsigned char>(p15_on ? 1u : 0u));
+                if (p15_on) {
+                    put32(static_cast<std::uint32_t>(p15side.size()));
+                    seg.insert(seg.end(), p15side.begin(), p15side.end());
+                }
                 goto block_tail;
             }
             {
@@ -11462,12 +11524,6 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                     return false;
                 }
             }
-            // A BWT block does not run through the LZ engine, but its
-            // pre-post-filter bytes still enter the window a later LZ block can
-            // match into (reference `mem->data += size`) -- so the ENCODER needs
-            // them as much as the verifier does.
-            co.FeedWindow(pre_p14, pre_p14_len);
-            verifier.FeedWindow(pre_p14, pre_p14_len);
             put32(psz);
             seg.insert(seg.end(), payload.begin(), payload.end());
             seg.push_back(0u);                       // decr_param: BWT
@@ -11478,10 +11534,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             // BWT's output, the payload.
             seg.push_back(static_cast<unsigned char>(3u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
                                                      (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
-                                                     (p14_on ? 1u : 0u)));
+                                                     (p15_on ? 1u : 0u) + (p14_on ? 1u : 0u)));
             if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
             if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
             if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            if (p15_on) seg.push_back(static_cast<unsigned char>(StageCheck255(blk, blk_len)));
             if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
@@ -11493,7 +11550,11 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
                 put32(static_cast<std::uint32_t>(p14side.size()));
                 seg.insert(seg.end(), p14side.begin(), p14side.end());
             }
-            seg.push_back(0u);                       // param15
+            seg.push_back(static_cast<unsigned char>(p15_on ? 1u : 0u));
+            if (p15_on) {
+                put32(static_cast<std::uint32_t>(p15side.size()));
+                seg.insert(seg.end(), p15side.begin(), p15side.end());
+            }
         }
     block_tail:
         seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));

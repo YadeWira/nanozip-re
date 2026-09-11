@@ -105,6 +105,16 @@ bool NzBwtParam15(const uint8_t* model_data, uint32_t model_len,
 // under 0x80 bytes, or a side stream that overflowed half its budget).
 void NzBwtParam14Stats(const uint8_t* data, uint32_t n, std::vector<uint16_t>* stats);
 
+// The param15 ENCODER (FUN_08083570): long matches against the LZ engine's ring
+// through the long-range index its window feed keeps. Returns the coded size, or
+// 0 when the pass does not pay (output + side stream must stay under n - 8).
+uint32_t NzBwtParam15Encode(const uint8_t* in, uint32_t n,
+                            const std::vector<uint16_t>& stats,
+                            const uint32_t* lr_table, uint32_t lr_mask,
+                            const uint8_t* ring, uint32_t ring_cap,
+                            uint32_t ring_fill, bool ring_scrolled,
+                            std::vector<uint8_t>* out, std::vector<uint8_t>* side,
+                            uint32_t side_cap);
 uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
                             const std::vector<uint16_t>& stats,
                             std::vector<uint8_t>* out,

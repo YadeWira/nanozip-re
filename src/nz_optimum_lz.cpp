@@ -300,6 +300,7 @@ NzOptimumLzDecoder::NzOptimumLzDecoder(std::uint32_t window_capacity) {
 }
 
 void NzOptimumLzDecoder::ResetModel() {
+    window_reset_pending_ = true;   // codec+0x3f738 <- 1 (FUN_0806f4d0)
     mem_ = OptimumColdState();
     mem_.resize(kTotalMemSize, 0);
     for (std::size_t i = 0; i < kAlignTableSize; i += 2) {

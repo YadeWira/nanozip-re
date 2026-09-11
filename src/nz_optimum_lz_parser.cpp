@@ -544,14 +544,41 @@ void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t l
         std::fprintf(stderr, "[FEED] len=%u cursor_before=%u cursor_after=%u -> from=%u n=%u\n",
                      len, cursor_before, ring_.cursor, from, n);
     std::uint8_t* const base = ring_.Base();
+    // FUN_0806f530 also keeps the LONG-RANGE index current over the fed bytes:
+    // it recomputes the 256-byte rolling hash at the start of each fed span,
+    // then walks the span storing `tag | (pos >> 8)` at every position that is a
+    // multiple of 256 (with the hash of the 256 bytes STARTING there, before
+    // rolling on) and rolling the hash one byte per position. A span that
+    // wraps the ring is two spans. param15's encoder reads this table, and only
+    // this table -- it never writes it -- so a block fed here without these
+    // stores is a block param15 can never match into.
+    const std::uint32_t* const LRO = LrOut();
+    auto lr_span = [&](std::uint32_t at, std::uint32_t cnt) {
+        std::uint32_t h = 0;
+        for (std::uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + base[at + i];
+        F.lrhash = h;
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t pos = at + i;
+            if ((pos & 0xffu) == 0u) F.lr[h & F.lrmask] = (h & 0xffc00000u) + (pos >> 8u);
+            h = h * 0x104070bu + base[pos + 0x100u] - LRO[base[pos]];
+            F.lrhash = h;
+        }
+    };
     if (from < ring_.cursor) {
         F.Skip(base, from, n);
+        lr_span(from, n);
     } else {
         const std::uint32_t tail = cap - from;
-        if (tail >= n) { F.Skip(base, from, n); }
-        else { F.Skip(base, from, tail); F.Skip(base, 0u, n - tail); }
+        if (tail >= n) { F.Skip(base, from, n); lr_span(from, n); }
+        else { F.Skip(base, from, tail); lr_span(from, tail); F.Skip(base, 0u, n - tail); lr_span(0u, n - tail); }
     }
+    window_reset_pending_ = false;
 }
+
+// The pieces the param15 ENCODER borrows from this engine: the ring it reads
+// its sources from and the long-range index the window feed maintains.
+const std::uint32_t* NzOptimumLzDecoder::LongRangeTable() const { return parser_ ? parser_->lr.data() : nullptr; }
+std::uint32_t NzOptimumLzDecoder::LongRangeMask() const { return parser_ ? parser_->lrmask : 0u; }
 
 bool NzOptimumLzDecoder::ChunkExhausted() const {
     return !parser_ || parser_->consumed >= parser_->size;

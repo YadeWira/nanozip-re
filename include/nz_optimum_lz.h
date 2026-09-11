@@ -184,6 +184,7 @@ private:
                                       std::uint8_t* out, std::uint32_t out_size);
     std::vector<OptimumDecision> decisions_;
     bool record_ = false;
+    bool window_reset_pending_ = false;   // codec+0x3f738: 1 after a model reset, 0 after a feed
 public:
 
     // Cold-start the adaptive model again, keeping the window. The original
@@ -203,6 +204,18 @@ public:
     // bytes does not, because EnsureHeadroom abandons up to 32 KB at the ring's
     // end whenever a chunk does not fit before it.
     const std::uint8_t* WindowBase() const;
+    // For the param15 encoder (FUN_08083570 reads them through the codec's
+    // vtable): how much of the ring holds real bytes, whether it has wrapped,
+    // whether the model was just cold-started (codec+0x3f738: set by the reset
+    // that a stored LZ block triggers, cleared by the window feed; the block
+    // analysis skips param15 while it is set -- the original's first BWT block
+    // after an LZ block DOES take param15, so a fresh codec starts clear), and
+    // the long-range index itself.
+    std::uint32_t WindowFill() const { return ring_.cursor; }
+    bool WindowScrolled() const { return ring_.scrolled_once; }
+    bool WindowResetPending() const { return window_reset_pending_; }
+    const std::uint32_t* LongRangeTable() const;
+    std::uint32_t LongRangeMask() const;
 
 
 private:
