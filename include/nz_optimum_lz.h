@@ -196,6 +196,13 @@ public:
     // The ring's capacity. param15's absolute offsets are ring positions, so the
     // post-filter needs it to map one back to the accumulated stream.
     std::uint32_t WindowCapacity() const;
+    // The ring's bytes, position 0 first, capacity + 256 bytes of slack behind
+    // it. param15 names its sources as RING positions (the encoder's long-range
+    // index speaks in them, 256-aligned), and the ring is the only buffer whose
+    // positions follow the original's cursor -- a flat accumulation of the same
+    // bytes does not, because EnsureHeadroom abandons up to 32 KB at the ring's
+    // end whenever a chunk does not fit before it.
+    const std::uint8_t* WindowBase() const;
 
 
 private:

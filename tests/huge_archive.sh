@@ -77,6 +77,21 @@ else
     echo "note: no NZ_BIG_OUT, skipping the over-4-GB-output case"
 fi
 
+# param15 offsets are LZ-ring positions. A -co archive whose worker stream wraps its
+# 8 MB ring with a gap (EnsureHeadroom abandoning the ring's tail when a 32 KB chunk
+# does not fit) and then carries a param15 block reproduced a wrong source 18 522
+# bytes late -- status 105 -- while the offsets were resolved against a flat copy of
+# the stream. The smallest input that showed it is 180 MB of tiled corpus material
+# (`mkmix.sh` in the agent workspace, first 180 000 000 bytes, `-co` by the original),
+# too large to ship; opt in with the archive:
+#
+#   NZ_P15_REPRO=/path/to/s_180000000.nz tests/huge_archive.sh
+if [ -n "$NZ_P15_REPRO" ] && [ -f "$NZ_P15_REPRO" ]; then
+    check "param15 across a ring gap" "Decompressed" "$BIN" t "$NZ_P15_REPRO"
+else
+    echo "note: no NZ_P15_REPRO, skipping the param15 ring-gap case"
+fi
+
 rm -rf "$W"
 echo "huge_archive: $ok ok, $bad bad"
 [ "$bad" = 0 ]

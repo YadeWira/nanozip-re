@@ -4436,7 +4436,6 @@ static bool DecodeOptimumBlockSequence(
     // index THIS stream, not the final output: param1 (the delta filter)
     // rewrites almost every byte, so a param15 match sourced from the final
     // output copies the wrong bytes into the block AND into the LZ window.
-    std::vector<std::uint8_t>& raw_stream,
     std::vector<unsigned char>* out_data);
 
 // Per-codec profiles of the two side models the optimum family carries.
@@ -6341,15 +6340,14 @@ bool TryParseLegacyCnArchive(
                                     nzr::audio::NzImageModel img;
                                     ConfigureOptimumModels(method_p0, aud, img);
                                     NzExeFilter exe;
-                                    std::vector<std::uint8_t> raw_stream;
                                     if (method_p0 == 5u) {
                                         nzr::optimum::NzOptimumLzDecoder dec(wcap);
                                         return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                          out_size, dec, aud, img, exe, raw_stream, dst);
+                                                                          out_size, dec, aud, img, exe, dst);
                                     }
                                     nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
                                     const bool r = DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
-                                                                              out_size, dec, aud, img, exe, raw_stream, dst);
+                                                                              out_size, dec, aud, img, exe, dst);
                                     return r;
                                 },
                                 &assembled, psink::Available(), psink::Policy::kProduced, 0u,
@@ -6601,8 +6599,7 @@ bool TryParseLegacyCnArchive(
                                 nzr::audio::NzImageModel simg;
                                 ConfigureOptimumModels(5u, saud, simg);
                                 NzExeFilter sexe;
-                                std::vector<std::uint8_t> sraw;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, sraw, out);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         } else {
                             decode_seq = [popt_window_capacity](
@@ -6613,8 +6610,7 @@ bool TryParseLegacyCnArchive(
                                 nzr::audio::NzImageModel simg;
                                 ConfigureOptimumModels(6u, saud, simg);
                                 NzExeFilter sexe;
-                                std::vector<std::uint8_t> sraw;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, sraw, out);
+                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         }
                         bool use_sink = psink::Available();
@@ -8299,7 +8295,6 @@ static bool DecodeOptimumBlockSequence(
     nzr::audio::NzAudioPred& audio,
     nzr::audio::NzImageModel& image,
     NzExeFilter& exe,
-    std::vector<std::uint8_t>& raw_stream,
     std::vector<unsigned char>* out_data) {
     progress::Scope pscope;
     std::size_t pos = blocks_begin;
@@ -8666,33 +8661,40 @@ static bool DecodeOptimumBlockSequence(
                 stgmark("p14", work.data(), cur_size);
             }
             if (param15_flag) {
-                // param15 matches are ABSOLUTE offsets into the whole
-                // accumulated PRE-post-filter stream (reference: mem->data_org
-                // .. mem->data, i.e. the LZ window's contents, NOT the final
-                // output -- sourcing them from out_data copied post-param1
-                // bytes and broke the next LZ block on a 16-bit BMP whose
-                // fourth block followed two BWT blocks). Splice this block onto
-                // raw_stream, run the transform against that, then roll it
-                // back -- the block's bytes are appended by the shared tail.
-                const std::size_t prev = raw_stream.size();
-                raw_stream.insert(raw_stream.end(), work.begin(), work.begin() + cur_size);
+                // param15 matches name their source as a RING POSITION: the
+                // encoder's long-range index stores one slot per 256 bytes of
+                // the LZ ring, and every offset ever observed is a multiple of
+                // 256. The ring is `dec`'s, the one every LZ block reads, and it
+                // follows the original's cursor exactly -- including the up to
+                // 32 KB EnsureHeadroom abandons at the ring's end whenever a
+                // chunk does not fit before it. This port used to resolve the
+                // offsets against a FLAT accumulation of the same bytes plus a
+                // mod-capacity congruence: right until the first such gap, and
+                // then wrong by exactly the gap. Measured on a 180 MB -co
+                // archive: an 83-byte block expanding to 82 240, source read
+                // 18 522 bytes late; the ring's wrap trace shows
+                // `cursor=8370086 cap=8388608 needed=32768 slack=18522`.
+                // (Offsets pointing into the block being decoded, or past the
+                // ring's end, have not been observed; both would fail the
+                // bound check below rather than read garbage.)
                 const std::uint32_t limit15 = OptimumRemainingOut(total_size_hint, out_data->size());
                 std::uint32_t cap = OptimumExpandStart(cur_size, limit15);
                 std::vector<std::uint8_t> t15;
                 std::uint32_t n15 = 0;
                 bool p15ok = false;
+                const std::uint8_t* const ring_base = dec.WindowBase();
+                const std::size_t ring_len = static_cast<std::size_t>(dec.WindowCapacity()) + 256u;
                 for (;;) {
                     t15.assign(cap, 0);
                     n15 = 0;
                     p15ok = NzBwtParam15(param15_data.data(),
                                 static_cast<std::uint32_t>(param15_data.size()),
-                                raw_stream.data() + prev, cur_size,
-                                raw_stream.data(), raw_stream.size(),
-                                t15.data(), cap, &n15, dec.WindowCapacity());
+                                work.data(), cur_size,
+                                ring_base, ring_len,
+                                t15.data(), cap, &n15, 0u);
                     if (p15ok || cap == limit15) break;
                     cap = OptimumExpandGrow(cap, limit15);
                 }
-                raw_stream.resize(prev);
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
                             param15_data.size(), cur_size, p15ok ? 1 : 0, n15);
@@ -8706,11 +8708,11 @@ static bool DecodeOptimumBlockSequence(
                         if (FILE* f = std::fopen(path, "wb")) { std::fwrite(data, 1, n, f); std::fclose(f); }
                     };
                     wr("model", param15_data.data(), param15_data.size());
-                    wr("in", raw_stream.data() + prev, cur_size);
-                    wr("window", raw_stream.data(), prev);
+                    wr("in", work.data(), cur_size);
+                    wr("window", dec.WindowBase(), static_cast<std::size_t>(dec.WindowCapacity()));
                     wr("out", t15.data(), n15);
-                    std::fprintf(stderr, "[P15] call=%u model=%zu in=%u window=%zu out=%u out_at=%zu ok=%d\n",
-                                 call_no, param15_data.size(), cur_size, prev, n15, out_data->size(), (int)p15ok);
+                    std::fprintf(stderr, "[P15] call=%u model=%zu in=%u ring=%u out=%u out_at=%zu ok=%d\n",
+                                 call_no, param15_data.size(), cur_size, dec.WindowCapacity(), n15, out_data->size(), (int)p15ok);
                 }
                 if (!p15ok || n15 == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
                 t15.resize(n15); work.swap(t15); cur_size = n15;
@@ -8820,12 +8822,9 @@ static bool DecodeOptimumBlockSequence(
             stgmark("lz", work.data(), cur_size);
             }
         }
-        // Reference `mem->data += size`: every non-audio block's pre-post-filter
-        // bytes join the accumulated stream that later param15 blocks index.
-        raw_stream.insert(raw_stream.end(), work.begin(), work.begin() + cur_size);
         if (NZ_ENV("NZOPT_TRACE_WIN")) {
-            fprintf(stderr, "[WIN] +%u -> %zu  decr=%u param6=%u p2=%u p1=%u tt=%u p14=%u p15=%u dece=%u out=%zu\n",
-                    cur_size, raw_stream.size(), decr_param, param6, param2_flag, param1_flag,
+            fprintf(stderr, "[WIN] +%u  decr=%u param6=%u p2=%u p1=%u tt=%u p14=%u p15=%u dece=%u out=%zu\n",
+                    cur_size, decr_param, param6, param2_flag, param1_flag,
                     tt_enabled ? tt_flags : 0u, param14_flag, param15_flag, dece_param, out_data->size());
         }
 
@@ -9152,19 +9151,18 @@ static bool TryDecodeLegacyOptimum(
     ConfigureOptimumModels(legacy.legacy_method_p0, *aud, *img);
     // The accumulated pre-post-filter stream param15 indexes, shared across
     // the entry's chain segments like the window it mirrors.
-    auto rawstream = std::make_shared<std::vector<std::uint8_t>>();
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, img, exe, rawstream, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, *rawstream, out);
+        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, img, exe, rawstream, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, *rawstream, out);
+        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     }
 

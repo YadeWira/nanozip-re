@@ -275,6 +275,20 @@ itself). Decoding undoes them the other way round, right after the inverse BWT.
 param15 appears in 3 of 289 corpus inputs and is not written; param14 appears in
 20 and is.
 
+**param15's offsets are ring positions**, and the decoder must resolve them against the
+LZ engine's ring, not against a flat accumulation of the same bytes. The encoder's
+long-range index keeps one slot per 256 bytes of the ring (every offset ever observed
+is a multiple of 256), and the ring's cursor does not advance uniformly: `EnsureHeadroom`
+abandons up to 32 KB at the ring's end whenever a chunk does not fit before it. A flat
+buffer of the accumulated pre-post-filter bytes -- what `DecodeOptimumBlockSequence`
+used, plus a mod-capacity congruence fitted to one measured case -- agrees with the ring
+right up to the first such gap and is then off by exactly the gap. Measured on a 180 MB
+`-co` archive (`p15_repro/` in the agent workspace): an 83-byte stored BWT block
+expanding to 82 240, its source read 18 522 bytes late, and the ring's wrap trace
+(`NZOPT_TRACE_WRAP=1`) shows `cursor=8370086 cap=8388608 needed=32768 slack=18522`.
+`NzBwtParam15` now reads from `dec.WindowBase()` with no congruence, and the flat copy
+of every entry's stream -- a whole extra copy of the output in memory -- is gone.
+
 **param14** (`NzBwtParam14Encode`, next to its decoder in `src/nz_bwt.cpp`) tags
 its matches in the BYTE stream -- `0xfe 0xf1` followed by a zero selector -- and
 codes offset and length in an arithmetic side stream with four repeat-offset

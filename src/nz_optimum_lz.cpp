@@ -312,6 +312,8 @@ std::uint32_t NzOptimumLzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
     std::uint32_t cap = capacity;
     std::uint32_t cur = cursor;
     if (cap - cur < needed) {
+        if (NZ_ENV("NZOPT_TRACE_WRAP"))
+            fprintf(stderr, "[WRAP] cursor=%u cap=%u needed=%u slack=%u\n", cur, cap, needed, cap - cur);
         std::uint8_t* b = Base();
         if (!scrolled_once) {
             scrolled_once = true;
@@ -1188,10 +1190,11 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
 }
 
 std::uint32_t NzOptimumLzDecoder::WindowCapacity() const { return ring_.capacity; }
+const std::uint8_t* NzOptimumLzDecoder::WindowBase() const { return ring_.Base(); }
 
 void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len) {
-    if (O1_DBG_ENV("NZOPT_DEBUG"))
-        fprintf(stderr, "FEED len=%u cursor_before=%u capacity=%u\n", len, ring_.cursor, ring_.capacity);
+    if (NZ_ENV("NZOPT_TRACE_WRAP"))
+        fprintf(stderr, "[FEED] len=%u cursor_before=%u capacity=%u\n", len, ring_.cursor, ring_.capacity);
     // Transcription of the compact engine's ring-feed (entry around 0x080bcc60),
     // which pushes bytes that did NOT come out of the LZ engine (stored blocks,
     // post-filter output) through the same window later matches read from. It is
