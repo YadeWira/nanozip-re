@@ -68,9 +68,12 @@ each finishes, like the original, but every worker still holds its whole stream 
 archive peaks at 6.7 GB of RAM), so the 32-bit builds cannot decode archives above about 1 GB and no
 build can address one above 4 GB in 32 bits at all -- an archive this reader cannot hold is now
 reported as `Out of memory!` rather than called corrupt, which is what a user's 4.5 GB archive first
-looked like. Testing a 4.4 GB archive measures 12.6 GB of peak RAM on a 64-bit build, about 3x the
-archive, because the output is assembled in memory; the original streams both ends and has neither
-limit. Format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other
+looked like. Measured on that reporter's own archive -- 4 617 294 329 bytes of `-cO`, 4600 MB of MPG
+inside -- a 64-bit build tests it and extracts it byte-identically to the original, in 38 minutes
+against the original's 38, at a peak of **16 860 MB** against the original's **129 MB**: the whole
+archive and the whole output are held at once where the original streams both ends and has neither
+limit. Until this reader streams too, its `IO-in` footer figure reports the mapping rather than a read
+(`0.00s` and a nonsense rate on a large archive) where the original reports real IO. Format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other
 than 2) are ported but unexercised.
 
 ## Usage

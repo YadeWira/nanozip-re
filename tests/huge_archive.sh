@@ -37,7 +37,7 @@ ok=0; bad=0
 check() {   # check <label> <expected-substring> <command...>
     label=$1; want=$2; shift 2
     got=$("$@" 2>&1 | tr '\r' '\n' | grep -vE '^[[:space:]]*$' | tail -3 || true)
-    if printf '%s' "$got" | grep -q "$want"; then ok=$((ok+1)); else
+    if printf '%s' "$got" | grep -aq "$want"; then ok=$((ok+1)); else
         bad=$((bad+1)); echo "FAIL $label: wanted '$want', got:"; printf '%s\n' "$got" | sed 's/^/    /'
     fi
 }
@@ -58,6 +58,24 @@ fi
 # A 64-bit build addresses it, so the archive is merely bad, not unreadable: the
 # report must come from the header walk, and the walk must stay within its budget.
 check "64-bit walks 4.3 GB of zeros" "corrupted while reading headers" "$BIN" t "$W/over4g.nz"
+
+# An archive whose ENTRY produces more than 4 GB. Three post-filter sites bounded
+# their expansion by (uint32)total - (uint32)produced, and that subtraction wraps
+# once an entry passes 4 GB: the wrapped cap came out SMALLER than the block being
+# expanded, the block-RLE refuses a capacity under its own input, and a sound
+# archive was called corrupt (code 100) at the first block past the wrap. Nothing
+# smaller reaches it -- the whole 3037-file sweep never produced a 4 GB entry --
+# so the case is opt-in and wants a real archive:
+#
+#   NZ_BIG_OUT=/path/to/one.nz tests/huge_archive.sh
+#
+# The fixture used to find it was the 4 617 294 329-byte -cO archive of a 4600 MB
+# MPG sent in by the reporter; testing it takes about 38 minutes and 17 GB of RAM.
+if [ -n "$NZ_BIG_OUT" ] && [ -f "$NZ_BIG_OUT" ]; then
+    check "64-bit decodes an entry over 4 GB" "Decompressed" "$BIN" t "$NZ_BIG_OUT"
+else
+    echo "note: no NZ_BIG_OUT, skipping the over-4-GB-output case"
+fi
 
 rm -rf "$W"
 echo "huge_archive: $ok ok, $bad bad"

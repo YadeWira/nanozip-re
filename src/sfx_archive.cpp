@@ -1227,6 +1227,24 @@ private:
     std::size_t n_ = 0;
 };
 
+// What the footer's "IO-in" line reports: the bytes of archive acquired and the
+// time acquiring them took. The original streams its input and measures a real
+// read; this reader maps the file, so on the mapped path the number is the
+// mapping call and comes out at 0.00s with an enormous rate -- true of a mapped
+// reader, and a real figure again the day this reader streams. It is kept here
+// rather than threaded through six call sites because the footer is printed once
+// per archive, immediately after that archive was opened. Before this, IO-in
+// repeated the DECODE time and rate, which claimed a 38-minute read of a file
+// the reader had already finished with.
+struct ArchiveIoStats {
+    std::uint64_t bytes = 0;
+    double seconds = 0.0;
+};
+inline ArchiveIoStats& LastArchiveIo() {
+    static ArchiveIoStats s;
+    return s;
+}
+
 // The archive file, mapped read-only where the platform allows it and read into
 // a vector otherwise (Windows, and any mmap failure).
 class ArchiveBytes {
@@ -1236,6 +1254,15 @@ public:
     ArchiveBytes(const ArchiveBytes&) = delete;
     ArchiveBytes& operator=(const ArchiveBytes&) = delete;
     bool Open(const std::string& path) {
+        const auto io_t0 = std::chrono::steady_clock::now();
+        const bool io_ok = OpenImpl(path);
+        LastArchiveIo().seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - io_t0).count();
+        LastArchiveIo().bytes = io_ok ? static_cast<std::uint64_t>(View().size()) : 0u;
+        return io_ok;
+    }
+private:
+    bool OpenImpl(const std::string& path) {
         Close();
         oom_ = false;
 #if !defined(_WIN32)
@@ -1322,6 +1349,7 @@ public:
         }
         return true;
     }
+public:
     void Close() {
         if (map_ != nullptr) {
 #if defined(_WIN32)
@@ -6091,7 +6119,11 @@ bool TryParseLegacyCnArchive(
                                 if (pwritten >= slice_total) break;
                                 const std::uint8_t* blk_in = bytes.data() + c.first;
                                 const std::uint32_t blk_in_size = static_cast<std::uint32_t>(c.second);
-                                const std::uint32_t blk_cap = static_cast<std::uint32_t>(slice_total - pwritten);
+                                // clamped, not narrowed -- see the note on block_cap below
+                                const std::uint64_t blk_left =
+                                    static_cast<std::uint64_t>(slice_total) - static_cast<std::uint64_t>(pwritten);
+                                const std::uint32_t blk_cap = blk_left > 0xffffffffull ? 0xffffffffu
+                                                                                       : static_cast<std::uint32_t>(blk_left);
                                 std::uint32_t produced = nzr::cd::NzCdDecodeStream(
                                     blk_in, blk_in_size, slice_window + pwritten, blk_cap,
                                     sring.data(), sring_size, &sring_pos,
@@ -7358,7 +7390,17 @@ static bool TryDecodeLegacyLzhd(
         // file). Blocks whose chunks carry a tt08/param14/CM/BWT post-filter
         // produce fewer bytes here; the size-mismatch check below rejects them so
         // they decline until those stages are wired.
-        const std::uint32_t block_cap = static_cast<std::uint32_t>(total_out - written);
+        // CLAMPED, not narrowed. This is the same 4 GB wrap the optimum/-cc
+        // post-filters had (OptimumRemainingOut), but UNEXERCISED and probably
+        // unreachable: restoring the narrowing and decoding a 4.5 GB -cd entry
+        // changes nothing, because an archive that large is a parallel container
+        // and takes the per-slice path below, where the cap is a slice's and
+        // never approaches 2^32. Reaching this line with a >4 GB entry would need
+        // one in a SINGLE container, which only exist under 8 MB. Fixed because
+        // the arithmetic is wrong either way, not because a failure was seen.
+        const std::uint64_t block_left = static_cast<std::uint64_t>(total_out) - static_cast<std::uint64_t>(written);
+        const std::uint32_t block_cap = block_left > 0xffffffffull ? 0xffffffffu
+                                                                  : static_cast<std::uint32_t>(block_left);
         std::uint32_t produced = nzr::cd::NzCdDecodeStream(
             block_in, block_in_size, window_base + written, block_cap,
             ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
@@ -7438,6 +7480,45 @@ static bool TryDecodeLegacyLzhd(
     out_data->assign(window_base, window_base + total_out);
     pscope.Commit();
     return true;
+}
+
+// How much output this entry still owes, computed in 64 bits. Three post-filter
+// sites bounded their expansion by `(uint32)total_size_hint - (uint32)produced`,
+// and that subtraction wraps as soon as an entry is larger than 4 GB -- worse,
+// the wrapped value can come out SMALLER than the block about to be expanded.
+// The block-RLE refuses a capacity under its own input, so a sound 4 823 005 184
+// byte -cO archive was reported `Archive corrupted. Error decoding (code 100)`
+// at output 520 093 696, the first block past the wrap. (The reporter's file;
+// the original decodes it whole.) Clamped to 32 bits because every transform
+// below takes a uint32 capacity.
+//
+// The clamp leaves a megabyte of headroom under 2^32, NOT the full range: the
+// text-transform steps below size their buffers as `remaining + 16` and
+// `remaining + 65536`, and a `remaining` of 0xffffffff turned those sums into
+// 15 and 65535 -- a 15-byte buffer handed to a dictionary transform that writes
+// 16-byte words and ignores its cap. Heap corruption, then a crash in free(),
+// on the -cc archive of a 4.5 GB entry (found under ASan the same day the clamp
+// went in). With the headroom no sum on this value can wrap.
+static std::uint32_t OptimumRemainingOut(std::uint64_t total, std::size_t produced) {
+    const std::uint64_t p = static_cast<std::uint64_t>(produced);
+    const std::uint64_t r = (total > p) ? (total - p) : 0u;
+    constexpr std::uint64_t kCeiling = 0xffffffffull - (1ull << 20);
+    return r > kCeiling ? static_cast<std::uint32_t>(kCeiling) : static_cast<std::uint32_t>(r);
+}
+
+// The whole remaining is the CORRECT bound for one block's expansion and a
+// multi-gigabyte allocation per block on a large entry, when every block but the
+// last needs a small fraction of it. Start from a generous multiple of the block
+// and quadruple on demand: a block that really does expand that far ends at
+// exactly the same capacity, one that does not never allocates it.
+static std::uint32_t OptimumExpandStart(std::uint32_t in_size, std::uint32_t limit) {
+    std::uint64_t want = static_cast<std::uint64_t>(in_size) * 2u + 0x10000u;
+    if (want < 0x100000u) want = 0x100000u;
+    return want >= limit ? limit : static_cast<std::uint32_t>(want);
+}
+static std::uint32_t OptimumExpandGrow(std::uint32_t cap, std::uint32_t limit) {
+    const std::uint64_t n = static_cast<std::uint64_t>(cap) * 4u;
+    return n >= limit ? limit : static_cast<std::uint32_t>(n);
 }
 
 // Decode -cc (nz_cm) compressed payload natively using the ported CM decoder.
@@ -7601,9 +7682,7 @@ static bool TryDecodeLegacyCm(
                 fprintf(stderr, "[TDCC] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
                         payload_size, decr_param, mode2_type, alt_out_size, pos, stream_end);
             }
-            if (alt_out_size >
-                static_cast<std::uint32_t>(legacy.total_data_size) -
-                static_cast<std::uint32_t>(out_data->size())) { ok = false; break; }
+            if (alt_out_size > OptimumRemainingOut(legacy.total_data_size, out_data->size())) { ok = false; break; }
 
             if (decr_param == 2u) {
                 if (alt_out_size == 0u) continue;
@@ -7827,9 +7906,7 @@ static bool TryDecodeLegacyCm(
         }
 
         const std::size_t prev_size = out_data->size();
-        const std::uint32_t remaining =
-            static_cast<std::uint32_t>(legacy.total_data_size) -
-            static_cast<std::uint32_t>(prev_size);
+        const std::uint32_t remaining = OptimumRemainingOut(legacy.total_data_size, prev_size);
 
         nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -7839,11 +7916,19 @@ static bool TryDecodeLegacyCm(
         }
         // param2: u32-wise RLE expansion driven by the param2 side stream.
         if (param2_flag) {
-            std::vector<std::uint8_t> exp(remaining);
-            std::uint32_t esz = remaining;
-            const bool p2ok = NzBwtRleDecodeU32(param2_data.data(),
-                                   static_cast<std::uint32_t>(param2_data.size()),
-                                   work.data(), cur_size, exp.data(), &esz);
+            std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
+            std::vector<std::uint8_t> exp;
+            std::uint32_t esz = 0;
+            bool p2ok = false;
+            for (;;) {
+                exp.assign(cap2, 0);
+                esz = cap2;
+                p2ok = NzBwtRleDecodeU32(param2_data.data(),
+                                         static_cast<std::uint32_t>(param2_data.size()),
+                                         work.data(), cur_size, exp.data(), &esz);
+                if (p2ok || cap2 == remaining) break;
+                cap2 = OptimumExpandGrow(cap2, remaining);
+            }
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] param2: data.size=%zu cur_size=%u -> ok=%d esz=%u\n",
                         param2_data.size(), cur_size, p2ok ? 1 : 0, esz);
@@ -8527,14 +8612,20 @@ static bool DecodeOptimumBlockSequence(
             if (param14_flag) {
                 // Output can grow: the transform expands LZ matches. Cap at
                 // whatever this entry still has left to produce.
-                const std::uint32_t cap =
-                    static_cast<std::uint32_t>(total_size_hint) -
-                    static_cast<std::uint32_t>(out_data->size());
-                std::vector<std::uint8_t> t14(cap);
+                const std::uint32_t limit14 = OptimumRemainingOut(total_size_hint, out_data->size());
+                std::uint32_t cap = OptimumExpandStart(cur_size, limit14);
+                std::vector<std::uint8_t> t14;
                 std::uint32_t n14 = 0;
-                const bool p14ok = NzBwtParam14(param14_data.data(),
-                                       static_cast<std::uint32_t>(param14_data.size()),
-                                       work.data(), cur_size, t14.data(), cap, &n14);
+                bool p14ok = false;
+                for (;;) {
+                    t14.assign(cap, 0);
+                    n14 = 0;
+                    p14ok = NzBwtParam14(param14_data.data(),
+                                static_cast<std::uint32_t>(param14_data.size()),
+                                work.data(), cur_size, t14.data(), cap, &n14);
+                    if (p14ok || cap == limit14) break;
+                    cap = OptimumExpandGrow(cap, limit14);
+                }
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
                             param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
@@ -8554,16 +8645,22 @@ static bool DecodeOptimumBlockSequence(
                 // back -- the block's bytes are appended by the shared tail.
                 const std::size_t prev = raw_stream.size();
                 raw_stream.insert(raw_stream.end(), work.begin(), work.begin() + cur_size);
-                const std::uint32_t cap =
-                    static_cast<std::uint32_t>(total_size_hint) -
-                    static_cast<std::uint32_t>(out_data->size());
-                std::vector<std::uint8_t> t15(cap);
+                const std::uint32_t limit15 = OptimumRemainingOut(total_size_hint, out_data->size());
+                std::uint32_t cap = OptimumExpandStart(cur_size, limit15);
+                std::vector<std::uint8_t> t15;
                 std::uint32_t n15 = 0;
-                const bool p15ok = NzBwtParam15(param15_data.data(),
-                                       static_cast<std::uint32_t>(param15_data.size()),
-                                       raw_stream.data() + prev, cur_size,
-                                       raw_stream.data(), raw_stream.size(),
-                                       t15.data(), cap, &n15, dec.WindowCapacity());
+                bool p15ok = false;
+                for (;;) {
+                    t15.assign(cap, 0);
+                    n15 = 0;
+                    p15ok = NzBwtParam15(param15_data.data(),
+                                static_cast<std::uint32_t>(param15_data.size()),
+                                raw_stream.data() + prev, cur_size,
+                                raw_stream.data(), raw_stream.size(),
+                                t15.data(), cap, &n15, dec.WindowCapacity());
+                    if (p15ok || cap == limit15) break;
+                    cap = OptimumExpandGrow(cap, limit15);
+                }
                 raw_stream.resize(prev);
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
                     fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
@@ -8695,19 +8792,31 @@ static bool DecodeOptimumBlockSequence(
         // Reference `mem->data += size`: every non-audio block's pre-post-filter
         // bytes join the accumulated stream that later param15 blocks index.
         raw_stream.insert(raw_stream.end(), work.begin(), work.begin() + cur_size);
+        if (NZ_ENV("NZOPT_TRACE_WIN")) {
+            fprintf(stderr, "[WIN] +%u -> %zu  decr=%u param6=%u p2=%u p1=%u tt=%u p14=%u p15=%u dece=%u out=%zu\n",
+                    cur_size, raw_stream.size(), decr_param, param6, param2_flag, param1_flag,
+                    tt_enabled ? tt_flags : 0u, param14_flag, param15_flag, dece_param, out_data->size());
+        }
 
         const std::size_t prev_size = out_data->size();
-        const std::uint32_t remaining =
-            static_cast<std::uint32_t>(total_size_hint) -
-            static_cast<std::uint32_t>(prev_size);
+        const std::uint32_t remaining = OptimumRemainingOut(total_size_hint, prev_size);
 
         if (param2_flag) {
-            std::vector<std::uint8_t> exp(remaining);
-            std::uint32_t esz = remaining;
-            if (!NzBwtRleDecodeU32(param2_data.data(),
-                                   static_cast<std::uint32_t>(param2_data.size()),
-                                   work.data(), cur_size, exp.data(), &esz)
-                || esz == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
+            std::vector<std::uint8_t> exp;
+            std::uint32_t esz = 0;
+            bool p2ok = false;
+            for (;;) {
+                exp.assign(cap2, 0);
+                esz = cap2;
+                p2ok = NzBwtRleDecodeU32(param2_data.data(),
+                                         static_cast<std::uint32_t>(param2_data.size()),
+                                         work.data(), cur_size, exp.data(), &esz)
+                       && esz != 0u;
+                if (p2ok || cap2 == remaining) break;
+                cap2 = OptimumExpandGrow(cap2, remaining);
+            }
+            if (!p2ok) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             exp.resize(esz); work.swap(exp); cur_size = esz;
             stgmark("p2", work.data(), cur_size);
         }
@@ -9358,6 +9467,40 @@ double ElapsedSince(const std::chrono::steady_clock::time_point& t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// FUN_0804bf50: the original's duration string, built by hand from a count of
+// MILLISECONDS -- there is no printf format for it in the binary. Hours and
+// minutes appear only when non-zero and are never zero-padded, the seconds field
+// is one digit under ten, and the fraction is two digits TRUNCATED from the
+// millisecond remainder:
+//
+//     1.05s      45.94s      37m 45.94s      2h 3m 4.56s
+//
+// with the quirk that a run of exactly two hours and four seconds prints
+// "2h 4.00s" -- the minute field is skipped outright rather than printed as 0.
+// This port printed "%.2fs" of the whole elapsed time everywhere, which agrees
+// only below one minute (and even there rounds where the original truncates).
+// Nothing in the test corpus ran for a minute, so the branch was never taken
+// until a 4.6 GB archive took 38 of them.
+std::string FormatElapsedMs(std::uint64_t ms) {
+    const std::uint64_t h = ms / 3600000ull;
+    const std::uint64_t m = (ms / 60000ull) % 60ull;
+    const std::uint64_t sec = (ms / 1000ull) % 60ull;
+    const std::uint64_t frac = ms % 1000ull;
+    char b[64];
+    std::string out;
+    if (h != 0ull) { std::snprintf(b, sizeof b, "%lluh ", (unsigned long long)h); out += b; }
+    if (m != 0ull) { std::snprintf(b, sizeof b, "%llum ", (unsigned long long)m); out += b; }
+    std::snprintf(b, sizeof b, "%llu.%llu%llus", (unsigned long long)sec,
+                  (unsigned long long)(frac / 100ull), (unsigned long long)((frac / 10ull) % 10ull));
+    out += b;
+    return out;
+}
+
+std::string FormatElapsed(double seconds) {
+    if (!(seconds > 0.0)) seconds = 0.0;
+    return FormatElapsedMs(static_cast<std::uint64_t>(seconds * 1000.0));
+}
+
 // The original's compression banner and summary. Shapes matched exactly; the
 // memory/IO-buffer figures are this port's own (it does not implement the original's
 // buffer budgeting), and `bpb` is out*8/(in+1) -- fitted to five measured samples,
@@ -9383,9 +9526,9 @@ void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t o
     char buf[224];
     ClearStatusLine(os);
     // Note: no trailing period on this line in the original; the IO line has one.
-    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %.2fs, %s",
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %s, %s",
                   FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
-                  seconds, FormatRate(bps).c_str());
+                  FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
     os << buf;
     if (verbose) {
         std::snprintf(buf, sizeof(buf), " (%.3f bpb)",
@@ -9393,7 +9536,7 @@ void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t o
         os << buf;
     }
     os << '\n';
-    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", seconds, FormatRate(bps).c_str());
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.", FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
     os << buf << '\n';
 }
 
@@ -9468,10 +9611,20 @@ void PrintDecodeFooter(std::ostream& os, std::uint64_t bytes, double seconds) {
     const double bps = (seconds > 0.0) ? (double)bytes / seconds : 0.0;
     char buf[192];
     ClearStatusLine(os);
-    std::snprintf(buf, sizeof(buf), "Decompressed %s bytes in %.2fs, %s.",
-                  FormatGrouped(bytes).c_str(), seconds, FormatRate(bps).c_str());
+    std::snprintf(buf, sizeof(buf), "Decompressed %s bytes in %s, %s.",
+                  FormatGrouped(bytes).c_str(), FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
     os << buf << '\n';
-    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", seconds, FormatRate(bps).c_str());
+    // IO-in is the INPUT: the archive's bytes over the time spent acquiring
+    // them, which is what the original reports (4.6 GB in 1.05 s on the
+    // reporter's file). The rate is clamped the way the original's is, at one
+    // millisecond, so a sub-millisecond acquisition prints a rate rather than
+    // dividing by zero.
+    const ArchiveIoStats& io = LastArchiveIo();
+    const double io_s = (io.seconds > 0.001) ? io.seconds : 0.001;
+    const double io_bps = (io.bytes != 0u) ? (double)io.bytes / io_s : bps;
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.",
+                  FormatElapsed(io.bytes != 0u ? io.seconds : seconds).c_str(),
+                  FormatRate(io_bps).c_str());
     os << buf << '\n';
 }
 
@@ -11400,19 +11553,19 @@ void PrintStoreEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint6
     };
     char buf[256];
     ClearStatusLine(os);
-    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %.2fs, %s",
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %s, %s",
                   FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
-                  static_cast<double>(total_ms) / 1000.0, rate(in_bytes, total_ms).c_str());
+                  FormatElapsedMs(total_ms).c_str(), rate(in_bytes, total_ms).c_str());
     os << buf;
     if (verbose) {
         std::snprintf(buf, sizeof(buf), " (%.3f bpb)", static_cast<double>(out_bytes) * 8.0 / static_cast<double>(in_bytes + 1u));
         os << buf;
     }
     os << '\n';
-    std::snprintf(buf, sizeof(buf), "IO-in: %.2fs, %s.", static_cast<double>(read_ms) / 1000.0, rate(in_bytes, read_ms).c_str());
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.", FormatElapsedMs(read_ms).c_str(), rate(in_bytes, read_ms).c_str());
     os << buf;
     if (write_ms > 0u) {
-        std::snprintf(buf, sizeof(buf), " IO-out: %.2fs, %s", static_cast<double>(write_ms) / 1000.0, rate(out_bytes, write_ms).c_str());
+        std::snprintf(buf, sizeof(buf), " IO-out: %s, %s", FormatElapsedMs(write_ms).c_str(), rate(out_bytes, write_ms).c_str());
         os << buf;
     }
     os << '\n';
