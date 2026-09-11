@@ -4302,6 +4302,14 @@ bool DecodeLzpfMember(
                 }
                 const std::size_t block_start_in_window = window_cursor;
                 const std::size_t avail_in = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                // `stream_data_end` is a header field: on a cut archive the block
+                // claims more input than the file holds. Decline instead of
+                // reading past the end -- which is what the old
+                // `bytes.data() + input_pos` did silently, and what the range
+                // request now makes visible by handing back nothing.
+                if (bytes.Span(input_pos, avail_in) == nullptr) {
+                    nzr::derr::SetAt(2u, input_pos); decode_ok = false; break;
+                }
                 const std::uint8_t pf_hdr = bytes[input_pos];
                 const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
                 const bool is_stereo_pf = (pf_channels != 0u);
@@ -4428,6 +4436,7 @@ bool DecodeLzpfMember(
                 if (input_pos + block_out_size > stream_data_end) {
                     if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
                     lit_avail = static_cast<std::size_t>(stream_data_end - input_pos);   // the rest of the block stays as it is
+                if (bytes.Span(input_pos, lit_avail) == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 }
                 const std::size_t block_start_in_window = window_cursor;
                 std::memcpy(window + block_start_in_window, bytes.Span(input_pos, lit_avail), lit_avail);
@@ -4489,6 +4498,7 @@ bool DecodeLzpfMember(
                     (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
                 input_pos += 2u;
                 const std::size_t arith_size = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                if (bytes.Span(input_pos, arith_size) == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 bytecode.assign(side_count + 16u, 0);
                 const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
                     bytes.Span(input_pos, arith_size), arith_size,
@@ -4504,6 +4514,7 @@ bool DecodeLzpfMember(
             } else {  // mode_lz77_raw
                 bc_len = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
                 bc_ptr = bytes.Span(input_pos, bc_len);
+                if (bc_ptr == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 raw_consumed_ptr = &raw_consumed;
             }
             const std::size_t block_start_in_window = window_cursor;
@@ -5789,7 +5800,9 @@ bool TryParseLegacyCnArchive(
 
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (e.has_checksum) {
-                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, bytes.Span(cursor, n), n);
+                const unsigned char* q = bytes.Span(cursor, n);
+                if (q == nullptr) return false;   // the entry claims more than the archive holds
+                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, q, n);
                 if (got != e.checksum) {
                     return false;
                 }
@@ -6312,6 +6325,7 @@ bool TryParseLegacyCnArchive(
                             for (const auto& c : s.chunks) {
                                 if (pwritten >= slice_total) break;
                                 const std::uint8_t* blk_in = bytes.Span(c.first, c.second);
+                                if (blk_in == nullptr) break;
                                 const std::uint32_t blk_in_size = static_cast<std::uint32_t>(c.second);
                                 // clamped, not narrowed -- see the note on block_cap below
                                 const std::uint64_t blk_left =
@@ -6882,7 +6896,9 @@ bool TryParseLegacyCnArchive(
                             OptimumOut ow = make_out();
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
-                                sok = decode_seq(bytes.Span(c.first, c.second), 0u, c.second, s.osz, &ow);
+                                const unsigned char* one = bytes.Span(c.first, c.second);
+                                sok = one != nullptr &&
+                                      decode_seq(one, 0u, c.second, s.osz, &ow);
                             } else {
                                 // Fast path: one record at a time, straight out of
                                 // the mapped archive. Concatenating them first cost a
@@ -6897,7 +6913,8 @@ bool TryParseLegacyCnArchive(
                                 // in the concatenated stream, so carry the base.
                                 std::uint64_t rec_base = 0;
                                 for (const auto& c : s.chunks) {
-                                    if (!sd.run(bytes.Span(c.first, c.second), c.second, s.osz, &ow)) {
+                                    const unsigned char* rec = bytes.Span(c.first, c.second);
+                                    if (rec == nullptr || !sd.run(rec, c.second, s.osz, &ow)) {
                                         nzr::derr::OffsetPos(rec_base);
                                         sok = false;
                                         break;
@@ -7198,6 +7215,7 @@ bool TryParseLegacyCnArchive(
                             LegacyPrefilterRangeCoder rc;
                             const std::size_t byte_copy_count =
                                 static_cast<std::size_t>(pf_input_size) - 11u;
+                            if (bytes.Span(pf_off, 1u + byte_copy_count) == nullptr) return false;
                             rc.Init(bytes.Span(pf_off, 1u), bytes.Span(pf_off + 1u, byte_copy_count));
                             std::vector<unsigned char> bwt_last;
                             if (DecodeLegacyPrefilterStream(
