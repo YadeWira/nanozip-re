@@ -1287,6 +1287,45 @@ public:
     bool empty() const { return n_ == 0u; }
     const unsigned char* begin() const { return p_; }
     const unsigned char* end() const { return p_ + n_; }
+    // A resident pointer to [off, off+len) of the archive. Today the whole file
+    // is mapped and this is plain pointer arithmetic; it exists so that every
+    // consumer already asks for a BOUNDED RANGE rather than helping itself to a
+    // pointer at the whole file, which is what a windowed mapping needs (a
+    // 32-bit build cannot map a 4.6 GB archive at all). Returns nullptr when the
+    // range runs past the end -- callers that bound-check first cannot see it.
+    const unsigned char* Span(ArcPos off, ArcPos len) const {
+        return (off <= n_ && len <= n_ - off) ? p_ + off : nullptr;
+    }
+    // Append [off, off+len) of the archive to a byte vector. The bulk of the
+    // former `begin() + a, begin() + b` pairs; one range request instead of two
+    // loose pointers into the whole file.
+    void AppendTo(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const {
+        const unsigned char* q = Span(off, len);
+        if (q != nullptr && len != 0u) dst->insert(dst->end(), q, q + static_cast<std::size_t>(len));
+    }
+    // Offset of the first `v` in [off, end), or `end` when there is none. The
+    // filename tables' NUL scans, as a range instead of two loose pointers.
+    ArcPos FindByte(ArcPos off, ArcPos end, unsigned char v) const {
+        if (off >= end || end > n_) return end;
+        const unsigned char* q = Span(off, end - off);
+        if (q == nullptr) return end;
+        const void* h = std::memchr(q, v, static_cast<std::size_t>(end - off));
+        return h == nullptr ? end : off + static_cast<ArcPos>(static_cast<const unsigned char*>(h) - q);
+    }
+    // [off, off+len) as a std::string -- the entry paths.
+    std::string StringAt(ArcPos off, ArcPos len) const {
+        const unsigned char* q = Span(off, len);
+        return q == nullptr ? std::string() : std::string(reinterpret_cast<const char*>(q), static_cast<std::size_t>(len));
+    }
+    // A little-endian u32 at `off`. 0 when the range runs past the end -- every
+    // caller bound-checks first, so that only happens on input already judged
+    // corrupt, where the old code read past the mapping instead.
+    std::uint32_t U32At(ArcPos off) const {
+        const unsigned char* q = Span(off, 4u);
+        if (q == nullptr) return 0u;
+        return static_cast<std::uint32_t>(q[0]) | (static_cast<std::uint32_t>(q[1]) << 8u) |
+               (static_cast<std::uint32_t>(q[2]) << 16u) | (static_cast<std::uint32_t>(q[3]) << 24u);
+    }
     unsigned char operator[](ArcPos i) const { return p_[i]; }
     ByteView subview(ArcPos off) const { return off <= n_ ? ByteView(p_ + off, n_ - off) : ByteView(); }
 private:
@@ -2572,7 +2611,7 @@ bool ApplyLegacyAttributeRecords(
             case 2u: {
                 if (rsize < 4u) return false;
                 ArcPos p = rbegin;
-                std::int64_t cur = static_cast<std::int64_t>(ReadU32LE(bytes.data() + p));
+                std::int64_t cur = static_cast<std::int64_t>(bytes.U32At(p));
                 p += 4u;
                 if (a.mtimes.size() >= n) return false;
                 a.mtimes.push_back(cur);
@@ -2664,7 +2703,7 @@ bool ApplyLegacyAttributeRecords(
                         (width == 2u)
                             ? (static_cast<std::uint32_t>(bytes[p]) |
                                (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
-                            : ReadU32LE(bytes.data() + p));
+                            : bytes.U32At(p));
                 }
                 break;
             }
@@ -2859,26 +2898,22 @@ bool ParseLegacyParallelStreams(
             while (tp < p + csz) {
                 std::uint64_t v = 0;
                 if (!ReadLegacyVarint(bytes, &tp, p + csz, &v)) break;
-                const auto nul_it = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(tp),
-                                              bytes.begin() + static_cast<std::ptrdiff_t>(p + csz),
-                                              static_cast<unsigned char>(0));
-                if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(p + csz)) break;
+                const ArcPos nul_at = bytes.FindByte(tp, p + csz, 0u);
+                if (nul_at == p + csz) break;
                 if (first) { st.osz = v; st.hassz = true; st.last_table_first = st.slices.size(); first = false; ++st.table_count; }
                 LegacyParallelSlice sl;
                 sl.table = st.table_count - 1u;
-                sl.path.assign(reinterpret_cast<const char*>(bytes.data() + tp),
-                               static_cast<std::size_t>(
-                                   std::distance(bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it)));
+                sl.path = bytes.StringAt(tp, nul_at - tp);
                 sl.osz = v;
                 st.slices.push_back(std::move(sl));
-                tp = static_cast<std::size_t>(std::distance(bytes.begin(), nul_it)) + 1u;
+                tp = nul_at + 1u;
             }
         } else if (ct == 11u && csz >= 1u) {
             st.p0 = bytes[p];
             st.p1 = (csz >= 2u) ? bytes[p + 1u] : 0u;
             st.hasparams = true;
         } else if (ct == 10u && csz >= 4u) {
-            st.ooff = ReadU32LE(bytes.data() + p);
+            st.ooff = bytes.U32At(p);
             st.hasoff = true;
             // The offset belongs to the continued file part the table just
             // introduced: its FIRST entry (a stream resumes a big file first,
@@ -2903,7 +2938,7 @@ bool ParseLegacyParallelStreams(
                     sl.cval = (width == 2u)
                         ? (static_cast<std::uint32_t>(bytes[q]) |
                            (static_cast<std::uint32_t>(bytes[q + 1u]) << 8u))
-                        : ReadU32LE(bytes.data() + q);
+                        : bytes.U32At(q);
                     sl.has_cksum = true;
                     q += width;
                 }
@@ -2913,7 +2948,7 @@ bool ParseLegacyParallelStreams(
                 st.cval = (width == 2u)
                     ? (static_cast<std::uint32_t>(bytes[p]) |
                        (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
-                    : ReadU32LE(bytes.data() + p);
+                    : bytes.U32At(p);
             }
         } else if (ct == 0u && csz > 0u) {
             if (!cut_rec || keep_cut_chunk) st.chunks.emplace_back(p, csz);
@@ -3191,9 +3226,7 @@ inline std::vector<unsigned char> ConcatParallelChunks(
     std::vector<unsigned char> in;
     for (const auto& c : chunks) {
         if (c.first + c.second > bytes.size()) return std::vector<unsigned char>();
-        in.insert(in.end(),
-                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                  bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+        bytes.AppendTo(&in, c.first, c.second);
     }
     return in;
 }
@@ -3264,9 +3297,7 @@ bool TryAssembleParallelStore(
         std::vector<unsigned char> slice;
         slice.reserve(static_cast<std::size_t>(st.osz));
         for (const auto& c : st.chunks) {
-            slice.insert(slice.end(),
-                         bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                         bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+            bytes.AppendTo(&slice, c.first, c.second);
         }
         if (slice.size() != st.osz) return false;
         if (ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) return false;
@@ -3324,8 +3355,7 @@ bool TryAssembleStoredBlocks(
             }
             const std::size_t ln = static_cast<std::size_t>(len);
             if (dst != nullptr) {
-                dst->insert(dst->end(), bytes.begin() + static_cast<std::ptrdiff_t>(q),
-                            bytes.begin() + static_cast<std::ptrdiff_t>(q + ln));
+                bytes.AppendTo(dst, q, ln);
             }
             acc += len;
             p = q + ln;
@@ -3397,13 +3427,10 @@ bool LooksLikeLegacyFilenameTable(
         if (!ReadLegacyVarint(bytes, &p, table_end, &file_size)) {
             return false;
         }
-        const auto nul_it = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(p),
-                                      bytes.begin() + static_cast<std::ptrdiff_t>(table_end),
-                                      static_cast<unsigned char>(0));
-        if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(table_end)) {
+        const ArcPos name_end = bytes.FindByte(p, table_end, 0u);
+        if (name_end == table_end) {
             return false;
         }
-        const ArcPos name_end = static_cast<ArcPos>(std::distance(bytes.begin(), nul_it));
         if (name_end <= p) {
             return false;
         }
@@ -4279,11 +4306,11 @@ bool DecodeLzpfMember(
                 const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
                 const bool is_stereo_pf = (pf_channels != 0u);
                 const std::size_t pf_consumed = (uvar18 != 0u)
-                    ? lzpf_img.Decode(bytes.data() + input_pos, avail_in,
+                    ? lzpf_img.Decode(bytes.Span(input_pos, avail_in), avail_in,
                                       window + block_start_in_window,
                                       static_cast<std::size_t>(block_out_size))
                     : nzr::lzpf::DecodePrefilterStream(
-                          bytes.data() + input_pos, avail_in,
+                          bytes.Span(input_pos, avail_in), avail_in,
                           window + block_start_in_window,
                           static_cast<std::size_t>(block_out_size),
                           is_stereo_pf, &pf_ctx,
@@ -4403,8 +4430,8 @@ bool DecodeLzpfMember(
                     lit_avail = static_cast<std::size_t>(stream_data_end - input_pos);   // the rest of the block stays as it is
                 }
                 const std::size_t block_start_in_window = window_cursor;
-                std::memcpy(window + block_start_in_window, bytes.data() + input_pos, lit_avail);
-                std::memcpy(decoded + total_written, bytes.data() + input_pos, lit_avail);
+                std::memcpy(window + block_start_in_window, bytes.Span(input_pos, lit_avail), lit_avail);
+                std::memcpy(decoded + total_written, bytes.Span(input_pos, lit_avail), lit_avail);
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 // Backfill hash_table for the literal bytes just written
                 // (legacy FUN_080b6d90 / FUN_080b6cf0, called after every
@@ -4464,7 +4491,7 @@ bool DecodeLzpfMember(
                 const std::size_t arith_size = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
                 bytecode.assign(side_count + 16u, 0);
                 const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
-                    bytes.data() + input_pos, arith_size,
+                    bytes.Span(input_pos, arith_size), arith_size,
                     bytecode.data(), side_count, /*max_len=*/12);
                 if (consumed == 0 || consumed > arith_size) {
                     if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
@@ -4475,8 +4502,8 @@ bool DecodeLzpfMember(
                 bc_ptr = bytecode.data();
                 bc_len = side_count;
             } else {  // mode_lz77_raw
-                bc_ptr = bytes.data() + input_pos;
                 bc_len = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                bc_ptr = bytes.Span(input_pos, bc_len);
                 raw_consumed_ptr = &raw_consumed;
             }
             const std::size_t block_start_in_window = window_cursor;
@@ -4650,7 +4677,8 @@ bool TryParseLegacyCnArchive(
     // and so does `l`/`x`/`t` here. Everything below indexes `bytes`, so dropping
     // the stub up front keeps every offset consistent.
     if (bytes.size() > 0x40u && bytes[0] == 'M' && bytes[1] == 'Z') {
-        const ArcPos off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u);
+        const std::size_t probe_n = bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u;
+        const ArcPos off = LegacySfxDataOffset(bytes.Span(0u, probe_n), probe_n);
         if (NZ_ENV("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
         if (off > 1u && off < bytes.size()) bytes = bytes.subview(off);
     }
@@ -4667,7 +4695,7 @@ bool TryParseLegacyCnArchive(
         }
         return false;
     }
-    if (std::memcmp(bytes.data() + 2, kKnownSignature, kKnownSignatureBytes) != 0) {
+    if (std::memcmp(bytes.Span(2u, kKnownSignatureBytes), kKnownSignature, kKnownSignatureBytes) != 0) {
         if (out_error_message != nullptr) {
             *out_error_message = "File is not a NanoZip archive.";
         }
@@ -4916,17 +4944,12 @@ bool TryParseLegacyCnArchive(
             while (tp < tend) {
                 std::uint64_t fsize = 0u;
                 if (!ReadLegacyVarint(bytes, &tp, tend, &fsize)) break;
-                const auto nul_it = std::find(
-                    bytes.begin() + static_cast<std::ptrdiff_t>(tp),
-                    bytes.begin() + static_cast<std::ptrdiff_t>(tend),
-                    static_cast<unsigned char>(0));
-                if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(tend)) break;
-                std::string fname(
-                    bytes.begin() + static_cast<std::ptrdiff_t>(tp), nul_it);
+                const ArcPos nul_at = bytes.FindByte(tp, tend, 0u);
+                if (nul_at == tend) break;
+                const std::string fname = bytes.StringAt(tp, nul_at - tp);
                 size_accum[fname] += fsize;
                 path_streams[fname].insert(cstream);
-                tp = static_cast<std::size_t>(
-                    std::distance(bytes.begin(), nul_it)) + 1u;
+                tp = nul_at + 1u;
             }
             // Record the FIRST type-1 chunk as the canonical table, whatever
             // stream it belongs to, and keep every one of them for the entry
@@ -5028,10 +5051,8 @@ bool TryParseLegacyCnArchive(
             return false;
         }
 
-        const auto nul_it = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(p),
-                                      bytes.begin() + static_cast<std::ptrdiff_t>(table_end),
-                                      static_cast<unsigned char>(0));
-        if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(table_end)) {
+        const ArcPos name_end = bytes.FindByte(p, table_end, 0u);
+        if (name_end == table_end) {
             // The table itself was cut off: keep the entries that are complete
             // (the original does, and then reports the truncation).
             if (truncated_input && !entries.empty()) break;
@@ -5041,9 +5062,8 @@ bool TryParseLegacyCnArchive(
             return false;
         }
 
-        const ArcPos name_end = static_cast<ArcPos>(std::distance(bytes.begin(), nul_it));
         LegacyCnEntry e;
-        e.path.assign(reinterpret_cast<const char*>(bytes.data() + p), name_end - p);
+        e.path = bytes.StringAt(p, name_end - p);
         e.size = file_size;
 
         p = name_end + 1u;
@@ -5212,18 +5232,13 @@ bool TryParseLegacyCnArchive(
                         valid = false;
                         break;
                     }
-                    const auto nul_it = std::find(
-                        bytes.begin() + static_cast<std::ptrdiff_t>(vp),
-                        bytes.begin() + static_cast<std::ptrdiff_t>(tend),
-                        static_cast<unsigned char>(0));
-                    if (nul_it == bytes.begin() + static_cast<std::ptrdiff_t>(tend)) {
+                    const ArcPos ne = bytes.FindByte(vp, tend, 0u);
+                    if (ne == tend) {
                         valid = false;
                         break;
                     }
-                    const std::size_t ne = static_cast<std::size_t>(
-                        std::distance(bytes.begin(), nul_it));
                     LegacyCnEntry ae;
-                    ae.path.assign(reinterpret_cast<const char*>(bytes.data() + vp), ne - vp);
+                    ae.path = bytes.StringAt(vp, ne - vp);
                     ae.size = fs;
                     if (!path_looks_like_real_legacy_entry(ae.path)) {
                         valid = false;
@@ -5415,9 +5430,7 @@ bool TryParseLegacyCnArchive(
                 store_blocks_buffer.clear();
                 store_blocks_buffer.reserve(static_cast<std::size_t>(total_data_size));
                 for (const auto& dp : data_payloads)
-                    store_blocks_buffer.insert(store_blocks_buffer.end(),
-                                               bytes.begin() + static_cast<std::ptrdiff_t>(dp.first),
-                                               bytes.begin() + static_cast<std::ptrdiff_t>(dp.second));
+                    bytes.AppendTo(&store_blocks_buffer, dp.first, dp.second - dp.first);
                 store_multiblock = true;
                 metadata_end = data_records.front().first;
                 payload_start = data_records.front().first;
@@ -5528,7 +5541,7 @@ bool TryParseLegacyCnArchive(
                             v = static_cast<std::uint32_t>(bytes[cp]) |
                                 (static_cast<std::uint32_t>(bytes[cp + 1u]) << 8u);
                         } else {
-                            v = ReadU32LE(bytes.data() + cp);
+                            v = bytes.U32At(cp);
                         }
                         entries[i].checksum = v;
                         entries[i].has_checksum = true;
@@ -5566,7 +5579,7 @@ bool TryParseLegacyCnArchive(
     } else if (entries.size() == 1u && metadata_end > metadata_begin) {
         ArcPos mp = metadata_begin;
         if (metadata_end >= mp + 5u && bytes[mp] == 0x42u) {
-            entries[0].mtime_unix = static_cast<std::int64_t>(ReadU32LE(bytes.data() + mp + 1u));
+            entries[0].mtime_unix = static_cast<std::int64_t>(bytes.U32At(mp + 1u));
             entries[0].has_mtime = true;
             mp += 5u;
         }
@@ -5582,7 +5595,7 @@ bool TryParseLegacyCnArchive(
         if (!entries[0].has_checksum && checksum_mode != ChecksumMode::kNone && metadata_end > mp) {
             const std::uint8_t tag = bytes[mp];
             if ((tag == 0x45u || tag == 0x47u) && metadata_end >= mp + 5u) {
-                entries[0].checksum = ReadU32LE(bytes.data() + mp + 1u);
+                entries[0].checksum = bytes.U32At(mp + 1u);
                 entries[0].has_checksum = true;
                 mp += 5u;
             } else if (tag == 0x26u && metadata_end >= mp + 3u) {
@@ -5599,17 +5612,15 @@ bool TryParseLegacyCnArchive(
     } else if (metadata_end > metadata_begin) {
         // Multi-file legacy metadata is still partially unknown; expose conservative defaults.
         const bool has_timestamp_tag = ((bytes[metadata_begin] & 0x0fu) == 0x02u);
-        const bool has_perm_tag = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(metadata_begin),
-                                            bytes.begin() + static_cast<std::ptrdiff_t>(metadata_end),
-                                            static_cast<unsigned char>(0x24u)) !=
-                                  bytes.begin() + static_cast<std::ptrdiff_t>(metadata_end);
+        const bool has_perm_tag =
+            bytes.FindByte(metadata_begin, metadata_end, 0x24u) != metadata_end;
         for (LegacyCnEntry& e : entries) {
             if (has_perm_tag) {
                 e.permissions = 0664u;
                 e.has_permissions = true;
             }
             if (has_timestamp_tag && metadata_begin + 5u <= metadata_end) {
-                e.mtime_unix = static_cast<std::int64_t>(ReadU32LE(bytes.data() + metadata_begin + 1u));
+                e.mtime_unix = static_cast<std::int64_t>(bytes.U32At(metadata_begin + 1u));
                 e.has_mtime = true;
             }
         }
@@ -5718,7 +5729,7 @@ bool TryParseLegacyCnArchive(
                             v = static_cast<std::uint32_t>(bytes[scan_cp]) |
                                 (static_cast<std::uint32_t>(bytes[scan_cp + 1u]) << 8u);
                         } else {
-                            v = ReadU32LE(bytes.data() + scan_cp);
+                            v = bytes.U32At(scan_cp);
                         }
                         // Fletcher32 never finalizes with either half at zero
                         // (both s1 and s2 are clamped to 0xffff before packing).
@@ -5778,7 +5789,7 @@ bool TryParseLegacyCnArchive(
 
             const std::size_t n = static_cast<std::size_t>(e.size);
             if (e.has_checksum) {
-                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, bytes.data() + cursor, n);
+                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, bytes.Span(cursor, n), n);
                 if (got != e.checksum) {
                     return false;
                 }
@@ -5884,9 +5895,7 @@ bool TryParseLegacyCnArchive(
         }
         if (!data_contiguous && !has_parallel_streams) {
             for (const auto& dr : data_records) {
-                spliced_data.insert(spliced_data.end(),
-                                    bytes.begin() + static_cast<std::ptrdiff_t>(dr.first),
-                                    bytes.begin() + static_cast<std::ptrdiff_t>(dr.second));
+                bytes.AppendTo(&spliced_data, dr.first, dr.second - dr.first);
             }
             if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
                 std::fprintf(stderr, "[SPLICE] records=%zu bytes=%zu head=", data_records.size(), spliced_data.size());
@@ -6056,8 +6065,7 @@ bool TryParseLegacyCnArchive(
                             if (!in_place) {
                                 payload.reserve(plen);
                                 for (const auto& c : s.chunks)
-                                    payload.insert(payload.end(), bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                                   bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                    bytes.AppendTo(&payload, c.first, c.second);
                             }
                             const ByteView pin = in_place ? bytes : ByteView(payload);
                             const std::size_t pbeg = in_place ? s.chunks.front().first : 0u;
@@ -6303,7 +6311,7 @@ bool TryParseLegacyCnArchive(
                             if (use_sink) psink::StreamBegin(idx);
                             for (const auto& c : s.chunks) {
                                 if (pwritten >= slice_total) break;
-                                const std::uint8_t* blk_in = bytes.data() + c.first;
+                                const std::uint8_t* blk_in = bytes.Span(c.first, c.second);
                                 const std::uint32_t blk_in_size = static_cast<std::uint32_t>(c.second);
                                 // clamped, not narrowed -- see the note on block_cap below
                                 const std::uint64_t blk_left =
@@ -6415,9 +6423,7 @@ bool TryParseLegacyCnArchive(
                                     std::vector<unsigned char> subdata;
                                     for (const auto& c : chunks) {
                                         WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
-                                        subdata.insert(subdata.end(),
-                                                       bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                                       bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                        bytes.AppendTo(&subdata, c.first, c.second);
                                     }
                                     sub.data = std::move(subdata);
                                     std::string err;
@@ -6463,7 +6469,7 @@ bool TryParseLegacyCnArchive(
                                     for (const auto& c : chunks) {
                                         if (written >= out_size) break;
                                         const std::uint32_t produced = nzr::cd::NzCdDecodeStream(
-                                            bytes.data() + c.first,
+                                            bytes.Span(c.first, c.second),
                                             static_cast<std::uint32_t>(c.second),
                                             dst->data() + written,
                                             static_cast<std::uint32_t>(out_size - written),
@@ -6603,9 +6609,7 @@ bool TryParseLegacyCnArchive(
                             for (const auto& c : st.chunks) {
                                 last_rec = subdata.size();
                                 WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
-                                subdata.insert(subdata.end(),
-                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                               bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                bytes.AppendTo(&subdata, c.first, c.second);
                             }
                             if (use_sink && st.chunks.size() > 1u) psink::SetLastRecordStart(idx, last_rec);
                             sub.data = std::move(subdata);
@@ -6782,10 +6786,9 @@ bool TryParseLegacyCnArchive(
                         // rewinds the stream and falls back to the concatenated
                         // path rather than calling such an archive corrupt.
                         struct StreamDecoder {
-                            std::function<bool(std::size_t, std::size_t, std::uint64_t, OptimumOut*)> run;
+                            std::function<bool(const unsigned char*, std::size_t, std::uint64_t, OptimumOut*)> run;
                         };
-                        const unsigned char* const raw_base = bytes.data();
-                        const auto make_stream_decoder = [popt_window_capacity, method_p0, raw_base]() {
+                        const auto make_stream_decoder = [popt_window_capacity, method_p0]() {
                             StreamDecoder sd;
                             auto aud = std::make_shared<nzr::audio::NzAudioPred>();
                             auto img = std::make_shared<nzr::audio::NzImageModel>();
@@ -6793,15 +6796,15 @@ bool TryParseLegacyCnArchive(
                             auto exe = std::make_shared<NzExeFilter>();
                             if (method_p0 == 5u) {
                                 auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(popt_window_capacity);
-                                sd.run = [dec, aud, img, exe, raw_base](std::size_t b, std::size_t e,
-                                                                        std::uint64_t hint, OptimumOut* out) {
-                                    return DecodeOptimumBlockSequence(raw_base, b, e, hint, *dec, *aud, *img, *exe, out);
+                                sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
+                                                              std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(rec, 0u, len, hint, *dec, *aud, *img, *exe, out);
                                 };
                             } else {
                                 auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(popt_window_capacity);
-                                sd.run = [dec, aud, img, exe, raw_base](std::size_t b, std::size_t e,
-                                                                        std::uint64_t hint, OptimumOut* out) {
-                                    return DecodeOptimumBlockSequence(raw_base, b, e, hint, *dec, *aud, *img, *exe, out);
+                                sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
+                                                              std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(rec, 0u, len, hint, *dec, *aud, *img, *exe, out);
                                 };
                             }
                             return sd;
@@ -6879,7 +6882,7 @@ bool TryParseLegacyCnArchive(
                             OptimumOut ow = make_out();
                             if (s.chunks.size() == 1u) {
                                 const auto& c = s.chunks.front();
-                                sok = decode_seq(bytes.data(), c.first, c.first + c.second, s.osz, &ow);
+                                sok = decode_seq(bytes.Span(c.first, c.second), 0u, c.second, s.osz, &ow);
                             } else {
                                 // Fast path: one record at a time, straight out of
                                 // the mapped archive. Concatenating them first cost a
@@ -6888,8 +6891,18 @@ bool TryParseLegacyCnArchive(
                                 // at once.
                                 StreamDecoder sd = make_stream_decoder();
                                 sok = true;
+                                // The engine records a failure position relative to
+                                // the record it was handed; the driver's
+                                // plain-vs-shifted rule compares against an offset
+                                // in the concatenated stream, so carry the base.
+                                std::uint64_t rec_base = 0;
                                 for (const auto& c : s.chunks) {
-                                    if (!sd.run(c.first, c.first + c.second, s.osz, &ow)) { sok = false; break; }
+                                    if (!sd.run(bytes.Span(c.first, c.second), c.second, s.osz, &ow)) {
+                                        nzr::derr::OffsetPos(rec_base);
+                                        sok = false;
+                                        break;
+                                    }
+                                    rec_base += c.second;
                                 }
                                 if (!sok || ow.size() != s.osz) {
                                     // Not one whole block per record after all (or a
@@ -6907,9 +6920,7 @@ bool TryParseLegacyCnArchive(
                                     for (const auto& c : s.chunks) clen += c.second;
                                     concat.reserve(clen);
                                     for (const auto& c : s.chunks)
-                                        concat.insert(concat.end(),
-                                                      bytes.begin() + static_cast<std::ptrdiff_t>(c.first),
-                                                      bytes.begin() + static_cast<std::ptrdiff_t>(c.first + c.second));
+                                        bytes.AppendTo(&concat, c.first, c.second);
                                     sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &ow);
                                 }
                             }
@@ -7051,7 +7062,7 @@ bool TryParseLegacyCnArchive(
                             pat[1u + k] = static_cast<std::uint8_t>((c >> (8u * k)) & 0xffu);
                         const std::size_t patlen = 1u + cw;
                         for (std::size_t q = 0; q + patlen <= bytes.size(); ++q)
-                            if (std::memcmp(bytes.data() + q, pat.data(), patlen) == 0) return true;
+                            if (std::memcmp(bytes.Span(q, patlen), pat.data(), patlen) == 0) return true;
                         return false;
                     };
                     std::vector<unsigned char> member_out;
@@ -7113,11 +7124,11 @@ bool TryParseLegacyCnArchive(
                     method_p1 == 0u &&
                     stream_bytes >= 7u &&
                     sp + 7u <= bytes.size()) {
-                    const std::uint32_t raw_size = ReadU32LE(bytes.data() + sp);
+                    const std::uint32_t raw_size = bytes.U32At(sp);
                     if (raw_size == total_data_size &&
                         stream_bytes >= 4u + static_cast<std::uint64_t>(raw_size) + 3u &&
                         sp + 4u + static_cast<std::size_t>(raw_size) + 3u <= bytes.size()) {
-                        const unsigned char* const bwt_last = bytes.data() + sp + 4u;
+                        const unsigned char* const bwt_last = bytes.Span(sp + 4u, raw_size);
                         const ArcPos trailer_off = sp + 4u + raw_size;
                         const auto try_bwt_primary = [&](std::uint32_t primary_index) -> bool {
                             std::vector<unsigned char> decoded;
@@ -7171,13 +7182,13 @@ bool TryParseLegacyCnArchive(
                     method_p1 == 0u &&
                     stream_bytes >= 4u + 11u + 22u &&
                     sp + 4u <= bytes.size()) {
-                    const std::uint32_t pf_input_size = ReadU32LE(bytes.data() + sp);
+                    const std::uint32_t pf_input_size = bytes.U32At(sp);
                     const ArcPos pf_off = sp + 4u;
                     if (pf_input_size >= 12u &&
                         stream_bytes >= 4u + static_cast<std::uint64_t>(pf_input_size) + 22u &&
                         pf_off + static_cast<std::size_t>(pf_input_size) + 22u <= bytes.size()) {
                         const std::size_t trailer_off = pf_off + static_cast<std::size_t>(pf_input_size);
-                        const std::uint32_t bwt_size_from_trailer = ReadU32LE(bytes.data() + trailer_off + 2u);
+                        const std::uint32_t bwt_size_from_trailer = bytes.U32At(trailer_off + 2u);
                         const std::uint32_t primary_from_trailer =
                             static_cast<std::uint32_t>(bytes[trailer_off + 11u]) |
                             (static_cast<std::uint32_t>(bytes[trailer_off + 12u]) << 8u) |
@@ -7185,12 +7196,12 @@ bool TryParseLegacyCnArchive(
                         if (bwt_size_from_trailer >= total_data_size &&
                             bwt_size_from_trailer <= total_data_size + 64u * 1024u) {
                             LegacyPrefilterRangeCoder rc;
-                            rc.Init(bytes.data() + pf_off, bytes.data() + pf_off + 1u);
                             const std::size_t byte_copy_count =
                                 static_cast<std::size_t>(pf_input_size) - 11u;
+                            rc.Init(bytes.Span(pf_off, 1u), bytes.Span(pf_off + 1u, byte_copy_count));
                             std::vector<unsigned char> bwt_last;
                             if (DecodeLegacyPrefilterStream(
-                                    bytes.data() + pf_off + 1u,
+                                    bytes.Span(pf_off + 1u, byte_copy_count),
                                     byte_copy_count,
                                     rc,
                                     static_cast<std::size_t>(bwt_size_from_trailer),
@@ -7222,7 +7233,7 @@ bool TryParseLegacyCnArchive(
                     method_p1 == 0u &&
                     stream_bytes >= 4u + total_data_size &&
                     sp + 4u <= bytes.size()) {
-                    const std::uint32_t raw_size = ReadU32LE(bytes.data() + sp);
+                    const std::uint32_t raw_size = bytes.U32At(sp);
                     const ArcPos bp = sp + 4u;
                     if (raw_size == total_data_size && validate_literal_candidate_with_checksums(bp)) {
                         native_literal_payload = true;
@@ -7238,7 +7249,7 @@ bool TryParseLegacyCnArchive(
                     method_p0 == 7u &&
                     stream_bytes >= 4u + total_data_size &&
                     sp + 4u <= bytes.size()) {
-                    const std::uint32_t raw_size = ReadU32LE(bytes.data() + sp);
+                    const std::uint32_t raw_size = bytes.U32At(sp);
                     const ArcPos bp = sp + 4u;
                     if (raw_size == total_data_size && validate_literal_candidate_with_checksums(bp)) {
                         native_literal_payload = true;
@@ -7359,8 +7370,10 @@ bool TryParseLegacyCnArchive(
             // Raw payload was reassembled from multiple stored blocks.
             ctx.data = std::move(store_blocks_buffer);
         } else {
-            const std::size_t data_offset = static_cast<std::size_t>(data_offset_u64);
-            ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(data_offset), bytes.end());
+            const ArcPos data_offset = data_offset_u64;
+            std::vector<unsigned char> tail;
+            bytes.AppendTo(&tail, data_offset, bytes.size() - data_offset);
+            ctx.data = std::move(tail);
         }
     } else if (native_literal_payload) {
         if (literal_data_owned) {
@@ -7368,9 +7381,9 @@ bool TryParseLegacyCnArchive(
             ctx.data = std::move(literal_data_buffer);
         } else {
             ctx.data_offset = static_cast<std::uint64_t>(literal_data_offset);
-            ctx.data.assign(
-                bytes.begin() + static_cast<std::ptrdiff_t>(literal_data_offset),
-                bytes.begin() + static_cast<std::ptrdiff_t>(literal_data_offset + literal_data_size));
+            std::vector<unsigned char> lit;
+            bytes.AppendTo(&lit, literal_data_offset, literal_data_size);
+            ctx.data = std::move(lit);
         }
     } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
                ((method == 0x4bu && method_p0 == 7u) ||
@@ -7392,8 +7405,9 @@ bool TryParseLegacyCnArchive(
         if (!spliced_data.empty()) {
             ctx.data = std::move(spliced_data);
         } else {
-            ctx.data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(payload_start),
-                            bytes.end());
+            std::vector<unsigned char> tail;
+            bytes.AppendTo(&tail, payload_start, bytes.size() - payload_start);
+            ctx.data = std::move(tail);
         }
     }
 
@@ -9609,7 +9623,7 @@ std::string LegacyProbeMessage(const std::string& path) {
         r.type = type; r.size = size; r.have = true;
         const ArcPos avail = bytes.size() - pos;
         const std::size_t n = size < avail ? size : avail;
-        std::memcpy(r.content, bytes.data() + pos, n);
+        std::memcpy(r.content, bytes.Span(pos, n), n);
         pos += size < avail ? size : avail;
         return true;
     };
@@ -9618,7 +9632,8 @@ std::string LegacyProbeMessage(const std::string& path) {
     if (!ok) {
         // Resync (FUN_08092220 -> FUN_080b0e50): the file may be a self-extracting
         // .exe with the archive appended after the PE image; seek past the image.
-        const ArcPos off = LegacySfxDataOffset(bytes.data(), bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u);
+        const std::size_t probe_n = bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u;
+        const ArcPos off = LegacySfxDataOffset(bytes.Span(0u, probe_n), probe_n);
         if (off == 0u) return not_archive;
         pos = off;
         if (!read_header(rec) || rec.type != 14u) return not_archive;

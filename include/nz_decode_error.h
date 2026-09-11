@@ -43,6 +43,14 @@ inline void Fatal(std::uint32_t id) { if (t_state.fatal_id == 0u) t_state.fatal_
 inline void SetPos(std::uint64_t input_pos) {
     if (!t_state.has_pos) { t_state.input_pos = input_pos; t_state.has_pos = true; }
 }
+// Move a recorded position into a wider space. The optimum family's parallel
+// streams are decoded one chunk RECORD at a time, so the engine records a
+// position relative to that record, while the driver's plain-vs-shifted rule
+// compares against an offset in the whole concatenated stream. Adding the
+// record's base is what puts the two in the same space.
+inline void OffsetPos(std::uint64_t base) {
+    if (t_state.has_pos) t_state.input_pos += base;
+}
 inline const State& Current() { return t_state; }
 // The CM/optimum family's per-stage check bytes: the stage that fails names the code.
 inline std::uint32_t StageCode(const char* stage) {
