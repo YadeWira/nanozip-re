@@ -20,7 +20,10 @@ namespace derr {
 struct State {
     std::uint32_t code = 0;       // the original's status (0 = none recorded)
     std::uint32_t fatal_id = 0;   // "Internal error: <id>!" assertion id (0 = none)
-    std::size_t input_pos = 0;    // input offset of the failing block, when known
+    // Input offset of the failing block, when known. 64-bit, not size_t: a
+    // 32-bit build still has to name a position inside an archive larger than
+    // its own address space.
+    std::uint64_t input_pos = 0;
     bool has_pos = false;
     bool parallel = false;        // failure of one worker stream of a parallel container
     std::size_t slot = 0;         // that stream's slot (the original's low report byte)
@@ -30,14 +33,14 @@ inline void Clear() { t_state = State{}; }
 inline void Set(std::uint32_t code) {
     if (t_state.code == 0u && t_state.fatal_id == 0u) t_state.code = code;
 }
-inline void SetAt(std::uint32_t code, std::size_t input_pos) {
+inline void SetAt(std::uint32_t code, std::uint64_t input_pos) {
     if (t_state.code == 0u && t_state.fatal_id == 0u) { t_state.code = code; t_state.input_pos = input_pos; t_state.has_pos = true; }
 }
 inline void Fatal(std::uint32_t id) { if (t_state.fatal_id == 0u) t_state.fatal_id = id; }
 // A failure with no status of its own (the engine declined) still has a PLACE:
 // record it so the plain-vs-shifted rule can see whether another record of the
 // stream lay ahead. Never overrides a position a status already recorded.
-inline void SetPos(std::size_t input_pos) {
+inline void SetPos(std::uint64_t input_pos) {
     if (!t_state.has_pos) { t_state.input_pos = input_pos; t_state.has_pos = true; }
 }
 inline const State& Current() { return t_state; }
