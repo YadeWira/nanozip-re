@@ -561,10 +561,32 @@ fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
 // 04755 lands as 0755, while a post-hoc chmod would restore the setuid bit the
 // original does not.  An archive with no permission record (which is also what
 // -np and an all-0600 input produce) uses the original's own default of 0600.
+// What the footer's "IO-out" figure reports on an extraction: bytes written to
+// disk and the time the writes took, summed over every file and every parallel
+// worker's pwrite. The original prints it after IO-in, on the same line and with
+// no trailing period, only when writing took a measurable millisecond:
+//     IO-in: 0.88s, 4959 MB/s. IO-out: 2.30s, 1997 MB/s
+// (measured on the reporter's 4.6 GB archive, Linux and Windows). `t` writes
+// nothing and prints none. This port printed no IO-out at all on decode.
+struct DecodeIoStats {
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> nanos{0};
+};
+inline DecodeIoStats& DecodeWriteIo() {
+    static DecodeIoStats s;
+    return s;
+}
+inline void NoteDecodeWrite(std::size_t n, std::chrono::steady_clock::time_point w0) {
+    DecodeWriteIo().bytes += n;
+    DecodeWriteIo().nanos += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count());
+}
+
 bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
                         std::uint32_t mode, long owner_uid = -1, long owner_gid = -1) {
 #if defined(_WIN32)
     (void)mode; (void)owner_uid; (void)owner_gid;
+    const auto w0 = std::chrono::steady_clock::now();
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     // Never hand the CRT a single write above 2 GB: msvcrt's _write() takes an
@@ -580,6 +602,7 @@ bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::si
         off += piece;
     }
     out.close();
+    NoteDecodeWrite(n, w0);
     return static_cast<bool>(out);
 #else
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
@@ -591,6 +614,7 @@ bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::si
     // user/group and ignores the result (measured: fchown32(fd, uid, gid), then
     // utime; nothing printed when it fails for a non-root user).
     if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
+    const auto w0 = std::chrono::steady_clock::now();
     std::size_t written = 0;
     while (written < n) {
         const ssize_t w = ::write(fd, data + written, n - written);
@@ -600,7 +624,9 @@ bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::si
         }
         written += static_cast<std::size_t>(w);
     }
-    return ::close(fd) == 0;
+    const bool closed = (::close(fd) == 0);
+    NoteDecodeWrite(n, w0);
+    return closed;
 #endif
 }
 
@@ -2020,7 +2046,7 @@ inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
 
 // Positional write, outside e.mu (per-file lock; workers of a split file share
 // the descriptor).
-inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
+inline void WriteAtImpl(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
     if (f.fd < 0 || n == 0u) return;
     std::lock_guard<std::mutex> lk(f.io);
 #if defined(_WIN32)
@@ -2038,6 +2064,11 @@ inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std
         p += w; n -= static_cast<std::size_t>(w); off += static_cast<std::uint64_t>(w);
     }
 #endif
+}
+inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
+    const auto w0 = std::chrono::steady_clock::now();
+    WriteAtImpl(f, off, p, n);
+    NoteDecodeWrite(n, w0);
 }
 
 inline void MismatchLine(Engine& e, const Slice& sl, std::uint32_t got) {
@@ -9625,7 +9656,18 @@ void PrintDecodeFooter(std::ostream& os, std::uint64_t bytes, double seconds) {
     std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.",
                   FormatElapsed(io.bytes != 0u ? io.seconds : seconds).c_str(),
                   FormatRate(io_bps).c_str());
-    os << buf << '\n';
+    os << buf;
+    // IO-out: what an extraction wrote, on the same line without a trailing
+    // period, only when the writes took a measurable millisecond -- the
+    // original's shape on Linux and Windows alike. A test writes nothing.
+    const DecodeIoStats& wo = DecodeWriteIo();
+    const std::uint64_t write_ms = wo.nanos.load() / 1000000ull;
+    if (wo.bytes.load() != 0u && write_ms > 0u) {
+        std::snprintf(buf, sizeof(buf), " IO-out: %s, %s", FormatElapsedMs(write_ms).c_str(),
+                      FormatRate(static_cast<double>(wo.bytes.load()) * 1000.0 / static_cast<double>(write_ms)).c_str());
+        os << buf;
+    }
+    os << '\n';
 }
 
 // Every field of a context except its (possibly gigabytes of) payload -- the

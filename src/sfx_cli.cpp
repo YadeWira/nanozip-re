@@ -448,6 +448,16 @@ std::string HostSummaryLine() {
     if (GlobalMemoryStatusEx(&ms)) {
         avail_mb = ms.ullAvailPhys / (1024ull * 1024ull);
         total_mb = ms.ullTotalPhys / (1024ull * 1024ull);
+        // The original's 32-bit Windows build reads GlobalMemoryStatus, whose
+        // DWORD fields saturate at 4 GB on a machine with more than that, and
+        // prints the saturated pair rounded up: a 64 GB desktop shows
+        // `4096/4096 MB` (a user's paste of the original, i9-11900K, Windows 11).
+        // This build's x86 .exe printed the real figures (`6476/8172 MB` on an
+        // 8 GB machine). Match the saturation, in 32-bit builds only.
+        if (sizeof(void*) == 4u) {
+            if (ms.ullAvailPhys > 0xffffffffull) avail_mb = 4096ull;
+            if (ms.ullTotalPhys > 0xffffffffull) total_mb = 4096ull;
+        }
     }
     const std::string brand = CpuidBrand();
     char wbuf[512];

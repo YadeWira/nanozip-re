@@ -73,7 +73,9 @@ looked like. Measured on that reporter's own archive -- 4 617 294 329 bytes of `
 inside -- a 64-bit build tests it and extracts it byte-identically to the original, in 38 minutes
 against the original's 38, at a peak of **16 860 MB** against the original's **129 MB**: the whole
 archive and the whole output are held at once where the original streams both ends and has neither
-limit. Until this reader streams too, its `IO-in` footer figure reports the mapping rather than a read
+limit. On a Windows machine with **8 GB** the 64-bit build decodes 2 GB of that file and then prints
+`Out of memory!` (clean; no crash, nothing called corrupt) -- so "use the 64-bit build" holds only
+with about 17 GB of RAM for a file this size. Until this reader streams too, its `IO-in` footer figure reports the mapping rather than a read
 (`0.00s` and a nonsense rate on a large archive) where the original reports real IO. Format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other
 than 2) are ported but unexercised.
 
