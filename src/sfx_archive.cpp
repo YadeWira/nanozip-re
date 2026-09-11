@@ -1277,16 +1277,23 @@ enum class LegacyPayloadMode {
 // first half of fixing that; windowing the mapping is the second.
 using ArcPos = std::uint64_t;
 
+class WindowedFile;
+
 class ByteView {
 public:
     ByteView() = default;
     ByteView(const unsigned char* p, ArcPos n) : p_(p), n_(n) {}
     ByteView(const std::vector<unsigned char>& v) : p_(v.data()), n_(v.size()) {}   // NOLINT: implicit by design
-    const unsigned char* data() const { return p_; }
+    // A view onto a file that is mapped a window at a time: there is no pointer
+    // to the whole thing, which is the point.
+    ByteView(WindowedFile* src, ArcPos base, ArcPos n) : src_(src), base_(base), n_(n) {}
     ArcPos size() const { return n_; }
     bool empty() const { return n_ == 0u; }
-    const unsigned char* begin() const { return p_; }
-    const unsigned char* end() const { return p_ + n_; }
+    // NOTE: no data(), begin() or end(). A windowed view cannot produce a
+    // pointer to the whole archive, so the absence is deliberate -- it makes a
+    // use that would only work on a fully mapped file a COMPILE error instead of
+    // a silent read of the wrong thing.
+    bool windowed() const { return src_ != nullptr; }
     // A resident pointer to [off, off+len) of the archive. Today the whole file
     // is mapped and this is plain pointer arithmetic; it exists so that every
     // consumer already asks for a BOUNDED RANGE rather than helping itself to a
@@ -1294,7 +1301,9 @@ public:
     // 32-bit build cannot map a 4.6 GB archive at all). Returns nullptr when the
     // range runs past the end -- callers that bound-check first cannot see it.
     const unsigned char* Span(ArcPos off, ArcPos len) const {
-        return (off <= n_ && len <= n_ - off) ? p_ + off : nullptr;
+        if (off > n_ || len > n_ - off) return nullptr;
+        if (src_ != nullptr) return ResidentSpan(off, len);
+        return p_ + off;
     }
     // Append [off, off+len) of the archive to a byte vector. The bulk of the
     // former `begin() + a, begin() + b` pairs; one range request instead of two
@@ -1326,10 +1335,21 @@ public:
         return static_cast<std::uint32_t>(q[0]) | (static_cast<std::uint32_t>(q[1]) << 8u) |
                (static_cast<std::uint32_t>(q[2]) << 16u) | (static_cast<std::uint32_t>(q[3]) << 24u);
     }
-    unsigned char operator[](ArcPos i) const { return p_[i]; }
-    ByteView subview(ArcPos off) const { return off <= n_ ? ByteView(p_ + off, n_ - off) : ByteView(); }
+    unsigned char operator[](ArcPos i) const {
+        if (src_ == nullptr) return p_[i];
+        const unsigned char* q = Span(i, 1u);
+        return q != nullptr ? *q : 0u;
+    }
+    ByteView subview(ArcPos off) const {
+        if (off > n_) return ByteView();
+        if (src_ != nullptr) return ByteView(src_, base_ + off, n_ - off);
+        return ByteView(p_ + off, n_ - off);
+    }
 private:
+    const unsigned char* ResidentSpan(ArcPos off, ArcPos len) const;   // needs WindowedFile
     const unsigned char* p_ = nullptr;
+    WindowedFile* src_ = nullptr;
+    ArcPos base_ = 0;
     ArcPos n_ = 0;
 };
 
@@ -1351,6 +1371,200 @@ inline ArchiveIoStats& LastArchiveIo() {
     return s;
 }
 
+// A file mapped a WINDOW at a time, for archives that do not fit the address
+// space -- a 32-bit build gets about 3 GB of it, so a 4.6 GB archive cannot be
+// mapped whole and this reader answered "Out of memory!" where the original,
+// which streams, reads the file without trouble.
+//
+// Every caller already asks for a bounded RANGE (ByteView::Span and friends), so
+// a window only has to cover the range in front of it. Two properties make the
+// returned pointers safe to hold:
+//
+//   * the windows are PER THREAD, so one worker can never unmap what another is
+//     reading -- no reference counting, no lock on the hot path;
+//   * each thread keeps several, so a caller that legitimately holds two spans
+//     at once (the BWT prefilter's range coder takes a byte and a buffer) does
+//     not evict the first with the second.
+//
+// A range larger than the standard window gets a mapping of its own size; the
+// decoders ask for one chunk record at a time, which is megabytes, not gigabytes.
+class WindowedFile {
+public:
+    // Without large-file support a 32-bit build's off_t is 32 bits, `fstat` on a
+    // 4.6 GB archive fails with EOVERFLOW and the window never opens -- the file
+    // simply looks unreadable. That is a BUILD flag, so catch it at compile time
+    // rather than as a runtime "Out of memory!": compile with
+    // -D_FILE_OFFSET_BITS=64 (harmless on 64-bit, where off_t is already 64).
+#if !defined(_WIN32)
+    static_assert(sizeof(off_t) >= 8,
+                  "build with -D_FILE_OFFSET_BITS=64: a 32-bit off_t cannot describe "
+                  "an archive over 2 GB, which is the whole point of the windowed reader");
+#endif
+    static constexpr std::uint64_t kWindowBytes = 8ull << 20;
+    static constexpr std::size_t kWindowsPerThread = 4;
+
+    ~WindowedFile() { Close(); }
+    bool Open(const std::string& path) {
+        Close();
+#if defined(_WIN32)
+        handle_ = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) { handle_ = nullptr; return false; }
+        LARGE_INTEGER li{};
+        if (!::GetFileSizeEx(handle_, &li) || li.QuadPart <= 0) { Close(); return false; }
+        size_ = static_cast<std::uint64_t>(li.QuadPart);
+        mapping_ = ::CreateFileMappingA(handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping_ == nullptr) { Close(); return false; }
+        SYSTEM_INFO si{}; ::GetSystemInfo(&si);
+        granularity_ = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+#else
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) return false;
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) { Close(); return false; }
+        size_ = static_cast<std::uint64_t>(st.st_size);
+        const long pg = ::sysconf(_SC_PAGESIZE);
+        granularity_ = pg > 0 ? static_cast<std::uint64_t>(pg) : 4096u;
+#endif
+        ++generation_;
+        return true;
+    }
+    void Close() {
+        DropAllThreadWindows();
+#if defined(_WIN32)
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); mapping_ = nullptr; }
+        if (handle_ != nullptr) { ::CloseHandle(handle_); handle_ = nullptr; }
+#else
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+#endif
+        size_ = 0;
+    }
+    std::uint64_t size() const { return size_; }
+    bool open() const {
+#if defined(_WIN32)
+        return mapping_ != nullptr;
+#else
+        return fd_ >= 0;
+#endif
+    }
+
+    // A pointer to [off, off+len) that stays valid until this thread asks for
+    // kWindowsPerThread further ranges that do not fit the same windows.
+    const unsigned char* Resident(std::uint64_t off, std::uint64_t len) {
+        if (!open() || off > size_ || len > size_ - off) return nullptr;
+        if (len == 0u) len = 1u;               // a zero-length range still needs a place
+        Cache& c = ThreadCache();
+        if (c.owner != this || c.generation != generation_) { c.Drop(); c.owner = this; c.generation = generation_; }
+        for (std::size_t i = 0; i < kWindowsPerThread; ++i) {
+            Win& w = c.w[i];
+            if (w.p != nullptr && off >= w.base && off + len <= w.base + w.len) {
+                w.used = ++c.tick;
+                return w.p + static_cast<std::size_t>(off - w.base);
+            }
+        }
+        return MapInto(c, off, len);
+    }
+
+private:
+    struct Win { std::uint64_t base = 0, len = 0, used = 0; unsigned char* p = nullptr; };
+    struct Cache {
+        Win w[kWindowsPerThread];
+        std::uint64_t tick = 0;
+        WindowedFile* owner = nullptr;
+        std::uint64_t generation = 0;
+        void Drop() {
+            for (Win& x : w) {
+                if (x.p != nullptr) {
+#if defined(_WIN32)
+                    ::UnmapViewOfFile(x.p);
+#else
+                    ::munmap(x.p, static_cast<std::size_t>(x.len));
+#endif
+                }
+                x = Win{};
+            }
+            tick = 0; owner = nullptr; generation = 0;
+        }
+        ~Cache() { Drop(); Unregister(this); }
+    };
+
+    // Every live thread cache, so Close() can drop the windows of threads that
+    // are still alive (the decode pool outlives one archive).
+    static std::mutex& CachesMutex() { static std::mutex m; return m; }
+    static std::vector<Cache*>& Caches() { static std::vector<Cache*> v; return v; }
+    static void Unregister(Cache* c) {
+        std::lock_guard<std::mutex> lk(CachesMutex());
+        std::vector<Cache*>& v = Caches();
+        v.erase(std::remove(v.begin(), v.end(), c), v.end());
+    }
+    static Cache& ThreadCache() {
+        static thread_local Cache c;
+        static thread_local bool registered = [] {
+            std::lock_guard<std::mutex> lk(CachesMutex());
+            return true;
+        }();
+        (void)registered;
+        static thread_local bool listed = [&] {
+            std::lock_guard<std::mutex> lk(CachesMutex());
+            Caches().push_back(&c);
+            return true;
+        }();
+        (void)listed;
+        return c;
+    }
+    void DropAllThreadWindows() {
+        std::lock_guard<std::mutex> lk(CachesMutex());
+        for (Cache* c : Caches()) if (c->owner == this) c->Drop();
+    }
+
+    const unsigned char* MapInto(Cache& c, std::uint64_t off, std::uint64_t len) {
+        const std::uint64_t base = (off / granularity_) * granularity_;
+        std::uint64_t span = (off - base) + len;
+        if (span < kWindowBytes) span = kWindowBytes;
+        if (base + span > size_) span = size_ - base;
+        // evict the least recently used slot
+        std::size_t victim = 0;
+        for (std::size_t i = 1; i < kWindowsPerThread; ++i)
+            if (c.w[i].p == nullptr || c.w[i].used < c.w[victim].used) victim = i;
+        Win& w = c.w[victim];
+        if (w.p != nullptr) {
+#if defined(_WIN32)
+            ::UnmapViewOfFile(w.p);
+#else
+            ::munmap(w.p, static_cast<std::size_t>(w.len));
+#endif
+            w = Win{};
+        }
+#if defined(_WIN32)
+        void* m = ::MapViewOfFile(mapping_, FILE_MAP_READ,
+                                  static_cast<DWORD>(base >> 32), static_cast<DWORD>(base & 0xffffffffu),
+                                  static_cast<SIZE_T>(span));
+        if (m == nullptr) return nullptr;
+#else
+        void* m = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ, MAP_PRIVATE, fd_,
+                         static_cast<off_t>(base));
+        if (m == MAP_FAILED) return nullptr;
+#endif
+        w.p = static_cast<unsigned char*>(m); w.base = base; w.len = span; w.used = ++c.tick;
+        return w.p + static_cast<std::size_t>(off - base);
+    }
+
+#if defined(_WIN32)
+    HANDLE handle_ = nullptr;
+    HANDLE mapping_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+    std::uint64_t size_ = 0;
+    std::uint64_t granularity_ = 4096;
+    std::uint64_t generation_ = 0;
+};
+
+inline const unsigned char* ByteView::ResidentSpan(ArcPos off, ArcPos len) const {
+    return src_->Resident(base_ + off, len);
+}
+
+
 // The archive file, mapped read-only where the platform allows it and read into
 // a vector otherwise (Windows, and any mmap failure).
 class ArchiveBytes {
@@ -1371,6 +1585,25 @@ private:
     bool OpenImpl(const std::string& path) {
         Close();
         oom_ = false;
+        // An archive that does not fit this build's address space is read a
+        // window at a time. A 32-bit build gets about 3 GB, so anything near or
+        // above that -- xman's 4.6 GB -cO archive, the case this exists for --
+        // never had a whole-file mapping available; it used to be refused with
+        // "Out of memory!" while the original, which streams, read it. Forcing
+        // the windowed path with NZ_MAP_WINDOW=1 is how a 64-bit build exercises
+        // it against the same archives the flat path is tested on.
+        if (!Addressable(FileSizeOf(path)) || NZ_ENV("NZ_MAP_WINDOW") != nullptr) {
+            if (win_.Open(path)) {
+                windowed_ = true;
+                if (NZ_ENV("NZ_VERBOSE_NATIVE"))
+                    std::fprintf(stderr, "[native] windowed mapping: %llu bytes in %llu-byte windows\n",
+                                 (unsigned long long)win_.size(),
+                                 (unsigned long long)WindowedFile::kWindowBytes);
+                return true;
+            }
+            oom_ = true;
+            return false;
+        }
 #if !defined(_WIN32)
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd >= 0) {
@@ -1426,6 +1659,17 @@ private:
             }
         }
 #endif
+        // A whole-file mapping that FAILED (a 3 GB archive does not fit a 32-bit
+        // process's address space even though its length is representable) is
+        // still a candidate for the windowed reader -- try that before falling
+        // back to reading the file into memory, which needs even more.
+        if (win_.Open(path)) {
+            windowed_ = true;
+            if (NZ_ENV("NZ_VERBOSE_NATIVE"))
+                std::fprintf(stderr, "[native] windowed mapping (whole-file mapping unavailable): %llu bytes\n",
+                             (unsigned long long)win_.size());
+            return true;
+        }
         std::ifstream input(path, std::ios::binary);
         if (!input) return false;
         input.seekg(0, std::ios::end);
@@ -1457,6 +1701,7 @@ private:
     }
 public:
     void Close() {
+        if (windowed_) { win_.Close(); windowed_ = false; }
         if (map_ != nullptr) {
 #if defined(_WIN32)
             ::UnmapViewOfFile(const_cast<unsigned char*>(map_));
@@ -1468,6 +1713,13 @@ public:
         }
         vec_.clear();
         vec_.shrink_to_fit();
+    }
+    // The file's length without mapping it -- what decides whether a whole-file
+    // mapping is even possible.
+    static std::uint64_t FileSizeOf(const std::string& path) {
+        std::error_code ec;
+        const auto n = fs::file_size(fs::u8path(path), ec);
+        return ec ? 0u : static_cast<std::uint64_t>(n);
     }
     // Whether this build can hold the whole archive at once. A 32-bit build
     // cannot above 4 GB: narrowing the length to size_t wraps it, and the header
@@ -1484,15 +1736,22 @@ public:
     bool oom() const { return oom_; }
     // `off` drops a self-extractor's PE stub without moving a byte.
     ByteView View(std::size_t off = 0u) const {
+        if (windowed_) {
+            const std::uint64_t n = win_.size();
+            return off <= n ? ByteView(const_cast<WindowedFile*>(&win_), off, n - off) : ByteView();
+        }
         const unsigned char* p = map_ != nullptr ? map_ : vec_.data();
         const std::size_t n = map_ != nullptr ? map_n_ : vec_.size();
         return off <= n ? ByteView(p + off, n - off) : ByteView();
     }
-    bool mapped() const { return map_ != nullptr; }
+    bool mapped() const { return map_ != nullptr || windowed_; }
+    bool windowed() const { return windowed_; }
 private:
     const unsigned char* map_ = nullptr;
     std::size_t map_n_ = 0;
     bool oom_ = false;
+    bool windowed_ = false;
+    WindowedFile win_;
     std::vector<unsigned char> vec_;
 };
 
