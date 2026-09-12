@@ -1038,6 +1038,27 @@ std::string HumanBytes(std::uint64_t bytes) {
     return oss.str();
 }
 
+// Whether a name survives a round trip through the machine's active code page.
+// On Windows the original only ever sees the ANSI form of a filename, so a name
+// that does not round-trip is a name it cannot open. Everywhere else the bytes
+// are the name and the question does not arise.
+inline bool NameSurvivesNativeCodePage(const fs::path& name) {
+#if defined(_WIN32)
+    const std::wstring w = name.wstring();
+    if (w.empty()) return true;
+    BOOL lossy = FALSE;
+    const int n = ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, &lossy);
+    if (n <= 0) return false;
+    std::string a(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &a[0], n, nullptr, &lossy);
+    return lossy == FALSE;
+#else
+    (void)name;
+    return true;
+#endif
+}
+
 // Windows: a filename is a byte string in the machine's ACTIVE CODE PAGE, not
 // UTF-8. The original calls the ANSI Win32 API (its own message for a name it
 // cannot open comes out mangled under a different code page), so an archive made
@@ -5047,8 +5068,11 @@ static bool DecodeOptimumBlockSequence(
     // a 32-bit build cannot afford. Every read below is bounded by a header
     // field, so a window (or a splice) can serve them all.
     const ByteView& src,
-    std::size_t blocks_begin,
-    std::size_t blocks_end,
+    // Payload offsets, NOT size_t: a single container's payload is the whole
+    // archive, so on a 32-bit build these wrap just short of 4 GB -- the decode
+    // then walks off the end of a perfectly good stream.
+    ArcPos blocks_begin,
+    ArcPos blocks_end,
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
@@ -9006,8 +9030,11 @@ static bool DecodeOptimumBlockSequence(
     // a 32-bit build cannot afford. Every read below is bounded by a header
     // field, so a window (or a splice) can serve them all.
     const ByteView& src,
-    std::size_t blocks_begin,
-    std::size_t blocks_end,
+    // Payload offsets, NOT size_t: a single container's payload is the whole
+    // archive, so on a 32-bit build these wrap just short of 4 GB -- the decode
+    // then walks off the end of a perfectly good stream.
+    ArcPos blocks_begin,
+    ArcPos blocks_end,
     std::uint64_t total_size_hint,
     OptimumDecoder& dec,
     nzr::audio::NzAudioPred& audio,
@@ -9015,8 +9042,8 @@ static bool DecodeOptimumBlockSequence(
     NzExeFilter& exe,
     OptimumOut* out_data) {
     progress::Scope pscope;
-    std::size_t pos = blocks_begin;
-    const std::size_t stream_end = blocks_end;
+    ArcPos pos = blocks_begin;
+    const ArcPos stream_end = blocks_end;
     bool ok = true;
 
     const bool trace_blocks = NZ_ENV("NZOPT_TRACE_TDO") != nullptr;
@@ -9865,7 +9892,7 @@ static bool TryDecodeLegacyOptimum(
     // immediately following the first segment's end. An earlier RE session's
     // "chain mode doesn't exist for -co" conclusion was apparently reached
     // from insufficient (large-synthetic-file-only) fixtures.
-    auto read_stream_tag = [&pv, raw_len](std::size_t* p, std::uint64_t* out_tag) -> bool {
+    auto read_stream_tag = [&pv, raw_len](ArcPos* p, std::uint64_t* out_tag) -> bool {
         unsigned shift = 7;
         if (*p >= raw_len) return false;
         unsigned char c = pv[(*p)++];
@@ -9923,33 +9950,33 @@ static bool TryDecodeLegacyOptimum(
     // the entry's chain segments like the window it mirrors.
     // One exe filter per entry, same run/reset semantics as -cc above.
     auto exe = std::make_shared<NzExeFilter>();
-    std::function<bool(std::size_t, std::size_t, OptimumOut*)> decode_seq;
+    std::function<bool(ArcPos, ArcPos, OptimumOut*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, OptimumOut* out) {
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](ArcPos b, ArcPos e, OptimumOut* out) {
             return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, OptimumOut* out) {
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](ArcPos b, ArcPos e, OptimumOut* out) {
             return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
         };
     }
 
-    std::size_t seg_pos = 0;
+    ArcPos seg_pos = 0;   // payload offsets: 64-bit, the payload can exceed 4 GB
     bool ok = true;
     // 64-bit compare: narrowing the total to size_t on a 32-bit build turned
     // 4 823 005 184 into 528 037 888, so the loop stopped after the fifth
     // segment and the check below then called a perfectly good archive corrupt
     // -- "unpacks about 512 MB, then code 100", exactly as reported.
     while (static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
-        std::size_t p = seg_pos;
+        ArcPos p = seg_pos;
         std::uint64_t stream_tag = 0;
         if (!read_stream_tag(&p, &stream_tag)) { ok = false; break; }
         if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
         const std::uint64_t stream_bytes = stream_tag >> 4u;
         if (stream_bytes > raw_len - p) { ok = false; break; }
-        const std::size_t stream_end = p + static_cast<std::size_t>(stream_bytes);
+        const ArcPos stream_end = p + stream_bytes;
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] chain segment: p=%zu stream_end=%zu out_data_size_before=%zu\n",
                     p, stream_end, out_data->size());
@@ -11556,6 +11583,10 @@ struct EncodeSource {
     fs::path fs_path;             // where the bytes are
     std::uint64_t size = 0;
     std::uint32_t mode = 0644;    // st_mode & 0xfff
+    // Windows: the attribute nibble the original stores instead of a POSIX mode
+    // -- 8 | READONLY | HIDDEN<<1 | SYSTEM<<2, with 8 (the archive bit) always
+    // set, so 8 means "plain" and an all-plain block omits the record entirely.
+    std::uint8_t win_attr = 8u;
     std::int64_t mtime = 0;       // epoch seconds
     std::uint16_t uid = 0, gid = 0;
     std::string display;          // the path as scanned ("./x" under `.`, "sub/x"): the console's name
@@ -11632,9 +11663,9 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
         const std::string name = NativeBytesFromPath(it->path().filename());
         if (!WildcardMatch(pattern, name)) continue;
 #if defined(_WIN32)
-        // No lstat/st_mode on mingw: std::filesystem gives the kind, size and time;
-        // the mode is the POSIX default (the Windows original stores attributes
-        // instead, quirk 48 -- not written by this port yet).
+        // No lstat/st_mode on mingw: std::filesystem gives the kind, size and
+        // time, and the Windows original stores ATTRIBUTES rather than a POSIX
+        // mode (quirk 48) -- read below and written as the type-3 record.
         std::error_code sec;
         fs::file_status fst = fs::symlink_status(it->path(), sec);
         if (sec) continue;
@@ -11645,7 +11676,29 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
             e.archive_name = prefix + name;
             e.fs_path = it->path();
             e.display = dir_part.empty() ? name : dir_part + "/" + name;
+            {
+                const DWORD at = ::GetFileAttributesW(it->path().wstring().c_str());
+                if (at != INVALID_FILE_ATTRIBUTES) {
+                    e.win_attr = static_cast<std::uint8_t>(
+                        8u | ((at & FILE_ATTRIBUTE_READONLY) ? 1u : 0u)
+                           | ((at & FILE_ATTRIBUTE_HIDDEN) ? 2u : 0u)
+                           | ((at & FILE_ATTRIBUTE_SYSTEM) ? 4u : 0u));
+                }
+            }
             { std::ifstream probe(it->path(), std::ios::binary); e.ghost = !probe.is_open(); }
+            // The original scans the directory with the ANSI API too, so a name
+            // its active code page cannot express comes back as `???` and it
+            // then cannot open the file: it prints "Cannot open: ??? ???.txt"
+            // and stores nothing. Measured on nine languages under a CP1252
+            // Windows -- Cyrillic, Chinese, Japanese, Arabic and Hindi all
+            // refused, German and Nordic stored.
+            //
+            // Matching that is not pedantry. Scanning with the wide API instead
+            // opens all of them and stores them under their MANGLED names, and
+            // two different files (a Russian and a Hindi one, here) then collapse
+            // onto the same stored name. The original's refusal loses nothing.
+            if (!e.ghost && !NameSurvivesNativeCodePage(it->path().filename()))
+                e.ghost = true;
             e.size = fs::file_size(it->path(), sec); if (sec) e.size = 0u;
             e.mode = 0644u;
             const fs::file_time_type ft = fs::last_write_time(it->path(), sec);
@@ -11916,6 +11969,25 @@ void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, c
             flush(mt);
         }
         if (!options.no_permissions) {
+#if defined(_WIN32)
+            // The Windows original writes ATTRIBUTES, one nibble per entry, high
+            // nibble first, zero-padded to a byte -- and omits the record when
+            // every file is plain, which is why an archive of one ordinary file
+            // carries no permission record at all. Writing a POSIX type-4 here
+            // instead put three bytes in an archive the original leaves out.
+            bool attrs_plain = true;
+            for (std::size_t i = from; i < to; ++i)
+                if (src[pieces[i].src].win_attr != 8u) { attrs_plain = false; break; }
+            if (!attrs_plain) {
+                std::vector<unsigned char> ab;
+                for (std::size_t i = from; i < to; i += 2u) {
+                    const unsigned hi = src[pieces[i].src].win_attr & 0xfu;
+                    const unsigned lo = (i + 1u < to) ? (src[pieces[i + 1u].src].win_attr & 0xfu) : 0u;
+                    ab.push_back(static_cast<unsigned char>((hi << 4u) | lo));
+                }
+                rec(3u, ab.data(), ab.size());
+            }
+#else
             bool all_default = true;
             for (std::size_t i = from; i < to; ++i) if ((src[pieces[i].src].mode & 0xfffu) != 0x180u) { all_default = false; break; }
             if (!all_default) {
@@ -11933,6 +12005,7 @@ void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, c
                 }
                 flush(pm);
             }
+#endif
         }
         if (options.restore_ownership) {
             for (unsigned t = 8u; t <= 9u; ++t) {

@@ -152,6 +152,21 @@ with 0, 2^1 … 2^31, 0.
   even form the path: reported by xman on Win7 x64, where the published v0.14.0-pre crashed with
   `filesystem_error: Cannot convert character sequence` on his accented .mpg, and refused to FIND a
   file with an accented name when compressing.
+- **No platform or OS is recorded anywhere, but the metadata record TYPE gives it away**: there is no
+  "created on" field of any kind -- no OS name, no architecture, no distro, and nothing from NTFS
+  beyond what is listed here. What does differ is WHICH metadata record the archive carries: a
+  Windows-made archive stores file ATTRIBUTES (type 3, the readonly/hidden/system/archive nibbles)
+  and a POSIX one stores PERMISSION bits (type 4). So `l` prints a `0664`-style column for an archive
+  made on Linux and none for one made on Windows, and that is the only platform signal in the format.
+- **The original cannot store a filename its machine's code page cannot express**: it calls the ANSI
+  Win32 API for the directory scan too, so on a Western (CP1252) Windows a Cyrillic, Chinese,
+  Japanese, Arabic or Hindi name comes back from the scan as `???` and the original then reports
+  `Cannot open: ??? ????.txt` and leaves the file OUT of the archive. German and Nordic names work
+  there because CP1252 covers them; on a Hungarian (CP1250) machine the coverage is different again.
+  This is not a limitation a reimplementation can quietly improve on: measured on nine languages,
+  this port's scan uses the wide API, so it OPENS all nine and stores six of them under the same
+  mangled `???` names -- two different files (Russian and Hindi) collapsing onto one stored name.
+  The original's refusal loses nothing; ours loses the distinction. [pending: match the refusal]
 - **The version string is a record**: an archive begins with a type-14 record holding
   `NanoZip 0.09 alpha` and a type-30 record holding the byte 9; the "incompatible version"
   message reports that byte divided by 100.
