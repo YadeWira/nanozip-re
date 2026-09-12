@@ -1297,7 +1297,8 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                std::uint8_t* lzhds_ctx_table, std::uint32_t* lzhds_ctx_index,
                                nzr::lzpf::PrefilterContext* pf_ctx,
                                nzr::lzpf::LmsObject* pf_lms1, nzr::lzpf::LmsObject* pf_lms2,
-                               nzr::audio::NzImageModel* img) {  // NOLINT
+                               nzr::audio::NzImageModel* img,
+                               std::uint32_t out_soft, std::size_t* in_consumed) {  // NOLINT
     // Decode one -cd/-cD stream into `out` using a CALLER-OWNED ring that PERSISTS across
     // streams (the binary keeps ONE window object for the whole archive; large files
     // split output into 1 MB streams that match into each other through this ring).
@@ -1310,7 +1311,9 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
     if (is_lzhds && (lzhds_ctx_table == nullptr || lzhds_ctx_index == nullptr)) return 0;
     std::size_t pos = 0;
     std::uint32_t written = 0;
-    while (pos < block_len && written < out_cap) {
+    if (in_consumed) *in_consumed = 0;
+    const std::uint32_t stop_at = (out_soft != 0u && out_soft < out_cap) ? out_soft : out_cap;
+    while (pos < block_len && written < stop_at) {
         std::size_t prev = pos;
         std::uint32_t adv = 0;
         std::uint32_t n = DecodeChunk(block, block_len, &pos,
@@ -1336,7 +1339,8 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
     }
     // Clean = every input byte consumed (or the output cap reached). A stream
     // that stopped on a malformed chunk is the one the original reports.
-    g_cd_stream_clean = (pos >= block_len) || (written >= out_cap);
+    g_cd_stream_clean = (pos >= block_len) || (written >= stop_at);
+    if (in_consumed) *in_consumed = pos;
     return written;
 }
 

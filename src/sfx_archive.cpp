@@ -2392,6 +2392,12 @@ struct Stream {
     // of one buffer at the end, so the stream's whole output never exists.
     bool incremental = false;
     std::uint64_t produced = 0;                 // bytes handed over so far
+    // kGroup holds back what a failure would NOT flush: the bytes after the last
+    // quantum boundary of the group in flight. That is at most one quantum (1 MB),
+    // so the stream still never materialises, and StreamEnd applies the same
+    // group/quantum rule to what is left here.
+    std::vector<unsigned char> hold;
+    std::uint64_t held_base = 0;                // hold covers [held_base, produced)
     std::vector<ChecksumStream> sck;            // one per slice, fed as bytes pass
     std::vector<std::pair<std::size_t, std::uint32_t>> pending_bad;  // slice index, computed value
 };
@@ -2461,6 +2467,10 @@ inline void Reset() {
 // Available to a parallel path of the parser: configured and not yet used.
 inline bool Available() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.configured && !e.published; }
 inline bool Committed() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.committed; }
+// Whether the published layout takes StreamWrite. kStore keeps the buffered path
+// (it reports slices over whatever ARRIVED, padding and all), so a worker must
+// ask before deciding to roll through a small output buffer.
+inline bool AcceptsIncremental() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.published && e.policy != Policy::kStore; }
 
 // The parser hands over the layout: streams in worker order, each a list of
 // slices (entry, offset in file, length, checksum) in stream order with their
@@ -2632,23 +2642,39 @@ inline void StreamRewind(std::size_t k) {
     s.pending_bad.clear();
     s.produced = 0;
     s.flushed = 0;
+    s.hold.clear(); s.hold.shrink_to_fit(); s.held_base = 0;
     s.sck.clear();
     for (Slice& sl : s.slices) sl.checked = false;
 }
 
-// A worker hands over the next `n` bytes of stream k, in order. Only for
-// Policy::kProduced, where a stream flushes everything it has produced and there
-// is no unit held back -- so writing as the bytes arrive is byte-for-byte the
-// same decision StreamEnd would make, and the stream's whole output need never
-// exist. Slice checksums are accumulated here and REPORTED in StreamEnd, in
-// slice order, so the console output does not depend on block boundaries.
+// The point up to which stream `s` would flush if it FAILED right now. kProduced
+// flushes everything; kGroup keeps only whole quanta of the group in flight (the
+// same rule StreamEnd applies). Monotonic: a new group starts at or after the
+// previous group's last whole quantum, so this never moves backwards.
+inline std::uint64_t SafeFlushPoint(const Engine& e, const Stream& s, std::uint64_t produced) {
+    if (e.policy != Policy::kGroup) return produced;
+    std::uint64_t gstart = 0;
+    for (std::uint64_t gs : s.group_start) if (gs <= produced) gstart = gs;
+    if (e.quantum != 0u && produced > gstart) return gstart + ((produced - gstart) / e.quantum) * e.quantum;
+    return gstart;
+}
+
+// A worker hands over the next `n` bytes of stream k, in order, instead of one
+// buffer at the end -- so the stream's whole output never exists. Under
+// Policy::kProduced a stream flushes everything it has produced and there is no
+// unit held back, so writing as the bytes arrive is byte-for-byte the same
+// decision StreamEnd would make. Under Policy::kGroup the bytes a failure would
+// NOT flush (after the last quantum boundary of the group in flight) are held in
+// `s.hold` -- at most one quantum -- and StreamEnd decides them. Slice checksums
+// are accumulated here and REPORTED in StreamEnd, in slice order, so the console
+// output does not depend on block boundaries.
 inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) {
     if (n == 0u) return;
     Engine& e = E();
     std::unique_lock<std::mutex> lk(e.mu);
     if (!e.published || k >= e.streams.size()) return;
     Stream& s = e.streams[k];
-    if (e.policy != Policy::kProduced) return;   // kGroup/kStore keep the buffered path
+    if (e.policy == Policy::kStore) return;      // store keeps the buffered path
     s.incremental = true;
     if (s.sck.size() != s.slices.size()) {
         s.sck.resize(s.slices.size());
@@ -2657,22 +2683,33 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     const std::uint64_t from = s.produced;
     std::uint64_t to = from + n;
     if (to > s.total) to = s.total;               // the caller overran its declared size
+    if (s.hold.empty()) s.held_base = from;
+    s.hold.insert(s.hold.end(), buf, buf + static_cast<std::size_t>(to - from));
+    s.produced = to;
+    const std::uint64_t safe = SafeFlushPoint(e, s, to);
     struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
     std::vector<Piece> pieces;
     for (std::size_t i = 0; i < s.slices.size(); ++i) {
         Slice& sl = s.slices[i];
         if (sl.len == 0u) continue;
-        const std::uint64_t a = std::max(sl.spos, from);
-        const std::uint64_t b = std::min(sl.spos + sl.len, to);
+        // Checksums follow the bytes as they pass, whatever the flush rule does
+        // with them: the original checks a slice it decoded, not one it wrote.
+        const std::uint64_t ca = std::max(sl.spos, from);
+        const std::uint64_t cb = std::min(sl.spos + sl.len, to);
+        if (ca < cb) s.sck[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+        const std::uint64_t a = std::max(sl.spos, s.held_base);
+        const std::uint64_t b = std::min(sl.spos + sl.len, safe);
         if (a < b) {
             CreateLocked(e, sl.entry, lk);
             FileState& f = *e.files[sl.entry];
-            const unsigned char* src = buf + (a - from);
-            s.sck[i].Update(src, static_cast<std::size_t>(b - a));
             if (f.write_it && f.fd >= 0)
-                pieces.push_back({&f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a)});
+                pieces.push_back({&f, sl.file_off + (a - sl.spos),
+                                  s.hold.data() + static_cast<std::size_t>(a - s.held_base),
+                                  static_cast<std::size_t>(b - a)});
         }
-        if (!sl.checked && to >= sl.spos + sl.len) {
+        // kProduced reports a slice the moment its last byte has passed; kGroup
+        // waits for StreamEnd, because a failure can still take those bytes back.
+        if (e.policy != Policy::kGroup && !sl.checked && to >= sl.spos + sl.len) {
             sl.checked = true;
             if (sl.has_cksum && e.opt->checksum != ChecksumMode::kNone) {
                 const std::uint32_t got = s.sck[i].Finish();
@@ -2680,11 +2717,15 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
             }
         }
     }
-    s.produced = to;
-    s.flushed = std::max(s.flushed, to);
+    s.flushed = std::max(s.flushed, safe);
     e.committed = e.committed || !pieces.empty();
     lk.unlock();
     for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
+    lk.lock();
+    if (safe > s.held_base) {
+        s.hold.erase(s.hold.begin(), s.hold.begin() + static_cast<std::size_t>(safe - s.held_base));
+        s.held_base = safe;
+    }
 }
 
 // A worker ends stream k. `buf` holds its output (produced bytes valid), `ok` =
@@ -2748,16 +2789,23 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     std::vector<Piece> pieces;
     std::vector<std::pair<const Slice*, std::uint32_t>> bad;
     for (const auto& pb : s.pending_bad) bad.emplace_back(&s.slices[pb.first], pb.second);
-    for (Slice& sl : s.slices) {
-        if (inc) break;
+    for (std::size_t si = 0; si < s.slices.size(); ++si) {
+        Slice& sl = s.slices[si];
+        // Incremental: everything up to s.flushed is already on disk and what is
+        // left of the stream lives in s.hold, covering [s.held_base, produced).
+        // Only the tail [s.flushed, flush_to) is still to decide -- under kGroup
+        // that is the group in flight, which a failure cuts back to a quantum.
         const std::uint64_t a = std::max(sl.spos, s.flushed);
         const std::uint64_t b = std::min(sl.spos + sl.len, flush_to);
         if (sl.len == 0u) continue;
-        if (a >= b) continue;
-        CreateLocked(e, sl.entry, lk);
-        FileState& f = *e.files[sl.entry];
-        if (f.write_it && f.fd >= 0)
-            pieces.push_back({&f, sl.file_off + (a - sl.spos), buf + a, static_cast<std::size_t>(b - a)});
+        if (a < b) {
+            CreateLocked(e, sl.entry, lk);
+            FileState& f = *e.files[sl.entry];
+            const unsigned char* src = inc ? (s.hold.data() + static_cast<std::size_t>(a - s.held_base))
+                                           : (buf + a);
+            if (f.write_it && f.fd >= 0)
+                pieces.push_back({&f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a)});
+        }
         // A stored slice is checked over whatever arrived (a cut one over 0 bytes:
         // the original prints "ffffffff" for those).
         const bool store_check = (e.policy == Policy::kStore) && !sl.checked;
@@ -2767,7 +2815,8 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
                 // Store: a slice with any byte received is checked whole (stub + zero
                 // padding); one with no record at all over nothing ("ffffffff").
                 const std::size_t avail = (store_check && received <= sl.spos) ? std::size_t{0} : static_cast<std::size_t>(sl.len);
-                const std::uint32_t got = ComputeBufferChecksum(sl.cmode, buf + sl.spos, avail);
+                const std::uint32_t got = inc ? s.sck[si].Finish()
+                                              : ComputeBufferChecksum(sl.cmode, buf + sl.spos, avail);
                 if (trace) std::fprintf(stderr, "[sink]   slice entry=%zu off=%llu len=%llu stored=%08x got=%08x\n", sl.entry,
                                         (unsigned long long)sl.file_off, (unsigned long long)sl.len, sl.cval, got);
                 if (got != sl.cval) { ++e.mismatches; bad.emplace_back(&sl, got); }
@@ -2791,8 +2840,9 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     e.committed = e.committed || !pieces.empty();
     std::vector<std::pair<const Slice*, std::uint32_t>> bad_copy = bad;
     lk.unlock();
-    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
+    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);   // `pieces` may point into s.hold
     for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
+    if (inc) { lk.lock(); s.hold.clear(); s.hold.shrink_to_fit(); }
 }
 
 struct Outcome { bool committed = false; bool stream_failed = false; bool plain_code = false; std::size_t mismatches = 0; std::size_t failed_entries = 0; };
@@ -6721,6 +6771,8 @@ bool TryParseLegacyCnArchive(
                             use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
                         bool all_ok = parse_ok && !ps.empty();
                         static constexpr std::size_t kCdWindowPad = 16u;
+                        static constexpr std::size_t kCdOutUnit = 0x100000u;      // rolling unit = the sink's quantum
+                        static constexpr std::size_t kCdOutHeadroom = 0x10000u;   // room for the chunk in flight
                         std::vector<PCdStream*> plist;
                         std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
                         for (auto& kv : ps) {
@@ -6754,7 +6806,24 @@ bool TryParseLegacyCnArchive(
                         if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
                             PCdStream& s = *plist[idx];
                             const std::size_t slice_total = static_cast<std::size_t>(s.osz);
-                            std::vector<unsigned char> slice_buf(kCdWindowPad + slice_total, 0u);
+                            // With the sink the slice's output never has to exist whole:
+                            // it is handed over a unit at a time and the buffer rolls.
+                            // Without it the in-memory path still slices one buffer back
+                            // into files, so it keeps the whole slice.
+                            //
+                            // The headroom is what lets the unit boundary fall anywhere:
+                            // NzCdDecodeStream stops STARTING chunks at `soft`, but any
+                            // chunk it did start still has the full buffer to finish in,
+                            // so no chunk is ever cut at a unit edge. A chunk's output is
+                            // at most 0x8000 bytes (its compact size is a 0x8001-capped
+                            // varint and the text pipeline chunks 32 KB of final output),
+                            // so 64 KB of headroom is twice what any chunk can need.
+                            const bool roll = use_sink && psink::AcceptsIncremental();
+                            const std::size_t buf_cap =
+                                roll ? std::min<std::size_t>(kCdOutUnit + kCdOutHeadroom,
+                                                             slice_total ? slice_total : std::size_t{1})
+                                     : slice_total;
+                            std::vector<unsigned char> slice_buf(kCdWindowPad + buf_cap, 0u);
                             unsigned char* const slice_window = slice_buf.data() + kCdWindowPad;
                             // Each stream is a FRESH nz_cd instance: its own ring (sized from its
                             // own p1), its own -cD context table and image model.
@@ -6772,7 +6841,7 @@ bool TryParseLegacyCnArchive(
                                 nzr::cd::NzLzhdsInitCtxTable(s_lzhds_ctx.data());
                                 s_lzhds_ctx_ptr = s_lzhds_ctx.data();
                             }
-                            std::size_t pwritten = 0u;
+                            std::uint64_t pwritten = 0u;
                             nzr::audio::NzImageModel s_img;
                             s_img.Configure(0x02u, 16u, 16u, true);
                             // Prefilter (0xc) sub-chunk state, per stream like everything else
@@ -6785,25 +6854,49 @@ bool TryParseLegacyCnArchive(
                                 if (pwritten >= slice_total) break;
                                 const std::uint8_t* blk_in = bytes.Span(c.first, c.second);
                                 if (blk_in == nullptr) break;
-                                const std::uint32_t blk_in_size = static_cast<std::uint32_t>(c.second);
-                                // clamped, not narrowed -- see the note on block_cap below
-                                const std::uint64_t blk_left =
-                                    static_cast<std::uint64_t>(slice_total) - static_cast<std::uint64_t>(pwritten);
-                                const std::uint32_t blk_cap = blk_left > 0xffffffffull ? 0xffffffffu
-                                                                                       : static_cast<std::uint32_t>(blk_left);
-                                std::uint32_t produced = nzr::cd::NzCdDecodeStream(
-                                    blk_in, blk_in_size, slice_window + pwritten, blk_cap,
-                                    sring.data(), sring_size, &sring_pos,
-                                    static_cast<std::uint32_t>(pwritten),
-                                    s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index,
-                                    &s_pf, &s_lms1, &s_lms2, &s_img);
-                                if (produced == 0u) {
+                                // One data record, decoded in units when rolling. The ring,
+                                // the -cD context table and the prefilter/LMS/image state
+                                // all live across the calls, so N unit calls are byte-for-
+                                // byte the one call this used to be.
+                                std::size_t in_off = 0u;
+                                bool step_failed = false;
+                                while (in_off < c.second && pwritten < slice_total) {
+                                    // clamped, not narrowed -- see the note on block_cap below
+                                    const std::uint64_t blk_left =
+                                        static_cast<std::uint64_t>(slice_total) - pwritten;
+                                    std::uint32_t blk_cap, blk_soft;
+                                    if (roll) {
+                                        const std::uint64_t room = std::min<std::uint64_t>(buf_cap, blk_left);
+                                        blk_cap = static_cast<std::uint32_t>(room);
+                                        blk_soft = (room > kCdOutHeadroom)
+                                                       ? static_cast<std::uint32_t>(room - kCdOutHeadroom)
+                                                       : blk_cap;
+                                    } else {
+                                        blk_cap = blk_left > 0xffffffffull ? 0xffffffffu
+                                                                           : static_cast<std::uint32_t>(blk_left);
+                                        blk_soft = 0u;
+                                    }
+                                    std::size_t consumed = 0u;
+                                    std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+                                        blk_in + in_off, c.second - in_off,
+                                        roll ? slice_window : slice_window + pwritten, blk_cap,
+                                        sring.data(), sring_size, &sring_pos,
+                                        static_cast<std::uint32_t>(pwritten),
+                                        s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index,
+                                        &s_pf, &s_lms1, &s_lms2, &s_img, blk_soft, &consumed);
+                                    if (produced == 0u) { step_failed = true; break; }
+                                    if (roll) psink::StreamWrite(idx, slice_window, produced);
+                                    pwritten += produced;
+                                    progress::Add(produced);
+                                    if (consumed == 0u) break;       // no input progress: stop the record
+                                    in_off += consumed;
+                                    if (!roll) break;                // one call covers the whole record
+                                }
+                                if (step_failed) {
                                     if (use_sink) psink::StreamEnd(idx, slice_window, pwritten, false,
                                                                    nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
                                     return false;
                                 }
-                                pwritten += produced;
-                                progress::Add(produced);
                             }
                             if (use_sink) {
                                 // Ran out of chunks before the slice was full: the sink reports
@@ -6816,7 +6909,7 @@ bool TryParseLegacyCnArchive(
                             if (pwritten != slice_total) return false;
                             if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) return false;
                             std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
-                                        slice_window, slice_total);
+                                        slice_window, slice_total);   // buffered path: buf_cap == slice_total
                             return true;
                         });
                         StageMark("streams decoded");

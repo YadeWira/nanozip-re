@@ -176,7 +176,22 @@ std::uint32_t NzCdDecodeStream(const std::uint8_t* block, std::size_t block_len,
                                // Image model for the 0xf sub-chunk (FUN_080a9ca0).
                                // Caller-owned, persists across the stream's chunks;
                                // nullptr makes such a chunk decline.
-                               nzr::audio::NzImageModel* img = nullptr);
+                               nzr::audio::NzImageModel* img = nullptr,
+                               // Soft stop: the loop stops starting new chunks once it
+                               // has written this many bytes, while each chunk it DOES
+                               // start still gets the full `out_cap` of room. That lets a
+                               // caller decode a long stream through a small rolling
+                               // buffer (soft = the unit, cap = unit + headroom) without
+                               // ever truncating a chunk mid-way -- truncation stays
+                               // exactly where it was, at the real end of the slice.
+                               // 0 = no soft stop (out_cap is both).
+                               std::uint32_t out_soft = 0,
+                               // Input bytes consumed, so the caller can resume this same
+                               // record where the soft stop left off. The ring, the -cD
+                               // context table, the prefilter/LMS/image state and
+                               // `*ring_pos` all persist across such calls by design, so
+                               // resuming is byte-for-byte one long call.
+                               std::size_t* in_consumed = nullptr);
 
 }  // namespace cd
 }  // namespace nzr
