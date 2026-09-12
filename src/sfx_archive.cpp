@@ -1451,6 +1451,12 @@ public:
         v.n_ = (map != nullptr) ? map->total : 0u;
         return v;
     }
+    // Which backing this view reads through -- a flat pointer, a window, or a
+    // splice. Diagnostics only.
+    const char* DebugKind() const {
+        if (smap_ != nullptr) return src_ != nullptr ? "splice/windowed" : "splice/flat";
+        return src_ != nullptr ? "windowed" : "flat";
+    }
     ByteView subview(ArcPos off) const {
         if (off > n_) return ByteView();
         if (smap_ != nullptr) return *this;            // splice space is not re-based
@@ -2053,7 +2059,9 @@ struct LegacyCnContext {
     bool decode_at_last_record = false;
     // Data records in payload (spliced) space: cumulative end offsets, and
     // whether any record follows the last data record in the file.
-    std::vector<std::size_t> payload_record_ends;
+    // FILE offsets (in payload space), so ArcPos -- they are compared against a
+    // decoder's recorded input position, which is 64-bit.
+    std::vector<ArcPos> payload_record_ends;
     bool records_after_data = false;
     // A parallel container written by the sink (psink): the files are already on
     // disk (or verified, for `t`); the extractor only reports.
@@ -3126,7 +3134,8 @@ std::uint32_t ReadU32LE(const unsigned char* p);
 // importantly, no half-parsed checksum can be mistaken for a real one.
 bool ApplyLegacyAttributeRecords(
     const ByteView& bytes,
-    const std::vector<std::array<std::size_t, 4>>& records,  // {stream, type, begin, end}
+    // {stream, type, begin, end} -- begin/end are FILE offsets, so ArcPos.
+    const std::vector<std::array<ArcPos, 4>>& records,
     const std::map<unsigned, std::vector<std::size_t>>& stream_named,
     const std::set<std::string>& split_paths,
     std::vector<LegacyCnEntry>* entries) {
@@ -3352,7 +3361,7 @@ struct LegacyParallelSlice {
 struct LegacyParallelStream {
     // Block-record payload ranges for this stream, in order. Usually one, but
     // concatenated when a stream spans several type-0 chunks.
-    std::vector<std::pair<std::size_t, std::size_t>> chunks;
+    std::vector<std::pair<ArcPos, ArcPos>> chunks;
     std::uint64_t osz = 0, ooff = 0;      // this slice's size and output offset
     ChecksumMode cmode = ChecksumMode::kNone;
     std::uint32_t cval = 0;               // checksum OF THE SLICE, not the file
@@ -3775,7 +3784,7 @@ bool AssembleParallelMultiFile(
 // Concatenate a stream's data-record payloads into one buffer.
 inline std::vector<unsigned char> ConcatParallelChunks(
     const ByteView& bytes,
-    const std::vector<std::pair<std::size_t, std::size_t>>& chunks) {
+    const std::vector<std::pair<ArcPos, ArcPos>>& chunks) {
     std::vector<unsigned char> in;
     for (const auto& c : chunks) {
         if (c.first + c.second > bytes.size()) return std::vector<unsigned char>();
@@ -5374,7 +5383,9 @@ bool TryParseLegacyCnArchive(
     // one table per block, so reading only the first loses every file after the
     // first block; a parallel container additionally puts some files ONLY in a
     // non-main stream's table.
-    std::vector<std::array<std::size_t, 3>> all_tables;  // {stream, begin, end}
+    // {stream, begin, end} -- begin/end are FILE offsets, so ArcPos: a filename
+    // table of a >4 GB archive sits past what a 32-bit size_t holds.
+    std::vector<std::array<ArcPos, 3>> all_tables;
     // Per table, whether a type-10 (slice offset) record follows it in its
     // stream: that is the original's "this entry is a slice of a file split
     // across streams" flag (entry byte 0x21 & 0x10), set on EVERY slice of such
@@ -5382,7 +5393,9 @@ bool TryParseLegacyCnArchive(
     std::vector<bool> table_has_off;
     std::map<unsigned, std::size_t> last_table_of_stream;   // stream -> index into all_tables
     // Per-file attribute records ({stream, type, begin, end}), in record order.
-    std::vector<std::array<std::size_t, 4>> attr_records;
+    // ArcPos, not size_t: `begin`/`end` are FILE offsets, and a 4.6 GB archive's
+    // records run past what a 32-bit size_t can hold.
+    std::vector<std::array<ArcPos, 4>> attr_records;
     // Start of the first main-stream type-0 record == end of the leading
     // metadata run (the offset the single-file path uses as payload_start).
     ArcPos first_data_record = 0u;
@@ -5390,10 +5403,17 @@ bool TryParseLegacyCnArchive(
     // Every main-stream data record, as [record_begin, record_end). In a
     // multi-block archive the next block's table/mtime/perm/checksum records sit
     // BETWEEN two data records, so the payload is not one contiguous run.
-    std::vector<std::pair<std::size_t, std::size_t>> data_records;
+    //
+    // ArcPos, NOT size_t. These are FILE offsets: on a 32-bit build every record
+    // past the 4 GB mark wrapped here, and the splice map built from them then
+    // read the archive 2^32 bytes short. On the reporter's 4.6 GB -cO archive
+    // that showed up as a decode that ran 535 segments -- 4280 MiB of correct
+    // output -- and then read its next stream tag at (offset - 2^32), got a
+    // nibble that was not 0, and called the archive corrupt (code 100).
+    std::vector<std::pair<ArcPos, ArcPos>> data_records;
     // The same records' PAYLOAD ranges (header excluded), whole records only:
     // a stored archive's content is their concatenation.
-    std::vector<std::pair<std::size_t, std::size_t>> data_payloads;
+    std::vector<std::pair<ArcPos, ArcPos>> data_payloads;
     // Any record belonging to a non-zero stream => parallel (-pN) container,
     // which has its own framing and must not be spliced.
     bool has_parallel_streams = false;
@@ -6034,7 +6054,9 @@ bool TryParseLegacyCnArchive(
             }
             return false;
         }
-        const std::size_t data_offset = static_cast<std::size_t>(data_offset_u64);
+        // ArcPos: a stored payload starts wherever the metadata ends, which on a
+        // >4 GB archive is past what a 32-bit size_t holds.
+        const ArcPos data_offset = data_offset_u64;
 
         // Find stream-prefix varint immediately before payload.
         const std::uint64_t expected_stream_len_tag = total_data_size << 4u;
@@ -6054,8 +6076,9 @@ bool TryParseLegacyCnArchive(
             }
         }
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
-            std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%zu table_end=%zu prefix_found=%d entries=%zu\n",
-                         (unsigned long long)total_data_size, data_offset, (size_t)table_end,
+            std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%llu table_end=%llu prefix_found=%d entries=%zu\n",
+                         (unsigned long long)total_data_size, (unsigned long long)data_offset,
+                         (unsigned long long)table_end,
                          (int)prefix_found, entries.size());
         // A stored archive cut into several blocks carries, before each block,
         // the table/mtime/permission records of the files that START in it
@@ -6092,7 +6115,7 @@ bool TryParseLegacyCnArchive(
             if (ParseLegacyParallelStreams(bytes, &pstreams, /*keep_cut_chunk=*/true) &&
                 AssembleParallelMultiFile(
                     bytes, pstreams, entries, total_data_size,
-                    [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                    [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
                         std::uint64_t out_size,
                         const std::function<bool(const std::vector<unsigned char>&)>&,
                         std::vector<unsigned char>* dst) {
@@ -6135,7 +6158,7 @@ bool TryParseLegacyCnArchive(
             // data_offset comes from the record walk and can point far past a truncated
             // file; never scan beyond the bytes we have (fuzz 2026-09-03: a 2 MB store cut
             // at 95 % made this loop run for minutes).
-            const std::size_t scan_end = std::min<std::size_t>(data_offset, bytes.size());
+            const ArcPos scan_end = std::min<ArcPos>(data_offset, bytes.size());
             for (ArcPos s = table_end; s <= scan_end; ++s) {
                 if (TryAssembleStoredBlocks(bytes, s, total_data_size,
                                             store_trailer_bytes, &store_blocks_buffer)) {
@@ -6603,7 +6626,7 @@ bool TryParseLegacyCnArchive(
                             // several type-0 chunks (one per ~1 MB output sub-
                             // stream); they form one logical lzpf stream and are
                             // concatenated before decode.
-                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
                             bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
@@ -6841,7 +6864,7 @@ bool TryParseLegacyCnArchive(
                         struct PCdStream {
                             // Each entry is one raw nz_cd block: (offset, size)
                             // into `bytes`, decoded in order into the slice.
-                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
                             bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
@@ -7120,7 +7143,7 @@ bool TryParseLegacyCnArchive(
                         if (method == 0x4bu && method_p0 == 7u) {
                             got = AssembleParallelMultiFile(
                                 bytes, pstreams, entries, total_data_size,
-                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>&,
                                     std::vector<unsigned char>* dst) {
@@ -7152,7 +7175,7 @@ bool TryParseLegacyCnArchive(
                             const bool s_is_lzhds = (method_p0 == 4u);
                             got = AssembleParallelMultiFile(
                                 bytes, pstreams, entries, total_data_size,
-                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>&,
                                     std::vector<unsigned char>* dst) {
@@ -7204,7 +7227,7 @@ bool TryParseLegacyCnArchive(
                                 nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
                             got = (wcap != 0u) && AssembleParallelMultiFile(
                                 bytes, pstreams, entries, total_data_size,
-                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>&,
                                     std::vector<unsigned char>* dst) {
@@ -7234,7 +7257,7 @@ bool TryParseLegacyCnArchive(
                             const bool vb = (method_p0 == 2u);
                             got = AssembleParallelMultiFile(
                                 bytes, pstreams, entries, total_data_size,
-                                [&](const std::vector<std::pair<std::size_t, std::size_t>>& chunks,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
                                     std::uint64_t out_size,
                                     const std::function<bool(const std::vector<unsigned char>&)>& accept,
                                     std::vector<unsigned char>* dst) {
@@ -7391,7 +7414,7 @@ bool TryParseLegacyCnArchive(
                             // (offset, size) into `bytes`; usually just one,
                             // but concatenated in order if a stream is ever
                             // split across more than one type-0 chunk.
-                            std::vector<std::pair<std::size_t, std::size_t>> chunks;
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
                             bool cut = false;   // its last data record was cut off by the end of the file
                             std::uint64_t osz = 0, ooff = 0;
                             ChecksumMode cmode = ChecksumMode::kNone;
@@ -10316,11 +10339,22 @@ static bool TryDecodeLegacyOptimum(
         ArcPos p = seg_pos;
         std::uint64_t stream_tag = 0;
         const auto seg_stop = [&](const char* why) {
-            if (NZ_ENV("NZOPT_TRACE_TDO"))
-                std::fprintf(stderr, "[TDO64] segment stop (%s): seg_pos=%llu p=%llu tag=%llu raw_len=%llu out=%llu\n",
-                             why, (unsigned long long)seg_pos, (unsigned long long)p,
-                             (unsigned long long)stream_tag, (unsigned long long)raw_len,
-                             (unsigned long long)out_data->size());
+            if (!NZ_ENV("NZOPT_TRACE_TDO")) return;
+            std::fprintf(stderr, "[TDO64] segment stop (%s): seg_pos=%llu p=%llu tag=%llu raw_len=%llu out=%llu\n",
+                         why, (unsigned long long)seg_pos, (unsigned long long)p,
+                         (unsigned long long)stream_tag, (unsigned long long)raw_len,
+                         (unsigned long long)out_data->size());
+            // Span() and operator[] take different routes to the same byte (the
+            // second has a flat fast path); printing both localises a bad read
+            // to the view rather than to the framing.
+            std::fprintf(stderr, "[TDO64]   idx:");
+            for (ArcPos k = 0; k < 8 && seg_pos + k < raw_len; ++k)
+                std::fprintf(stderr, " %02x", pv[seg_pos + k]);
+            const unsigned char* q = pv.Span(seg_pos, 8);
+            std::fprintf(stderr, "   span:");
+            if (q == nullptr) std::fprintf(stderr, " (null)");
+            else for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %02x", q[k]);
+            std::fprintf(stderr, "   view=%s\n", pv.DebugKind());
         };
         if (!read_stream_tag(&p, &stream_tag)) { seg_stop("tag read"); ok = false; break; }
         if ((stream_tag & 0x0fu) != 0u) { seg_stop("tag nibble"); ok = false; break; }
