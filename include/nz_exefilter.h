@@ -57,6 +57,15 @@ class NzExeFilter {
                 const std::uint8_t* in, std::uint32_t in_size,
                 std::uint8_t* out, std::uint32_t out_cap, std::uint32_t* out_size);
 
+    // An upper bound on what Decode will write for this (side, in_size) pair.
+    // Decode declines when it runs out of room, but its recent-target caches
+    // are already mutated by then, so "try small, retry bigger" would decode
+    // from the wrong state -- a caller has to size the output buffer correctly
+    // the FIRST time, and this is what lets it size it from the BLOCK rather
+    // than from the whole rest of the stream's output.
+    static std::uint64_t DecodedSizeBound(const std::uint8_t* side, std::uint32_t side_len,
+                                          std::uint32_t in_size);
+
  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

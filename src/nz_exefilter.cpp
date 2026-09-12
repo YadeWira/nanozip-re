@@ -554,6 +554,27 @@ bool NzExeFilter::Decode(const std::uint8_t* side, std::uint32_t side_len,
     return impl_->Decode(side, side_len, in, in_size, out, out_cap, out_size);
 }
 
+std::uint64_t NzExeFilter::DecodedSizeBound(const std::uint8_t* side, std::uint32_t side_len,
+                                            std::uint32_t in_size) {
+    // Every output byte is one of:
+    //   - an instruction byte copied 1:1            (at most in_size of them)
+    //   - a restored JUMP/Jcc displacement, 4 bytes. These are driven by the
+    //     ARITHMETIC decoder and consume NO side-stream byte, so nothing in the
+    //     side stream counts them -- only the input does, since each needs its
+    //     own opcode byte. That is what makes 5 * in_size the leading term.
+    //   - a restored CALL displacement, 4 bytes, plus an optional 3-byte add-esp
+    //     -- one `addesp_stream` byte each, so `num_call` of them at most.
+    // Hence in_size + 4*in_size + 7*num_call. Loose, but sound, and still a
+    // small multiple of the BLOCK where the alternative is the whole rest of
+    // the stream's output.
+    const std::uint64_t n = in_size;
+    if (side == nullptr || side_len == 0u) return n * 5u + 16u;
+    BackwardsByteStream backwards(side, side_len);
+    const std::uint32_t num_call_offs = backwards.ReadBackwardsVarint();
+    const std::uint32_t num_call = backwards.ReadBackwardsVarint() + num_call_offs;
+    return n * 5u + static_cast<std::uint64_t>(num_call) * 7u + 16u;
+}
+
 
 // ---------------------------------------------------------------------------
 // The encoder (reference FUN_08090360). Its decisions are: which of the three

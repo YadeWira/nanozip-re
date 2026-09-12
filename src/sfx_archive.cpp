@@ -7631,6 +7631,9 @@ bool TryParseLegacyCnArchive(
                                     // reader did before. Rewinding puts the sink's
                                     // cursor back, and re-running rewrites the same
                                     // absolute file ranges.
+                                    if (NZ_ENV("NZ_TRACE_BIGALLOC"))
+                                        std::fprintf(stderr, "[big] co stream %zu: per-record path failed, concatenating %zu records\n",
+                                                     idx, s.chunks.size());
                                     if (use_sink) { psink::StreamRewind(idx); streamed = 0; }
                                     slice.clear();
                                     nzr::derr::Clear();
@@ -8938,6 +8941,8 @@ static bool TryDecodeLegacyCm(
         // param2: u32-wise RLE expansion driven by the param2 side stream.
         if (param2_flag) {
             std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
+            if (NZ_ENV("NZ_TRACE_BIGALLOC") && cap2 >= (64u << 20))
+                std::fprintf(stderr, "[big] param2 expand start %u (remaining %u)\n", cap2, remaining);
             std::vector<std::uint8_t> exp;
             std::uint32_t esz = 0;
             bool p2ok = false;
@@ -9001,11 +9006,36 @@ static bool TryDecodeLegacyCm(
         // p14 was set 1 272 times. So this decline covers a bit the encoder
         // expresses elsewhere, not a gap in the port.
         if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
+        // Text-transform scratch, the same shape the optimum family uses (see
+        // the tt_scratch there): `remaining` -- the whole rest of the ENTRY's
+        // output -- is a correct cap and a ruinous allocation. On a 4.5 GB -cc
+        // entry the first block of every stage took gigabytes of zero-filled
+        // scratch, which is most of what kept this at 13 GB where the original
+        // holds 554 MB. Start block-proportional and fall back to the full cap
+        // only when the transform says it did not fit; a transform returns 0
+        // both for bad data and for no room, so no valid block can be lost.
+        const auto cm_tt_scratch = [&](std::vector<std::uint8_t>* buf,
+                                       const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run)
+                                   -> std::uint32_t {
+            std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
+            if (want > remaining) want = remaining;
+            std::uint32_t cap = static_cast<std::uint32_t>(want);
+            buf->assign(cap, 0u);
+            std::uint32_t n = run(buf->data(), cap);
+            if (n == 0u && cap < remaining) {
+                cap = remaining;
+                buf->assign(cap, 0u);
+                n = run(buf->data(), cap);
+            }
+            return n;
+        };
         if (tt_enabled && (tt_flags & 0x10u)) {
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransformNumber(
-                tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
-                work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformNumber(
+                    tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                    work.data(), cur_size, o, cap);
+            });
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9040,8 +9070,10 @@ static bool TryDecodeLegacyCm(
         if (tt_enabled && (tt_flags & 0x04u)) {
             // HTML closing-tag restoration (NzTextTransformHtml). Reference
             // order puts 0x04 after the 0x08 dictionary and before 0x02.
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransformHtml(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformHtml(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9051,10 +9083,16 @@ static bool TryDecodeLegacyCm(
             // Insert-LF transform (NzTextTransformInsertLf, ported from
             // TransformText_3_InsertLF). Byte-count-preserving pure byte
             // post-filter driven by the tt2_data side stream.
-            std::vector<std::uint8_t> tbuf(remaining);
+            // Byte-count-PRESERVING (see nz_text_transform.h, and its own
+            // `allocated < in_size` guard): the output is exactly cur_size, so
+            // sizing this from `remaining` -- the whole rest of the stream's
+            // output -- allocated 258 MB per block on a 281 MB worker stream,
+            // sixteen workers at once. The other text stages were moved off
+            // `remaining` in ef6468b; this one and dece below were missed.
+            std::vector<std::uint8_t> tbuf(cur_size);
             const std::uint32_t n = NzTextTransformInsertLf(
                 tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
-                work.data(), cur_size, tbuf.data(), remaining);
+                work.data(), cur_size, tbuf.data(), cur_size);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9070,8 +9108,10 @@ static bool TryDecodeLegacyCm(
             // identically regardless of codec (no reorder_ascii_ dependency),
             // and a wrong result is caught by the entry checksum and declines
             // exactly as it does today.
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransformRle(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformRle(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9081,8 +9121,10 @@ static bool TryDecodeLegacyCm(
             // Chess/PGN transform, between 0x20 and 0x01 in the reference's
             // dispatch order. Not in the community reference at all (its body
             // is assert(0)); decoded from (input, output) pairs plus the binary.
-            std::vector<std::uint8_t> tbuf(remaining);
-            const std::uint32_t n = NzTextTransform6(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransform6(work.data(), cur_size, o, cap);
+            });
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -9108,11 +9150,24 @@ static bool TryDecodeLegacyCm(
             // text transforms -> dece). Output GROWS (4 bytes per restored
             // displacement, 3 more per add-esp), and since dece is last its
             // result IS the block final output, so `remaining` is the right cap.
-            std::vector<std::uint8_t> tbuf(remaining);
+            // Sized from what THIS block's side stream can add, not from the
+            // whole rest of the stream: `remaining` was 258 MB per block on a
+            // 281 MB worker stream. A retry-if-it-did-not-fit is not available
+            // here -- dece TRUNCATES rather than failing when it runs out of
+            // room, and its recent-call/recent-jump/carry state advances as it
+            // goes -- so the cap has to be right the first time. The bound is
+            // exact-or-over: the input plus 4 bytes per restored call target
+            // and 3 per add-esp immediate, both counted in the side stream.
+            const std::uint64_t dece_bound = NzExeFilter::DecodedSizeBound(
+                dece_data.data(), static_cast<std::uint32_t>(dece_data.size()), cur_size);
+            const std::uint32_t dece_cap = dece_bound >= remaining
+                                               ? remaining
+                                               : static_cast<std::uint32_t>(dece_bound);
+            std::vector<std::uint8_t> tbuf(dece_cap);
             std::uint32_t n = 0;
             const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
-                                 work.data(), cur_size, tbuf.data(), remaining, &n);
+                                 work.data(), cur_size, tbuf.data(), dece_cap, &n);
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDCC] dece: param=%u data=%zu in=%u -> %d out=%u\n",
                         dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
@@ -9957,6 +10012,8 @@ static bool DecodeOptimumBlockSequence(
             buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
             std::uint32_t n = run(buf->data(), cap);
             if (n == 0u && cap < remaining) {
+                if (NZ_ENV("NZ_TRACE_BIGALLOC"))
+                    std::fprintf(stderr, "[big] tt scratch retry at the full cap: %u -> %u\n", cap, remaining);
                 cap = remaining;
                 buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
                 n = run(buf->data(), cap);
@@ -10017,10 +10074,17 @@ static bool DecodeOptimumBlockSequence(
             // Byte-count-preserving pure byte post-filter driven by the
             // tt2_data side stream (its own embedded arithmetic decoder,
             // independent of the CM/LZ entropy coder).
-            std::vector<std::uint8_t> tbuf(remaining);
+            //
+            // Byte-count-PRESERVING (its own `allocated < in_size` guard says
+            // so), so the output is exactly cur_size. Sizing it from `remaining`
+            // -- the whole rest of the stream's output -- allocated 258 MB per
+            // block on a 281 MB worker stream, sixteen workers at once. The
+            // other text stages moved off `remaining` in ef6468b; this one and
+            // dece below were missed.
+            std::vector<std::uint8_t> tbuf(cur_size);
             const std::uint32_t n = NzTextTransformInsertLf(
                 tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
-                work.data(), cur_size, tbuf.data(), remaining);
+                work.data(), cur_size, tbuf.data(), cur_size);
             if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             tbuf.resize(n); work.swap(tbuf); cur_size = n;
             tt_step("lf");
@@ -10078,12 +10142,23 @@ static bool DecodeOptimumBlockSequence(
             // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
             // text transforms -> dece). Output GROWS (4 bytes per restored
             // displacement, 3 more per add-esp), and since dece is last its
-            // result IS the block final output, so `remaining` is the right cap.
-            std::vector<std::uint8_t> tbuf(remaining);
+            // result IS the block final output, so `remaining` is a correct cap
+            // -- and a ruinous allocation, 258 MB per block on a 281 MB worker
+            // stream. A try-small-then-retry is not available here: dece
+            // declines when it runs out of room, but its recent-target caches
+            // are already mutated by then, so a second run would decode from
+            // the wrong state. NzExeFilter::DecodedSizeBound bounds the block
+            // from the block itself instead.
+            const std::uint64_t dece_bound = NzExeFilter::DecodedSizeBound(
+                dece_data.data(), static_cast<std::uint32_t>(dece_data.size()), cur_size);
+            const std::uint32_t dece_cap = dece_bound >= remaining
+                                               ? remaining
+                                               : static_cast<std::uint32_t>(dece_bound);
+            std::vector<std::uint8_t> tbuf(dece_cap);
             std::uint32_t n = 0;
             const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
-                                 work.data(), cur_size, tbuf.data(), remaining, &n);
+                                 work.data(), cur_size, tbuf.data(), dece_cap, &n);
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] dece: param=%u data=%zu in=%u -> %d out=%u\n",
                         dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
@@ -10240,10 +10315,17 @@ static bool TryDecodeLegacyOptimum(
     while (static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
         ArcPos p = seg_pos;
         std::uint64_t stream_tag = 0;
-        if (!read_stream_tag(&p, &stream_tag)) { ok = false; break; }
-        if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
+        const auto seg_stop = [&](const char* why) {
+            if (NZ_ENV("NZOPT_TRACE_TDO"))
+                std::fprintf(stderr, "[TDO64] segment stop (%s): seg_pos=%llu p=%llu tag=%llu raw_len=%llu out=%llu\n",
+                             why, (unsigned long long)seg_pos, (unsigned long long)p,
+                             (unsigned long long)stream_tag, (unsigned long long)raw_len,
+                             (unsigned long long)out_data->size());
+        };
+        if (!read_stream_tag(&p, &stream_tag)) { seg_stop("tag read"); ok = false; break; }
+        if ((stream_tag & 0x0fu) != 0u) { seg_stop("tag nibble"); ok = false; break; }
         const std::uint64_t stream_bytes = stream_tag >> 4u;
-        if (stream_bytes > raw_len - p) { ok = false; break; }
+        if (stream_bytes > raw_len - p) { seg_stop("stream past end"); ok = false; break; }
         const ArcPos stream_end = p + stream_bytes;
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] chain segment: p=%zu stream_end=%zu out_data_size_before=%zu\n",
