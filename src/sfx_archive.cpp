@@ -1038,8 +1038,51 @@ std::string HumanBytes(std::uint64_t bytes) {
     return oss.str();
 }
 
+// Windows: a filename is a byte string in the machine's ACTIVE CODE PAGE, not
+// UTF-8. The original calls the ANSI Win32 API (its own message for a name it
+// cannot open comes out mangled under a different code page), so an archive made
+// on a Hungarian Windows carries CP1250 bytes and one made on a Russian machine
+// CP1251 -- and extracting on the same machine has to recreate exactly that name.
+//
+// libstdc++'s `std::filesystem::path(std::string)` on MinGW instead requires
+// valid UTF-8 and THROWS "Cannot convert character sequence" on anything else, so
+// every archive whose names are not plain ASCII failed with a filesystem error
+// where the original works. Reported by xman on Win7 x64 with Hungarian accented
+// filenames; reproduced here under wine, and in four lines of libstdc++.
+//
+// So: convert through the active code page, exactly as the ANSI API would, and
+// leave every other platform's bytes alone (they are already the native encoding).
+inline fs::path PathFromNativeBytes(const std::string& s) {
+#if defined(_WIN32)
+    if (s.empty()) return fs::path();
+    const int n = ::MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return fs::path(s);   // not representable: let the caller fail as it did
+    std::wstring w(static_cast<std::size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return fs::path(w);
+#else
+    return fs::path(s);
+#endif
+}
+
+// The inverse: the bytes the original would store or print for a path.
+inline std::string NativeBytesFromPath(const fs::path& p) {
+#if defined(_WIN32)
+    const std::wstring w = p.wstring();
+    if (w.empty()) return std::string();
+    const int n = ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    return s;
+#else
+    return p.string();
+#endif
+}
+
 fs::path ResolveArchivePath(const CliOptions& options) {
-    fs::path out(options.archive_path);
+    fs::path out = PathFromNativeBytes(options.archive_path);
     if (!options.no_filename_ext && out.extension() != ".nz") {
         out += ".nz";
     }
@@ -1142,7 +1185,7 @@ bool SkipBytes(std::istream& in, std::uint64_t size) {
 }
 
 fs::path SanitizeExtractPath(const std::string& name) {
-    fs::path p(name);
+    fs::path p = PathFromNativeBytes(name);
     if (p.is_absolute()) {
         return {};
     }
@@ -2328,7 +2371,7 @@ inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
     if (e.test_mode || !f.selected) { f.write_it = false; return; }
     fs::path safe_rel = e.opt->strip_paths ? fs::path(SanitizeExtractPath(en.path)).filename()
                                            : SanitizeExtractPath(en.path);
-    if (e.opt->forceout) safe_rel = fs::path(e.opt->positional.empty() ? std::string("*") : e.opt->positional.front());
+    if (e.opt->forceout) safe_rel = PathFromNativeBytes(e.opt->positional.empty() ? std::string("*") : e.opt->positional.front());
     if (safe_rel.empty()) {
         std::cerr << "Skipping unsafe path in archive: " << en.path << '\n';
         ++e.unsafe; f.write_it = false; return;
@@ -10430,7 +10473,7 @@ int RunLegacyCnExtractOrTest(
         return 2;
     }
 
-    const fs::path output_root = options.output_path.empty() ? fs::current_path() : fs::path(options.output_path);
+    const fs::path output_root = options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path);
 
     std::size_t processed = 0;
     std::size_t failed = 0;
@@ -10516,7 +10559,7 @@ int RunLegacyCnExtractOrTest(
             fs::path safe_rel = options.strip_paths
                 ? fs::path(SanitizeExtractPath(e.path)).filename()
                 : SanitizeExtractPath(e.path);
-            if (options.forceout) safe_rel = fs::path(options.positional.empty() ? std::string("*") : options.positional.front());
+            if (options.forceout) safe_rel = PathFromNativeBytes(options.positional.empty() ? std::string("*") : options.positional.front());
             if (safe_rel.empty()) {
                 // The original writes such a path as it is (`../../x`, `/abs/x` with
                 // the leading slash dropped) -- a deliberate departure, pending the
@@ -11349,9 +11392,9 @@ struct LegacyMetaBuffer {
 void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern, const std::string& prefix,
                          bool recurse, std::vector<EncodeSource>* out) {
     std::error_code ec;
-    const fs::path dir = dir_part.empty() ? fs::path(".") : fs::path(dir_part);
+    const fs::path dir = dir_part.empty() ? fs::path(".") : PathFromNativeBytes(dir_part);
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        const std::string name = it->path().filename().string();
+        const std::string name = NativeBytesFromPath(it->path().filename());
         if (!WildcardMatch(pattern, name)) continue;
 #if defined(_WIN32)
         // No lstat/st_mode on mingw: std::filesystem gives the kind, size and time;
@@ -12728,7 +12771,7 @@ std::vector<EncodeSource> CollectEncodeSources(const CliOptions& options, std::o
     // `./b.bin` under `-r .`; `-x*.dat` does exclude `sub/c.dat`), and an
     // excluded file is not dropped here: it becomes a ghost the reader reports.
     for (EncodeSource& e : found) if (IsExcluded(e.display, options.exclude_patterns)) e.ghost = true;
-    if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = fs::path(e.archive_name).filename().string();
+    if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = NativeBytesFromPath(PathFromNativeBytes(e.archive_name).filename());
     if (options.sort_mode != 0u) LegacyMergeSort(&found, options.sort_mode);
     return found;
 }
@@ -13041,7 +13084,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
             // registered with the progress engine and fired by the first progress
             // tick (from the parser's snapshot) or explicitly after the parse.
             psink::Configure(options, test_mode, os,
-                             options.output_path.empty() ? fs::current_path() : fs::path(options.output_path));
+                             options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path));
             struct SinkEnd { ~SinkEnd() { psink::Reset(); } } sink_end;
             progress::Begin(&os, [&](std::ostream& o) {
                 const LegacyCnContext& c = parsed ? legacy_cn : progress::Snapshot();
@@ -13086,7 +13129,7 @@ int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os
     }
     in.seekg(static_cast<std::streamoff>(context.data_offset), std::ios::beg);
 
-    const fs::path output_root = options.output_path.empty() ? fs::current_path() : fs::path(options.output_path);
+    const fs::path output_root = options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path);
 
     std::size_t processed = 0;
     std::size_t failed = 0;

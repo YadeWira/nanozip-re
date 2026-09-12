@@ -144,6 +144,14 @@ with 0, 2^1 … 2^31, 0.
   happens to be representable, and lands one step low otherwise.
 - **A `-co` block at or above 16 MB is never stepped up**: the step is applied only to a block
   that is both below the input and below 16 MB, so the two regimes meet with a discontinuity.
+- **Filenames are bytes in the machine's ACTIVE CODE PAGE, not UTF-8**: the Windows original calls
+  the ANSI Win32 API, so an archive made on a Hungarian Windows stores CP1250 bytes and one made on
+  a Russian machine CP1251 -- and `l` prints those bytes raw, so the listing only reads correctly on
+  a machine with the same code page. The same archive on a Linux original goes through unchanged,
+  which is why the two agree byte for byte. A reimplementation that treats the bytes as UTF-8 cannot
+  even form the path: reported by xman on Win7 x64, where the published v0.14.0-pre crashed with
+  `filesystem_error: Cannot convert character sequence` on his accented .mpg, and refused to FIND a
+  file with an accented name when compressing.
 - **The version string is a record**: an archive begins with a type-14 record holding
   `NanoZip 0.09 alpha` and a type-30 record holding the byte 9; the "incompatible version"
   message reports that byte divided by 100.
