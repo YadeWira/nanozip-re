@@ -1322,6 +1322,33 @@ using ArcPos = std::uint64_t;
 
 class WindowedFile;
 
+// The main stream's data records, as one continuous byte space WITHOUT copying
+// them. A multi-block archive interleaves tables and checksums between its data
+// records, so the chain decoders need them spliced; doing that with a real
+// buffer costs a copy of the whole payload -- 4.6 GB on the archive this exists
+// for, which is what a 32-bit build cannot have. The map translates a splice
+// offset into a file offset instead.
+struct SpliceMap {
+    std::vector<std::pair<ArcPos, ArcPos>> rec;   // (offset in the file, length)
+    std::vector<ArcPos> start;                    // cumulative start in splice space
+    ArcPos total = 0;
+    void Add(ArcPos off, ArcPos len) {
+        if (len == 0u) return;
+        rec.emplace_back(off, len);
+        start.push_back(total);
+        total += len;
+    }
+    std::size_t Find(ArcPos p) const {            // record holding splice offset p
+        if (p >= total || rec.empty()) return rec.size();
+        std::size_t lo = 0, hi = rec.size();
+        while (lo + 1u < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2u;
+            if (start[mid] <= p) lo = mid; else hi = mid;
+        }
+        return lo;
+    }
+};
+
 class ByteView {
 public:
     ByteView() = default;
@@ -1330,6 +1357,10 @@ public:
     // A view onto a file that is mapped a window at a time: there is no pointer
     // to the whole thing, which is the point.
     ByteView(WindowedFile* src, ArcPos base, ArcPos n) : src_(src), base_(base), n_(n) {}
+    // The spliced data records of a source, as one continuous space. `flat` is
+    // used when the archive is fully mapped and `src` when it is windowed.
+    ByteView(WindowedFile* src, const unsigned char* flat, const SpliceMap* map)
+        : p_(flat), src_(src), smap_(map), n_(map != nullptr ? map->total : 0u) {}
     ArcPos size() const { return n_; }
     bool empty() const { return n_ == 0u; }
     // NOTE: no data(), begin() or end(). A windowed view cannot produce a
@@ -1345,6 +1376,7 @@ public:
     // range runs past the end -- callers that bound-check first cannot see it.
     const unsigned char* Span(ArcPos off, ArcPos len) const {
         if (off > n_ || len > n_ - off) return nullptr;
+        if (smap_ != nullptr) return SplicedSpan(off, len);
         if (src_ != nullptr) return ResidentSpan(off, len);
         return p_ + off;
     }
@@ -1379,19 +1411,37 @@ public:
                (static_cast<std::uint32_t>(q[2]) << 16u) | (static_cast<std::uint32_t>(q[3]) << 24u);
     }
     unsigned char operator[](ArcPos i) const {
-        if (src_ == nullptr) return p_[i];
+        // The fast path is ONLY for a plain flat view. A spliced one has to
+        // translate even a single byte: `src_ == nullptr` is true for a splice
+        // over a fully mapped archive too, and taking the shortcut there read
+        // the file at the untranslated offset -- every varint and block header
+        // silently wrong, while Span() still answered correctly.
+        if (src_ == nullptr && smap_ == nullptr) return p_[i];
         const unsigned char* q = Span(i, 1u);
         return q != nullptr ? *q : 0u;
     }
+    // The records of `map`, whose offsets are in THIS view's space, as one
+    // continuous space. Inherits the backing AND the base: a self-extractor's
+    // view starts past the PE stub, and building the splice over the archive's
+    // own base instead put every record off by the stub's length.
+    ByteView Spliced(const SpliceMap* map) const {
+        ByteView v(*this);
+        v.smap_ = map;
+        v.n_ = (map != nullptr) ? map->total : 0u;
+        return v;
+    }
     ByteView subview(ArcPos off) const {
         if (off > n_) return ByteView();
+        if (smap_ != nullptr) return *this;            // splice space is not re-based
         if (src_ != nullptr) return ByteView(src_, base_ + off, n_ - off);
         return ByteView(p_ + off, n_ - off);
     }
 private:
     const unsigned char* ResidentSpan(ArcPos off, ArcPos len) const;   // needs WindowedFile
+    const unsigned char* SplicedSpan(ArcPos off, ArcPos len) const;
     const unsigned char* p_ = nullptr;
     WindowedFile* src_ = nullptr;
+    const SpliceMap* smap_ = nullptr;
     ArcPos base_ = 0;
     ArcPos n_ = 0;
 };
@@ -1605,6 +1655,38 @@ private:
 
 inline const unsigned char* ByteView::ResidentSpan(ArcPos off, ArcPos len) const {
     return src_->Resident(base_ + off, len);
+}
+
+// A range in splice space. Inside one record it is the file's own bytes; across
+// a record boundary it has to be gathered, so a small per-thread scratch holds
+// it -- two slots, for the same reason a thread keeps several windows.
+inline const unsigned char* ByteView::SplicedSpan(ArcPos off, ArcPos len) const {
+    if (len == 0u) len = 1u;
+    const std::size_t i = smap_->Find(off);
+    if (i >= smap_->rec.size()) return nullptr;
+    const ArcPos in_rec = off - smap_->start[i];
+    const auto at = [&](ArcPos file_off, ArcPos n) -> const unsigned char* {
+        return src_ != nullptr ? src_->Resident(base_ + file_off, n) : p_ + file_off;
+    };
+    if (in_rec + len <= smap_->rec[i].second) return at(smap_->rec[i].first + in_rec, len);
+    struct Scratch { std::vector<unsigned char> b[2]; unsigned next = 0; };
+    static thread_local Scratch sc;
+    std::vector<unsigned char>& buf = sc.b[sc.next];
+    sc.next ^= 1u;
+    buf.assign(static_cast<std::size_t>(len), 0u);
+    ArcPos done = 0, p = off;
+    while (done < len) {
+        const std::size_t k = smap_->Find(p);
+        if (k >= smap_->rec.size()) return nullptr;
+        const ArcPos ko = p - smap_->start[k];
+        ArcPos take = smap_->rec[k].second - ko;
+        if (take > len - done) take = len - done;
+        const unsigned char* q = at(smap_->rec[k].first + ko, take);
+        if (q == nullptr) return nullptr;
+        std::memcpy(buf.data() + static_cast<std::size_t>(done), q, static_cast<std::size_t>(take));
+        done += take; p += take;
+    }
+    return buf.data();
 }
 
 
@@ -1900,6 +1982,34 @@ struct LegacyCnContext {
     std::uint64_t data_offset = 0;
     std::uint64_t total_data_size = 0;
     ByteBuffer data;
+    // The archive's mapping, kept alive past the parse, and the payload as a
+    // VIEW onto it. `data` is a copy of the payload and costs as much memory as
+    // the payload is long -- 4.6 GB on a large archive, which is what a 32-bit
+    // build cannot have and what makes even `l` cost gigabytes. When the parse
+    // can describe the payload instead of copying it, it fills these and leaves
+    // `data` empty; `Payload()` is what the decoders read either way.
+    std::shared_ptr<ArchiveBytes> src;
+    std::shared_ptr<SpliceMap> splice;
+    ByteView payload_view;
+    bool payload_is_view = false;
+    ByteView Payload() const {
+        if (payload_is_view) return payload_view;
+        return ByteView(data.data(), data.size());
+    }
+    // A flat pointer to the payload, materialised ONCE on demand, for the
+    // decoders that still index a contiguous buffer. Asking for it costs a copy
+    // of the whole payload -- exactly what the view exists to avoid -- so a
+    // decoder that has been converted to read ranges must not call it.
+    mutable ByteBuffer flat_cache;
+    const ByteBuffer& PayloadFlat() const {
+        if (!payload_is_view) return data;
+        if (flat_cache.empty() && payload_view.size() != 0u) {
+            std::vector<unsigned char> v;
+            payload_view.AppendTo(&v, 0u, payload_view.size());
+            flat_cache = ByteBuffer(std::move(v));
+        }
+        return flat_cache;
+    }
 };
 
 // Copies the thread's recorded decode error (nz_decode_error.h) into the context
@@ -4919,7 +5029,11 @@ private:
 // containers; parallel -cO containers are wired too, see TryParseLegacyCnArchive).
 template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
-    const unsigned char* raw,
+    // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
+    // container's payload can be the whole archive, and copying it flat is what
+    // a 32-bit build cannot afford. Every read below is bounded by a header
+    // field, so a window (or a splice) can serve them all.
+    const ByteView& src,
     std::size_t blocks_begin,
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
@@ -4975,9 +5089,12 @@ bool TryParseLegacyCnArchive(
 
     // The archive is mapped, not copied (see ArchiveBytes): the parse and every
     // decoder only read it, and a 2 GB archive would otherwise be 2 GB of
-    // anonymous memory.
+    // anonymous memory. The mapping is SHARED with the context so it can outlive
+    // this function -- the decoders run after the parse returns, and a payload
+    // they can read through the mapping is a payload nobody has to copy.
     input.close();
-    ArchiveBytes archive;
+    auto archive_ptr = std::make_shared<ArchiveBytes>();
+    ArchiveBytes& archive = *archive_ptr;
     if (!archive.Open(archive_path)) {
         if (out_error_message != nullptr)
             *out_error_message = archive.oom() ? "Out of memory!" : "Cannot open archive!";
@@ -6199,7 +6316,7 @@ bool TryParseLegacyCnArchive(
     // for both the chain decoders and ctx.data. Left empty when the records are
     // already adjacent (every single-block archive and every contiguous chain)
     // and for parallel containers, which have their own framing.
-    std::vector<unsigned char> spliced_data;
+    auto spliced_map = std::make_shared<SpliceMap>();
     {
         bool data_contiguous = true;
         for (std::size_t i = 1; i < data_records.size(); ++i) {
@@ -6210,11 +6327,13 @@ bool TryParseLegacyCnArchive(
         }
         if (!data_contiguous && !has_parallel_streams) {
             for (const auto& dr : data_records) {
-                bytes.AppendTo(&spliced_data, dr.first, dr.second - dr.first);
+                spliced_map->Add(dr.first, dr.second - dr.first);
             }
             if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
-                std::fprintf(stderr, "[SPLICE] records=%zu bytes=%zu head=", data_records.size(), spliced_data.size());
-                for (std::size_t k = 0; k < 12 && k < spliced_data.size(); ++k) std::fprintf(stderr, "%02x", spliced_data[k]);
+                std::fprintf(stderr, "[SPLICE] records=%zu bytes=%llu head=", data_records.size(),
+                             (unsigned long long)spliced_map->total);
+                const ByteView sv = bytes.Spliced(spliced_map.get());
+                for (ArcPos k = 0; k < 12 && k < sv.size(); ++k) std::fprintf(stderr, "%02x", sv[k]);
                 std::fprintf(stderr, " first_rec=(%zu,%zu)\n", data_records[0].first, data_records[0].second);
             }
         }
@@ -6819,13 +6938,14 @@ bool TryParseLegacyCnArchive(
                                     ConfigureOptimumModels(method_p0, aud, img);
                                     NzExeFilter exe;
                                     OptimumOut ow(dst);
+                                    const ByteView in_view(in.data(), in.size());
                                     if (method_p0 == 5u) {
                                         nzr::optimum::NzOptimumLzDecoder dec(wcap);
-                                        return DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
+                                        return DecodeOptimumBlockSequence(in_view, 0u, in.size(),
                                                                           out_size, dec, aud, img, exe, &ow);
                                     }
                                     nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
-                                    const bool r = DecodeOptimumBlockSequence(in.data(), 0u, in.size(),
+                                    const bool r = DecodeOptimumBlockSequence(in_view, 0u, in.size(),
                                                                               out_size, dec, aud, img, exe, &ow);
                                     return r;
                                 },
@@ -7066,28 +7186,30 @@ bool TryParseLegacyCnArchive(
                         // doesn't vary per stream), so pick it once here rather
                         // than duplicating the per-stream loop body per type.
                         std::function<bool(const unsigned char*, std::size_t, std::size_t,
-                                            std::uint64_t, OptimumOut*)> decode_seq;
+                                            std::uint64_t, OptimumOut*)> decode_seq;   // (record, len, hint, out)
                         if (method_p0 == 5u) {
                             decode_seq = [popt_window_capacity](
                                 const unsigned char* raw, std::size_t b, std::size_t e,
                                 std::uint64_t hint, OptimumOut* out) {
                                 nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
+                                const ByteView rec_view(raw, e);
                                 nzr::audio::NzAudioPred saud;
                                 nzr::audio::NzImageModel simg;
                                 ConfigureOptimumModels(5u, saud, simg);
                                 NzExeFilter sexe;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
+                                return DecodeOptimumBlockSequence(rec_view, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         } else {
                             decode_seq = [popt_window_capacity](
                                 const unsigned char* raw, std::size_t b, std::size_t e,
                                 std::uint64_t hint, OptimumOut* out) {
                                 nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
+                                const ByteView rec_view(raw, e);
                                 nzr::audio::NzAudioPred saud;
                                 nzr::audio::NzImageModel simg;
                                 ConfigureOptimumModels(6u, saud, simg);
                                 NzExeFilter sexe;
-                                return DecodeOptimumBlockSequence(raw, b, e, hint, sdec, saud, simg, sexe, out);
+                                return DecodeOptimumBlockSequence(rec_view, b, e, hint, sdec, saud, simg, sexe, out);
                             };
                         }
                         // A per-stream decoder whose state (ring, audio, image and exe
@@ -7114,13 +7236,13 @@ bool TryParseLegacyCnArchive(
                                 auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(popt_window_capacity);
                                 sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
                                                               std::uint64_t hint, OptimumOut* out) {
-                                    return DecodeOptimumBlockSequence(rec, 0u, len, hint, *dec, *aud, *img, *exe, out);
+                                    return DecodeOptimumBlockSequence(ByteView(rec, len), 0u, len, hint, *dec, *aud, *img, *exe, out);
                                 };
                             } else {
                                 auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(popt_window_capacity);
                                 sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
                                                               std::uint64_t hint, OptimumOut* out) {
-                                    return DecodeOptimumBlockSequence(rec, 0u, len, hint, *dec, *aud, *img, *exe, out);
+                                    return DecodeOptimumBlockSequence(ByteView(rec, len), 0u, len, hint, *dec, *aud, *img, *exe, out);
                                 };
                             }
                             return sd;
@@ -7387,8 +7509,8 @@ bool TryParseLegacyCnArchive(
                     std::vector<unsigned char> member_out;
                     // payload_start IS data_records[0].first, so the same parse
                     // applies to the spliced buffer from its own start.
-                    const bool use_splice = !spliced_data.empty();
-                    const ByteView chain_src = use_splice ? ByteView(spliced_data) : bytes;
+                    const bool use_splice = spliced_map->total != 0u;
+                    const ByteView chain_src = use_splice ? bytes.Spliced(spliced_map.get()) : bytes;
                     const ArcPos chain_sp = use_splice ? (sp - payload_start) : sp;
                     // With no checksum stored (-hn / -nm) there is nothing to
                     // adjudicate between capacity candidates, so use only the
@@ -7649,7 +7771,7 @@ bool TryParseLegacyCnArchive(
     }
     if (NZ_ENV("NZ_TRACE_PARSTREAM"))
         std::fprintf(stderr, "[PAYLOAD] payload_start=%zu first_data_record=%zu data_records=%zu spliced=%zu store=%d literal=%d\n",
-                     payload_start, first_data_record, data_records.size(), spliced_data.size(),
+                     payload_start, first_data_record, data_records.size(), (std::size_t)spliced_map->total,
                      (int)native_store_payload, (int)native_literal_payload);
     ctx.native_payload_supported = native_store_payload || native_literal_payload;
     ctx.truncated_input = truncated_input;
@@ -7722,12 +7844,18 @@ bool TryParseLegacyCnArchive(
         //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
         //    (historical note: parallel-container -cO and decr_param==0 BWT were once unported; both are native now)
         //    (see nz_optimum2_lz.h for the engine's scope).
-        if (!spliced_data.empty()) {
-            ctx.data = std::move(spliced_data);
+        // Describe the payload instead of copying it: the mapping is shared with
+        // the context, so the decoders can read it through the same window (or
+        // the same splice) after this function returns. A 4.6 GB payload used to
+        // be 4.6 GB of anonymous memory here, which is what a 32-bit build cannot
+        // have and what made even `l` cost gigabytes.
+        ctx.src = archive_ptr;
+        ctx.payload_is_view = true;
+        if (spliced_map->total != 0u) {
+            ctx.splice = spliced_map;
+            ctx.payload_view = bytes.Spliced(spliced_map.get());
         } else {
-            std::vector<unsigned char> tail;
-            bytes.AppendTo(&tail, payload_start, bytes.size() - payload_start);
-            ctx.data = std::move(tail);
+            ctx.payload_view = bytes.subview(payload_start);
         }
     }
 
@@ -7863,20 +7991,21 @@ static bool TryDecodeLegacyLzhd(
     if (NZ_ENV("NZOPT_TRACE_CD")) {
         fprintf(stderr, "[LZHD] enter: method=0x%x p0=%u p1=%u total=%llu data=%zu\n",
                 legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1,
-                (unsigned long long)legacy.total_data_size, legacy.data.size());
+                (unsigned long long)legacy.total_data_size, legacy.PayloadFlat().size());
     }
     if (legacy.legacy_method != 0x2bu ||
         (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u)) {
         if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
         return false;
     }
-    if (legacy.data.empty()) {
+    const ByteBuffer& payload_flat = legacy.PayloadFlat();
+    if (payload_flat.empty()) {
         if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
         return false;
     }
 
-    const auto* raw = legacy.data.data();
-    const std::size_t raw_len = legacy.data.size();
+    const auto* raw = payload_flat.data();
+    const std::size_t raw_len = payload_flat.size();
 
     // Pre-allocate full output with 16-byte zero prefix for safe history reads
     // (DecLZ reads cur_ptr[-5] etc. from the first byte).
@@ -8131,10 +8260,11 @@ static bool TryDecodeLegacyCm(
     out_data->clear();
 
     if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
-    if (legacy.data.empty()) return false;
+    const ByteBuffer& payload_flat = legacy.PayloadFlat();
+    if (payload_flat.empty()) return false;
 
-    const auto* raw = legacy.data.data();
-    const std::size_t raw_len = legacy.data.size();
+    const auto* raw = payload_flat.data();
+    const std::size_t raw_len = payload_flat.size();
 
     // Create the CM decoder once; its state persists across all data chunks.
     NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
@@ -8857,7 +8987,11 @@ static bool TryDecodeLegacyCm(
 // function ports the actual per-block LZ/CM engine.
 template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
-    const unsigned char* raw,
+    // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
+    // container's payload can be the whole archive, and copying it flat is what
+    // a 32-bit build cannot afford. Every read below is bounded by a header
+    // field, so a window (or a splice) can serve them all.
+    const ByteView& src,
     std::size_t blocks_begin,
     std::size_t blocks_end,
     std::uint64_t total_size_hint,
@@ -8878,21 +9012,22 @@ static bool DecodeOptimumBlockSequence(
             if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
         }
         const std::uint32_t payload_size =
-            static_cast<std::uint32_t>(raw[pos]) |
-            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            static_cast<std::uint32_t>(src[pos]) |
+            (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(src[pos+3]) << 24u);
         pos += 4u;
         if (trace_blocks) fprintf(stderr, "[TDO] block at %zu payload_size=%u remaining=%zu out=%zu\n", pos - 4u, payload_size, stream_end - pos, out_data->size());
         if (payload_size > stream_end - pos) {
             if (trace_blocks) fprintf(stderr, "[TDO] stop: payload %u runs past the stream (%zu left)\n", payload_size, stream_end - pos);
             if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
         }
-        const std::uint8_t* payload = raw + pos;
+        const std::uint8_t* payload = src.Span(pos, payload_size);
+        if (payload == nullptr) { ok = false; break; }
         pos += payload_size;
 
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t decr_param = raw[pos++];
+        const std::uint8_t decr_param = src[pos++];
 
         // decr_param 2 (audio) and 3 use a TRUNCATED header that stops right
         // after size18: no staged-checksum count, and none of the param2 /
@@ -8906,14 +9041,14 @@ static bool DecodeOptimumBlockSequence(
             std::uint8_t mode2_type = 0;
             if (decr_param == 2u) {
                 if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-                mode2_type = raw[pos++];
+                mode2_type = src[pos++];
             }
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             const std::uint32_t audio_out_size =
-                static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+                static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
@@ -8968,20 +9103,22 @@ static bool DecodeOptimumBlockSequence(
         image.Reset();
 
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t param6 = raw[pos++];
+        const std::uint8_t param6 = src[pos++];
         std::uint32_t out_size = 0;
         if (param6) {
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            out_size = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            out_size = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
         }
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t staged_count = raw[pos++];
+        const std::uint8_t staged_count = src[pos++];
         if (pos + staged_count > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
+        const std::uint8_t* staged_p = src.Span(pos, staged_count);
+        if (staged_p == nullptr) { ok = false; break; }
+        const std::vector<std::uint8_t> staged(staged_p, staged_p + staged_count);
         pos += staged_count;
         static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
         std::string stg;
@@ -9023,32 +9160,34 @@ static bool DecodeOptimumBlockSequence(
         std::vector<std::uint8_t> param14_data, param15_data;
         auto read_u32vec = [&](std::vector<std::uint8_t>& dst) -> bool {
             if (pos + 4u > stream_end) return false;
-            const std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            const std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (vlen > stream_end - pos) return false;
-            dst.assign(raw + pos, raw + pos + vlen);
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) return false;
+              dst.assign(q, q + vlen); }
             pos += vlen;
             return true;
         };
         if (decr_param == 0u) {
             if (param6) {
                 if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-                bwt_param7 = raw[pos++];
+                bwt_param7 = src[pos++];
             }
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            bwt_start_pos = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            bwt_start_pos = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            param14_flag = raw[pos++];
+            param14_flag = src[pos++];
             if (param14_flag && !read_u32vec(param14_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            param15_flag = raw[pos++];
+            param15_flag = src[pos++];
             if (param15_flag && !read_u32vec(param15_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
                 fprintf(stderr, "[TDO] BWT hdr: param7=%u bwt_start_pos=%u param14=%u (%zu bytes) param15=%u (%zu bytes) pos=%zu\n",
@@ -9058,52 +9197,58 @@ static bool DecodeOptimumBlockSequence(
         }
 
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t param2_flag = raw[pos++];
+        const std::uint8_t param2_flag = src[pos++];
         std::vector<std::uint8_t> param2_data;
         if (param2_flag) {
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            param2_data.assign(raw + pos, raw + pos + vlen);
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              param2_data.assign(q, q + vlen); }
             pos += vlen;
         }
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t param1_flag = raw[pos++];
+        const std::uint8_t param1_flag = src[pos++];
         std::vector<std::uint8_t> param1_data;
         if (param1_flag) {
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            param1_data.assign(raw + pos, raw + pos + vlen);
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              param1_data.assign(q, q + vlen); }
             pos += vlen;
         }
         if (pos + 1u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         pos++;  // param16
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-        const std::uint8_t tt_enabled = raw[pos++];
+        const std::uint8_t tt_enabled = src[pos++];
         std::uint8_t tt_flags = 0;
         std::vector<std::uint8_t> tt16_data, tt2_data;
         if (tt_enabled) {
             if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            tt_flags = raw[pos++];
+            tt_flags = src[pos++];
             auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
                 if (pos >= stream_end) return false;
                 std::uint32_t n = 0, sh = 0; unsigned char vc;
                 do {
                     if (pos >= stream_end) return false;
-                    vc = raw[pos++];
+                    vc = src[pos++];
                     n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh; sh += 7u;
                 } while (vc & 0x80u);
                 if (pos + n > stream_end) return false;
-                dst.assign(raw + pos, raw + pos + n); pos += n; return true;
+                { const unsigned char* q = src.Span(pos, n);
+                  if (q == nullptr) return false;
+                  dst.assign(q, q + n); } pos += n; return true;
             };
             if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
             if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
@@ -9114,16 +9259,18 @@ static bool DecodeOptimumBlockSequence(
         }
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         std::vector<std::uint8_t> dece_data;
-        const std::uint8_t dece_param = raw[pos++];
+        const std::uint8_t dece_param = src[pos++];
         if (dece_param) {
             if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            std::uint32_t vlen = static_cast<std::uint32_t>(raw[pos]) |
-                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
-                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
-                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
             pos += 4u;
             if (vlen > stream_end - pos) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
-            dece_data.assign(raw + pos, raw + pos + vlen);
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              dece_data.assign(q, q + vlen); }
             pos += vlen;
         }
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
@@ -9684,10 +9831,13 @@ static bool TryDecodeLegacyOptimum(
     if (legacy.legacy_method != 0x3bu ||
         (legacy.legacy_method_p0 != 5u && legacy.legacy_method_p0 != 6u))
         return false;
-    if (legacy.data.empty()) return false;
-
-    const auto* raw = legacy.data.data();
-    const std::size_t raw_len = legacy.data.size();
+    // The payload as a RANGE SOURCE. This is the single-container path, where
+    // the payload can be the whole archive: asking for a flat pointer here is
+    // what made a 4.6 GB -cO archive cost 4.6 GB of anonymous memory and put it
+    // out of reach of a 32-bit build entirely.
+    const ByteView pv = legacy.Payload();
+    if (pv.empty()) return false;
+    const ArcPos raw_len = pv.size();
 
     // Read one top-level `stream_tag` varint: (stream_bytes<<4)|0, giving the
     // byte range of one segment's block-record sequence. Real single-
@@ -9701,14 +9851,14 @@ static bool TryDecodeLegacyOptimum(
     // immediately following the first segment's end. An earlier RE session's
     // "chain mode doesn't exist for -co" conclusion was apparently reached
     // from insufficient (large-synthetic-file-only) fixtures.
-    auto read_stream_tag = [raw, raw_len](std::size_t* p, std::uint64_t* out_tag) -> bool {
+    auto read_stream_tag = [&pv, raw_len](std::size_t* p, std::uint64_t* out_tag) -> bool {
         unsigned shift = 7;
         if (*p >= raw_len) return false;
-        unsigned char c = raw[(*p)++];
+        unsigned char c = pv[(*p)++];
         std::uint64_t tag = static_cast<std::uint64_t>(c & 0x7fu);
         while ((c & 0x80u) != 0u) {
             if (*p >= raw_len || shift >= 63u) return false;
-            c = raw[(*p)++];
+            c = pv[(*p)++];
             tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
             shift += 7u;
         }
@@ -9732,7 +9882,8 @@ static bool TryDecodeLegacyOptimum(
     }
     if (const char* dp = NZ_ENV("NZOPT_DUMP_RAW")) {
         FILE* f = fopen(dp, "wb");
-        if (f) { fwrite(raw, 1, raw_len, f); fclose(f); }
+        if (f) { const ByteBuffer& fl = legacy.PayloadFlat();   // debug switch only
+                 fwrite(fl.data(), 1, fl.size(), f); fclose(f); }
     }
     out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
     // method_p0==5 -> -co (nz_optimum1, NzOptimumLzDecoder / FUN_0809e600);
@@ -9761,15 +9912,15 @@ static bool TryDecodeLegacyOptimum(
     std::function<bool(std::size_t, std::size_t, std::vector<unsigned char>*)> decode_seq;
     if (legacy.legacy_method_p0 == 5u) {
         auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
             OptimumOut ow(out);
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
+            return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
         };
     } else {
         auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
-        decode_seq = [raw, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](std::size_t b, std::size_t e, std::vector<unsigned char>* out) {
             OptimumOut ow(out);
-            return DecodeOptimumBlockSequence(raw, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
+            return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, &ow);
         };
     }
 
