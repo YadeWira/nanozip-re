@@ -2683,8 +2683,15 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     const std::uint64_t from = s.produced;
     std::uint64_t to = from + n;
     if (to > s.total) to = s.total;               // the caller overran its declared size
-    if (s.hold.empty()) s.held_base = from;
-    s.hold.insert(s.hold.end(), buf, buf + static_cast<std::size_t>(to - from));
+    // kProduced flushes everything as it arrives, so the bytes go straight from
+    // the caller's buffer -- no hold, and no copy of every block.
+    const bool hold_back = (e.policy == Policy::kGroup);
+    if (hold_back) {
+        if (s.hold.empty()) s.held_base = from;
+        s.hold.insert(s.hold.end(), buf, buf + static_cast<std::size_t>(to - from));
+    } else {
+        s.held_base = from;
+    }
     s.produced = to;
     const std::uint64_t safe = SafeFlushPoint(e, s, to);
     struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
@@ -2704,7 +2711,7 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
             FileState& f = *e.files[sl.entry];
             if (f.write_it && f.fd >= 0)
                 pieces.push_back({&f, sl.file_off + (a - sl.spos),
-                                  s.hold.data() + static_cast<std::size_t>(a - s.held_base),
+                                  (hold_back ? s.hold.data() : buf) + static_cast<std::size_t>(a - s.held_base),
                                   static_cast<std::size_t>(b - a)});
         }
         // kProduced reports a slice the moment its last byte has passed; kGroup
@@ -2722,10 +2729,10 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     lk.unlock();
     for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
     lk.lock();
-    if (safe > s.held_base) {
+    if (hold_back && safe > s.held_base) {
         s.hold.erase(s.hold.begin(), s.hold.begin() + static_cast<std::size_t>(safe - s.held_base));
-        s.held_base = safe;
     }
+    s.held_base = safe;
 }
 
 // A worker ends stream k. `buf` holds its output (produced bytes valid), `ok` =
@@ -4582,7 +4589,14 @@ bool DecodeLzpfMember(
     bool lenient = false,
     // Where this member's input ends inside `bytes` (0 = the whole buffer): lets a
     // parallel worker decode its record in place instead of copying it out.
-    std::size_t input_end = 0u) {
+    std::size_t input_end = 0u,
+    // Hand each block's output over as it is produced instead of assembling the
+    // member. The output buffer then rolls (one block at a time, grown to the
+    // largest block seen), so a 280 MB slice costs a megabyte. Requires
+    // `derived_cap_only` -- a second dictionary candidate would have to redo
+    // output already handed over -- and a `verify` that accepts anything, since
+    // there is no assembled buffer left to check. `out`/`direct_out` are unused.
+    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr) {
     const ArcPos in_end = (input_end != 0u && input_end <= bytes.size()) ? input_end : bytes.size();
     // A corrupt header can declare any output size, and the buffer below IS that
     // size, so an implausible one reached the allocator: ASan aborted with
@@ -4686,13 +4700,37 @@ bool DecodeLzpfMember(
         std::vector<std::uint8_t> window_alloc(
             window_left_pad + window_capacity + window_tail_slack, 0);
         std::uint8_t* const window = window_alloc.data() + window_left_pad;
+        // Rolling output: `decoded_store` holds [decoded_base, total_written) and
+        // is handed over and reset whenever the next block would not fit.
+        const bool rolling = (stream_out != nullptr);
+        static constexpr std::size_t kLzpfRollUnit = 0x100000u;
+        std::size_t total_written = 0;
         std::vector<unsigned char> decoded_store;
+        std::size_t decoded_base = 0;
         unsigned char* decoded = direct_out;
-        if (decoded == nullptr) {
+        if (rolling) {
+            decoded_store.assign(kLzpfRollUnit, 0);
+            decoded = decoded_store.data();
+        } else if (decoded == nullptr) {
             decoded_store.assign(static_cast<std::size_t>(total), 0);
             decoded = decoded_store.data();
         }
+        // Make room for the next `need` output bytes, handing over what is already
+        // in the buffer first. A block larger than the unit grows it; the buffer
+        // never shrinks, so it settles at the largest block of the stream.
+        const auto roll_room = [&](std::size_t need) {
+            if (!rolling) return;
+            if (total_written - decoded_base + need <= decoded_store.size()) return;
+            if (total_written > decoded_base)
+                (*stream_out)(decoded_store.data(), total_written - decoded_base);
+            decoded_base = total_written;
+            if (need > decoded_store.size()) decoded_store.assign(need, 0);
+            decoded = decoded_store.data();
+        };
+        // Where an ABSOLUTE output offset lands in the buffer.
+        const auto at_out = [&](std::size_t abs) { return decoded + (abs - decoded_base); };
         auto run_verify = [&]() -> bool {
+            if (rolling) return true;   // nothing assembled to check; the sink checks the slice
             if constexpr (std::is_invocable_v<Verify, const unsigned char*, std::size_t>)
                 return verify(static_cast<const unsigned char*>(decoded), static_cast<std::size_t>(total));
             else
@@ -4703,7 +4741,6 @@ bool DecodeLzpfMember(
         std::vector<std::uint8_t> byte_buffer_b(
             is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
         std::size_t window_cursor = window_initial_cursor;
-        std::size_t total_written = 0;
         ArcPos input_pos = first_block_pos;
         bool decode_ok = true;
         std::size_t blk_idx = 0;
@@ -4824,7 +4861,8 @@ bool DecodeLzpfMember(
                 if (pf_consumed == 0) { nzr::derr::SetAt(5u, input_pos); decode_ok = false; break; }
                 input_pos += pf_consumed;
                 window_cursor += static_cast<std::size_t>(block_out_size);
-                std::memcpy(decoded + total_written, window + block_start_in_window,
+                roll_room(static_cast<std::size_t>(block_out_size));
+                std::memcpy(at_out(total_written), window + block_start_in_window,
                             static_cast<std::size_t>(block_out_size));
                 // Backfill hash_table for the prefilter block's window bytes.
                 // The real dispatcher FUN_08097570 calls FUN_080b6d90 at the end
@@ -4909,7 +4947,7 @@ bool DecodeLzpfMember(
             // this branch.
             auto apply_exe_filter = [&](std::size_t out_off, std::size_t n) {
                 if ((uvar9 & 4u) == 0u) return;
-                nzr::cd::NzCdExeUnfilter(decoded + out_off, static_cast<std::uint32_t>(n),
+                nzr::cd::NzCdExeUnfilter(at_out(out_off), static_cast<std::uint32_t>(n),
                                 static_cast<std::uint32_t>(out_off + 4u));
             };
             if (mode_literal) {
@@ -4923,7 +4961,14 @@ bool DecodeLzpfMember(
                 }
                 const std::size_t block_start_in_window = window_cursor;
                 std::memcpy(window + block_start_in_window, bytes.Span(input_pos, lit_avail), lit_avail);
-                std::memcpy(decoded + total_written, bytes.Span(input_pos, lit_avail), lit_avail);
+                roll_room(static_cast<std::size_t>(block_out_size));
+                std::memcpy(at_out(total_written), bytes.Span(input_pos, lit_avail), lit_avail);
+                // A clamped literal block leaves the rest of its output untouched;
+                // it read as zeros out of the zero-filled member buffer, so say so
+                // (the rolling buffer carries the previous block's bytes there).
+                if (lit_avail < static_cast<std::size_t>(block_out_size))
+                    std::memset(at_out(total_written) + lit_avail, 0,
+                                static_cast<std::size_t>(block_out_size) - lit_avail);
                 window_cursor += static_cast<std::size_t>(block_out_size);
                 // Backfill hash_table for the literal bytes just written
                 // (legacy FUN_080b6d90 / FUN_080b6cf0, called after every
@@ -5018,19 +5063,32 @@ bool DecodeLzpfMember(
             // garbage it copies the slot out and moves to the next header, which is
             // where its report comes from. Same here (the slot is bounded).
             window_cursor = block_start_in_window + static_cast<std::size_t>(block_out_size);
-            std::memcpy(decoded + total_written, window + block_start_in_window,
+            roll_room(static_cast<std::size_t>(block_out_size));
+            std::memcpy(at_out(total_written), window + block_start_in_window,
                         static_cast<std::size_t>(block_out_size));
             apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
             total_written += static_cast<std::size_t>(block_out_size);
                 progress::Add(block_out_size);
         }
+        // Hand over whatever is still in the rolling buffer -- on the way out of a
+        // clean stream and on the way out of a broken one alike: the original
+        // flushes a block the moment it has it (measured on a damaged -cf -p4
+        // container: it writes 110 of 114 MB where a member-at-a-time reader
+        // writes 1), so a failing block loses only itself.
+        if (rolling && total_written > decoded_base) {
+            (*stream_out)(decoded_store.data(), total_written - decoded_base);
+            decoded_base = total_written;
+        }
         if (trace_lzpf) {
             if (const char* dp = NZ_ENV("NZOPT_DUMP_LZPF")) {
+                if (rolling) { /* the output is gone: nothing to dump */ }
+                else {
                 char path[512];
                 snprintf(path, sizeof(path), "%s.cap%zu", dp, window_capacity);
                 if (FILE* fp = fopen(path, "wb")) {
                     fwrite(decoded, 1, total_written, fp);
                     fclose(fp);
+                }
                 }
             }
             fprintf(stderr, "[lzpf] cap=%zu blocks=%zu ok=%d written=%zu/%llu verify=%d\n",
@@ -5041,7 +5099,7 @@ bool DecodeLzpfMember(
         if (first_candidate) {
             first_candidate = false;
             if (out_member_done != nullptr) *out_member_done = member_done;
-            if (member_done > 0 && member_done < total && direct_out == nullptr)
+            if (member_done > 0 && member_done < total && direct_out == nullptr && !rolling)
                 first_prefix.assign(decoded, decoded + member_done);
         }
         if (decode_ok && total_written == total && run_verify()) {
@@ -5051,7 +5109,7 @@ bool DecodeLzpfMember(
             // 0, the guesses can go (see the note next to cap_candidates).
             nz_trace::Construct("lzpf_cap candidate=%zu of=%zu p1=%u variant=%c",
                                 cap_idx, cap_candidates.size(), method_p1, is_variant_b ? 'B' : 'A');
-            if (direct_out != nullptr) { if (out != nullptr) out->clear(); }
+            if (direct_out != nullptr || rolling) { if (out != nullptr) out->clear(); }
             else *out = std::move(decoded_store);
             pscope.Commit();
             return true;
@@ -6580,6 +6638,15 @@ bool TryParseLegacyCnArchive(
                             PStream& s = *plist[idx];
                             // One record (the usual case) is decoded in place; several are
                             // concatenated first.
+                            //
+                            // A SpliceMap would save this copy (the whole compressed slice:
+                            // 78 MB per worker on a 1.2 GB -cf container, 155 MB on a
+                            // 2.5 GB -cF one) -- but not here. lzpf asks for "the rest of
+                            // the member" as one range on every block (`arith_size`, and
+                            // `bc_len` in the raw-bytecode mode), and a spliced range that
+                            // straddles records is GATHERED: 78 MB re-assembled per block,
+                            // measured at ~100x slower. Saving it needs a bound on what a
+                            // block can consume, which the block header does not carry.
                             std::vector<unsigned char> payload;
                             std::size_t plen = 0;
                             for (const auto& c : s.chunks) plen += c.second;
@@ -6603,14 +6670,22 @@ bool TryParseLegacyCnArchive(
                                 // The original knows its dictionary capacity and verifies
                                 // nothing while decoding: one candidate, the sink checks the
                                 // slice and writes whatever came out.
-                                std::vector<unsigned char> sbuf(static_cast<std::size_t>(s.osz));
                                 psink::StreamBegin(idx);
                                 std::size_t mdone = 0;
                                 const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
+                                const bool roll = psink::AcceptsIncremental();
+                                // Rolling: the slice's output never exists whole -- each
+                                // block goes to the sink as the decoder produces it, which
+                                // is also what the original's worker does with it.
+                                const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                                    [&](const unsigned char* p, std::size_t n) { psink::StreamWrite(idx, p, n); };
+                                std::vector<unsigned char> sbuf(roll ? std::size_t{0}
+                                                                     : static_cast<std::size_t>(s.osz));
                                 const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
                                                                   is_variant_b, method_p1, /*derived_cap_only=*/true, accept_all, &unused,
-                                                                  sbuf.data(), false, &mdone, /*lenient=*/true, pend);
-                                psink::StreamEnd(idx, sbuf.data(), okd ? s.osz : mdone, okd,
+                                                                  roll ? nullptr : sbuf.data(), false, &mdone, /*lenient=*/true, pend,
+                                                                  roll ? &to_sink : nullptr);
+                                psink::StreamEnd(idx, sbuf.empty() ? nullptr : sbuf.data(), okd ? s.osz : mdone, okd,
                                                  !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
                                 return okd;
                             }
