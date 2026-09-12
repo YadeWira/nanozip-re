@@ -1678,6 +1678,68 @@ inline const unsigned char* ByteView::ResidentSpan(ArcPos off, ArcPos len) const
     return src_->Resident(base_ + off, len);
 }
 
+// Write [off, off+len) of a payload VIEW to a file, a window at a time. The
+// flat sibling above needs a pointer at the whole entry, which is exactly what
+// a >4 GB payload cannot give -- and what makes a 32-bit build say "Out of
+// memory!" on an archive it has already decoded. Chunked at the mapping window
+// so a windowed or spliced payload serves every piece from one window.
+bool WriteExtractedFileRange(const fs::path& path, const ByteView& src, ArcPos off, ArcPos len,
+                             std::uint32_t mode, long owner_uid = -1, long owner_gid = -1) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+#if defined(_WIN32)
+    (void)mode; (void)owner_uid; (void)owner_gid;
+    const auto w0 = std::chrono::steady_clock::now();
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) return false;
+        out.write(reinterpret_cast<const char*>(q), static_cast<std::streamsize>(take));
+        if (!out) return false;
+        done += take;
+    }
+    out.close();
+    NoteDecodeWrite(static_cast<std::size_t>(len), w0);
+    return static_cast<bool>(out);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                          static_cast<mode_t>(mode & 07777u));
+    if (fd < 0) return false;
+    if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
+    const auto w0 = std::chrono::steady_clock::now();
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) { ::close(fd); return false; }
+        ArcPos w_done = 0;
+        while (w_done < take) {
+            const ssize_t w = ::write(fd, q + w_done, static_cast<std::size_t>(take - w_done));
+            if (w <= 0) { ::close(fd); return false; }
+            w_done += static_cast<ArcPos>(w);
+        }
+        done += take;
+    }
+    const bool closed = (::close(fd) == 0);
+    NoteDecodeWrite(static_cast<std::size_t>(len), w0);
+    return closed;
+#endif
+}
+
+// The checksum of [off, off+len) of a payload VIEW, a window at a time.
+std::uint32_t ChecksumRange(ChecksumMode mode, const ByteView& src, ArcPos off, ArcPos len) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+    ChecksumStream cs; cs.Reset(mode);
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) break;
+        cs.Update(q, static_cast<std::size_t>(take));
+        done += take;
+    }
+    return cs.Finish();
+}
+
 // A range in splice space. Inside one record it is the file's own bytes; across
 // a record boundary it has to be gathered, so a small per-thread scratch holds
 // it -- two slots, for the same reason a thread keeps several windows.
@@ -3266,8 +3328,9 @@ bool ApplyLegacyAttributeRecords(
 }
 
 struct LegacyCnContext;
+class OptimumOut;
 static bool TryDecodeLegacyCm(const LegacyCnContext& legacy,
-                              std::vector<unsigned char>* out_data,
+                              OptimumOut* out_data,
                               std::string* out_error_message);
 
 // One slice of one file inside a parallel (-pN) container. Each stream's record
@@ -5958,6 +6021,10 @@ bool TryParseLegacyCnArchive(
     // bytes are not a contiguous tail of the archive, so we assemble them here.
     bool store_multiblock = false;
     std::vector<unsigned char> store_blocks_buffer;
+    // The data records of a STORED archive, as one space: filled only by the
+    // data-record assembly site below, which is the one whose output is exactly
+    // their concatenation (the block-chain and parallel sites are not).
+    std::shared_ptr<SpliceMap> store_splice;
 
     if (native_store_payload) {
         data_offset_u64 = static_cast<std::uint64_t>(bytes.size()) - total_data_size;
@@ -6002,10 +6069,14 @@ bool TryParseLegacyCnArchive(
             std::uint64_t sum = 0;
             for (const auto& dp : data_payloads) sum += dp.second - dp.first;
             if (sum == total_data_size) {
-                store_blocks_buffer.clear();
-                store_blocks_buffer.reserve(static_cast<std::size_t>(total_data_size));
+                // Describe the payload instead of concatenating it: a stored
+                // entry's records ARE the file, so a splice map over them reads
+                // exactly the same bytes for nothing. Copying them cost the whole
+                // output -- 4.3 GB on a 4.5 GB `-cn` archive, where the original
+                // uses 543 MB, and a 32-bit build simply said "Out of memory!".
+                store_splice = std::make_shared<SpliceMap>();
                 for (const auto& dp : data_payloads)
-                    bytes.AppendTo(&store_blocks_buffer, dp.first, dp.second - dp.first);
+                    store_splice->Add(dp.first, dp.second - dp.first);
                 store_multiblock = true;
                 metadata_end = data_records.front().first;
                 payload_start = data_records.front().first;
@@ -7068,7 +7139,8 @@ bool TryParseLegacyCnArchive(
                                     }
                                     sub.data = std::move(subdata);
                                     std::string err;
-                                    return TryDecodeLegacyCm(sub, dst, &err);
+                                    OptimumOut dst_out(dst);
+                                    return TryDecodeLegacyCm(sub, &dst_out, &err);
                                 },
                                 &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kCm,
                                  checksum_mode != ChecksumMode::kNone);
@@ -7256,16 +7328,17 @@ bool TryParseLegacyCnArchive(
                             if (use_sink && st.chunks.size() > 1u) psink::SetLastRecordStart(idx, last_rec);
                             sub.data = std::move(subdata);
                             std::vector<unsigned char> slice;
+                            OptimumOut slice_out(&slice);
                             std::string sub_err;
                             if (use_sink) {
                                 psink::StreamBegin(idx);
-                                const bool okd = TryDecodeLegacyCm(sub, &slice, &sub_err) && slice.size() == st.osz;
+                                const bool okd = TryDecodeLegacyCm(sub, &slice_out, &sub_err) && slice.size() == st.osz;
                                 if (slice.size() > st.osz) slice.resize(static_cast<std::size_t>(st.osz));
                                 const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
                                 psink::StreamEnd(idx, slice.data(), slice.size(), okd, clean);
                                 return okd;
                             }
-                            if (!TryDecodeLegacyCm(sub, &slice, &sub_err) ||
+                            if (!TryDecodeLegacyCm(sub, &slice_out, &sub_err) ||
                                 slice.size() != st.osz ||
                                 ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) {
                                 return false;
@@ -8014,14 +8087,21 @@ bool TryParseLegacyCnArchive(
     ctx.data_offset = (native_store_payload && !store_multiblock) ? data_offset_u64 : 0u;
     ctx.total_data_size = total_data_size;
     if (native_store_payload) {
-        if (store_multiblock) {
+        if (store_splice && store_splice->total == total_data_size) {
+            // The stored records, spliced: no copy at all.
+            ctx.src = archive_ptr;
+            ctx.payload_is_view = true;
+            ctx.splice = store_splice;
+            ctx.payload_view = bytes.Spliced(store_splice.get());
+        } else if (store_multiblock) {
             // Raw payload was reassembled from multiple stored blocks.
             ctx.data = std::move(store_blocks_buffer);
         } else {
-            const ArcPos data_offset = data_offset_u64;
-            std::vector<unsigned char> tail;
-            bytes.AppendTo(&tail, data_offset, bytes.size() - data_offset);
-            ctx.data = std::move(tail);
+            // One contiguous run from data_offset to the end of the archive: a
+            // subview, which is the same bytes without the copy.
+            ctx.src = archive_ptr;
+            ctx.payload_is_view = true;
+            ctx.payload_view = bytes.subview(data_offset_u64);
         }
     } else if (native_literal_payload) {
         if (literal_data_owned) {
@@ -8459,11 +8539,15 @@ static std::uint32_t OptimumExpandGrow(std::uint32_t cap, std::uint32_t limit) {
 // immediately follow it, and feeds each block to CM_Decode.
 static bool TryDecodeLegacyCm(
     const LegacyCnContext& legacy,
-    std::vector<unsigned char>* out_data,
+    // Count-and-sink or buffer, like the optimum family: a -cc entry's output
+    // can be gigabytes, and holding it here (and then again in the context, and
+    // again in the extractor) is what made a 4.5 GB one cost 13 GB where the
+    // original uses 554 MB.
+    OptimumOut* out_data,
     std::string* out_error_message) {
     progress::Scope pscope;
     if (out_data == nullptr) return false;
-    out_data->clear();
+    out_data->Clear();
 
     if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
     const ByteBuffer& payload_flat = legacy.PayloadFlat();
@@ -8501,7 +8585,7 @@ static bool TryDecodeLegacyCm(
     // rather than by the chunk count a corrupt header can invent.
     NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
                              (1u << 20));
-    out_data->reserve(static_cast<std::size_t>(legacy.total_data_size));
+    out_data->Reserve(legacy.total_data_size);
     bool ok = true;
     std::size_t pos = 0;
 
@@ -8514,8 +8598,12 @@ static bool TryDecodeLegacyCm(
     // payload into multiple chunks; the CM state carries across them (a block with
     // decr_param != 1 does not reset). Each chunk header is a biased varint
     // (size<<4)|type; non-type-0 chunks (metadata) between data chunks are skipped.
+    // 64-bit compare: on a 32-bit build the cast turned a 4 823 005 184-byte
+    // total into 528 037 888, so the loop stopped a tenth of the way in and the
+    // size gate below then called a complete archive corrupt -- the same wrap
+    // the optimum family's segment loop had.
     while (ok && pos < raw_len &&
-           out_data->size() < static_cast<std::size_t>(legacy.total_data_size)) {
+           static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
         std::uint64_t stream_tag = 0;
         {
             unsigned shift = 7;
@@ -8640,7 +8728,7 @@ static bool TryDecodeLegacyCm(
                 // established deviation -- see the long comment below), so if a
                 // decr_param==0 CM block ever turns up after an audio block and
                 // decodes wrong, this is the first place to look.
-                out_data->insert(out_data->end(), abuf.begin(), abuf.end());
+                out_data->Append(abuf.data(), abuf.size());
                 progress::Add(abuf.size());
                 continue;
             }
@@ -8658,7 +8746,7 @@ static bool TryDecodeLegacyCm(
                         payload_size, alt_out_size, iused);
             }
             if (iused == 0u) { nzr::derr::SetAt(2u, pos); ok = false; break; }
-            out_data->insert(out_data->end(), work3.begin(), work3.end());
+            out_data->Append(work3.data(), work3.size());
             progress::Add(work3.size());
             continue;
         }
@@ -8838,7 +8926,7 @@ static bool TryDecodeLegacyCm(
             stgmark("cm", work.data(), cur_size);
         }
 
-        const std::size_t prev_size = out_data->size();
+        const std::uint64_t prev_size = out_data->size();
         const std::uint32_t remaining = OptimumRemainingOut(legacy.total_data_size, prev_size);
 
         nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
@@ -9038,7 +9126,7 @@ static bool TryDecodeLegacyCm(
 
         stg_report();
         if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); ok = false; break; }
-        out_data->insert(out_data->end(), work.begin(), work.begin() + cur_size);
+        out_data->Append(work.data(), cur_size);
         progress::Add(cur_size);
         }
     }
@@ -9046,8 +9134,8 @@ static bool TryDecodeLegacyCm(
     NzCmDestroy(cm);
 
     if (NZ_ENV("NZOPT_TRACE_TDO")) {
-        fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%zu total_data_size=%llu\n",
-                ok ? 1 : 0, pos, raw_len, out_data->size(),
+        fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%llu total_data_size=%llu\n",
+                ok ? 1 : 0, pos, raw_len, (unsigned long long)out_data->size(),
                 static_cast<unsigned long long>(legacy.total_data_size));
     }
     if (!ok) {
@@ -9056,9 +9144,8 @@ static bool TryDecodeLegacyCm(
         if (out_error_message) *out_error_message = "cm: malformed block stream";
         return false;
     }
-    if (static_cast<std::uint64_t>(out_data->size()) != legacy.total_data_size) {
-        if (static_cast<std::uint64_t>(out_data->size()) > legacy.total_data_size)
-            out_data->resize(static_cast<std::size_t>(legacy.total_data_size));
+    if (out_data->size() != legacy.total_data_size) {
+        out_data->TruncateTo(legacy.total_data_size);
         if (out_error_message) *out_error_message = "cm: output size mismatch";
         return false;
     }
@@ -9066,8 +9153,9 @@ static bool TryDecodeLegacyCm(
     // Checksum self-verify, mirroring the sibling TryDecodeLegacyLzhd and
     if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
         FILE* f = fopen(dp, "wb");
-        if (f) { fwrite(out_data->data(), 1, out_data->size(), f); fclose(f); }
-        fprintf(stderr, "[TDCC] dumped pre-checksum output (%zu bytes) to %s\n", out_data->size(), dp);
+        if (f) { if (const auto* b = out_data->buffer()) fwrite(b->data(), 1, b->size(), f); fclose(f); }
+        fprintf(stderr, "[TDCC] dumped pre-checksum output (%llu bytes) to %s\n",
+                (unsigned long long)out_data->size(), dp);
     }
 
     // TryDecodeLegacyOptimum gates: a stored per-file checksum mismatch means
@@ -9091,18 +9179,19 @@ static bool TryDecodeLegacyCm(
     if (legacy.checksum_verification_supported &&
         legacy.checksum_mode != ChecksumMode::kNone &&
         !legacy.entries.empty()) {
+        // The verdict belongs to the caller (CheckEntries, or the sink's own
+        // per-slice checks when the output was streamed straight to the files);
+        // what this gate decides is an archive with no usable checksum at all.
+        // The per-entry recompute below is a trace, and needs the buffer.
+        const std::vector<unsigned char>* buf = out_data->buffer();
         std::size_t cursor = 0;
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
-            fprintf(stderr, "[TDCC] checksum gate: mode=%d entries=%zu outsize=%zu\n",
-                    (int)legacy.checksum_mode, legacy.entries.size(), out_data->size());
+            fprintf(stderr, "[TDCC] checksum gate: mode=%d entries=%zu outsize=%llu\n",
+                    (int)legacy.checksum_mode, legacy.entries.size(),
+                    (unsigned long long)out_data->size());
         }
         for (const LegacyCnEntry& e : legacy.entries) {
             const std::size_t n = static_cast<std::size_t>(e.size);
-            if (cursor + n > out_data->size()) break;
-            if (NZ_ENV("NZOPT_TRACE_TDO")) {
-                fprintf(stderr, "[TDCC]   entry: size=%zu has_cksum=%d cursor=%zu outsize=%zu\n",
-                        n, (int)e.has_checksum, cursor, out_data->size());
-            }
             std::uint32_t expected = e.checksum;
             if (!e.has_checksum) {
                 // Fall back to a checksum record found mid-stream. Only for the
@@ -9110,19 +9199,20 @@ static bool TryDecodeLegacyCm(
                 // from here which entry a mid-stream record belongs to.
                 if (inline_checksum_seen) nz_trace::Construct("cc_midstream_checksum entries=%zu", legacy.entries.size());
                 if (!inline_checksum_seen || legacy.entries.size() != 1u) {
-                    out_data->clear();
+                    out_data->Clear();
                     if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
                     return false;
                 }
                 expected = inline_checksum;
             }
-            const std::uint32_t got =
-                ComputeBufferChecksum(legacy.checksum_mode, out_data->data() + cursor, n);
+            if (buf == nullptr) continue;             // streamed: the sink checked it
+            if (cursor + n > buf->size()) break;
             if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                const std::uint32_t got =
+                    ComputeBufferChecksum(legacy.checksum_mode, buf->data() + cursor, n);
                 fprintf(stderr, "[TDCC]   entry n=%zu expected=0x%08x computed=0x%08x %s\n",
                         n, expected, got, got == expected ? "OK" : "MISMATCH");
             }
-            (void)got; (void)expected;   // verdict recorded by the caller (CheckEntries)
             cursor += n;
         }
     }
@@ -10026,6 +10116,16 @@ static bool DecodeOptimumBlockSequence(
     if (ok) pscope.Commit();
     if (trace_blocks) fprintf(stderr, "[TDO] loop end: ok=%d pos=%zu stream_end=%zu out=%zu want=%llu\n",
                               (int)ok, pos, stream_end, out_data->size(), (unsigned long long)total_size_hint);
+    // Width-correct twin of the line above: every other [TDO] trace prints an
+    // ArcPos with %zu, which is a 64-bit value through a 32-bit conversion on a
+    // 32-bit build -- right where a >4 GB decode has to be read.
+    if (trace_blocks) {
+        const nzr::derr::State& st = nzr::derr::Current();
+        fprintf(stderr, "[TDO64] exit ok=%d pos=%llu stream_end=%llu out=%llu want=%llu derr=%u fatal=%u pos_set=%d at=%llu\n",
+                (int)ok, (unsigned long long)pos, (unsigned long long)stream_end,
+                (unsigned long long)out_data->size(), (unsigned long long)total_size_hint,
+                st.code, st.fatal_id, (int)st.has_pos, (unsigned long long)st.input_pos);
+    }
     return ok;
 }
 
@@ -10164,7 +10264,10 @@ static bool TryDecodeLegacyOptimum(
                 (unsigned long long)legacy.total_data_size, dp);
     }
 
-    if (!ok || out_data->size() != static_cast<std::size_t>(legacy.total_data_size)) {
+    // 64-bit compare, for the same reason the loop above is: narrowing the total
+    // to size_t on a 32-bit build turns 4 823 005 184 into 528 037 888, and a
+    // decode that produced every one of those bytes is then called corrupt.
+    if (!ok || out_data->size() != legacy.total_data_size) {
         // out_data keeps the blocks completed before the failure: the original
         // has written exactly those by the time it reports the error.
         out_data->TruncateTo(legacy.total_data_size);
@@ -10768,7 +10871,13 @@ int RunLegacyCnExtractOrTest(
                 psink::Slice sl;
                 sl.entry = i; sl.file_off = 0u; sl.len = en.size;
                 sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
-                sl.has_cksum = en.has_checksum; sl.group = 0u;
+                // One group per ENTRY: in a single container the original opens
+                // the next output file only when a flush reaches it, so the file
+                // the cursor stands in when a decode stops is the one it leaves
+                // behind empty. With every slice in group 0 that file was never
+                // created (measured on a flipped multi-file -cc container: the
+                // original leaves a.cpp at 0 bytes, this left nothing).
+                sl.has_cksum = en.has_checksum; sl.group = i;
                 ps.slices.push_back(sl);
             }
             pstreams.push_back(std::move(ps));
@@ -10780,12 +10889,16 @@ int RunLegacyCnExtractOrTest(
         std::vector<unsigned char> optimum_native_data;
         std::uint64_t optimum_streamed = 0;
         OptimumOut optimum_out = optimum_sink
+            // StreamBegin on the FIRST byte, not before the decode: it creates
+            // the stream's first output file, and a decode that then produces
+            // nothing must leave no file at all -- the original opens the next
+            // output file only after a flush reaches it.
             ? OptimumOut([&optimum_streamed](const unsigned char* q, std::size_t n) {
+                  if (optimum_streamed == 0u) psink::StreamBegin(0u);
                   psink::StreamWrite(0u, q, n);
                   optimum_streamed += n;
               })
             : OptimumOut(&optimum_native_data);
-        if (optimum_sink) psink::StreamBegin(0u);
         const bool optimum_ok = TryDecodeLegacyOptimum(legacy, &optimum_out, &optimum_decode_error);
         if (optimum_sink && !optimum_ok && optimum_streamed == 0u) {
             // Declined before producing anything: hand the sink back unused so
@@ -10847,7 +10960,62 @@ int RunLegacyCnExtractOrTest(
         }
         std::string cm_decode_error;
         std::vector<unsigned char> cm_native_data;
-        const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_native_data, &cm_decode_error);
+        // Same single-stream sink the optimum family publishes above: the CM
+        // decoder hands each block over and the entry's output never has to
+        // exist. Only for -cc, and only after the engines above have declined,
+        // so the sink is free again by the time this runs.
+        const bool cm_codec = (legacy.legacy_method == 0x4bu && legacy.legacy_method_p0 == 7u);
+        bool cm_sink = false;
+        if (cm_codec && psink::Available() && !legacy.entries.empty()) {
+            std::vector<psink::Stream> pstreams;
+            psink::Stream ps;
+            for (std::size_t i = 0; i < legacy.entries.size(); ++i) {
+                const LegacyCnEntry& en = legacy.entries[i];
+                psink::Slice sl;
+                sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
+                sl.has_cksum = en.has_checksum; sl.group = i;   // one group per entry, see above
+                ps.slices.push_back(sl);
+            }
+            pstreams.push_back(std::move(ps));
+            cm_sink = psink::Publish(legacy.entries, std::move(pstreams),
+                                     psink::Policy::kProduced, 0u, psink::Family::kCm);
+        }
+        std::uint64_t cm_streamed = 0;
+        OptimumOut cm_out = cm_sink
+            ? OptimumOut([&cm_streamed](const unsigned char* q, std::size_t n) {
+                  if (cm_streamed == 0u) psink::StreamBegin(0u);   // see above
+                  psink::StreamWrite(0u, q, n);
+                  cm_streamed += n;
+              })
+            : OptimumOut(&cm_native_data);
+        const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_out, &cm_decode_error);
+        if (cm_sink && !cm_native_ok && cm_streamed == 0u) {
+            // Declined before producing anything: hand the sink back unused.
+            psink::Reset();
+            psink::Configure(options, test_mode, os,
+                             options.output_path.empty() ? fs::current_path()
+                                                         : PathFromNativeBytes(options.output_path));
+            cm_sink = false;
+        }
+        if (cm_sink) {
+            psink::StreamEnd(0u, nullptr, cm_streamed, cm_native_ok, false);
+            LegacyCnContext done = CloneLegacyMeta(legacy);
+            const psink::Outcome so = psink::Finish();
+            done.sink_handled = true;
+            done.sink_failed_entries = so.failed_entries;
+            done.sink_plain_code = so.plain_code;
+            if (cm_native_ok) {
+                done.native_payload_supported = true;
+                done.decode_failed = so.stream_failed;
+                return RunLegacyCnExtractOrTest(options, done, test_mode, os, run_start);
+            }
+            // The sink wrote whatever completed before the failure, which is what
+            // the original leaves behind too; report through the same path.
+            done.decode_failed = true;
+            AdoptDecodeError(done);
+            return PrintCorruptLine(os, done);
+        }
         // Native -cc CM decode; checksum-gated inside TryDecodeLegacyCm.
         if (cm_native_ok) {
             LegacyCnContext bridged = CloneLegacyMeta(legacy);
@@ -10898,7 +11066,14 @@ int RunLegacyCnExtractOrTest(
         }
         return kLegacyNeedCompat;
     }
-    if (!legacy.decode_failed && legacy.total_data_size != legacy.data.size()) {
+    // The payload as a RANGE SOURCE. It is `legacy.data` when a decoder handed
+    // over a buffer, and a view onto the archive when the parse could describe
+    // the payload instead of copying it -- a stored entry, above all, where the
+    // payload IS the file. Nothing below wants a pointer at the whole thing:
+    // that is what put a >4 GB entry out of a 32-bit build's reach even after
+    // the decode itself had stopped needing one.
+    const ByteView payload = legacy.Payload();
+    if (!legacy.decode_failed && legacy.total_data_size != payload.size()) {
         os << "Data corrupted while reading file payload.\n";
         return 2;
     }
@@ -10908,7 +11083,7 @@ int RunLegacyCnExtractOrTest(
     std::size_t processed = 0;
     std::size_t failed = 0;
     std::uint64_t bytes_ok = 0;
-    std::size_t cursor = 0;
+    ArcPos cursor = 0;
 
     // The header (Archive / Threads / Compressor) is printed by the caller before
     // the decode is attempted, as the original does, so a failing decode shows
@@ -10923,15 +11098,15 @@ int RunLegacyCnExtractOrTest(
     for (const LegacyCnEntry& e : legacy.entries) {
         if (stopped) break;
         bool last_partial = false;
-        std::size_t n = static_cast<std::size_t>(e.size);
-        if (cursor > legacy.data.size() || e.size > legacy.data.size() - cursor) {
+        ArcPos n = e.size;
+        if (cursor > payload.size() || e.size > payload.size() - cursor) {
             if (!legacy.decode_failed) {
                 os << "Data corrupted while reading file payload: " << e.path << '\n';
                 return 2;
             }
             last_partial = true;
             stopped = true;
-            n = legacy.data.size() - cursor;
+            n = payload.size() - cursor;
             if (SafeMode()) break;   // never write unverified bytes in safe mode
         }
 
@@ -10940,7 +11115,7 @@ int RunLegacyCnExtractOrTest(
         // when there is none), so later entries overwrite earlier ones.
         const bool selected = MatchesAnyPattern(e.path, options.positional) &&
                               !IsExcluded(e.path, options.exclude_patterns);
-        const unsigned char* ptr = legacy.data.data() + cursor;
+        const ArcPos entry_off = cursor;
         cursor += n;
 
         // The original decodes the whole stream whatever the file filter says, so
@@ -10964,7 +11139,7 @@ int RunLegacyCnExtractOrTest(
             const std::size_t idx = static_cast<std::size_t>(&e - legacy.entries.data());
             const bool known_bad = legacy.checksums_verified && idx < legacy.entry_checksum_ok.size() && !legacy.entry_checksum_ok[idx];
             if (known_bad || !legacy.checksums_verified) {
-                const std::uint32_t got = ComputeBufferChecksum(legacy.checksum_mode, ptr, n);
+                const std::uint32_t got = ChecksumRange(legacy.checksum_mode, payload, entry_off, n);
                 if (got != e.checksum) {
                     checksum_bad = true;
                     ClearStatusLine(os);
@@ -11029,7 +11204,7 @@ int RunLegacyCnExtractOrTest(
                 if (out_path.has_parent_path()) {
                     MakeDirs0700(out_path.parent_path());
                 }
-                if (!WriteExtractedFile(out_path, ptr, n,
+                if (!WriteExtractedFileRange(out_path, payload, entry_off, n,
                                         e.has_permissions ? e.permissions : 0600u,
                                         (options.restore_ownership && e.has_owner) ? static_cast<long>(e.uid) : -1L,
                                         (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L)) {
