@@ -90,6 +90,8 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <functional>
+#include <memory>
 #include <vector>
 
 namespace nzr {
@@ -127,6 +129,30 @@ public:
     void RecordDecisions(bool on) { record_ = on; }
     const std::vector<Optimum2Decision>& LastDecisions() const { return decisions_; }
 
+    // The -cO optimal parser (FUN_08083e90, the DAT_08183620 == 0 / -t1 path --
+    // the structural twin of the `-co` engine's FUN_0806f8e0, differing in its
+    // table addresses, a 0x1040-node horizon instead of 0x120, a 0x200-byte
+    // immediate-match threshold instead of 0x20, a match-finder chain depth of
+    // 0x100 instead of 0x10, and a literal priced from the 8-input mixer with no
+    // price cache at all). Turns one block's bytes into the decision list the
+    // original would pick, using the models in their CURRENT state. Feed the
+    // result to EncodeBlock to get the payload.
+    bool ParseBlock(const std::uint8_t* data, std::uint32_t size,
+                    std::vector<Optimum2Decision>& out);
+
+    // Parse AND code one block in the original's interleaved order: the parser
+    // hands the coder one flush of decisions at a time and the coder advances the
+    // models before the next flush is parsed, so prices track the model as it
+    // adapts inside the block. This is the real encoder entry point.
+    bool EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
+                           std::vector<std::uint8_t>& payload,
+                           std::vector<Optimum2Decision>* out_decisions);
+
+    // Build the match finder NOW, before any block is parsed -- see the `-co`
+    // sibling: a plain decode never builds one, so an encoder whose first block
+    // is a BWT block would otherwise feed the window without feeding the hash.
+    void EnableParser();
+
     // Decode one block. `in`/`in_len` is this block's compressed payload
     // (the range-coder bitstream, starting at its very first byte -- no
     // extra header inside this call). Produces exactly `out_size` bytes into
@@ -147,6 +173,23 @@ private:
     template <class IO>
     bool RunBlock(IO& io, const Optimum2Decision* dec, std::size_t ndec,
                   std::uint8_t* out, std::uint32_t out_size);
+
+    struct ParserState;
+    std::shared_ptr<ParserState> parser_;
+    // when set, RunBlock pulls the next decision from here instead of a list
+    std::function<bool(Optimum2Decision&)> feed_;
+    // installed by the encoding pass; called at the top of every chunk
+    std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, bool)> chunk_begin_;
+    // Stage one chunk for the parser at the window position the coder reads it
+    // from: the engine splits a block into chunks of at most 0x8000 and the
+    // original parses once per chunk, so the two must step together.
+    void BeginChunk(std::uint32_t off, std::uint32_t len, std::uint32_t ring_pos, bool reset_reps);
+    bool ChunkExhausted() const;
+    // The window feed also pushes what it appended into the match finder, which is
+    // how a later block's matches can start inside a stored or filtered block.
+    void FeedFinder(std::uint32_t cursor_before, std::uint32_t len);
+    bool ParseNextFlush(std::vector<Optimum2Decision>& out);
+    void BeginParse(const std::uint8_t* data, std::uint32_t size);
 public:
 
     // Feed already-known output bytes into the window WITHOUT decoding, so a
@@ -195,6 +238,9 @@ private:
     };
 
     Ring ring_;
+    // The match finder's tree is sized from the archive's BLOCK size (the `-co`
+    // sibling's note applies verbatim).
+    std::uint32_t blocksize_ = 0x100000u;
     std::vector<Optimum2Decision> decisions_;
     bool record_ = false;
     std::vector<std::uint8_t> mem_;  // the "large" subengine's ~0x1083000-byte state

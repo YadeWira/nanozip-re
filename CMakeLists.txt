@@ -33,6 +33,7 @@ set(RECON_SOURCES
     src/nz_texttransform_num.cpp
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_parser.cpp
+    src/nz_optimum2_lz_parser.cpp
     src/nz_optimum_lz_tables.cpp
     src/nz_optimum2_lz.cpp
     src/nz_optimum2_lz_tables.cpp
@@ -101,7 +102,10 @@ endif()
 add_executable(test_optimum2_lz
     tests/test_optimum2_lz.cpp
     src/nz_optimum2_lz.cpp
+    src/nz_optimum2_lz_parser.cpp
     src/nz_optimum2_lz_tables.cpp
+    src/nz_optimum_lz.cpp
+    src/nz_optimum_lz_parser.cpp
     src/nz_optimum_lz_tables.cpp
     src/nz_cm.cpp
 )

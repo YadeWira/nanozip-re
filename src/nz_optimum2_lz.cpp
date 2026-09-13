@@ -151,6 +151,7 @@ extern uint32_t kDivideLookup[256];
 namespace nzr {
 namespace optimum2 {
 
+
 namespace {
 
 constexpr std::size_t kMemSize = 0x1083000u;
@@ -424,10 +425,12 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
     // state the block STARTED in and compare with the input -- the encoder's
     // mirror check (the `-co` sibling's NZOPT_RECODE, same shape).
     static const bool recode = (NZ_ENV("NZO2_RECODE") != nullptr);
-    const bool want_dec = recode || (NZ_ENV("NZO2_DUMP_DECISIONS") != nullptr);
+    const bool want_dec = recode || (NZ_ENV("NZO2_PARSECHK") != nullptr) ||
+                          (NZ_ENV("NZO2_DUMP_DECISIONS") != nullptr);
     std::unique_ptr<NzOptimum2LzDecoder> before;
     if (want_dec) { record_ = true; decisions_.clear(); }
-    if (recode) before = std::unique_ptr<NzOptimum2LzDecoder>(new NzOptimum2LzDecoder(*this));
+    if (recode || NZ_ENV("NZO2_PARSECHK") != nullptr)
+        before = std::unique_ptr<NzOptimum2LzDecoder>(new NzOptimum2LzDecoder(*this));
     DecodeIO io;
     io.rc.Init(in, in_len);
     const bool ok = RunBlock(io, nullptr, 0u, out, out_size);
@@ -439,6 +442,44 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
             const Optimum2Decision& d = decisions_[i];
             if (d.is_literal) std::fprintf(stderr, "[DEC2] %zu lit %02x\n", i, d.byte);
             else std::fprintf(stderr, "[DEC2] %zu match sg=%u len=%u dist=%u\n", i, d.sg, d.len, d.dist);
+        }
+    }
+    if (NZ_ENV("NZO2_PARSECHK") != nullptr && ok && before) {
+        // Run the parser from the state the block started in and compare its
+        // decisions with the ones the decode just read out of the original's own
+        // bitstream: the parser's oracle.
+        std::vector<Optimum2Decision> mine;
+        std::vector<std::uint8_t> mypayload;
+        NzOptimum2LzDecoder snap(*before);
+        bool pok = false;
+        try { pok = snap.EncodeBlockParsed(out, out_size, mypayload, &mine); }
+        catch (...) { pok = false; }
+        std::size_t first = 0;
+        while (first < mine.size() && first < decisions_.size()) {
+            const Optimum2Decision& a = mine[first];
+            const Optimum2Decision& b = decisions_[first];
+            if (a.is_literal != b.is_literal) break;
+            if (a.is_literal) { if (a.byte != b.byte) break; }
+            else if (a.sg != b.sg || a.len != b.len || a.dist != b.dist) break;
+            ++first;
+        }
+        const bool same = pok && mine.size() == decisions_.size() && first == mine.size();
+        const bool paysame = (mypayload.size() == in_len) &&
+                             std::memcmp(mypayload.data(), in, in_len) == 0;
+        std::fprintf(stderr, "[PARSECHK2] out=%u target=%zu mine=%zu match=%zu -> %s payload=%zu/%u %s\n",
+                     out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF",
+                     mypayload.size(), in_len, paysame ? "EXACT" : "diff");
+        if (!same) {
+            for (std::size_t i = (first > 2 ? first - 2 : 0);
+                 i < first + 3 && i < std::max(mine.size(), decisions_.size()); ++i) {
+                auto pr = [&](const char* tag, const std::vector<Optimum2Decision>& v) {
+                    if (i >= v.size()) { std::fprintf(stderr, "  %s[%zu] -\n", tag, i); return; }
+                    const Optimum2Decision& d = v[i];
+                    if (d.is_literal) std::fprintf(stderr, "  %s[%zu] lit %02x\n", tag, i, d.byte);
+                    else std::fprintf(stderr, "  %s[%zu] match sg=%u len=%u dist=%u\n", tag, i, d.sg, d.len, d.dist);
+                };
+                pr("want", decisions_); pr("got ", mine);
+            }
         }
     }
     if (recode && ok && before) {
@@ -472,6 +513,45 @@ bool NzOptimum2LzDecoder::EncodeBlock(const Optimum2Decision* dec, std::size_t n
     return true;
 }
 
+bool NzOptimum2LzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32_t size,
+                                            std::vector<std::uint8_t>& payload,
+                                            std::vector<Optimum2Decision>* out_decisions) {
+    if (size == 0u) return false;
+    BeginParse(data, size);
+    EncodeIO io;
+    std::vector<std::uint16_t> q;
+    io.q = &q;
+    std::vector<std::uint8_t> tmp(static_cast<std::size_t>(size) + 16u);
+    std::vector<Optimum2Decision> pending;
+    std::size_t pi = 0;
+    std::uint32_t produced = 0;
+    bool parse_ok = true;
+    chunk_begin_ = [&](std::uint32_t off, std::uint32_t len, std::uint32_t pos, bool rst) {
+        BeginChunk(off, len, pos, rst);
+        pending.clear();
+        pi = 0;
+    };
+    feed_ = [&](Optimum2Decision& d) -> bool {
+        if (produced >= size) return false;   // the block is covered; a clean end
+        while (pi >= pending.size()) {
+            if (ChunkExhausted()) return false;
+            pending.clear();
+            pi = 0;
+            if (!ParseNextFlush(pending) || pending.empty()) { parse_ok = false; return false; }
+        }
+        d = pending[pi++];
+        produced += d.is_literal ? 1u : d.len;
+        if (out_decisions != nullptr) out_decisions->push_back(d);
+        return true;
+    };
+    const bool ok = RunBlock(io, nullptr, 0u, tmp.data(), size);
+    feed_ = nullptr;
+    chunk_begin_ = nullptr;
+    if (!ok || !parse_ok) return false;
+    RangeEncodePairs(q, payload);
+    return true;
+}
+
 template <class IO>
 bool NzOptimum2LzDecoder::RunBlock(IO& io, const Optimum2Decision* dec, std::size_t ndec,
                                    std::uint8_t* out, std::uint32_t out_size) {
@@ -501,7 +581,12 @@ bool NzOptimum2LzDecoder::RunBlock(IO& io, const Optimum2Decision* dec, std::siz
     if (dec != nullptr && ndec != 0) cur = dec[0];
     auto next_dec = [&]() {
         if (dec != nullptr) { ++di; cur = (di < ndec) ? dec[di] : Optimum2Decision{}; }
+        else if (feed_) { Optimum2Decision d{}; cur = feed_(d) ? d : Optimum2Decision{}; }
     };
+
+    // true while this call is CODING (a decision list or a live parse feed), which
+    // is the only direction that maintains the parser's price caches
+    const bool encoding = (dec != nullptr) || static_cast<bool>(feed_);
 
     std::uint32_t rep[4] = {1, 1, 1, 1};
     std::uint8_t* mem = mem_.data();
@@ -842,6 +927,8 @@ bool NzOptimum2LzDecoder::RunBlock(IO& io, const Optimum2Decision* dec, std::siz
             if (f) { std::fwrite(mem_.data(), 1, mem_.size(), f); std::fclose(f); }
             std::fprintf(stderr, "[O2] chunk dump: produced=%u -> %s\n", local_74, nm);
         }
+        if (chunk_begin_) chunk_begin_(local_74, chunk_size, ring_.cursor, headroom == 0);
+        if (feed_) { Optimum2Decision d0{}; cur = feed_(d0) ? d0 : Optimum2Decision{}; }
         std::uint8_t* base = ring_.Base();
         std::uint32_t chunk_start = ring_.cursor;
         std::uint32_t local_50 = chunk_start + chunk_size;
@@ -1082,6 +1169,20 @@ bool NzOptimum2LzDecoder::RunBlock(IO& io, const Optimum2Decision* dec, std::siz
                     }
                 }
                 std::uint32_t length = local_a4v + 2u;
+
+                // Coding a match INVALIDATES the parser's cached price for that
+                // length (0x103b388 + (len-2)*4, the rep0 variant two bytes on),
+                // so the next parse prices it against the model this very match
+                // just advanced. Without it the cache only ever decays and the
+                // parser's lengths drift away from the original's within a few
+                // hundred decisions. Encoder-side only: the real decoder has no
+                // parser and never touches these cells.
+                if (encoding && length >= 2u) {
+                    const std::uint32_t vinv = length - 2u;
+                    if (vinv < 0x100u)
+                        Wr16(mem, 0x103b388 + static_cast<int>(vinv) * 4 +
+                                  ((slot_group == 1u) ? 2 : 0), 0xffffu);
+                }
 
                 if (local_94 < length) { if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@length pos=%u local_94=%u length=%u\n", local_54, local_94, length); failed = true; break; }
 
@@ -1407,8 +1508,13 @@ void NzOptimum2LzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len
         if (ring_.EnsureHeadroom(len) == 0u)
             std::memset(mem + 0x1042c00, 0, 0x40000u);
     }
+    const std::uint32_t cursor_before = ring_.cursor;
     std::memcpy(ring_.Base() + ring_.cursor, data, len);
     ring_.cursor += len;
+    // The original's feed also pushes what it appended into the match finder and
+    // the long-range index, which is how a later block's matches can start inside
+    // a stored or filtered block. Only the encoding side has a finder at all.
+    FeedFinder(cursor_before, len);
 }
 
 }  // namespace optimum2
