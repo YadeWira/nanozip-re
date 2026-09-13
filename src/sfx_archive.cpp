@@ -3158,10 +3158,15 @@ bool ApplyLegacyAttributeRecords(
     for (const auto& rec : records) {
         const unsigned sid = static_cast<unsigned>(rec[0]);
         const unsigned rtype = static_cast<unsigned>(rec[1]);
-        const std::size_t rbegin = rec[2];
-        const std::size_t rend = rec[3];
+        // FILE offsets: on a 32-bit build a record past the 4 GB mark wrapped
+        // here, and every walk below read the archive 2^32 bytes short. On the
+        // reporter's 4.6 GB archive that made `l` print the WRONG stored
+        // checksum (d0b231e8 for 74abd879) and `x`/`t` then report a mismatch
+        // on output that was byte-identical to the original's.
+        const ArcPos rbegin = rec[2];
+        const ArcPos rend = rec[3];
         if (rbegin > rend || rend > bytes.size()) return false;
-        const std::size_t rsize = rend - rbegin;
+        const ArcPos rsize = rend - rbegin;
 
         const auto named_it = stream_named.find(sid);
         if (named_it == stream_named.end()) return false;
@@ -3197,13 +3202,13 @@ bool ApplyLegacyAttributeRecords(
                 // the file count through this block. The gap is filled with 8
                 // (plain), which is what the original lists for such an entry.
                 std::size_t k = 0;
-                for (std::size_t p = rbegin; p < rend; ++p) {
+                for (ArcPos p = rbegin; p < rend; ++p) {
                     if (((bytes[p] >> 4) & 0x0fu) != 0u) ++k;
                     if ((bytes[p] & 0x0fu) != 0u) ++k;
                 }
                 if (a.mtimes.size() >= k && a.attrs.size() < a.mtimes.size() - k)
                     a.attrs.resize(a.mtimes.size() - k, 8u);
-                for (std::size_t p = rbegin; p < rend; ++p) {
+                for (ArcPos p = rbegin; p < rend; ++p) {
                     for (int half = 1; half >= 0; --half) {
                         const std::uint32_t nib = (static_cast<std::uint32_t>(bytes[p]) >> (half * 4)) & 0x0fu;
                         if (nib == 0u) continue;            // padding
@@ -3215,7 +3220,7 @@ bool ApplyLegacyAttributeRecords(
             }
             case 4u: {
                 if ((rsize % 2u) != 0u) return false;
-                for (std::size_t p = rbegin; p + 1u < rend; p += 2u) {
+                for (ArcPos p = rbegin; p + 1u < rend; p += 2u) {
                     const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
                                             (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
                     std::uint32_t mode = v;
@@ -3237,7 +3242,7 @@ bool ApplyLegacyAttributeRecords(
                 // (three files with uid 1000 were stored as e8 03 three times).
                 std::vector<std::uint32_t>& dst = (rtype == 8u) ? a.uids : a.gids;
                 if ((rsize % 2u) != 0u) return false;
-                for (std::size_t p = rbegin; p + 1u < rend; p += 2u) {
+                for (ArcPos p = rbegin; p + 1u < rend; p += 2u) {
                     const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
                                             (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
                     std::uint32_t id = v;
@@ -3259,7 +3264,7 @@ bool ApplyLegacyAttributeRecords(
                 const std::size_t width = (rtype == 6u) ? 2u : 4u;
                 if (rsize == 0u || (rsize % width) != 0u) return false;
                 if (a.checksums.size() + rsize / width > n) return false;
-                for (std::size_t p = rbegin; p < rend; p += width) {
+                for (ArcPos p = rbegin; p < rend; p += width) {
                     a.checksums.push_back(
                         (width == 2u)
                             ? (static_cast<std::uint32_t>(bytes[p]) |
@@ -4661,7 +4666,8 @@ bool DecodeLzpfMember(
     bool lenient = false,
     // Where this member's input ends inside `bytes` (0 = the whole buffer): lets a
     // parallel worker decode its record in place instead of copying it out.
-    std::size_t input_end = 0u,
+    // ArcPos -- it is a FILE offset when the record is decoded in place.
+    ArcPos input_end = 0u,
     // Hand each block's output over as it is produced instead of assembling the
     // member. The output buffer then rolls (one block at a time, grown to the
     // largest block seen), so a 280 MB slice costs a megabyte. Requires
@@ -6742,18 +6748,20 @@ bool TryParseLegacyCnArchive(
                             // measured at ~100x slower. Saving it needs a bound on what a
                             // block can consume, which the block header does not carry.
                             std::vector<unsigned char> payload;
-                            std::size_t plen = 0;
+                            ArcPos plen = 0;
                             for (const auto& c : s.chunks) plen += c.second;
                             const bool in_place = (s.chunks.size() == 1u);
                             if (!in_place) {
-                                payload.reserve(plen);
+                                payload.reserve(static_cast<std::size_t>(plen));
                                 for (const auto& c : s.chunks)
                                     bytes.AppendTo(&payload, c.first, c.second);
                             }
                             const ByteView pin = in_place ? bytes : ByteView(payload);
-                            const std::size_t pbeg = in_place ? s.chunks.front().first : 0u;
-                            const std::size_t plen_in = in_place ? s.chunks.front().second : payload.size();
-                            const std::size_t pend = in_place ? pbeg + plen_in : 0u;
+                            // ArcPos: `pbeg` is a FILE offset when the record is
+                            // decoded in place, so a >4 GB archive wraps it.
+                            const ArcPos pbeg = in_place ? s.chunks.front().first : 0u;
+                            const ArcPos plen_in = in_place ? s.chunks.front().second : payload.size();
+                            const ArcPos pend = in_place ? pbeg + plen_in : 0u;
                             const ChecksumMode cm = s.cmode;
                             const std::uint32_t cv = s.cval;
                             auto slice_verify = [&](const unsigned char* dec, std::size_t n) -> bool {
@@ -7265,8 +7273,8 @@ bool TryParseLegacyCnArchive(
                                     const std::vector<unsigned char> in = one ? std::vector<unsigned char>() : ConcatParallelChunks(bytes, chunks);
                                     if (!one && in.empty()) return false;
                                     const ByteView pin = one ? bytes : ByteView(in);
-                                    const std::size_t pbeg = one ? chunks.front().first : 0u;
-                                    const std::size_t plen_in = one ? chunks.front().second : in.size();
+                                    const ArcPos pbeg = one ? chunks.front().first : 0u;   // FILE offset
+                                    const ArcPos plen_in = one ? chunks.front().second : in.size();
                                     const bool sinking = psink::Available() || psink::Committed();
                                     std::size_t mdone = 0;
                                     const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, out_size, vb,
@@ -7933,7 +7941,7 @@ bool TryParseLegacyCnArchive(
                     if (pf_input_size >= 12u &&
                         stream_bytes >= 4u + static_cast<std::uint64_t>(pf_input_size) + 22u &&
                         pf_off + static_cast<std::size_t>(pf_input_size) + 22u <= bytes.size()) {
-                        const std::size_t trailer_off = pf_off + static_cast<std::size_t>(pf_input_size);
+                        const ArcPos trailer_off = pf_off + pf_input_size;   // FILE offset
                         const std::uint32_t bwt_size_from_trailer = bytes.U32At(trailer_off + 2u);
                         const std::uint32_t primary_from_trailer =
                             static_cast<std::uint32_t>(bytes[trailer_off + 11u]) |
@@ -8084,7 +8092,7 @@ bool TryParseLegacyCnArchive(
     ctx.saw_data_record = saw_data_record || has_parallel_streams;
     ctx.cut_first_data_record = cut_first_data_record;
     {
-        std::size_t acc = 0;
+        ArcPos acc = 0;   // payload-space offsets: 64-bit, like the records themselves
         for (const auto& dr : data_records) { acc += dr.second - dr.first; ctx.payload_record_ends.push_back(acc); }
         ctx.records_after_data = !data_records.empty() && data_records.back().second < bytes.size();
     }
