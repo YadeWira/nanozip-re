@@ -12,6 +12,7 @@
 #endif
 #include <cstdio>
 #include <memory>
+#include <string>
 #include <cstdlib>
 // Native linux32 `-cO` (nz_optimum2) LZ/CM engine. See include/nz_optimum2_lz.h
 // for the architecture summary and RE provenance. This file is a careful,
@@ -429,6 +430,13 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                           (NZ_ENV("NZO2_DUMP_DECISIONS") != nullptr);
     std::unique_ptr<NzOptimum2LzDecoder> before;
     if (want_dec) { record_ = true; decisions_.clear(); }
+    if (NZ_ENV("NZO2_PARSECHK") != nullptr) {
+        // One parser instance for the whole stream, shared with every snapshot:
+        // the match finder a block's parse fills is the one the NEXT block's parse
+        // searches, which is how a real encoder sees it. A fresh finder per block
+        // would make every block after the first start blind.
+        EnableParser();
+    }
     if (recode || NZ_ENV("NZO2_PARSECHK") != nullptr)
         before = std::unique_ptr<NzOptimum2LzDecoder>(new NzOptimum2LzDecoder(*this));
     DecodeIO io;
@@ -466,9 +474,20 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         const bool same = pok && mine.size() == decisions_.size() && first == mine.size();
         const bool paysame = (mypayload.size() == in_len) &&
                              std::memcmp(mypayload.data(), in, in_len) == 0;
-        std::fprintf(stderr, "[PARSECHK2] out=%u target=%zu mine=%zu match=%zu -> %s payload=%zu/%u %s\n",
+        // when the decisions agree but the payload does not, the gap is in the
+        // CODING path, not the parse: code the same list the plain way and see
+        const char* recheck = "";
+        if (same && !paysame) {
+            std::vector<std::uint8_t> p2;
+            NzOptimum2LzDecoder snap2(*before);
+            const bool e2 = snap2.EncodeBlock(mine.data(), mine.size(), out_size, p2);
+            recheck = (e2 && p2.size() == in_len && std::memcmp(p2.data(), in, in_len) == 0)
+                          ? " (EncodeBlock EXACT -> coding path differs)"
+                          : " (EncodeBlock also differs)";
+        }
+        std::fprintf(stderr, "[PARSECHK2] out=%u target=%zu mine=%zu match=%zu -> %s payload=%zu/%u %s%s\n",
                      out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF",
-                     mypayload.size(), in_len, paysame ? "EXACT" : "diff");
+                     mypayload.size(), in_len, paysame ? "EXACT" : "diff", recheck);
         if (!same) {
             for (std::size_t i = (first > 2 ? first - 2 : 0);
                  i < first + 3 && i < std::max(mine.size(), decisions_.size()); ++i) {
@@ -509,6 +528,14 @@ bool NzOptimum2LzDecoder::EncodeBlock(const Optimum2Decision* dec, std::size_t n
     const bool ok = RunBlock(io, dec, ndec, tmp.data(), out_size);
     record_ = saved_record;
     if (!ok) return false;
+    if (const char* qd = NZ_ENV("NZO2_QDUMP")) {
+        FILE* f = std::fopen((std::string(qd) + ".block").c_str(), "wb");
+        if (f) { std::fwrite(q.data(), 2, q.size(), f); std::fclose(f); }
+        f = std::fopen((std::string(qd) + ".block.ring").c_str(), "wb");
+        if (f) { std::fwrite(ring_.storage.data(), 1, ring_.storage.size(), f); std::fclose(f); }
+        f = std::fopen((std::string(qd) + ".block.mem").c_str(), "wb");
+        if (f) { std::fwrite(mem_.data(), 1, mem_.size(), f); std::fclose(f); }
+    }
     RangeEncodePairs(q, payload);
     return true;
 }
@@ -548,6 +575,14 @@ bool NzOptimum2LzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint3
     feed_ = nullptr;
     chunk_begin_ = nullptr;
     if (!ok || !parse_ok) return false;
+    if (const char* qd = NZ_ENV("NZO2_QDUMP")) {
+        FILE* f = std::fopen((std::string(qd) + ".parsed").c_str(), "wb");
+        if (f) { std::fwrite(q.data(), 2, q.size(), f); std::fclose(f); }
+        f = std::fopen((std::string(qd) + ".parsed.ring").c_str(), "wb");
+        if (f) { std::fwrite(ring_.storage.data(), 1, ring_.storage.size(), f); std::fclose(f); }
+        f = std::fopen((std::string(qd) + ".parsed.mem").c_str(), "wb");
+        if (f) { std::fwrite(mem_.data(), 1, mem_.size(), f); std::fclose(f); }
+    }
     RangeEncodePairs(q, payload);
     return true;
 }

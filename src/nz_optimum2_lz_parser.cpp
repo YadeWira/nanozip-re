@@ -90,6 +90,7 @@ inline void          Wr8 (std::uint8_t* m, std::size_t o, std::uint8_t v) { m[o]
 inline std::uint16_t Rd16(const std::uint8_t* m, std::size_t o) { std::uint16_t v; std::memcpy(&v, m + o, 2); return v; }
 inline void          Wr16(std::uint8_t* m, std::size_t o, std::uint16_t v) { std::memcpy(m + o, &v, 2); }
 inline std::int32_t  Rd32(const std::uint8_t* m, std::size_t o) { std::int32_t v; std::memcpy(&v, m + o, 4); return v; }
+inline void          Wr32(std::uint8_t* m, std::size_t o, std::int32_t v) { std::memcpy(m + o, &v, 4); }
 inline int Stretch(std::uint8_t s) { return kLzModelInterpolation[s]; }
 inline std::uint32_t Load16(const std::uint8_t* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t Load32(const std::uint8_t* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -325,6 +326,11 @@ std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
     const std::uint32_t v = L - 2u;
     if (v >= 0xffu) return 0u;
     const std::size_t cell = 0x103b380u + static_cast<std::size_t>(L) * 4u + ((a0 == 0u) ? 2u : 0u);
+    // The original remembers THIS cell in a scratch field (0x103b988) and decays
+    // whatever that field points at when a relaxation beats an existing node. The
+    // field is only refreshed while v is under 0xff, so a length past that decays
+    // the last cell some earlier, shorter length left behind -- kept as it is.
+    Wr32(mem, 0x103b988, static_cast<std::int32_t>(cell));
     if (use_cache && v < 0x20u) {
         const std::uint16_t c = Rd16(mem, cell);
         if (c != 0xffffu) return c;
@@ -710,15 +716,17 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         // write one relaxed node; false means the existing path is cheaper,
         // which ends the whole relaxation
         auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
-                          const std::uint32_t* nr, std::uint32_t basep, std::uint32_t lenp,
-                          std::size_t lencell) -> bool {
+                          const std::uint32_t* nr, std::uint32_t basep, std::uint32_t lenp) -> bool {
             Node& tg = nodes[ni + L];
             const std::uint32_t price = basep + lenp;
             if (tg.tag == TAG) {
                 if (tg.price <= price) return false;
-                if (lencell != 0u) {   // the original decays the cache cell it just beat
-                    const std::uint16_t c = Rd16(mem, lencell);
-                    Wr16(mem, lencell, static_cast<std::uint16_t>(c - (c >> 7)));
+                // decay the length-price cell this relaxation just beat, through the
+                // engine's own scratch pointer (see LenCost)
+                const std::size_t lc = static_cast<std::size_t>(Rd32(mem, 0x103b988));
+                if (lc >= 0x103b380u && lc < 0x103b788u) {
+                    const std::uint16_t c = Rd16(mem, lc);
+                    Wr16(mem, lc, static_cast<std::uint16_t>(c - (c >> 7)));
                 }
             }
             tg.tag = TAG;
@@ -773,9 +781,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                 if (ni + len > front) front = ni + len;
                 const std::uint32_t basep = nd.price + SelPrice(i);
                 for (std::uint32_t L = len; L >= 2u; --L) {
-                    const std::size_t cell = 0x103b380u + static_cast<std::size_t>(L) * 4u + ((i == 0u) ? 2u : 0u);
                     const std::uint32_t lenp = LenCost(mem, T, L, i, true);
-                    if (!Update(L, i, r + 1u, nr, basep, lenp, cell)) break;
+                    if (!Update(L, i, r + 1u, nr, basep, lenp)) break;
                     if (L > thrv) thrv = L;
                 }
             } else {
@@ -859,9 +866,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                                                 ni, L, dist, dprice, bp, (int)(tgc.tag == TAG), tgc.price);
                         if (tgc.tag == TAG && tgc.price <= (dprice >> 3u) + bp) break;
                         const std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
-                        const std::size_t cell = 0x103b380u + static_cast<std::size_t>(L) * 4u;
                         const std::uint32_t lenp = LenCost(mem, T, L, 4u, true);
-                        if (!Update(L, 4u, dist, nr, bp, lenp, cell)) break;
+                        if (!Update(L, 4u, dist, nr, bp, lenp)) break;
                     }
                     }
                 }
