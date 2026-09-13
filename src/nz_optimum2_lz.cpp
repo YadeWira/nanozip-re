@@ -394,6 +394,7 @@ NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
 }
 
 void NzOptimum2LzDecoder::ResetModel() {
+    window_reset_pending_ = true;
     mem_ = Optimum2ColdState();
     mem_.resize(kTotalMemSize, 0);
     for (std::size_t i = 0; i < kTier2AlignSize; i += 2) {
@@ -456,6 +457,11 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         // Run the parser from the state the block started in and compare its
         // decisions with the ones the decode just read out of the original's own
         // bitstream: the parser's oracle.
+        if (const char* dl = NZ_ENV("NZO2_DUMP_BLOCKIN")) {
+            static int bn = 0; char path[512];
+            std::snprintf(path, sizeof path, "%s.%d", dl, bn++);
+            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(out, 1, out_size, f); std::fclose(f); }
+        }
         std::vector<Optimum2Decision> mine;
         std::vector<std::uint8_t> mypayload;
         NzOptimum2LzDecoder snap(*before);
@@ -1550,6 +1556,7 @@ void NzOptimum2LzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len
     // the long-range index, which is how a later block's matches can start inside
     // a stored or filtered block. Only the encoding side has a finder at all.
     FeedFinder(cursor_before, len);
+    window_reset_pending_ = false;
 }
 
 }  // namespace optimum2

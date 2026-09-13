@@ -579,6 +579,11 @@ void NzOptimum2LzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t 
     }
 }
 
+// The pieces param15's encoder borrows: the long-range index the window feed
+// maintains (the ring itself comes from WindowBase/WindowCapacity).
+const std::uint32_t* NzOptimum2LzDecoder::LongRangeTable() const { return parser_ ? parser_->lr.data() : nullptr; }
+std::uint32_t NzOptimum2LzDecoder::LongRangeMask() const { return parser_ ? parser_->lrmask : 0u; }
+
 bool NzOptimum2LzDecoder::ChunkExhausted() const {
     return !parser_ || parser_->consumed >= parser_->size;
 }

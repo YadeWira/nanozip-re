@@ -210,6 +210,16 @@ public:
     // Cold-start the adaptive model again, keeping the window (see the -co sibling).
     void ResetModel();
 
+    // What the encoder driver needs to read off the window, the same five the
+    // `-co` sibling exposes: how far the ring is filled, whether it has ever
+    // scrolled, whether a model reset is still waiting for its first feed (which
+    // is what gates param15), and the long-range index param15 searches.
+    std::uint32_t WindowFill() const { return ring_.cursor; }
+    bool WindowScrolled() const { return ring_.scrolled_once; }
+    bool WindowResetPending() const { return window_reset_pending_; }
+    const std::uint32_t* LongRangeTable() const;
+    std::uint32_t LongRangeMask() const;
+
     // The ring's capacity. param15's absolute offsets are ring positions, so the
     // post-filter needs it to map one back to the accumulated stream.
     std::uint32_t WindowCapacity() const;
@@ -243,6 +253,7 @@ private:
     std::uint32_t blocksize_ = 0x100000u;
     std::vector<Optimum2Decision> decisions_;
     bool record_ = false;
+    bool window_reset_pending_ = false;   // 1 after a model reset, 0 after a feed
     std::vector<std::uint8_t> mem_;  // the "large" subengine's ~0x1083000-byte state
 };
 

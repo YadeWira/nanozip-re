@@ -12605,6 +12605,22 @@ struct EncodeStatus {
 // only when it comes out strictly smaller. A sample the bucket coder cannot
 // shrink at all makes it "LZ if LZ shrank the sample", else BWT, whose stored
 // form is what an incompressible block becomes.
+// Which decision type an optimum engine parses into -- the two are the same
+// shape, so everything below is written once for both.
+// Which decision type an optimum engine parses into, and the one header field
+// that tells the two apart: a compressed BWT block's param7, which the decoder
+// reads and never uses. Measured over every such block of a 180-file corpus,
+// both codecs: -co writes 0 in all 18, -cO writes 1 in all 18.
+template <class E> struct OptimumDecisionOf;
+template <> struct OptimumDecisionOf<nzr::optimum::NzOptimumLzDecoder> {
+    using type = nzr::optimum::OptimumDecision;
+    static constexpr unsigned char kBwtParam7 = 0u;
+};
+template <> struct OptimumDecisionOf<nzr::optimum2::NzOptimum2LzDecoder> {
+    using type = nzr::optimum2::Optimum2Decision;
+    static constexpr unsigned char kBwtParam7 = 1u;
+};
+
 static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
     const std::uint32_t sample = (n >> 3) < 0x80000u ? (n >> 3) : 0x80000u;
     if (sample == 0u) return true;
@@ -12616,6 +12632,11 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
         // one -- which is the TREE's size, not the window's -- makes the chain
         // walk confirm different entries and the sample come out a few bytes
         // off, which is enough to flip a block from LZ to BWT.
+        // ALWAYS the compact engine, even under -cO: FUN_0808d7f0 is shared and
+        // builds its own coder rather than borrowing the codec's. Sampling with
+        // the large engine instead made 14 of the corpus's blocks come out LZ
+        // where the original takes BWT -- it shrinks the sample more, so it wins
+        // a comparison the original loses.
         nzr::optimum::NzOptimumLzDecoder sampler(0x100000u);
         if (!sampler.EncodeBlockParsed(data, sample, lzpay, nullptr)) lzpay.clear();
     }
@@ -12631,7 +12652,11 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
     return lz < b;
 }
 
-static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint32_t block_size,
+// The whole post-filter chain and block framing is shared between `-co` and
+// `-cO`: the two differ only in which LZ engine codes the block and samples the
+// LZ-or-BWT decision, exactly as the decode side's own framed loop does.
+template <class Engine>
+static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
                                  std::vector<unsigned char>& out, std::uint32_t window_cap) {
     // One type-0 DATA record PER BLOCK: the record header is the chain segment's
@@ -12664,7 +12689,7 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
     // it is committed. The -co engine is newly reaching block shapes it was
     // never exercised on (an LZ block after a BWT block, for one), and an
     // archive our own decoder cannot read must never reach the disk.
-    nzr::optimum::NzOptimumLzDecoder verifier(window_cap);
+    Engine verifier(window_cap);
     std::uint32_t off = 0;
     while (off < len) {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
@@ -12757,12 +12782,21 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             }
         }
 
+        // NZOPT_DUMP_LZIN=<path>: the exact bytes the LZ/BWT stage is handed for
+        // each block, appended with a one-line header -- for diffing an encoder
+        // block against the same block decoded out of the original's archive.
+        if (const char* dl = NZ_ENV("NZOPT_DUMP_LZIN")) {
+            static int blkno = 0;
+            char path[512];
+            std::snprintf(path, sizeof path, "%s.%d", dl, blkno++);
+            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(lz_in, 1, m, f); std::fclose(f); }
+        }
         std::vector<std::uint8_t> payload;
         // A dece block never reaches FUN_0808d7f0 in the reference: the
         // LZ-or-BWT flag it would set is left true, so the block goes LZ.
         const bool lz_kind = exe_on ? true : OptimumBlockIsLz(lz_in, m);
         if (lz_kind) {
-            std::vector<nzr::optimum::OptimumDecision> our_dec;
+            std::vector<typename OptimumDecisionOf<Engine>::type> our_dec;
             const char* const edp = NZ_ENV("NZOPT_DUMP_DEC");
             if (!co.EncodeBlockParsed(lz_in, m, payload, edp ? &our_dec : nullptr)) return false;
             if (edp != nullptr) {
@@ -12967,7 +13001,7 @@ static bool OptimumEncodeSegment(nzr::optimum::NzOptimumLzDecoder& co, std::uint
             seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
             seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
-            seg.push_back(0u);                       // param7
+            seg.push_back(OptimumDecisionOf<Engine>::kBwtParam7);   // param7
             put32(primary);                          // bwt_start_pos
             seg.push_back(static_cast<unsigned char>(p14_on ? 1u : 0u));
             if (p14_on) {
@@ -13016,11 +13050,13 @@ struct EncodeCodec {
     std::uint32_t co_window = 0;
     std::unique_ptr<nzr::lzpf_enc::State> lz;
     std::unique_ptr<nzr::lzhd_enc::State> cd;
-    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;   // the -co engine carries its own encode side
+    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;    // the -co engine carries its own encode side
+    std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO;  // ... and so does -cO's
     std::uint32_t co_block = 0x100000u;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
-             : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : "nz_optimum1";
+             : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
+             : "nz_optimum2";
     }
     // FUN_0805a110: the working set the Compressor line reports -- the window, the
     // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
@@ -13032,7 +13068,10 @@ struct EncodeCodec {
         // console's working set for the same archive, which comes to 13 MB: the
         // compressor also carries the match finder and the analysis object, and
         // splitting that difference into its terms waits on the block driver.
-        if (p0 == 5u) { (void)threads; (void)window; return 18ull << 20u; }
+        // -cO is -co plus exactly 16 MB at every budget the two were measured at
+        // (18/34, 59/75, 62/78 MB) -- its model object is ~0x1083000 bytes where
+        // the compact engine's is 0x3f700.
+        if (p0 == 5u || p0 == 6u) { (void)threads; (void)window; return (18ull + (p0 == 6u ? 16ull : 0ull)) << 20u; }
         if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
         if (p0 >= 3u) {
             // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
@@ -13159,6 +13198,11 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         // The finder has to exist before the first FeedWindow, or a leading BWT
         // block's bytes reach the window without reaching the hash.
         codec.co->EnableParser();
+        codec.co_window = static_cast<std::uint32_t>(window);
+    }
+    if (codec.p0 == 6u && !codec.cO) {
+        codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+        codec.cO->EnableParser();
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     // The pieces of this range, in the order the reader meets them, then the
@@ -13338,6 +13382,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 if (!OptimumEncodeSegment(*codec.co, codec.co_block, block.data(),
                                           static_cast<std::uint32_t>(block.size()), stream, payload,
                                           codec.co_window)) return false;
+            } else if (codec.p0 == 6u) {
+                if (!OptimumEncodeSegment(*codec.cO, codec.co_block, block.data(),
+                                          static_cast<std::uint32_t>(block.size()), stream, payload,
+                                          codec.co_window)) return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
@@ -13349,7 +13397,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 }
             }
         }
-        if (chunked && codec.p0 == 5u) {
+        if (chunked && codec.p0 >= 5u) {
             // already framed, one record per block
             out.insert(out.end(), payload.begin(), payload.end());
         } else {
@@ -13450,7 +13498,10 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         // block has been computed, and the block rule below consumes the
         // unfloored value -- which is 0 for any budget at or under 16 MB, and
         // that zero is what produces the 16/17-unit blocks seen down there.
-        case 5u: reduced = (budget > (16ull << 20u)) ? (budget - (16ull << 20u)) >> 1u : 0ull; break;
+        // -cO takes the SAME rule: window and block match -co's at every budget
+        // from 4 MB to 96 MB on the same input, despite the engine being 16 MB
+        // bigger (measured on both, nine budgets).
+        case 5u: case 6u: reduced = (budget > (16ull << 20u)) ? (budget - (16ull << 20u)) >> 1u : 0ull; break;
         default: reduced = budget; break;
     }
     if (reduced > 0xf0000000ull) reduced = 0xf0000000ull;
@@ -13511,7 +13562,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // Validated against the original on a grid of inputs (0.75 MB .. 48 MB, plus
     // deliberately non-representable sizes) crossed with budgets of 4 .. 512 MB.
     std::uint32_t co_block = 0x100000u;
-    if (p0 == 5u) {
+    if (p0 >= 5u) {
         const std::uint64_t w = window_raw;                      // NOT floored to 64 KB
         const std::uint32_t wm1 = static_cast<std::uint32_t>(w - 1u);   // w == 0 -> 0xffffffff
         unsigned e = 31u; while (e != 0u && ((wm1 >> e) & 1u) == 0u) --e;   // bsr
@@ -13651,6 +13702,7 @@ bool RunAddCanEncode(const CliOptions& options) {
     switch (options.compressor) {
         case Compressor::kNone: case Compressor::kLzpf: case Compressor::kLzpfLarge:
         case Compressor::kLzhd: case Compressor::kLzhds: case Compressor::kOptimum1:
+        case Compressor::kOptimum2:
             return true;
         default: return false;
     }
@@ -13672,10 +13724,15 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     // switches) refuse outright, which was the most visible 1:1 divergence left.
     if (options.compressor == Compressor::kOptimum1)
         return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
-    // The compressors not ported yet (-cO, -cc): refuse. The decode phase's stub
+    // -cO: the same driver with the large engine in the LZ slot -- every other
+    // stage of the block (the detector, the text transforms, param1/2/14/15,
+    // dece, the BWT bucket coder, the framing) is the one the two share.
+    if (options.compressor == Compressor::kOptimum2)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 6u);
+    // The compressor not ported yet (-cc): refuse. The decode phase's stub
     // writer labelled raw bytes with the codec's byte, an archive the original
     // cannot decode ("code 1024" on a -cD one); nothing is better.
-    os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF or -cd.\n";
+    os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF, -cd, -co or -cO.\n";
     return 1;
     {
         std::vector<SourceFile> sources;
