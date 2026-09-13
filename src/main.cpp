@@ -82,8 +82,7 @@ int main(int argc, char** argv) {
         case Command::kInfo:
             rc = nz::recon::RunInfo(std::cout); break;
         case Command::kW32c:
-            std::cout << "SFX creation is intentionally omitted in this reconstruction.\n";
-            rc = 2; break;
+            rc = nz::recon::RunAdd(options, std::cout); break;
         case Command::kHelp:
             nz::recon::PrintAdvancedHelp(std::cout); break;
         case Command::kUnknown:

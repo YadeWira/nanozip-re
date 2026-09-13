@@ -1104,10 +1104,28 @@ inline std::string NativeBytesFromPath(const fs::path& p) {
 
 fs::path ResolveArchivePath(const CliOptions& options) {
     fs::path out = PathFromNativeBytes(options.archive_path);
-    if (!options.no_filename_ext && out.extension() != ".nz") {
+    // The CLI already applied the original's suffix rule (".nz", or ".exe" for
+    // `w32c`); only a name with neither gets one here.
+    if (!options.no_filename_ext && out.extension() != ".nz" && out.extension() != ".exe") {
         out += ".nz";
     }
     return out;
+}
+
+// The directory holding this executable. `w32c` reads its self-extractor stub
+// from there -- measured with strace on the original, which opens
+// `<exedir>/nz_w32c.sfx`, not a path relative to the working directory.
+fs::path ExecutableDir() {
+    std::error_code ec;
+#if defined(_WIN32)
+    wchar_t buf[32768];
+    const DWORD n = ::GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+    if (n != 0u) return fs::path(std::wstring(buf, buf + n)).parent_path();
+#else
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) return self.parent_path();
+#endif
+    return fs::current_path(ec);
 }
 
 bool CopyFileData(std::istream& in, std::ostream* out, std::uint64_t size, std::uint32_t* out_checksum, ChecksumMode mode) {
@@ -13033,12 +13051,44 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
     unsigned threads = host;
     if (options.threads > 0u && options.threads < host) threads = options.threads;
     const auto mb = [](std::uint64_t b) { return ((b >> 19u) + 1u) >> 1u; };
-    const std::uint64_t rbuf = options.read_buffer_bytes ? options.read_buffer_bytes : (20ull << 20u);
-    const std::uint64_t wbuf = options.write_buffer_bytes ? options.write_buffer_bytes : (4ull << 20u);
+    // The automatic read-ahead is keyed on the CODEC and on nothing else: the
+    // same figure across -m4m..-m4g, across input sizes, and for every parallel
+    // variant. The write-behind is always 1 MB. Measured on all eight
+    // selectors; getting this from one codec and assuming the rest is exactly
+    // what a first pass here did, and the encode oracle caught it.
+    //   -cn -cf -cF -cd -cD (and -cdp/-cdP/-cDp/-cDP)   20 MB
+    //   -co -cO                                          4 MB
+    //   -cc                                              1 MB
+    const auto auto_read_mb = [](Compressor c) -> std::uint64_t {
+        switch (c) {
+            case Compressor::kOptimum1: case Compressor::kOptimum2: return 4ull;
+            case Compressor::kCm: return 1ull;
+            default: return 20ull;
+        }
+    };
+    // The write-behind is 4 MB only for the 20 MB family AND only when the
+    // command actually writes: `s` produces no file and reports 1 MB for the
+    // same codec. Everything else is 1 MB. (`-br` moves the read figure alone --
+    // `-br40m` gives 40+4 for -cn and 40+1 for -co, so the two are independent.)
+    const auto auto_write_mb = [&](Compressor c) -> std::uint64_t {
+        const bool writes = (options.command != Command::kSimulate);
+        return (writes && auto_read_mb(c) == 20ull) ? 4ull : 1ull;
+    };
+    // -br/-bw override them, and an explicit `-br0` means NO read buffer, which
+    // changes the line's shape rather than its numbers (measured:
+    // `IO-write-buffer: 1 MB`).
+    const std::uint64_t rbuf = options.read_buffer_set ? options.read_buffer_bytes
+                                                       : (auto_read_mb(options.compressor) << 20u);
+    const std::uint64_t wbuf = options.write_buffer_set ? options.write_buffer_bytes
+                                                        : (auto_write_mb(options.compressor) << 20u);
     if (workers > threads) os << "Warning: number of compressors set is higher than the number of threads!\n";
     os << "Archive: " << options.archive_path << '\n';
     os << "Threads: " << threads << ", memory: " << mb(options.memory_bytes) << " MB";   // the -m budget, half-up MB (-m256k prints 0)
-    if (threads > 1u) os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
+    if (threads > 1u) {
+        if (rbuf && wbuf)   os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
+        else if (rbuf)      os << ", IO-read-buffer: " << mb(rbuf) << " MB";
+        else if (wbuf)      os << ", IO-write-buffer: " << mb(wbuf) << " MB";
+    }
     os << '\n';
     if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
     for (unsigned k = 0; k < workers; ++k) {
@@ -13409,10 +13459,52 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     const std::uint64_t window_raw = LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
     std::uint64_t window = (window_raw < 0x10000u) ? 0x10000u : window_raw;   // the floor, applied LAST
 
+    // `s` (simulate) is `a` with the bytes thrown away: the original runs the
+    // whole compression and reports what it WOULD have produced, so the encoder
+    // below is untouched and only its sink changes. Nothing is created on disk,
+    // not even the parent directory.
+    const bool simulate = (options.command == Command::kSimulate);
+    // It has to COUNT, not just swallow: the footer reports what the archive
+    // would have been, and it reads that off tellp().
+    struct DiscardBuf : std::streambuf {
+        std::streamoff n = 0;
+        int_type overflow(int_type c) override { if (c != traits_type::eof()) ++n; return c; }
+        std::streamsize xsputn(const char*, std::streamsize k) override { n += k; return k; }
+        pos_type seekoff(off_type, std::ios_base::seekdir, std::ios_base::openmode) override {
+            return pos_type(n);
+        }
+    } discard_buf;
+    std::ostream discard(&discard_buf);
     const fs::path out_path = ResolveArchivePath(options);
-    if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
-    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
-    if (!out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
+    std::ofstream file_out;
+    if (!simulate) {
+        if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
+        file_out.open(out_path, std::ios::binary | std::ios::trunc);
+        if (!file_out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
+    }
+    std::ostream& out = simulate ? discard : static_cast<std::ostream&>(file_out);
+    // `w32c` writes the Windows self-extractor stub first and the ordinary
+    // archive after it -- measured byte for byte: the original's output is
+    // `nz_w32c.sfx` verbatim followed by exactly the archive `a` would write,
+    // and the footer counts both (22 000 -> 123 002 = 122 880 + 122).
+    if (options.command == Command::kW32c) {
+        const fs::path stub = ExecutableDir() / "nz_w32c.sfx";
+        std::ifstream sfx(stub, std::ios::binary);
+        if (!sfx) {
+            // Measured on the original with the stub removed: this line, nothing
+            // written, and it still exits 0.
+            ClearStatusLine(os);
+            os << "Cannot open: " << stub.string() << '\n';
+            if (!simulate) { file_out.close(); std::error_code rc; fs::remove(out_path, rc); }
+            return 1;
+        }
+        char buf[1 << 16];
+        while (sfx) {
+            sfx.read(buf, sizeof buf);
+            const std::streamsize got = sfx.gcount();
+            if (got > 0) out.write(buf, got);
+        }
+    }
     // -co block: FUN_0804cec0, 0x0804d63a .. 0x0804d787. Two reserves are taken
     // off the budget on top of a flat 1 MB, the rest is split five ways with the
     // window, and the result is rounded to a byte-float and then stepped once.
@@ -13446,9 +13538,11 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // as "Data corrupted while reading headers!", so remove the partial file
     // and say plainly what happened.
     const auto decline = [&]() -> int {
-        out.close();
-        std::error_code ec;
-        fs::remove(out_path, ec);
+        if (!simulate) {
+            file_out.close();
+            std::error_code ec;
+            fs::remove(out_path, ec);
+        }
         os << "This compressor cannot yet write this input; no archive was created.\n";
         return 1;
     };
@@ -13549,6 +13643,17 @@ std::vector<EncodeSource> CollectEncodeSources(const CliOptions& options, std::o
     if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = NativeBytesFromPath(PathFromNativeBytes(e.archive_name).filename());
     if (options.sort_mode != 0u) LegacyMergeSort(&found, options.sort_mode);
     return found;
+}
+
+// Which compressors RunAdd can actually write. `s` shares the dispatch, so it
+// only falls back to the estimate for the ones that cannot encode yet.
+bool RunAddCanEncode(const CliOptions& options) {
+    switch (options.compressor) {
+        case Compressor::kNone: case Compressor::kLzpf: case Compressor::kLzpfLarge:
+        case Compressor::kLzhd: case Compressor::kLzhds: case Compressor::kOptimum1:
+            return true;
+        default: return false;
+    }
 }
 
 int RunAdd(const CliOptions& options, std::ostream& os) {
@@ -13717,6 +13822,11 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
 }
 
 int RunSimulate(const CliOptions& options, std::ostream& os) {
+    // The original's `s` IS `a` with the output discarded -- same banner, same
+    // per-file progress, same "Compressed N into M" footer -- so route it
+    // through the same encoder rather than estimating anything. RunAdd's writer
+    // swaps its sink when options.command is kSimulate.
+    if (RunAddCanEncode(options)) return RunAdd(options, os);
     const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
 
     std::vector<SourceFile> sources;

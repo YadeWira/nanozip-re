@@ -206,8 +206,10 @@ CliOptions ParseCli(int argc, char** argv) {
             if (sw.size() < 2u) ok = false; else out.exclude_patterns.push_back(sw.substr(1));
         } else if (sw.compare(0, 2, "br") == 0) {
             ok = parse_size(sw.substr(2), &out.read_buffer_bytes);
+            if (ok) out.read_buffer_set = true;
         } else if (sw.compare(0, 2, "bw") == 0) {
             ok = parse_size(sw.substr(2), &out.write_buffer_bytes);
+            if (ok) out.write_buffer_set = true;
         } else if (sw[0] == 't') {
             const std::string v = sw.substr(1);
             if (!is_digits(v)) ok = false;
@@ -221,17 +223,15 @@ CliOptions ParseCli(int argc, char** argv) {
         if (!ok) { out.unknown_switches.push_back(token); return out; }
     }
 
-    if (out.command == Command::kW32c) {
-        // The original validates the archive name for `w32c` like any other
-        // command ("Error: Archive name missing..."); only the self-extractor
-        // build itself is missing here.
-        if (plain.empty()) {
-            out.show_usage = true;
-            out.error = "archive name missing";
-            return out;
-        }
-        out.archive_path = plain.front(); plain.erase(plain.begin());
+    // `s` (simulate) takes NO archive name: every plain argument is an input
+    // file and the archive line reads a fixed placeholder. Measured --
+    // `nz s x.nz t.txt` answers "No files found with x.nz" and then compresses
+    // t.txt, so x.nz was read as a FILE, and the banner says `Archive:
+    // <dummy>.nz` either way.
+    if (out.command == Command::kSimulate) {
+        out.archive_path = "<dummy>.nz";
         out.positional = plain;
+        if (out.positional.empty()) out.positional.push_back("*");
         return out;
     }
 
@@ -260,7 +260,10 @@ CliOptions ParseCli(int argc, char** argv) {
             const std::size_t n = std::strlen(suf);
             return a.size() >= n && a.compare(a.size() - n, n, suf) == 0;
         };
-        if (!ends(".nz") && !ends(".exe")) out.archive_path += ".nz";
+        // `w32c` appends `.exe`, every other command `.nz` -- measured:
+        // `w32c noext` -> `noext.exe`, while `w32c x.nz` keeps `x.nz`.
+        if (!ends(".nz") && !ends(".exe"))
+            out.archive_path += (out.command == Command::kW32c) ? ".exe" : ".nz";
     }
 
     // No file arguments: the original scans "*" (measured: `nz a new.nz` in a

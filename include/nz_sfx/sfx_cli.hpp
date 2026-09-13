@@ -77,6 +77,11 @@ struct CliOptions {
     // -t<n>: thread count to report (0 = auto); -br/-bw: IO buffer sizes in bytes
     // (0 = auto, not shown); -swapinout / -forceout: the benchmark helpers.
     unsigned threads = 0;
+    // Whether -br/-bw were given AT ALL, separately from their value: the
+    // original treats an explicit `-br0` as "no read buffer" and changes the
+    // banner line to `IO-write-buffer: N MB`, which a plain 0 cannot express.
+    bool read_buffer_set = false;
+    bool write_buffer_set = false;
     std::uint64_t read_buffer_bytes = 0;
     std::uint64_t memory_bytes = 512ull << 20;   // -m: the budget the console reports (default 512 MB)
     std::uint64_t write_buffer_bytes = 0;
