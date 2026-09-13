@@ -102,9 +102,30 @@ namespace optimum2 {
 // `-co` engine uses (confirmed shared -- both are the same `nz_cm`-family
 // dispatcher's subengine, differing only in which vtable/parameters the
 // container selected).
+// One parse decision of the large LZ engine -- the same shape the sibling
+// `-co` engine's OptimumDecision has (slot group 0 = a new distance, 1..4 =
+// rep0..rep3), kept as its own type so the two engines stay independent.
+struct Optimum2Decision {
+    std::uint8_t is_literal = 0;
+    std::uint8_t byte = 0;
+    std::uint8_t sg = 0;
+    std::uint32_t len = 0;
+    std::uint32_t dist = 0;
+};
+
 class NzOptimum2LzDecoder {
 public:
     explicit NzOptimum2LzDecoder(std::uint32_t window_capacity);
+
+    // The encoder's side of the same block loop: codes `dec` with the models in
+    // their current state (which advances exactly as a decode would) and
+    // range-codes the result into `payload`. The window receives the block's
+    // bytes as in a decode.
+    bool EncodeBlock(const Optimum2Decision* dec, std::size_t ndec, std::uint32_t out_size,
+                     std::vector<std::uint8_t>& payload);
+    // Decode-side: keep the decisions of the last DecodeBlock (for the recode check).
+    void RecordDecisions(bool on) { record_ = on; }
+    const std::vector<Optimum2Decision>& LastDecisions() const { return decisions_; }
 
     // Decode one block. `in`/`in_len` is this block's compressed payload
     // (the range-coder bitstream, starting at its very first byte -- no
@@ -116,6 +137,17 @@ public:
     // output on failure.
     bool DecodeBlock(const std::uint8_t* in, std::uint32_t in_len,
                       std::uint8_t* out, std::uint32_t out_size);
+
+private:
+    // The block loop, written once and instantiated over the bit source: a
+    // decoding IO reads each bit from the range decoder, an encoding one codes
+    // the bit it was handed. Everything between the bit calls -- every model
+    // read, update and symbol assembly -- is therefore literally the same code
+    // in both directions. See nz_optimum_lz.cpp for the sibling that does this.
+    template <class IO>
+    bool RunBlock(IO& io, const Optimum2Decision* dec, std::size_t ndec,
+                  std::uint8_t* out, std::uint32_t out_size);
+public:
 
     // Feed already-known output bytes into the window WITHOUT decoding, so a
     // later block's matches can reference them. Needed because in the original
@@ -163,6 +195,8 @@ private:
     };
 
     Ring ring_;
+    std::vector<Optimum2Decision> decisions_;
+    bool record_ = false;
     std::vector<std::uint8_t> mem_;  // the "large" subengine's ~0x1083000-byte state
 };
 

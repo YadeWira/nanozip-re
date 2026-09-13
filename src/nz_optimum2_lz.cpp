@@ -11,6 +11,7 @@
 #define O2_DBG_ENV(name) static_cast<const char*>(nullptr)
 #endif
 #include <cstdio>
+#include <memory>
 #include <cstdlib>
 // Native linux32 `-cO` (nz_optimum2) LZ/CM engine. See include/nz_optimum2_lz.h
 // for the architecture summary and RE provenance. This file is a careful,
@@ -276,24 +277,75 @@ struct RangeDecoder {
     }
 };
 
+// The block loop is one template over the BIT SOURCE, exactly as the `-co`
+// sibling does it (nz_optimum_lz.cpp): decoding reads the bit from the range
+// decoder and ignores the `intended` argument, encoding queues
+// (probability << 2 | intended) and RETURNS the intended bit -- so every line
+// of symbol assembly between the bit calls is written once and is identical in
+// both directions, which is what keeps the model updates symmetric by
+// construction rather than by review.
+struct DecodeIO {
+    RangeDecoder rc;
+    std::uint32_t Bit(std::uint32_t prob, std::uint32_t) { return rc.DecodeBit(prob); }
+    std::uint32_t RawBit(std::uint32_t) { return rc.DecodeRawBit(); }
+    std::uint32_t Lo() const { return rc.lo; }
+    std::uint32_t Hi() const { return rc.hi; }
+    std::uint32_t Code() const { return rc.code; }
+};
+struct EncodeIO {
+    std::vector<std::uint16_t>* q = nullptr;
+    std::uint32_t Bit(std::uint32_t prob, std::uint32_t intended) {
+        q->push_back(static_cast<std::uint16_t>((prob << 2) | (intended & 1u)));
+        return intended & 1u;
+    }
+    std::uint32_t RawBit(std::uint32_t intended) { return Bit(0x800u, intended); }
+    std::uint32_t Lo() const { return 0; }
+    std::uint32_t Hi() const { return 0; }
+    std::uint32_t Code() const { return 0; }
+};
+// The encoding side's second pass: the same range coder run forward over the
+// queued (probability, bit) pairs, then the single flush byte. Identical to the
+// `-co` sibling's RangeEncodePairs -- both engines drive the same coder.
+void RangeEncodePairs(const std::vector<std::uint16_t>& q, std::vector<std::uint8_t>& out) {
+    std::uint32_t lo = 0, hi = 0xffffffffu;
+    for (std::uint16_t e : q) {
+        const std::uint32_t prob = e >> 2, bit = e & 1u;
+        const std::uint32_t mid = ((hi - lo) >> 12) * prob + lo;
+        if (bit) hi = mid; else lo = mid + 1u;
+        while ((hi ^ lo) < 0x1000000u) {
+            out.push_back(static_cast<std::uint8_t>(hi >> 24));
+            hi = (hi << 8) | 0xffu;
+            lo <<= 8;
+        }
+    }
+    out.push_back(static_cast<std::uint8_t>(hi >> 24));
+}
+inline std::uint32_t BitLenU(std::uint32_t v) { std::uint32_t n = 0; while (v) { ++n; v >>= 1; } return n; }
+
 // Adaptive bit decode against a 16-bit direct-probability cell (same shape
 // as nz_optimum_lz.cpp's DecodeAdaptiveKSB).
-std::uint32_t DecodeAdaptiveKSB(RangeDecoder& rc, std::uint8_t* mem, int off,
-                                 std::uint32_t K, std::uint32_t S, bool bias) {
+template <class IO>
+std::uint32_t DecodeAdaptiveKSB(IO& io, std::uint8_t* mem, int off,
+                                 std::uint32_t K, std::uint32_t S, bool bias,
+                                 std::uint32_t intended) {
     std::uint32_t cell = Rd16(mem, off);
     std::uint32_t prob = cell >> 4;
     if (bias) prob = prob + ((prob < 0x800u) ? 1u : 0u);
-    std::uint32_t bit = rc.DecodeBit(prob);
+    std::uint32_t bit = io.Bit(prob, intended);
     std::uint32_t upd = (std::uint32_t)((std::int32_t)((K - cell) + bit * 0x10000u) >> S) + cell;
     Wr16(mem, off, (std::uint16_t)upd);
     return bit;
 }
-inline std::uint32_t DecodeAdaptiveKS(RangeDecoder& rc, std::uint8_t* mem, int off,
-                                       std::uint32_t K, std::uint32_t S) {
-    return DecodeAdaptiveKSB(rc, mem, off, K, S, /*bias=*/false);
+template <class IO>
+inline std::uint32_t DecodeAdaptiveKS(IO& io, std::uint8_t* mem, int off,
+                                       std::uint32_t K, std::uint32_t S,
+                                       std::uint32_t intended) {
+    return DecodeAdaptiveKSB(io, mem, off, K, S, /*bias=*/false, intended);
 }
-inline std::uint32_t DecodeAdaptive16(RangeDecoder& rc, std::uint8_t* mem, int off) {
-    return DecodeAdaptiveKSB(rc, mem, off, 0x10u, 5u, /*bias=*/true);
+template <class IO>
+inline std::uint32_t DecodeAdaptive16(IO& io, std::uint8_t* mem, int off,
+                                      std::uint32_t intended) {
+    return DecodeAdaptiveKSB(io, mem, off, 0x10u, 5u, /*bias=*/true, intended);
 }
 
 // Current ring position, for the rare-branch profiler only (the mixer lambda is
@@ -367,7 +419,62 @@ std::uint32_t NzOptimum2LzDecoder::Ring::EnsureHeadroom(std::uint32_t needed) {
 // DecodeBlock -- transcription of FUN_080a5d90.
 // ---------------------------------------------------------------------------
 bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_len,
-                                       std::uint8_t* out, std::uint32_t out_size) {
+                                      std::uint8_t* out, std::uint32_t out_size) {
+    // NZO2_RECODE=1: after the decode, re-encode the recorded decisions from the
+    // state the block STARTED in and compare with the input -- the encoder's
+    // mirror check (the `-co` sibling's NZOPT_RECODE, same shape).
+    static const bool recode = (NZ_ENV("NZO2_RECODE") != nullptr);
+    const bool want_dec = recode || (NZ_ENV("NZO2_DUMP_DECISIONS") != nullptr);
+    std::unique_ptr<NzOptimum2LzDecoder> before;
+    if (want_dec) { record_ = true; decisions_.clear(); }
+    if (recode) before = std::unique_ptr<NzOptimum2LzDecoder>(new NzOptimum2LzDecoder(*this));
+    DecodeIO io;
+    io.rc.Init(in, in_len);
+    const bool ok = RunBlock(io, nullptr, 0u, out, out_size);
+    if (const char* dd = NZ_ENV("NZO2_DUMP_DECISIONS")) {
+        static int blk = 0;
+        std::fprintf(stderr, "[DEC2] block=%d out_size=%u in_len=%u ndec=%zu\n",
+                     blk++, out_size, in_len, decisions_.size());
+        if (*dd == 'v') for (std::size_t i = 0; i < decisions_.size(); ++i) {
+            const Optimum2Decision& d = decisions_[i];
+            if (d.is_literal) std::fprintf(stderr, "[DEC2] %zu lit %02x\n", i, d.byte);
+            else std::fprintf(stderr, "[DEC2] %zu match sg=%u len=%u dist=%u\n", i, d.sg, d.len, d.dist);
+        }
+    }
+    if (recode && ok && before) {
+        std::vector<std::uint8_t> payload;
+        const bool eok = before->EncodeBlock(decisions_.data(), decisions_.size(), out_size, payload);
+        std::size_t first = 0;
+        while (first < payload.size() && first < in_len && payload[first] == in[first]) ++first;
+        const bool same = eok && payload.size() == in_len && first == in_len;
+        std::fprintf(stderr, "[RECODE2] out=%u decisions=%zu in_len=%u recoded=%zu -> %s",
+                     out_size, decisions_.size(), in_len, payload.size(), same ? "IDENTICAL" : "DIFF");
+        if (!same) std::fprintf(stderr, " first diff at %zu", first);
+        std::fprintf(stderr, "\n");
+    }
+    return ok;
+}
+
+bool NzOptimum2LzDecoder::EncodeBlock(const Optimum2Decision* dec, std::size_t ndec,
+                                      std::uint32_t out_size, std::vector<std::uint8_t>& payload) {
+    EncodeIO io;
+    std::vector<std::uint16_t> q;
+    io.q = &q;
+    // the encode writes the block's bytes into the ring exactly as a decode does;
+    // `tmp` receives the copy-out the decode would have made
+    std::vector<std::uint8_t> tmp(static_cast<std::size_t>(out_size) + 16u);
+    const bool saved_record = record_;
+    record_ = false;
+    const bool ok = RunBlock(io, dec, ndec, tmp.data(), out_size);
+    record_ = saved_record;
+    if (!ok) return false;
+    RangeEncodePairs(q, payload);
+    return true;
+}
+
+template <class IO>
+bool NzOptimum2LzDecoder::RunBlock(IO& io, const Optimum2Decision* dec, std::size_t ndec,
+                                   std::uint8_t* out, std::uint32_t out_size) {
     if (out_size == 0) return true;
 
     if (const char* dp = O2_DBG_ENV("NZO2_DUMP_MEM")) {
@@ -385,8 +492,16 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      mem_.size(), nm);
     }
 
-    RangeDecoder rc;
-    rc.Init(in, in_len);
+
+    // The decision cursor: on the encode side every bit below is coded from
+    // `cur`; on the decode side `dec` is null and every `intended` argument is
+    // ignored by DecodeIO, so the same lines read the bit instead.
+    std::size_t di = 0;
+    Optimum2Decision cur{};
+    if (dec != nullptr && ndec != 0) cur = dec[0];
+    auto next_dec = [&]() {
+        if (dec != nullptr) { ++di; cur = (di < ndec) ? dec[di] : Optimum2Decision{}; }
+    };
 
     std::uint32_t rep[4] = {1, 1, 1, 1};
     std::uint8_t* mem = mem_.data();
@@ -406,7 +521,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
     // "current tree position" scalars).
     auto MixerBit = [&](int ctxP, int ctx2, std::uint32_t ctx1p, int ctx3,
                          std::uint32_t ctx6s, std::uint32_t ctx7s, std::uint32_t ctxC,
-                         std::uint32_t* outPFinal) -> std::uint32_t {
+                         std::uint32_t intended, std::uint32_t* outPFinal) -> std::uint32_t {
         ++g_mixbits;
         std::uint8_t stateP = Rd8(mem, ctxP);
         int modele0Off = 0x1021900 + static_cast<int>(stateP) * 4;
@@ -517,9 +632,9 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
         }
 #endif
 #ifdef NZOPT_DEBUG
-        const std::uint32_t rclo_ = rc.lo, rchi_ = rc.hi, rccode_ = rc.code;
+        const std::uint32_t rclo_ = io.Lo(), rchi_ = io.Hi(), rccode_ = io.Code();
 #endif
-        std::uint32_t bit = rc.DecodeBit(pFinal);
+        std::uint32_t bit = io.Bit(pFinal, intended);
 #ifdef NZOPT_DEBUG
         static const char* const mixfrom_ = O2_DBG_ENV("NZO2_MIXFROM");
         static const long mixfrom = mixfrom_ ? atol(mixfrom_) : -1;
@@ -852,7 +967,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      (((static_cast<std::uint32_t>(apm2Lo) * (0x1000u - frac2) +
                         frac2 * static_cast<std::uint32_t>(apm2Hi)) >> 16) * 3u)) >> 2;
 
-                std::uint32_t bit = rc.DecodeBit(mixedP + ((mixedP < 0x800u) ? 1u : 0u));
+                std::uint32_t bit = io.Bit(mixedP + ((mixedP < 0x800u) ? 1u : 0u), cur.is_literal ? 1u : 0u);
 
                 Wr8(mem, 0x1040480 + dispIdx,
                     static_cast<std::uint8_t>((static_cast<std::int32_t>((4 - dstate) + bit * 0x100) >> 3) + dstate));
@@ -862,7 +977,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      static_cast<std::uint16_t>((static_cast<std::int32_t>(bit * 0x1001e - apm2Old) >> 5) + apm2Old));
 
                 g_rare_pos = local_54;
-                if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "pos=%u mixbits=%ld dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, g_mixbits, bit, mixedP, rc.lo, rc.hi, rc.code);
+                if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "pos=%u mixbits=%ld dispatch_bit=%u mixedP=%u lo=%#x hi=%#x code=%#x\n", local_54, g_mixbits, bit, mixedP, io.Lo(), io.Hi(), io.Code());
                 if (bit != 0) break;  // literal: fall through to mixer below
 
                 // ===================== MATCH DECODE =====================
@@ -883,7 +998,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 // counter-driven addressing scheme.
                 int unit_idx = static_cast<int>((local_9c * 0x10u + (local_81 & 0xfu)) * 8u);
                 Wr16(mem, 0x1040440, static_cast<std::uint16_t>(unit_idx));
-                std::uint32_t b1 = DecodeAdaptive16(rc, mem, 0x103f400 + (unit_idx & 0x3f8) * 2);
+                std::uint32_t b1 = DecodeAdaptive16(io, mem, 0x103f400 + (unit_idx & 0x3f8) * 2,
+                                                    cur.sg == 0u ? 1u : 0u);
                 Wr16(mem, 0x1040440, static_cast<std::uint16_t>(Rd16(mem, 0x1040440) + 1));
                 std::uint32_t slot_group = 0;
                 if (b1 == 0) {
@@ -893,7 +1009,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         std::uint32_t counter = Rd16(mem, 0x1040440);
                         std::uint32_t idx = ((counter & 7u) == 1u) ? (counter & 0x7ffu) : counter;
                         int cellOff = 0x103f400 + static_cast<int>(idx) * 2;
-                        bitk = DecodeAdaptive16(rc, mem, cellOff);
+                        bitk = DecodeAdaptive16(io, mem, cellOff, (cur.sg == sg) ? 1u : 0u);
                         sg = sg + (1u - bitk);
                         Wr16(mem, 0x1040440, static_cast<std::uint16_t>(Rd16(mem, 0x1040440) + 1));
                     } while (sg != 4u && bitk == 0u);
@@ -906,6 +1022,11 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                     rep0_persist = (local_a8_rep == 0) ? 0x10u : 0u;
                 }
 
+                // the encoder's view of the length code: v = len - 2, raw = its
+                // bit length (1 for v < 2), U1 = raw - 1 bits follow the leading one
+                const std::uint32_t vE = (cur.len >= 2u) ? cur.len - 2u : 0u;
+                const std::uint32_t rawE = (vE < 2u) ? 1u : BitLenU(vE);
+                const std::uint32_t U1E = rawE - 1u;
                 std::uint32_t raw = 0;
                 {
                     int lenOff = 0x103ae40 + static_cast<int>(rep0_persist) * 2;
@@ -923,7 +1044,7 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         // bound, so declining here cannot reject anything the
                         // original would have decoded.
                         if (coff < 0 || static_cast<std::size_t>(coff) + 2u > mem_.size()) return false;
-                        b = DecodeAdaptiveKS(rc, mem, coff, 0x10u, 5u);
+                        b = DecodeAdaptiveKS(io, mem, coff, 0x10u, 5u, (raw + 1u < rawE) ? 1u : 0u);
                         raw += 1;
                     } while (b != 0);
                 }
@@ -948,14 +1069,15 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                     for (std::uint32_t i = 0; i < nbits; i++) {
                         std::uint32_t iVar9u = persisted + U1 * 32u + 0x60u;
                         int cellOff = 0x103ae40 + static_cast<int>(iVar9u) * 2;
-                        std::uint32_t bit2 = DecodeAdaptiveKS(rc, mem, cellOff, 8u, 4u);
+                        std::uint32_t bit2 = DecodeAdaptiveKS(io, mem, cellOff, 8u, 4u,
+                            (rawE == 1u) ? (vE & 1u) : ((vE >> ((U1E - 1u - i) & 31u)) & 1u));
                         persisted = bit2 + persisted * 2u;
                         local_a4v = bit2 + local_a4v * 2u;
                     }
                 }
                 if (raw >= 5u) {
                     for (std::uint32_t i = 0; i < U1 - 4u; i++) {
-                        std::uint32_t bit2 = rc.DecodeRawBit();
+                        std::uint32_t bit2 = io.RawBit((vE >> ((U1E - 5u - i) & 31u)) & 1u);
                         local_a4v = bit2 + local_a4v * 2u;
                     }
                 }
@@ -964,10 +1086,15 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 if (local_94 < length) { if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "FAIL@length pos=%u local_94=%u length=%u\n", local_54, local_94, length); failed = true; break; }
 
                 if (slot_group == 0) {
-                    if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "  entering slot-tree: lo=%#x hi=%#x code=%#x\n", rc.lo, rc.hi, rc.code);
+                    if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "  entering slot-tree: lo=%#x hi=%#x code=%#x\n", io.Lo(), io.Hi(), io.Code());
                     std::uint32_t length_code = std::min<std::uint32_t>(local_a4v, 15u);
                     std::uint8_t lengthBucket = nzr::optimum::OptimumDat081724d0()[length_code];
                     std::uint32_t rowBias = static_cast<std::uint32_t>(lengthBucket) << 5;
+                    // the encoder's view: D = dist - 1; slot = its bit length - 1
+                    // (0 for D < 2); the tree codes slot ^ 0x1f, MSB-first
+                    const std::uint32_t DE = (cur.dist >= 1u) ? cur.dist - 1u : 0u;
+                    const std::uint32_t slotE = (DE < 2u) ? 0u : BitLenU(DE) - 1u;
+                    const std::uint32_t slotAccE = slotE ^ 0x1fu;
                     std::uint32_t treepos = 1;
                     std::uint32_t slotAcc = 0;
                     for (int i = 0; i < 5; i++) {
@@ -984,7 +1111,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         std::uint32_t combined =
                             (prob1 + 2u +
                              (((static_cast<std::uint32_t>(cell2hi) + 1u + static_cast<std::uint32_t>(cell2lo)) >> 5) * 3u)) >> 2;
-                        std::uint32_t bit2 = rc.DecodeBit(combined + ((combined < 0x800u) ? 1u : 0u));
+                        std::uint32_t bit2 = io.Bit(combined + ((combined < 0x800u) ? 1u : 0u),
+                                                    (slotAccE >> ((4u - static_cast<std::uint32_t>(i)) & 31u)) & 1u);
                         if (O2_DBG_ENV("NZOPT2_TRACE")) fprintf(stderr, "    slotbit[%d] treepos_before=%u cell1Off=%#x cell1=%u prob1=%u iVar26u=%u cell2lo=%u cell2hi=%u combined=%u bit=%u\n",
                                                               i, treepos, cell1Off, cell1, prob1, iVar26u, cell2lo, cell2hi, combined, bit2);
 
@@ -1011,7 +1139,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         for (std::uint32_t i = 0; i < n1; i++) {
                             std::uint32_t iVar9u = t1pos + 0xf80u + slot * 0x60u;
                             int cellOff = 0x103b9c0 + static_cast<int>(iVar9u) * 2;
-                            std::uint32_t bit2 = DecodeAdaptiveKS(rc, mem, cellOff, 8u, 4u);
+                            std::uint32_t bit2 = DecodeAdaptiveKS(io, mem, cellOff, 8u, 4u,
+                                (slot < 2u) ? (DE & 1u) : ((DE >> ((slot - 1u - i) & 31u)) & 1u));
                             t1pos = bit2 + t1pos * 2u;
                             acc = bit2 + acc * 2u;
                         }
@@ -1025,7 +1154,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         std::uint32_t t2pos = 1;
                         for (std::uint32_t i = 0; i < n2; i++) {
                             int cellOff = kTier2AlignOff + static_cast<int>(t2pos) * 2;
-                            std::uint32_t bit2 = DecodeAdaptiveKSB(rc, mem, cellOff, 0x10u, 5u, /*bias=*/false);
+                            std::uint32_t bit2 = DecodeAdaptiveKSB(io, mem, cellOff, 0x10u, 5u, /*bias=*/false,
+                                                                  (DE >> (i & 31u)) & 1u);
                             t2pos = bit2 + t2pos * 2u;
                             acc |= bit2 << i;
                         }
@@ -1059,7 +1189,8 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                         std::uint32_t hi_bits = 0;
                         for (std::uint32_t i = 0; i < n3; i++) {
                             int cellOff = 0x103c0c0 + static_cast<int>(slot - 6u) * 0xc0 + static_cast<int>(i) * 2;
-                            std::uint32_t bit2 = DecodeAdaptiveKS(rc, mem, cellOff, 0x20u, 6u);
+                            std::uint32_t bit2 = DecodeAdaptiveKS(io, mem, cellOff, 0x20u, 6u,
+                                                                 ((DE >> 4u) >> ((n3 - 1u - i) & 31u)) & 1u);
                             hi_bits = (hi_bits << 1) | bit2;
                         }
                         std::uint32_t low4 = acc & 0xfu;
@@ -1129,6 +1260,10 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 std::uint8_t histLo = base[local_54 + length - 1u];
                 local_a4 = (static_cast<std::uint32_t>(histHi) << 8) | histLo;
 
+                if (record_)
+                    decisions_.push_back(Optimum2Decision{0u, 0u, static_cast<std::uint8_t>(slot_group),
+                                                          length, distance});
+                next_dec();
                 local_54 += length;
                 local_94 -= length;
                 if (local_94 == 0) goto chunk_done;
@@ -1180,13 +1315,17 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                 for (;;) {
                     std::uint32_t pFinal1;
                     std::uint32_t bit1 = MixerBit(ctxP_off, ctx2_off, ctx1_pos, ctx3_off,
-                                                   ctx6_seed, ctx7_seed, ctxC_idx, &pFinal1);
+                                                   ctx6_seed, ctx7_seed, ctxC_idx,
+                                                   (static_cast<std::uint32_t>(cur.byte) >> ((7u - 2u * (4u - bitsLeft)) & 31u)) & 1u,
+                                                   &pFinal1);
                     AdvanceAfterBit(bit1, pFinal1, ctxP_off, ctx2_off, ctx1_pos, ctx3_off,
                                     ctx6_seed, ctx7_seed, ctxC_idx);
 
                     std::uint32_t pFinal2;
                     std::uint32_t bit2 = MixerBit(ctxP_off, ctx2_off, ctx1_pos, ctx3_off,
-                                                   ctx6_seed, ctx7_seed, ctxC_idx, &pFinal2);
+                                                   ctx6_seed, ctx7_seed, ctxC_idx,
+                                                   (static_cast<std::uint32_t>(cur.byte) >> ((6u - 2u * (4u - bitsLeft)) & 31u)) & 1u,
+                                                   &pFinal2);
 
                     bitsLeft -= 1;
                     byteAcc = bit2 + (bit1 + byteAcc * 2u) * 2u;
@@ -1198,6 +1337,9 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
 
                 local_a4 = byteAcc;
                 if (O2_DBG_ENV("NZOPT2_TRACE_LIT")) fprintf(stderr, "LIT pos=%u byte=%#x (%c)\n", local_54, byteAcc, (byteAcc>=32&&byteAcc<127)?(char)byteAcc:'.');
+                if (record_)
+                    decisions_.push_back(Optimum2Decision{1u, static_cast<std::uint8_t>(byteAcc), 0u, 0u, 0u});
+                next_dec();
                 base[local_54] = static_cast<std::uint8_t>(byteAcc);
                 local_54 += 1;
                 local_94 -= 1;
