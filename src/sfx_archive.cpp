@@ -12240,7 +12240,18 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
 
 // One argument of `a`: split at the last slash, scan. "." and ".." as the
 // pattern name the directory itself (`a -r x.nz .` stores names without "./").
-void LegacyScanArgument(const std::string& arg, bool recurse, std::vector<EncodeSource>* out) {
+void LegacyScanArgument(const std::string& arg_in, bool recurse, std::vector<EncodeSource>* out) {
+    // On Windows the separator a user types is '\\', and the original takes it:
+    // `nz a out.nz in\001.bin` stores the entry as `in/001.bin`. This scan splits
+    // on '/' alone, so a backslash path matched nothing and `a` answered "No files
+    // found with in\001.bin" -- every codec, since the encoder first shipped.
+    // Converting here fixes the scan AND the stored name in one step, because the
+    // name is built from the same string. Windows only: on a unix filesystem a
+    // backslash is an ordinary character in a filename.
+    std::string arg = arg_in;
+#ifdef _WIN32
+    for (char& c : arg) if (c == '\\') c = '/';
+#endif
     std::string dir_part, pattern = arg;
     const std::size_t slash = arg.find_last_of('/');
     if (slash != std::string::npos) { dir_part = arg.substr(0, slash); pattern = arg.substr(slash + 1u); if (dir_part.empty()) dir_part = "/"; }
