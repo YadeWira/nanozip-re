@@ -1180,6 +1180,54 @@ static void CM_Decode(CM* cm, const uint8_t* in, uint32_t in_size, uint8_t* out,
 }
 
 // ---------------------------------------------------------------------------
+// CM_Encode -- the mirror of CM_Decode.
+//
+// CM_Input_Bit never reads the arithmetic coder: it takes the bit and updates
+// the model. So the encoder is the decode loop with the range decoder replaced
+// by a range CODER fed the bit the output byte actually carries, MSB first (the
+// order NzCmFeedByte already uses). The coder itself is ReadHighPrec run
+// forward -- the same 64-bit mid-point, the same renormalisation, the top byte
+// of `hi` emitted on each shift because the two ends agree there by then.
+// ---------------------------------------------------------------------------
+
+struct ArithmeticEncoder {
+    uint32_t range_hi_ = 0xffffffffu, range_lo_ = 0;
+    std::vector<uint8_t>* out_ = nullptr;
+
+    void Renormalize() {
+        while ((range_lo_ ^ range_hi_) < 0x1000000u) {
+            out_->push_back((uint8_t)(range_hi_ >> 24));
+            range_lo_ <<= 8;
+            range_hi_ = (range_hi_ << 8) + 0xff;
+        }
+    }
+    void WriteHighPrec(uint32_t model, uint32_t bit) {
+        uint32_t compare = range_lo_ + (uint32_t)(((range_hi_ - range_lo_) * (uint64_t)model) >> 12);
+        if (bit) range_hi_ = compare; else range_lo_ = compare + 1u;
+        Renormalize();
+    }
+    // ONE byte, not four: the decoder reads past the end as zeros, and the top
+    // byte of `hi` is enough to keep every pending decision on the right side.
+    // Measured -- a four-byte flush made every payload exactly three bytes too
+    // long with the first 394 identical.
+    void Flush() { out_->push_back((uint8_t)(range_hi_ >> 24)); }
+};
+
+static void CM_Encode(CM* cm, const uint8_t* data, uint32_t size, std::vector<uint8_t>* payload) {
+    ArithmeticEncoder aenc;
+    aenc.out_ = payload;
+    for (uint32_t i = 0; i < size; i++) {
+        const uint32_t b = data[i];
+        for (int k = 7; k >= 0; --k) {
+            const uint32_t bit = (b >> k) & 1u;
+            aenc.WriteHighPrec(cm->next_probability, bit);
+            CM_Input_Bit(cm, bit);
+        }
+    }
+    aenc.Flush();
+}
+
+// ---------------------------------------------------------------------------
 // CM_ModelG_Reset
 // ---------------------------------------------------------------------------
 
@@ -1425,6 +1473,11 @@ void NzCmSetBitBudget(NzCmDecoder* cm, uint64_t bits) {
 void NzCmDecode(NzCmDecoder* cm, const uint8_t* in, uint32_t in_size,
                 uint8_t* out, uint32_t out_size) {
     CM_Decode(reinterpret_cast<CM*>(cm), in, in_size, out, out_size);
+}
+
+void NzCmEncode(NzCmDecoder* cm, const uint8_t* data, uint32_t size,
+                std::vector<uint8_t>* payload) {
+    CM_Encode(reinterpret_cast<CM*>(cm), data, size, payload);
 }
 
 void NzCmFeedByte(NzCmDecoder* cm, uint8_t byte) {

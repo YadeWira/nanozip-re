@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
 project(nanozip_reconstruction LANGUAGES CXX)
 
+# Without this a plain `cmake -B build` emits NO optimisation flag at all, and
+# the binary comes out four to five times slower than the released one (measured:
+# 27.1 s against 5.7 s decoding the same 29 MB `-cO` archive, where the original
+# takes 5.7 s). Reported from the field by someone who built the 32-bit target
+# himself and found it 4x slower than the published .exe. An explicit
+# -DCMAKE_BUILD_TYPE=... on the command line still wins.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

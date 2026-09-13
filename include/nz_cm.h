@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 
 void NzCmInitAll();
 
@@ -17,6 +18,14 @@ void NzCmReset(NzCmDecoder* cm);
 
 void NzCmDecode(NzCmDecoder* cm, const uint8_t* in, uint32_t in_size,
                 uint8_t* out, uint32_t out_size);
+
+// The same model driven the other way: code `size` bytes of `data` with the
+// probabilities the decoder would have used, advancing the model exactly as a
+// decode of the result would. Nothing but the coder's direction differs -- the
+// prediction never reads the arithmetic coder, so the two sides stay in step by
+// construction. Appends the payload to `payload`.
+void NzCmEncode(NzCmDecoder* cm, const uint8_t* data, uint32_t size,
+                std::vector<uint8_t>* payload);
 
 // Feeds a single already-known byte through the CM context/prediction model
 // (the same per-bit update path CM_Decode uses) WITHOUT consuming any

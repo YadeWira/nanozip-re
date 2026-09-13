@@ -8637,6 +8637,10 @@ static bool TryDecodeLegacyCm(
     // rather than by the chunk count a corrupt header can invent.
     NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
                              (1u << 20));
+    // The encoder-direction mirror for NZCC_RECODE (owned here, freed with cm).
+    NzCmDecoder* cm_mirror = nullptr;
+    if (NZ_ENV("NZCC_RECODE") != nullptr)
+        cm_mirror = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
     out_data->Reserve(legacy.total_data_size);
     bool ok = true;
     std::size_t pos = 0;
@@ -8966,6 +8970,7 @@ static bool TryDecodeLegacyCm(
             for (std::uint32_t i = 0; i < payload_size; ++i) {
                 NzCmFeedByte(cm, payload[i]);
             }
+            if (cm_mirror) for (std::uint32_t i = 0; i < payload_size; ++i) NzCmFeedByte(cm_mirror, payload[i]);
             work.assign(payload, payload + payload_size);
             cur_size = payload_size;
             stgmark("payload", payload, payload_size);
@@ -8976,6 +8981,21 @@ static bool TryDecodeLegacyCm(
             cur_size = out_size;
             stgmark("payload", payload, payload_size);
             stgmark("cm", work.data(), cur_size);
+            // NZCC_RECODE=1: a second model walking the same blocks in the encoder's
+            // direction. It has seen exactly what the decoder's has, so coding this
+            // block's own output must reproduce the payload byte for byte.
+            if (cm_mirror) {
+                if (decr_param == 1u) NzCmReset(cm_mirror);
+                std::vector<std::uint8_t> again;
+                NzCmEncode(cm_mirror, work.data(), cur_size, &again);
+                std::size_t fd = 0;
+                while (fd < again.size() && fd < payload_size && again[fd] == payload[fd]) ++fd;
+                const bool same = (again.size() == payload_size) && fd == payload_size;
+                std::fprintf(stderr, "[RECODECC] out=%u in_len=%u recoded=%zu -> %s",
+                             cur_size, payload_size, again.size(), same ? "IDENTICAL" : "DIFF");
+                if (!same) std::fprintf(stderr, " first diff at %zu", fd);
+                std::fprintf(stderr, "\n");
+            }
         }
 
         const std::uint64_t prev_size = out_data->size();
@@ -9236,6 +9256,7 @@ static bool TryDecodeLegacyCm(
     }
 
     NzCmDestroy(cm);
+    if (cm_mirror) NzCmDestroy(cm_mirror);
 
     if (NZ_ENV("NZOPT_TRACE_TDO")) {
         fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%llu total_data_size=%llu\n",
@@ -12736,6 +12757,18 @@ static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
             if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, true, false)) {
                 tbuf.assign(src, src + n);
                 tbuf.resize(n + 0x2000u, 0);
+                // The number step's entropy estimate reads FOUR bytes past the
+                // range it measures, and for the block's second half that lands
+                // just past the block -- where the original's buffer holds the
+                // bytes that follow in the input, not zeros. One block of one
+                // corpus file turns on it (4839 against our 4822).
+                {
+                    const std::size_t after = static_cast<std::size_t>(off) + n;
+                    if (after < len) {
+                        const std::size_t tail = std::min<std::size_t>(0x2000u, len - after);
+                        std::memcpy(tbuf.data() + n, reinterpret_cast<const std::uint8_t*>(data) + after, tail);
+                    }
+                }
                 tmp.assign(n + 0x2000u, 0);
                 std::uint8_t* pa = tbuf.data();
                 std::uint8_t* pb = tmp.data();
@@ -13045,6 +13078,166 @@ static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
     return true;
 }
 
+// The `-cc` block writer. The framing, the detector, the text pipeline, dece and
+// param1/param2 are the ones the optimum family already writes -- what differs is
+// the middle: there is no LZ-or-BWT decision and no BWT at all, the block's bytes
+// go straight through the CM, and a block the CM cannot shrink is STORED
+// (param6 == 0, no size18 field) rather than declined. Coding a block and then
+// storing it anyway leaves the model exactly where a decoder's byte feed would:
+// CM_Input_Bit is the same update in both directions.
+static bool CmEncodeSegment(NzCmDecoder* cm, std::uint32_t block_size,
+                            const unsigned char* data, std::uint32_t len, unsigned stream,
+                            std::vector<unsigned char>& out) {
+    std::vector<unsigned char> seg;
+    std::vector<unsigned char> emitted;
+    const auto put32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
+    };
+    const auto flush_block = [&]() {
+        std::vector<unsigned char> hdr;
+        WriteLegacyRecordHeader(&hdr, 0u, stream, seg.size());
+        emitted.insert(emitted.end(), hdr.begin(), hdr.end());
+        emitted.insert(emitted.end(), seg.begin(), seg.end());
+        seg.clear();
+    };
+    NzExeFilterEnc exe_enc;
+    std::uint32_t off = 0;
+    while (off < len) {
+        const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
+        const std::uint32_t n = nzr::opt_enc::CoBlockLength(src, len - off, block_size);
+
+        std::vector<std::uint8_t> exe_buf, exe_side;
+        bool exe_on = false;
+        const std::uint8_t* exe_out = src;
+        std::uint32_t exe_len = n;
+        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) {
+            const std::uint32_t r = exe_enc.Encode(src, n, &exe_buf, &exe_side);
+            if (r != 0u) { exe_on = true; exe_out = exe_buf.data(); exe_len = r; exe_enc.Advance(n); }
+            else exe_enc.Reset();
+        } else {
+            exe_enc.Reset();
+        }
+
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16, scratch(n + 0x2000u, 0);
+        std::uint8_t applied = 0;
+        bool tt_on = false;
+        const std::uint8_t* cm_in = exe_out;
+        std::uint32_t m = exe_len;
+        if (!exe_on) {
+            bool route = false;
+            // `cm` true and the dictionary's ASCII reorder OFF: the two flags the
+            // text machinery already carries for this codec.
+            const std::uint32_t mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), true, &route);
+            if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, false, true)) {
+                tbuf.assign(src, src + n);
+                tbuf.resize(n + 0x2000u, 0);
+                // see the same note in OptimumEncodeSegment: the estimate reads
+                // past the block and the original's buffer has the next bytes
+                {
+                    const std::size_t after = static_cast<std::size_t>(off) + n;
+                    if (after < len) {
+                        const std::size_t tail = std::min<std::size_t>(0x2000u, len - after);
+                        std::memcpy(tbuf.data() + n, reinterpret_cast<const std::uint8_t*>(data) + after, tail);
+                    }
+                }
+                tmp.assign(n + 0x2000u, 0);
+                std::uint8_t* pa = tbuf.data();
+                std::uint8_t* pb = tmp.data();
+                const std::uint32_t r = nzr::opt_enc::CoTextPipeline(mask, pa, n, pb, block_size + 0x40u,
+                                                                     &applied, &tt2, &tt16, false, true);
+                if (r != 0u) { tt_on = true; cm_in = pa; m = r; }
+            }
+        }
+
+        std::vector<std::uint8_t> p1buf, p1side;
+        bool p1_on = false;
+        const std::uint8_t* pre_p1 = cm_in;
+        const std::uint32_t pre_p1_len = m;
+        if (!tt_on) {
+            if (nzr::opt_enc::NzOptimumParam1Encode(cm_in, m, &p1buf, &p1side)) {
+                p1_on = true;
+                cm_in = p1buf.data();
+            }
+        }
+
+        std::vector<std::uint8_t> p2buf, p2side;
+        bool p2_on = false;
+        const std::uint8_t* pre_p2 = cm_in;
+        const std::uint32_t pre_p2_len = m;
+        if (!tt_on) {
+            p2buf.assign(m + 0x40u, 0);
+            std::vector<std::uint8_t> side;
+            const std::uint32_t r = NzPostfilterParam2Encode(cm_in, m, p2buf.data(), m + 0x40u,
+                                                             &side, nzr::opt_enc::kCoAuxStreamBytes);
+            const std::uint32_t slack = ((m >> 7u) < 0x800u) ? (m >> 7u) : 0x800u;
+            if (r != 0u && static_cast<std::uint64_t>(side.size()) + r < m - slack) {
+                p2side = side; p2_on = true; cm_in = p2buf.data(); m = r;
+            }
+        }
+
+        std::vector<std::uint8_t> payload;
+        NzCmEncode(cm, cm_in, m, &payload);
+        const bool stored = (payload.size() >= m);
+        if (stored) {
+            // The model has already seen every byte through the coding pass, which
+            // is the same update the decoder's NzCmFeedByte performs over a stored
+            // payload -- nothing to undo.
+            put32(m);
+            seg.insert(seg.end(), cm_in, cm_in + m);
+            seg.push_back(0u);                       // decr_param: do not reset the model
+            seg.push_back(0u);                       // param6: stored, and NO size18 after it
+            seg.push_back(static_cast<unsigned char>(1u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(cm_in, m)));
+        } else {
+            put32(static_cast<std::uint32_t>(payload.size()));
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(0u);                       // decr_param
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the CM's input size
+            seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(cm_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        }
+        seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
+        if (p2_on) {
+            put32(static_cast<std::uint32_t>(p2side.size()));
+            seg.insert(seg.end(), p2side.begin(), p2side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(p1_on ? 1u : 0u));
+        if (p1_on) {
+            put32(static_cast<std::uint32_t>(p1side.size()));
+            seg.insert(seg.end(), p1side.begin(), p1side.end());
+        }
+        seg.push_back(0u);                       // param16
+        seg.push_back(static_cast<unsigned char>(tt_on ? 1u : 0u));
+        if (tt_on) {
+            seg.push_back(applied);
+            std::vector<std::uint8_t> side;
+            nzr::opt_enc::CoSideStreamBytes(applied, tt2, tt16, &side);
+            seg.insert(seg.end(), side.begin(), side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(exe_on ? 1u : 0u));
+        if (exe_on) {
+            put32(static_cast<std::uint32_t>(exe_side.size()));
+            seg.insert(seg.end(), exe_side.begin(), exe_side.end());
+        }
+        flush_block();
+        off += n;
+    }
+    out.insert(out.end(), emitted.begin(), emitted.end());
+    return true;
+}
+
 struct EncodeCodec {
     unsigned p0 = 0;
     std::uint32_t co_window = 0;
@@ -13052,11 +13245,13 @@ struct EncodeCodec {
     std::unique_ptr<nzr::lzhd_enc::State> cd;
     std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;    // the -co engine carries its own encode side
     std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO;  // ... and so does -cO's
+    NzCmDecoder* cc = nullptr;                               // -cc's CM, freed by the caller
+    int cm_a_bits = 22, cm_b_bits = 18;
     std::uint32_t co_block = 0x100000u;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
              : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
-             : "nz_optimum2";
+             : p0 == 6u ? "nz_optimum2" : "nz_cm";
     }
     // FUN_0805a110: the working set the Compressor line reports -- the window, the
     // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
@@ -13072,6 +13267,21 @@ struct EncodeCodec {
         // (18/34, 59/75, 62/78 MB) -- its model object is ~0x1083000 bytes where
         // the compact engine's is 0x3f700.
         if (p0 == 5u || p0 == 6u) { (void)threads; (void)window; return (18ull + (p0 == 6u ? 16ull : 0ull)) << 20u; }
+        if (p0 == 7u) {
+            // -cc reports the DECODE working set of the object it just sized --
+            // the same FUN_080aafb0 the console prints when reading such an
+            // archive -- plus a flat 2.5 MB the compressor carries on top.
+            // Measured on 13 (input, budget) pairs spanning windows of 1..168 MB
+            // and both table widths: the difference is constant to within the
+            // rounding, and 0x280000 is the only round value the whole set allows.
+            LegacyCnContext ctx;
+            ctx.legacy_method = 0x4bu;
+            ctx.legacy_method_p0 = 7u;
+            ctx.cm_a_bits = cm_a_bits;
+            ctx.cm_b_bits = cm_b_bits;
+            (void)threads;
+            return LegacyCmFamilyWorkingSet(ctx, window) + 0x280000ull;
+        }
         if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
         if (p0 >= 3u) {
             // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
@@ -13178,7 +13388,16 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
         }
         const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
-        if (codec.p0 >= 5u) {
+        if (codec.p0 == 7u) {
+            // -cc adds a FOURTH byte: the two hash-table widths, packed as
+            // (a - 20) << 4 | (b - 18).
+            const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+            const unsigned char cd = static_cast<unsigned char>(((codec.cm_a_bits - 20) << 4) |
+                                                                (codec.cm_b_bits - 18));
+            const unsigned char rec[4] = {7u, static_cast<unsigned char>(p1),
+                                          static_cast<unsigned char>(p2), cd};
+            WriteLegacyRecordHeader(&hdr, 11u, stream, 4u); hdr.insert(hdr.end(), rec, rec + 4);
+        } else if (codec.p0 >= 5u) {
             // the optimum family adds the block-size byte-float as a third byte
             const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
             const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
@@ -13199,6 +13418,11 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         // block's bytes reach the window without reaching the hash.
         codec.co->EnableParser();
         codec.co_window = static_cast<std::uint32_t>(window);
+    }
+    if (codec.p0 == 7u && !codec.cc) {
+        NzCmInitAll();
+        codec.cc = NzCmCreate(codec.cm_a_bits, codec.cm_b_bits, static_cast<std::uint32_t>(window));
+        if (codec.cc) NzCmReset(codec.cc);
     }
     if (codec.p0 == 6u && !codec.cO) {
         codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
@@ -13386,6 +13610,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 if (!OptimumEncodeSegment(*codec.cO, codec.co_block, block.data(),
                                           static_cast<std::uint32_t>(block.size()), stream, payload,
                                           codec.co_window)) return false;
+            } else if (codec.p0 == 7u) {
+                if (!codec.cc) return false;
+                if (!CmEncodeSegment(codec.cc, codec.co_block, block.data(),
+                                     static_cast<std::uint32_t>(block.size()), stream, payload)) return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
@@ -13510,6 +13738,45 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     const std::uint64_t window_raw = LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
     std::uint64_t window = (window_raw < 0x10000u) ? 0x10000u : window_raw;   // the floor, applied LAST
 
+    // -cc has its own branch of FUN_0804cec0 (0x0804cf96): a flat 26 MB comes off
+    // the budget, never below 5 MB, and a quarter of what is left is the window's
+    // first claim. When the INPUT is smaller than that quarter the window becomes
+    // the input (or 1 MB, whichever is larger) and the two hash tables get the
+    // rest; when it is not, the tables are sized first and the window is whatever
+    // they leave. Their widths are the top bit of what is left, floored at 20 and
+    // 18 and capped at 35 and 33. Validated against the original's own codec
+    // object, read live right after this call, on a 7 x 13 grid of input sizes
+    // (100 KB .. 900 MB) and budgets (1 MB .. 2 GB): 91 of 91, block always 1 MB.
+    int cm_a_bits = 22, cm_b_bits = 18;
+    if (p0 == 7u) {
+        const auto bsr = [](std::uint64_t v) -> unsigned {
+            unsigned e = 0; while (v >>= 1) ++e; return e;
+        };
+        std::uint64_t avail = (budget > 0x1a00000ull) ? (budget - 0x1a00000ull) : 0ull;
+        if (avail < 0x500000ull) avail = 0x500000ull;
+        std::uint64_t w = avail >> 2u;
+        const bool input_bound = (w > per);
+        if (input_bound) w = (per >= 0x100000ull) ? per : 0x100000ull;
+        if (w > 0x80000000ull) w = 0x80000000ull;
+        if (avail < w) w = avail;
+        const std::uint64_t rem = avail - w;
+        unsigned a = bsr(rem);
+        if (a < 20u) a = 20u;
+        if (a > 35u) a = 35u;
+        std::uint64_t sa = 1ull << a;
+        if (sa > rem) sa = rem;
+        const std::uint64_t rem2 = rem - sa;
+        unsigned b = bsr(rem2 >> 2u);
+        if (b < 18u) b = 18u;
+        if (b > 33u) b = 33u;
+        const std::uint64_t sb = 4ull << b;
+        cm_a_bits = static_cast<int>(a);
+        cm_b_bits = static_cast<int>(b);
+        const std::uint64_t chosen = input_bound ? w : (avail - sa - sb);
+        window = LegacyByteFloatDecode(LegacyByteFloatEncode(chosen));
+        if (window < 0x10000u) window = 0x10000u;
+    }
+
     // `s` (simulate) is `a` with the bytes thrown away: the original runs the
     // whole compression and reports what it WOULD have produced, so the encoder
     // below is untouched and only its sink changes. Nothing is created on disk,
@@ -13598,10 +13865,12 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         return 1;
     };
     EncodeCodec header_codec; header_codec.p0 = p0; header_codec.co_block = co_block;
+    header_codec.cm_a_bits = cm_a_bits; header_codec.cm_b_bits = cm_b_bits;
     PrintStoreEncodeHeader(os, options, workers, window, header_codec);
     // one codec state per worker stream (the original's workers own their windows)
     std::vector<EncodeCodec> codecs(workers);
-    for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block; }
+    for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block;
+                                    c.cm_a_bits = cm_a_bits; c.cm_b_bits = cm_b_bits; }
     EncodeStatus status(workers);
     std::uint64_t read_ms = 0, write_ms = 0;
     const auto timed_write = [&](const std::vector<unsigned char>& v) {
@@ -13702,7 +13971,7 @@ bool RunAddCanEncode(const CliOptions& options) {
     switch (options.compressor) {
         case Compressor::kNone: case Compressor::kLzpf: case Compressor::kLzpfLarge:
         case Compressor::kLzhd: case Compressor::kLzhds: case Compressor::kOptimum1:
-        case Compressor::kOptimum2:
+        case Compressor::kOptimum2: case Compressor::kCm:
             return true;
         default: return false;
     }
@@ -13729,7 +13998,10 @@ int RunAdd(const CliOptions& options, std::ostream& os) {
     // dece, the BWT bucket coder, the framing) is the one the two share.
     if (options.compressor == Compressor::kOptimum2)
         return RunAddStoreContainer(options, std::move(found), os, add_start, 6u);
-    // The compressor not ported yet (-cc): refuse. The decode phase's stub
+    // -cc: the same driver again, with the CM in the LZ slot and no BWT at all.
+    if (options.compressor == Compressor::kCm)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 7u);
+    // Nothing left that can reach here today; kept for a compressor added later. The decode phase's stub
     // writer labelled raw bytes with the codec's byte, an archive the original
     // cannot decode ("code 1024" on a -cD one); nothing is better.
     os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF, -cd, -co or -cO.\n";
