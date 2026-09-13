@@ -106,12 +106,14 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
 Produces `bin/nz-re`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows, which add `-D_WIN32_WINNT=0x0600`). `-D_FILE_OFFSET_BITS=64` is not optional: without it a 32-bit build's `off_t` is 32 bits and an archive over 2 GB cannot even be measured, so the code refuses to compile without it.
 
-**Minimum Windows version: Vista (NT 6.0).** Not a preference -- `std::condition_variable` needs the
-`CONDITION_VARIABLE` API that arrives in Vista, so a build targeting XP does not compile at all. The
-two `.exe` builds pin `_WIN32_WINNT=0x0600` and declare subsystem 6.00 in their PE header, so no
-newer API can creep in unnoticed and an XP machine gets a clean refusal rather than a confusing
-failure. Nothing else in the port needs anything past Vista: the binaries import only `kernel32.dll`
-and `msvcrt.dll`. Linux builds have no such floor.
+**Minimum Windows version: Vista (NT 6.0).** The two `.exe` builds pin `_WIN32_WINNT=0x0600` and
+declare subsystem 6.00 in their PE header, so no newer API can creep in unnoticed and an older
+machine gets a clean refusal rather than a confusing failure. Nothing in the port needs anything
+past Vista: the binaries import only `kernel32.dll` and `msvcrt.dll`, and the only Vista-era entry
+points among them are the four `CONDITION_VARIABLE` functions that libstdc++ pulls in through
+`<filesystem>` -- not through threading, which this port's own code reaches for without ever naming
+a `std::condition_variable`. Anything older than Vista is out of scope: it cannot be tested here, so
+it is not claimed. Linux builds have no such floor.
 
 The 32-bit builds add `-m32 -msse2`: the SSE2 paths (audio predictor, `-cO` mixer) are compiled only when the target has SSE2, and on a 137 MB mixed tar that is a 19 % shorter `-cO` decode for a Pentium 4-class minimum (the original needed MMX).
 
