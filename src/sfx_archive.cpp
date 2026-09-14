@@ -997,7 +997,9 @@ void SetExtractedWinAttributes(const fs::path& path, std::uint8_t attr) {
     if (attr & 2u) flags |= FILE_ATTRIBUTE_HIDDEN;
     if (attr & 4u) flags |= FILE_ATTRIBUTE_SYSTEM;
     if (attr & 8u) flags |= FILE_ATTRIBUTE_ARCHIVE;
-    if (flags != 0u) SetFileAttributesA(path.string().c_str(), flags);
+    // the wide form for the same reason _wopen is used in the sink: path::string()
+    // is UTF-8 on MinGW and the A entry point would read it in the code page
+    if (flags != 0u) SetFileAttributesW(path.wstring().c_str(), flags);
 #else
     (void)path; (void)attr;   // on a POSIX host the mode carries this (0400/0600)
 #endif
@@ -1042,16 +1044,31 @@ std::string HumanBytes(std::uint64_t bytes) {
 // On Windows the original only ever sees the ANSI form of a filename, so a name
 // that does not round-trip is a name it cannot open. Everywhere else the bytes
 // are the name and the question does not arise.
+// WC_NO_BEST_FIT_CHARS, except on a UTF-8 ACP where the flag is not allowed.
+// Without it the conversion silently APPROXIMATES: on a CP1252 machine the
+// Hungarian `u`- and `o`-double-acute come back as plain `u` and `o` and the
+// name looks convertible, so a file the original refuses got stored under a
+// mangled name (`arvizturo.txt` for `árvíztűrő.txt`). The Win32 A file APIs do
+// not best-fit filenames either, which is why the original prints `???` and
+// stores nothing. Reported by xman as diacritics differing after unpacking.
+#if defined(_WIN32)
+inline DWORD NativeCpFlags() {
+    return (::GetACP() == CP_UTF8) ? 0u : WC_NO_BEST_FIT_CHARS;
+}
+#endif
+
 inline bool NameSurvivesNativeCodePage(const fs::path& name) {
 #if defined(_WIN32)
     const std::wstring w = name.wstring();
     if (w.empty()) return true;
     BOOL lossy = FALSE;
-    const int n = ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()),
-                                        nullptr, 0, nullptr, &lossy);
+    const DWORD fl = NativeCpFlags();
+    BOOL* const pl = (fl == 0u) ? nullptr : &lossy;   // not allowed with CP_UTF8
+    const int n = ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, pl);
     if (n <= 0) return false;
     std::string a(static_cast<std::size_t>(n), '\0');
-    ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &a[0], n, nullptr, &lossy);
+    ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()), &a[0], n, nullptr, pl);
     return lossy == FALSE;
 #else
     (void)name;
@@ -1091,11 +1108,12 @@ inline std::string NativeBytesFromPath(const fs::path& p) {
 #if defined(_WIN32)
     const std::wstring w = p.wstring();
     if (w.empty()) return std::string();
-    const int n = ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()),
+    const DWORD fl = NativeCpFlags();   // no best-fit, as the A file APIs do
+    const int n = ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()),
                                         nullptr, 0, nullptr, nullptr);
     if (n <= 0) return std::string();
     std::string s(static_cast<std::size_t>(n), '\0');
-    ::WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
     return s;
 #else
     return p.string();
@@ -2606,7 +2624,9 @@ inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
         ++e.unsafe; f.write_it = false; return;
     }
     f.path = e.root / safe_rel;
-    f.display = e.opt->output_path.empty() ? safe_rel.string() : f.path.string();
+    // the same rule for what is PRINTED: the original's console carries the
+    // machine's code page, not UTF-8
+    f.display = e.opt->output_path.empty() ? NativeBytesFromPath(safe_rel) : NativeBytesFromPath(f.path);
     f.write_it = true;
     std::error_code ec;
     if (!e.yes_to_all && fs::exists(f.path, ec)) {
@@ -2646,7 +2666,15 @@ inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
 #if defined(_WIN32)
     // mingw's <sys/stat.h> does not always expose _S_IREAD/_S_IWRITE, and the
     // mode is irrelevant on Windows anyway (the permission records are POSIX).
-    f.fd = ::_open(f.path.string().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
+    //
+    // _wopen, NOT _open(path.string()): on MinGW `path::string()` returns UTF-8,
+    // and the ANSI _open then reads those bytes in the machine's code page -- a
+    // name with `a`-acute came out as the two characters its UTF-8 form spells in
+    // CP1252. Reported by xman on Win7 as "characters with diacritics in the
+    // unpacked file differ from the original"; it hit only the codecs that
+    // extract through this sink (-co, -cO, -cc), which is why the -cn and -cd
+    // paths looked fine. The wide form goes to the wide API unchanged.
+    f.fd = ::_wopen(f.path.wstring().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
 #else
     f.fd = ::open(f.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
                   static_cast<mode_t>((en.has_permissions ? en.permissions : 0600u) & 07777u));
