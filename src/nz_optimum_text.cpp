@@ -372,7 +372,10 @@ std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32
     std::uint8_t done = 0;
     tt2->clear();
     tt16->clear();
-    auto run = [&](std::uint32_t r, std::uint8_t bit) { if (r != 0u) { std::swap(buf, tmp); n = r; done |= bit; } };
+    const bool trp = std::getenv("NZOPT_TRACE_PIPE") != nullptr;
+    auto run = [&](std::uint32_t r, std::uint8_t bit) {
+        if (trp) std::fprintf(stderr, "[pipe] bit=0x%02x n=%u -> %u%s\n", bit, n, r, r ? "" : " (skip)");
+        if (r != 0u) { std::swap(buf, tmp); n = r; done |= bit; } };
     if (bits & 1u) run(TextCrlfEncode(buf, n, tmp, std::min(cap, n + 0x10u)), 1u);
     if (bits & 0x40u) run(TextChessEncode(buf, n, tmp, std::min(cap, n + 0x400u)), 0x40u);
     if (bits & 0x20u) run(TextLineRleEncode(10u, buf, n, tmp, n), 0x20u);

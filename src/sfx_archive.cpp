@@ -12688,9 +12688,10 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 // `-cO`: the two differ only in which LZ engine codes the block and samples the
 // LZ-or-BWT decision, exactly as the decode side's own framed loop does.
 template <class Engine>
-static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
+static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& exe_enc,
+                                 std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
-                                 std::vector<unsigned char>& out, std::uint32_t window_cap) {
+                                 std::vector<unsigned char>& out) {
     // One type-0 DATA record PER BLOCK: the record header is the chain segment's
     // tag, so a stream of N blocks is N records, not one. Walking a two-block
     // archive the original wrote shows exactly that -- 2 type-0 records where a
@@ -12715,13 +12716,6 @@ static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
     // persist across a RUN of consecutive filtered blocks and reset as soon as
     // a block goes unfiltered (reference FUN_080b98a0 / FUN_080b98e0 on the
     // codec object's own state at obj+0x90).
-    NzExeFilterEnc exe_enc;
-    // A second engine in the decoder's role, fed exactly what the real decoder
-    // will be fed, so every block this segment writes is proved readable before
-    // it is committed. The -co engine is newly reaching block shapes it was
-    // never exercised on (an LZ block after a BWT block, for one), and an
-    // archive our own decoder cannot read must never reach the disk.
-    Engine verifier(window_cap);
     std::uint32_t off = 0;
     while (off < len) {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
@@ -13096,7 +13090,7 @@ static bool OptimumEncodeSegment(Engine& co, std::uint32_t block_size,
 // (param6 == 0, no size18 field) rather than declined. Coding a block and then
 // storing it anyway leaves the model exactly where a decoder's byte feed would:
 // CM_Input_Bit is the same update in both directions.
-static bool CmEncodeSegment(NzCmDecoder* cm, std::uint32_t block_size,
+static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc, std::uint32_t block_size,
                             const unsigned char* data, std::uint32_t len, unsigned stream,
                             std::vector<unsigned char>& out) {
     std::vector<unsigned char> seg;
@@ -13111,7 +13105,6 @@ static bool CmEncodeSegment(NzCmDecoder* cm, std::uint32_t block_size,
         emitted.insert(emitted.end(), seg.begin(), seg.end());
         seg.clear();
     };
-    NzExeFilterEnc exe_enc;
     std::uint32_t off = 0;
     while (off < len) {
         const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
@@ -13257,6 +13250,16 @@ struct EncodeCodec {
     std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;    // the -co engine carries its own encode side
     std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO;  // ... and so does -cO's
     NzCmDecoder* cc = nullptr;                               // -cc's CM, freed by the caller
+    // A second engine in the decoder's role, fed exactly what the real decoder
+    // will be fed, so every block written is proved readable before it is
+    // committed -- and the dece filter's run state. BOTH belong to the STREAM,
+    // not to one call: the driver hands the codec one piece of at most 1 MB at a
+    // time (and stops early at a file boundary), so a multi-file archive gets
+    // several calls. Building them per call left the verifier cold from the
+    // second piece on, and `a -co f1 f2 f3` declined its own output.
+    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co_v;
+    std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO_v;
+    NzExeFilterEnc exe_enc;
     int cm_a_bits = 22, cm_b_bits = 18;
     std::uint32_t co_block = 0x100000u;
     const char* Label() const {
@@ -13428,6 +13431,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         // The finder has to exist before the first FeedWindow, or a leading BWT
         // block's bytes reach the window without reaching the hash.
         codec.co->EnableParser();
+        codec.co_v = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     if (codec.p0 == 7u && !codec.cc) {
@@ -13438,6 +13442,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     if (codec.p0 == 6u && !codec.cO) {
         codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
         codec.cO->EnableParser();
+        codec.cO_v = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     // The pieces of this range, in the order the reader meets them, then the
@@ -13534,7 +13539,15 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     // before a 65536-byte one share theirs). Each chunk is one DATA record of
     // 32 KB blocks; the store's unit is its window.
     // FUN_0805b020 reads 1 MB pieces with a 64 KB file-boundary rule; FUN_08065a40 (lzhd) with 16 KB
-    const std::uint64_t piece_bound = codec.p0 >= 3u ? 0x4000u : 0x10000u;
+    // ... and the optimum/CM family does not stop at a file boundary AT ALL: it
+    // fills its 1 MB piece across as many files as fit. Measured on the original
+    // with pairs of 0.1/0.2/0.3/0.5/0.7/0.9 MB, a 2 MB file followed by a 50 KB
+    // one, and the reverse: ONE filename table every time, where a 64 KB rule
+    // would have cut the piece at the first boundary. Using the lzhd bound here
+    // put each file in its own piece and every multi-file archive diverged from
+    // the original's at the first table.
+    const std::uint64_t piece_bound = codec.p0 >= 5u ? ~std::uint64_t{0}
+                                                     : (codec.p0 >= 3u ? 0x4000u : 0x10000u);
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
         const std::size_t met_start = cur_met;   // the reader's first entry of this piece
@@ -13614,16 +13627,16 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             // 4-byte alignment matters to the side stream's overflow check only)
             if (codec.p0 == 5u) {
                 // writes its own records, one per block
-                if (!OptimumEncodeSegment(*codec.co, codec.co_block, block.data(),
-                                          static_cast<std::uint32_t>(block.size()), stream, payload,
-                                          codec.co_window)) return false;
+                if (!OptimumEncodeSegment(*codec.co, *codec.co_v, codec.exe_enc, codec.co_block,
+                                          block.data(), static_cast<std::uint32_t>(block.size()),
+                                          stream, payload)) return false;
             } else if (codec.p0 == 6u) {
-                if (!OptimumEncodeSegment(*codec.cO, codec.co_block, block.data(),
-                                          static_cast<std::uint32_t>(block.size()), stream, payload,
-                                          codec.co_window)) return false;
+                if (!OptimumEncodeSegment(*codec.cO, *codec.cO_v, codec.exe_enc, codec.co_block,
+                                          block.data(), static_cast<std::uint32_t>(block.size()),
+                                          stream, payload)) return false;
             } else if (codec.p0 == 7u) {
                 if (!codec.cc) return false;
-                if (!CmEncodeSegment(codec.cc, codec.co_block, block.data(),
+                if (!CmEncodeSegment(codec.cc, codec.exe_enc, codec.co_block, block.data(),
                                      static_cast<std::uint32_t>(block.size()), stream, payload)) return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
