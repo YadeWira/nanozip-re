@@ -832,7 +832,11 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // a divergence to the state or to the walk.
                 if (const char* fs = NZ_ENV("NZOPT_PROBE_STATE")) {
                     static int nstate = 0;
-                    if (++nstate == std::atoi(fs)) {
+                    ++nstate;
+                    const char* bycur = NZ_ENV("NZOPT_PROBE_STATE_CUR");
+                    static bool once = false;
+                    if (bycur ? (!once && cur == static_cast<std::uint32_t>(std::atoi(bycur)) && (once = true))
+                              : (nstate == std::atoi(fs) && F.winsize == 0x10000u)) {
                         auto wr = [&](const char* nm, const void* q, std::size_t nb) {
                             char path[256];
                             std::snprintf(path, sizeof path, "%s.%s",
@@ -843,10 +847,24 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         wr("tree", F.tree.data(), F.tree.size() * 4u);
                         wr("cache", F.cache.data(), F.cache.size() * 4u);
                         wr("ring", base, ring_.storage.size());
-                        std::fprintf(stderr, "[STATE] cur=%u dumped\n", cur);
+                        wr("lr", F.lr.data(), F.lr.size() * 4u);
+                        std::fprintf(stderr, "[STATE] cur=%u lrhash=%u lrmask=%u dumped\n", cur, F.lrhash, F.lrmask);
                     }
                 }
                 F.Find(base, cur, cend, remain, cands, 0x10u);
+                // NZOPT_PROBE_TREE=1: the tree's answer alone, before the
+                // long-range index appends its own -- the shape a breakpoint on
+                // the return of the original's FUN_08073ca0 prints.
+                if (NZ_ENV("NZOPT_PROBE_TREE")) {
+                    // '@' = the stream's own finder (64 KB window), '#' = the
+                    // block-kind sampler's throwaway one (1 MB) -- two objects,
+                    // two trees, one call counter
+                    std::fprintf(stderr, "%c%u", F.winsize == 0x10000u ? '@' : '#', cur);
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " %u/%u", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
                 // NZOPT_PROBE_AT=<offset in the block>: dump the finder's answer at
                 // exactly one position, for diffing a single divergence against the
                 // original without a trace of the whole parse. NZOPT_PROBE_AT=all
