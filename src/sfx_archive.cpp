@@ -12719,9 +12719,9 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 // LZ-or-BWT decision, exactly as the decode side's own framed loop does.
 template <class Engine>
 static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& exe_enc,
-                                 std::uint32_t block_size,
+                                 nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
-                                 std::vector<unsigned char>& out) {
+                                 std::vector<unsigned char>& out, bool final) {
     // One type-0 DATA record PER BLOCK: the record header is the chain segment's
     // tag, so a stream of N blocks is N records, not one. Walking a two-block
     // archive the original wrote shows exactly that -- 2 type-0 records where a
@@ -12746,14 +12746,14 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
     // persist across a RUN of consecutive filtered blocks and reset as soon as
     // a block goes unfiltered (reference FUN_080b98a0 / FUN_080b98e0 on the
     // codec object's own state at obj+0x90).
-    std::uint32_t off = 0;
-    while (off < len) {
-        const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
-        // FUN_0808d0b0 decides the block's length before anything looks at it:
-        // an order-1 entropy split over what it buffered, capped at the block
-        // size. A 68 KB HTML file becomes two blocks this way while a 148 KB one
-        // stays whole.
-        const std::uint32_t n = nzr::opt_enc::CoBlockLength(src, len - off, block_size);
+    // FUN_0808d0b0 decides the block's length before anything looks at it: an
+    // order-1 entropy split over what its 1 MB buffer holds, capped at the block
+    // size. The buffer spans the calls -- it is filled from the STREAM, not from
+    // this one piece -- so a piece that does not fill it codes nothing and waits.
+    feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
+    while (feeder.Next(block_size, final)) {
+        const std::uint8_t* src = feeder.Data();
+        const std::uint32_t n = feeder.Len();
 
         // FUN_0808da10's block analysis. The image and audio blocks are not
         // written yet, so a block that would take one of those paths declines
@@ -12797,13 +12797,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 // just past the block -- where the original's buffer holds the
                 // bytes that follow in the input, not zeros. One block of one
                 // corpus file turns on it (4839 against our 4822).
-                {
-                    const std::size_t after = static_cast<std::size_t>(off) + n;
-                    if (after < len) {
-                        const std::size_t tail = std::min<std::size_t>(0x2000u, len - after);
-                        std::memcpy(tbuf.data() + n, reinterpret_cast<const std::uint8_t*>(data) + after, tail);
-                    }
-                }
+                std::memcpy(tbuf.data() + n, src + n, 0x2000u);
                 tmp.assign(n + 0x2000u, 0);
                 std::uint8_t* pa = tbuf.data();
                 std::uint8_t* pb = tmp.data();
@@ -12945,11 +12939,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 if (!co.WindowResetPending() && co.LongRangeTable() != nullptr) {
                     std::vector<std::uint8_t> padded(static_cast<std::size_t>(blk_len) + 0x200u, 0u);
                     std::memcpy(padded.data(), blk, blk_len);
-                    const std::size_t after_off = static_cast<std::size_t>(off) + blk_len;
-                    if (after_off < len) {
-                        const std::size_t tail = std::min<std::size_t>(0x200u, len - after_off);
-                        std::memcpy(padded.data() + blk_len, reinterpret_cast<const std::uint8_t*>(data) + after_off, tail);
-                    }
+                    if (blk == src) std::memcpy(padded.data() + blk_len, src + blk_len, 0x200u);
                     const std::uint32_t r15 = NzBwtParam15Encode(padded.data(), blk_len, stats,
                                                                  co.LongRangeTable(), co.LongRangeMask(),
                                                                  co.WindowBase(), co.WindowCapacity(),
@@ -12981,16 +12971,22 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 verifier.FeedWindow(blk, blk_len);
                 // param14 loads a 32-bit word per position (P14Load32) and
                 // compares candidates at `cur - 3`, so it reads up to three bytes
-                // past the last one it counts. In the reference that is the
-                // middle of the codec's own block buffer and lands on its own
-                // memory; here the input is an exactly-sized vector (param15's
-                // output) or the caller's segment, and the read runs off the end
-                // -- ASan finds it on five of the 289 corpus inputs, at three
-                // different sites in the search. The slack is the caller's to
+                // past the last one it counts, and what it finds there CHANGES
+                // WHAT IT WRITES. In the reference that is the block buffer's
+                // own slack -- the tail the split pushed back -- so when the
+                // block is still the buffer's own bytes it is read straight out
+                // of the feeder, whose dst carries that slack. Only when an
+                // earlier pass has replaced them (param15's output) is a padded
+                // copy the right shape, and then the slack is the caller's to
                 // provide, exactly as it is for param1's front padding.
-                std::vector<std::uint8_t> p14in(static_cast<std::size_t>(m) + 0x10u, 0u);
-                std::memcpy(p14in.data(), lz_in, m);
-                const std::uint32_t r = NzBwtParam14Encode(p14in.data(), m, stats, &p14buf, &p14side);
+                std::vector<std::uint8_t> p14in;
+                const std::uint8_t* p14src = lz_in;
+                if (lz_in != src) {
+                    p14in.assign(static_cast<std::size_t>(m) + 0x10u, 0u);
+                    std::memcpy(p14in.data(), lz_in, m);
+                    p14src = p14in.data();
+                }
+                const std::uint32_t r = NzBwtParam14Encode(p14src, m, stats, &p14buf, &p14side);
                 if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
             } else {
                 co.FeedWindow(blk, blk_len);
@@ -13107,7 +13103,6 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
             seg.insert(seg.end(), exe_side.begin(), exe_side.end());
         }
         flush_block();
-        off += n;
     }
     out.insert(out.end(), emitted.begin(), emitted.end());
     return true;
@@ -13120,9 +13115,10 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
 // (param6 == 0, no size18 field) rather than declined. Coding a block and then
 // storing it anyway leaves the model exactly where a decoder's byte feed would:
 // CM_Input_Bit is the same update in both directions.
-static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc, std::uint32_t block_size,
+static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
+                            nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
                             const unsigned char* data, std::uint32_t len, unsigned stream,
-                            std::vector<unsigned char>& out) {
+                            std::vector<unsigned char>& out, bool final) {
     std::vector<unsigned char> seg;
     std::vector<unsigned char> emitted;
     const auto put32 = [&](std::uint32_t v) {
@@ -13135,10 +13131,10 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc, std::uint3
         emitted.insert(emitted.end(), seg.begin(), seg.end());
         seg.clear();
     };
-    std::uint32_t off = 0;
-    while (off < len) {
-        const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(data) + off;
-        const std::uint32_t n = nzr::opt_enc::CoBlockLength(src, len - off, block_size);
+    feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
+    while (feeder.Next(block_size, final)) {
+        const std::uint8_t* src = feeder.Data();
+        const std::uint32_t n = feeder.Len();
 
         std::vector<std::uint8_t> exe_buf, exe_side;
         bool exe_on = false;
@@ -13167,13 +13163,7 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc, std::uint3
                 tbuf.resize(n + 0x2000u, 0);
                 // see the same note in OptimumEncodeSegment: the estimate reads
                 // past the block and the original's buffer has the next bytes
-                {
-                    const std::size_t after = static_cast<std::size_t>(off) + n;
-                    if (after < len) {
-                        const std::size_t tail = std::min<std::size_t>(0x2000u, len - after);
-                        std::memcpy(tbuf.data() + n, reinterpret_cast<const std::uint8_t*>(data) + after, tail);
-                    }
-                }
+                std::memcpy(tbuf.data() + n, src + n, 0x2000u);
                 tmp.assign(n + 0x2000u, 0);
                 std::uint8_t* pa = tbuf.data();
                 std::uint8_t* pb = tmp.data();
@@ -13266,7 +13256,6 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc, std::uint3
             seg.insert(seg.end(), exe_side.begin(), exe_side.end());
         }
         flush_block();
-        off += n;
     }
     out.insert(out.end(), emitted.begin(), emitted.end());
     return true;
@@ -13292,6 +13281,10 @@ struct EncodeCodec {
     NzExeFilterEnc exe_enc;
     int cm_a_bits = 22, cm_b_bits = 18;
     std::uint32_t co_block = 0x100000u;
+    // FUN_0808d0b0's 1 MB staging buffer and the block it assembles: STREAM
+    // state, like the verifier above -- the block boundaries depend on what the
+    // whole stream has fed it, not on where the reader's pieces fall.
+    nzr::opt_enc::CoBlockFeeder feeder;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
              : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
@@ -13578,10 +13571,47 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     // the original's at the first table.
     const std::uint64_t piece_bound = codec.p0 >= 5u ? ~std::uint64_t{0}
                                                      : (codec.p0 >= 3u ? 0x4000u : 0x10000u);
+    // The optimum/CM family's block driver (FUN_0808d0b0) buffers the stream:
+    // what a piece leaves under its 0xff000 threshold is not coded here but
+    // carried into the next piece, and what is left when the stream ends comes
+    // out in the flush below. Cutting each piece on its own instead put a block
+    // boundary at every megabyte, which the original does not.
+    // the metadata run the reads have produced since the last DATA record
+    std::size_t pend_a_from = pieces.size(), pend_a_to = 0;
+    std::size_t pend_c_from = pieces.size(), pend_c_to = 0;
+    const auto flush_pending_meta = [&]() {
+        if (pend_a_from > pend_a_to) pend_a_from = pend_a_to;
+        if (pend_c_from > pend_c_to) pend_c_from = pend_c_to;
+        if (pend_a_from == pend_a_to && pend_c_from == pend_c_to) return;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, pend_a_from, pend_a_to,
+                                pend_c_from, pend_c_to, ckmode, options);
+        pend_a_from = pieces.size(); pend_a_to = 0;
+        pend_c_from = pieces.size(); pend_c_to = 0;
+    };
+    const auto run_optimum = [&](std::vector<unsigned char>& payload, const unsigned char* d,
+                                 std::uint32_t n, bool final) -> bool {
+        if (codec.p0 == 5u)
+            return OptimumEncodeSegment(*codec.co, *codec.co_v, codec.exe_enc, codec.feeder,
+                                        codec.co_block, d, n, stream, payload, final);
+        if (codec.p0 == 6u)
+            return OptimumEncodeSegment(*codec.cO, *codec.cO_v, codec.exe_enc, codec.feeder,
+                                        codec.co_block, d, n, stream, payload, final);
+        return codec.cc != nullptr &&
+               CmEncodeSegment(codec.cc, codec.exe_enc, codec.feeder, codec.co_block, d, n,
+                               stream, payload, final);
+    };
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
         const std::size_t met_start = cur_met;   // the reader's first entry of this piece
-        const std::uint64_t want = std::min<std::uint64_t>(chunked ? 0x100000u : window, total - written);
+        // The reader is asked for what fits in the codec's staging buffer, not
+        // for a flat megabyte: FUN_0808d0b0 calls it with `0x100000 - held`, and
+        // a file's metadata records are written where the read that finished it
+        // fell. With a flat megabyte the checksum of a 1.5 MB file came out one
+        // block too early.
+        const std::uint64_t room = (chunked && codec.p0 >= 5u)
+                                       ? 0x100000ull - codec.feeder.Held()
+                                       : 0x100000ull;
+        const std::uint64_t want = std::min<std::uint64_t>(chunked ? room : window, total - written);
         while (block.size() < want && cur_met < met.size()) {
             if (chunked && !block.empty() && ((cur_off == 0u && ghost_budget == 0u) || budget_end)) {
                 // the reader decides at an entry boundary looking at the next NON-EMPTY
@@ -13650,24 +13680,26 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         }
         if (a_from > a_to) a_from = a_to;
         if (c_from > c_to) c_from = c_to;
-        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, c_from, c_to, ckmode, options);
+        // The optimum/CM family reads several times per block, so the records a
+        // read produces WAIT for the next one: two files that end before the
+        // same block are announced in ONE type-5 record of eight bytes, not two
+        // of four. Everything else writes its run per piece as before.
+        if (chunked && codec.p0 >= 5u) {
+            // (an EMPTY range is [0,0) after the normalisation above, so merging
+            // it would drag the run's start back to the first entry)
+            if (a_from < a_to) { pend_a_from = std::min(pend_a_from, a_from); pend_a_to = std::max(pend_a_to, a_to); }
+            if (c_from < c_to) { pend_c_from = std::min(pend_c_from, c_from); pend_c_to = std::max(pend_c_to, c_to); }
+        } else {
+            LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, c_from, c_to, ckmode, options);
+        }
         std::vector<unsigned char> payload;
         if (chunked) {
             // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
             // 4-byte alignment matters to the side stream's overflow check only)
-            if (codec.p0 == 5u) {
+            if (codec.p0 >= 5u) {
                 // writes its own records, one per block
-                if (!OptimumEncodeSegment(*codec.co, *codec.co_v, codec.exe_enc, codec.co_block,
-                                          block.data(), static_cast<std::uint32_t>(block.size()),
-                                          stream, payload)) return false;
-            } else if (codec.p0 == 6u) {
-                if (!OptimumEncodeSegment(*codec.cO, *codec.cO_v, codec.exe_enc, codec.co_block,
-                                          block.data(), static_cast<std::uint32_t>(block.size()),
-                                          stream, payload)) return false;
-            } else if (codec.p0 == 7u) {
-                if (!codec.cc) return false;
-                if (!CmEncodeSegment(codec.cc, codec.exe_enc, codec.co_block, block.data(),
-                                     static_cast<std::uint32_t>(block.size()), stream, payload)) return false;
+                if (!run_optimum(payload, block.data(), static_cast<std::uint32_t>(block.size()), false))
+                    return false;
             } else if (codec.p0 == 3u || codec.p0 == 4u) {
                 nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
             } else {
@@ -13680,8 +13712,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             }
         }
         if (chunked && codec.p0 >= 5u) {
-            // already framed, one record per block
-            out.insert(out.end(), payload.begin(), payload.end());
+            // already framed, one record per block -- and a read that did not
+            // fill the staging buffer writes nothing at all, its metadata run
+            // included
+            if (!payload.empty()) { flush_pending_meta(); out.insert(out.end(), payload.begin(), payload.end()); }
         } else {
             const std::vector<unsigned char>& data = chunked ? payload : block;
             std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
@@ -13690,6 +13724,13 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         written = block_end;
         status.BlockDone(os, stream, block.size());
         if (total == 0u) break;
+    }
+    if (chunked && codec.p0 >= 5u) {
+        // the stream is over: whatever the staging buffer still holds is cut now
+        std::vector<unsigned char> payload;
+        if (!run_optimum(payload, nullptr, 0u, true)) return false;
+        flush_pending_meta();
+        out.insert(out.end(), payload.begin(), payload.end());
     }
     if (chunked && cur_met < met.size()) {
         // the entries left are zero-length (or ghosts) after a boundary stop: the
@@ -13882,8 +13923,12 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // window, and the result is rounded to a byte-float and then stepped once.
     // Validated against the original on a grid of inputs (0.75 MB .. 48 MB, plus
     // deliberately non-representable sizes) crossed with budgets of 4 .. 512 MB.
+    // -cc does not share it: 0x0804d173 hands FUN_0804c9f0 a flat 0x100000, so
+    // the CM's block is always 1 MB. It agrees with the formula below on every
+    // input up to a megabyte (the 1 MB floor), which is why only a 1.1 MB file
+    // showed the difference -- one byte of the parameter record.
     std::uint32_t co_block = 0x100000u;
-    if (p0 >= 5u) {
+    if (p0 == 5u || p0 == 6u) {
         const std::uint64_t w = window_raw;                      // NOT floored to 64 KB
         const std::uint32_t wm1 = static_cast<std::uint32_t>(w - 1u);   // w == 0 -> 0xffffffff
         unsigned e = 31u; while (e != 0u && ((wm1 >> e) & 1u) == 0u) --e;   // bsr

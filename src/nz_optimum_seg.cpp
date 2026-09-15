@@ -88,6 +88,16 @@ void CoSegmenter::Reset() {
     std::fill(counts.begin(), counts.end(), 0u);
 }
 
+void CoSegmenter::Fold() {
+    for (std::uint32_t cv = 0; cv < 0x100u; ++cv) {
+        counts[kLeftTotal + cv] += counts[kRightTotal + cv];
+        counts[kRightTotal + cv] = 0u;
+        std::uint32_t* l = &counts[kLeftCell + cv * 0x100u];
+        std::uint32_t* r = &counts[kRightCell + cv * 0x100u];
+        for (std::uint32_t b = 0; b < 0x100u; ++b) { l[b] += r[b]; r[b] = 0u; }
+    }
+}
+
 void CoSegmenter::Prime(const std::uint8_t* buf, std::uint32_t n) {
     std::uint32_t c = ctx;
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -166,6 +176,65 @@ std::uint32_t CoBlockLength(const std::uint8_t* buf, std::uint32_t n, std::uint3
     if (std::getenv("NZOPT_TRACE_TDO") != nullptr)
         std::fprintf(stderr, "[tdo] segment n=%u take=%u -> %u\n", n, take, r);
     return r;
+}
+
+void CoBlockFeeder::Feed(const std::uint8_t* p, std::size_t n) {
+    if (n == 0u) return;
+    if (pend_off != 0u) { pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(pend_off)); pend_off = 0; }
+    pending.insert(pending.end(), p, p + n);
+}
+
+bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
+    if (dst.size() < static_cast<std::size_t>(block_size) + 0x2010u)
+        dst.resize(static_cast<std::size_t>(block_size) + 0x2010u, 0u);
+    if (!started) { total = 0; budget = block_size; }
+    for (;;) {                                   // LAB_0808d0de
+        // The read loop. The reader is asked for more until the buffer holds
+        // 0xff000 bytes or it hands back nothing; the audio/image detector that
+        // sits in this loop is not written, so a detected region is not forced
+        // into its own block here.
+        while (ring.size() + 0x1000u <= 0xfffffu && pend_off < pending.size()) {
+            const std::size_t got = std::min<std::size_t>(0x100000u - ring.size(),
+                                                          pending.size() - pend_off);
+            ring.insert(ring.end(), pending.begin() + static_cast<std::ptrdiff_t>(pend_off),
+                        pending.begin() + static_cast<std::ptrdiff_t>(pend_off + got));
+            pend_off += got;
+        }
+        if (pend_off >= pending.size() && !pending.empty()) { pending.clear(); pend_off = 0; }
+        if (ring.size() + 0x1000u <= 0xfffffu && !final) {
+            // the reader would have gone on into the next piece; wait for it
+            started = (total != 0u);
+            return false;
+        }
+        if (ring.empty()) {                      // LAB_0808d237, param_1[3] == 0
+            started = false;
+            if (total == 0u) return false;       // the stream is over
+            blk_len = total;
+            return true;
+        }
+        const std::uint32_t take = std::min<std::uint32_t>(budget, static_cast<std::uint32_t>(ring.size()));
+        const std::uint32_t prev = total;
+        if (prev == 0u) seg.Reset(); else seg.Fold();
+        std::memcpy(dst.data() + prev, ring.data(), take);   // FUN_080aee40
+        ring.erase(ring.begin(), ring.begin() + static_cast<std::ptrdiff_t>(take));
+        seg.Prime(dst.data() + prev, take);
+        total = prev + take;
+        const std::uint32_t split = seg.Split(dst.data(), total, prev);
+        if (split < total) {                     // LAB_0808d355
+            const std::uint32_t tail = total - split;
+            started = false;
+            if (static_cast<std::size_t>(tail) + ring.size() > 0x100000u) {
+                blk_len = total;                 // no room to give it back: keep it whole
+                return true;
+            }
+            ring.insert(ring.begin(), dst.begin() + split, dst.begin() + total);
+            blk_len = split;                     // the tail stays in `dst` as the slack
+            return true;
+        }
+        budget -= take;
+        if (budget < 0x1001u) { started = false; blk_len = total; return true; }
+        started = true;                          // go back for more and extend this block
+    }
 }
 
 }  // namespace nzr::opt_enc
