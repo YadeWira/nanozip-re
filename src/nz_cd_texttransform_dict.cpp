@@ -5516,8 +5516,13 @@ const std::uint16_t* nzr::cd::NzCdDictBucketStarts() {
         std::uint32_t acc = 0;
         for (int i = 0; i < 0x2da; ++i) { table[i] = static_cast<std::uint16_t>(acc); acc += counts[i]; }
         table[0x2da] = static_cast<std::uint16_t>(acc);
-        // the original writes cumulative[i] for i < 0x2da then shifts the array by one short
-        for (int i = 0; i < 0x2d9; ++i) table[i] = table[i + 1];
+        // the original writes cumulative[i] for i < 0x2da then shifts the array by
+        // one short -- ALL of it, 0x2da entries. Stopping at 0x2d9 left the last
+        // entry unshifted, and the lookup reads `ends[bucket + 1]` as the end of
+        // the range: the LAST bucket (728, a word whose last two letters are
+        // `zz`) then got lo == hi and its single word was unreachable. `jazz`
+        // came out as four literal bytes where the original codes it in two.
+        for (int i = 0; i < 0x2da; ++i) table[i] = table[i + 1];
         built = true;
     }
     return table;

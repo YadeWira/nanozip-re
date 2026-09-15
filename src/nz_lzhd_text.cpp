@@ -516,6 +516,12 @@ dispatch:
                     lo = mid + 1u;
                 }
                 const std::uint32_t code = ~found;   // 0 when not found
+                if (const char* dtr = std::getenv("NZ_TRACE_DICT")) {
+                    char w[16]; for (std::uint32_t i = 0; i < L && i < 15u; ++i) w[i] = (char)wbuf[i]; w[L < 15u ? L : 15u] = 0;
+                    if (std::strstr(w, dtr) != nullptr)
+                        std::fprintf(stderr, "[dict] '%s' L=%u k1=%08x k2=%08x bucket=%u lo=%u hi=%u found=%u hit=%d code=%u sep=%02x\n",
+                                     w, L, k1, k2, bucket, D.ends[bucket], D.ends[bucket + 1u], found, (int)hit, code, sep);
+                }
                 if (hit) { p9[0] = static_cast<std::uint8_t>(code >> 7u); p9[1] = static_cast<std::uint8_t>(code | 0x80u); }
                 if (!hit || code == 0u) {
                     std::memcpy(p9, wbuf, 16);      // the raw word (LAB_08055590)
