@@ -935,6 +935,14 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
     }
     std::vector<std::uint8_t> bc;
     LzParse(st, static_cast<std::size_t>(block - st.window), len, bc);
+    // NZ_DUMP_LZBC=<prefix>: this block's LZ bytecode, one file per block, for
+    // diffing two builds against each other.
+    if (const char* bp = std::getenv("NZ_DUMP_LZBC")) {
+        static int bn = 0;
+        char path[512];
+        std::snprintf(path, sizeof path, "%s.%d", bp, bn++);
+        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(bc.data(), 1, bc.size(), f); std::fclose(f); }
+    }
     const std::uint32_t flags = flags58 | 3u;
     const std::size_t limit = len - (len < 2u ? len : 2u);
     std::vector<std::uint8_t> ar;
