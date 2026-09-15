@@ -645,10 +645,22 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         std::uint32_t dist = 0;
         std::uint32_t rep[4] = {0, 0, 0, 0};
     };
+    // The lookahead below reads up to node ni+6, and the original reads the
+    // stack locals that follow its own array there.
+    //
+    // The array has to arrive CLEAR (a node counts as written only while its
+    // tag is this chunk's, and the tag of an untouched one must not be), but
+    // clearing all of it costs more than the parse: this runs once per handful
+    // of input bytes and the array is 133 KB, which was 64 % of a `-cO` encode.
+    // So only what the last call dirtied is cleared -- everything above it is
+    // still Node{} from before.
+    constexpr std::uint32_t kNodes = 0x1040u + 8u;
     static thread_local std::vector<Node> nodes;
-    // the lookahead below reads up to node ni+6, and the original reads the
-    // stack locals that follow its own array there
-    nodes.assign(0x1040u + 8u, Node{});
+    static thread_local std::uint32_t nodes_dirty = 0;
+    if (nodes.size() != kNodes) nodes.assign(kNodes, Node{});
+    else if (nodes_dirty != 0u) std::fill_n(nodes.begin(), nodes_dirty, Node{});
+    nodes_dirty = kNodes;              // pessimistic until the parse has ended
+    std::uint32_t dirty_hi = 0;        // the highest node this call writes
 
     std::uint32_t* const rep0 = F.rep0;
     std::uint8_t& hist0 = F.hist0;
@@ -681,7 +693,6 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         F.lrhash = lrh;
     }
     const std::uint32_t remain0 = chunk - emitted;
-    for (auto& n : nodes) n.tag = 0;
     nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
     for (int k = 0; k < 4; ++k) nodes[0].rep[k] = rep0[k];
     std::uint32_t front = 1;
@@ -723,6 +734,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
                           const std::uint32_t* nr, std::uint32_t basep, std::uint32_t lenp) -> bool {
             Node& tg = nodes[ni + L];
+            if (ni + L > dirty_hi) dirty_hi = ni + L;
             const std::uint32_t price = basep + lenp;
             if (tg.tag == TAG) {
                 if (tg.price <= price) return false;
@@ -750,6 +762,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         auto TakeWhole = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
                              const std::uint32_t* nr) {
             Node& tg = nodes[ni + 1u];
+            if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
             tg.tag = TAG;
             tg.back = static_cast<std::uint16_t>(ni);
             tg.len = static_cast<std::uint16_t>(L);
@@ -922,6 +935,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                                     am2, am3, remain);
             const std::uint32_t price = nd.price + lp;
             if (!tagged || price <= tg.price + 3u + (lp >> 4u)) {
+                if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
                 tg.tag = TAG;
                 tg.price = static_cast<std::uint16_t>(price);
                 tg.back = static_cast<std::uint16_t>(ni);
@@ -947,6 +961,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         }
     }
     if (endnode == 0u) endnode = 1u;
+    nodes_dirty = std::min<std::uint32_t>(dirty_hi + 1u, kNodes);
     if (NZ_ENV("NZO2_NODES")) {
         static int fl = 0;
         std::fprintf(stderr, "[N2] flush=%d cur0=%u front=%u end=%u\n", fl++, pos0 + emitted, front, endnode);

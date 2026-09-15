@@ -640,10 +640,19 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
         std::uint32_t dist = 0;
         std::uint32_t rep[4] = {0, 0, 0, 0};
     };
+    // Six extra slots: the lookahead below reads up to node ni+6, and the
+    // original reads the stack locals that follow its array there.
+    //
+    // The array has to arrive CLEAR (an untouched node must not carry this
+    // chunk's tag), but this runs once per handful of input bytes, so only what
+    // the last call dirtied is cleared -- everything above it is still Node{}.
+    constexpr std::uint32_t kNodes = 0x120u + 8u;
     static thread_local std::vector<Node> nodes;
-    // six extra slots: the lookahead below reads up to node ni+6, and the
-    // original reads the stack locals that follow its array there
-    nodes.assign(0x120u + 8u, Node{});
+    static thread_local std::uint32_t nodes_dirty = 0;
+    if (nodes.size() != kNodes) nodes.assign(kNodes, Node{});
+    else if (nodes_dirty != 0u) std::fill_n(nodes.begin(), nodes_dirty, Node{});
+    nodes_dirty = kNodes;              // pessimistic until the parse has ended
+    std::uint32_t dirty_hi = 0;        // the highest node this call writes
 
     std::uint32_t* const rep0 = F.rep0;
     std::uint8_t& hist0 = F.hist0;
@@ -685,7 +694,6 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 F.lrhash = lrh;
             }
             const std::uint32_t remain0 = chunk - emitted;
-            for (auto& n : nodes) n.tag = 0;
             nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
             for (int k = 0; k < 4; ++k) nodes[0].rep[k] = rep0[k];
             std::uint32_t front = 1;       // uStack_230f4: furthest relaxed node
@@ -737,6 +745,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
                                   const std::uint32_t* nr, std::uint32_t price) -> bool {
                     Node& tg = nodes[ni + L];
+                    if (ni + L > dirty_hi) dirty_hi = ni + L;
                     // the first writer keeps a tie, as the decompile compares
                     if (tg.tag == static_cast<std::uint16_t>(chunk) && price >= tg.price) return false;
                     tg.tag = static_cast<std::uint16_t>(chunk);
@@ -786,6 +795,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         }
                     } else {
                         Node& tg = nodes[ni + 1u];
+                        if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
                         tg.tag = static_cast<std::uint16_t>(chunk);
                         tg.back = static_cast<std::uint16_t>(ni);
                         tg.len = static_cast<std::uint16_t>(len);
@@ -918,6 +928,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                     if (topdist != 0u && topdist <= cap) {
                         if (toplen >= 0x20u || ni + toplen >= 0x120u) {
                             Node& tg = nodes[ni + 1u];
+                            if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
                             tg.tag = static_cast<std::uint16_t>(chunk);
                             tg.back = static_cast<std::uint16_t>(ni);
                             tg.len = static_cast<std::uint16_t>(toplen);
@@ -981,6 +992,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // ---- the literal
                 {
                     Node& tg = nodes[ni + 1u];
+                    if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
                     const bool tagged = (tg.tag == static_cast<std::uint16_t>(chunk));
                     // Before pricing anything the original looks six nodes ahead:
                     // if any of them is already at most three units plus twice the
@@ -1043,6 +1055,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             }
             (void)flushed;
             if (endnode == 0u) endnode = 1u;
+            nodes_dirty = std::min<std::uint32_t>(dirty_hi + 1u, kNodes);
             if (const char* dc = NZ_ENV("NZOPT_DCLS")) {
                 static std::uint16_t last = 0xffffu;
                 const std::uint16_t v = Rd16(mem, 0x3d848u + static_cast<std::size_t>(std::atoi(dc)) * 2u);
