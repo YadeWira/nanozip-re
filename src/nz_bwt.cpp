@@ -1822,7 +1822,14 @@ struct P14Encoder {
     const uint8_t* in = nullptr;
     uint32_t n = 0;
     uint32_t hash_mask = 0, chain_mask = 0, off_mask = 0, tag_mask = 0;
-    std::vector<uint32_t> head, chain;
+    // The reference's two tables are not allocations of their own: they are the
+    // 3 MB the -co/-cO parser uses for its match-finder tree (head 2^19 words,
+    // chain 2^18 -- 2 MB + 1 MB, exactly `blocksize * 3` at -m4m), which is why
+    // each pass starts on whatever the other left there. `arena` points at that
+    // memory when the caller lends it; `own` is the private, zeroed fallback.
+    uint32_t* head = nullptr;
+    uint32_t* chain = nullptr;
+    std::vector<uint32_t> own;
     uint32_t budget = 0;                              // st[8]
     const uint16_t* stats = nullptr;
 
@@ -2303,7 +2310,8 @@ uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
                             const std::vector<uint16_t>& stats,
                             std::vector<uint8_t>* out,
                             std::vector<uint8_t>* side,
-                            uint32_t side_cap) {
+                            uint32_t side_cap,
+                            uint32_t* arena, std::size_t arena_words) {
     out->clear();
     side->clear();
     if (in == nullptr || n < 0x80u || stats.size() < 0x40000u) return 0;
@@ -2324,14 +2332,16 @@ uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
     const uint32_t bits = (hb + 1u > 0x14u) ? hb : 0x13u;
     e.hash_mask = (1u << bits) - 1u;
     e.chain_mask = (1u << (bits - 1u)) - 1u;
-    e.head.assign((size_t)e.hash_mask + 1u, 0);
-    e.chain.assign((size_t)e.chain_mask + 1u, 0);
-    // The reference's hash table is scratch past the block buffer's 2n mark and
-    // is never cleared, so it arrives holding whatever that memory last had
-    // (22 211 live entries on the first call of a run, measured). It does not
-    // matter: a stale entry still has to pass the position and tag checks and
-    // then a four-byte verification, so it can only ever name a real match --
-    // seeding ours from a dump of the reference's own table changes nothing.
+    const std::size_t need = (std::size_t)e.hash_mask + 1u + (std::size_t)e.chain_mask + 1u;
+    if (arena != nullptr && arena_words >= need) {
+        // The reference's tables: the parser's arena, never cleared, head first.
+        e.head = arena;
+        e.chain = arena + (std::size_t)e.hash_mask + 1u;
+    } else {
+        e.own.assign(need, 0u);
+        e.head = e.own.data();
+        e.chain = e.own.data() + (std::size_t)e.hash_mask + 1u;
+    }
     e.budget = 0;
 
     // The reference writes into the block buffer's tail and copies back; the

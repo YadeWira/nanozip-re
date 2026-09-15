@@ -214,6 +214,12 @@ public:
     std::uint32_t WindowFill() const { return ring_.cursor; }
     bool WindowScrolled() const { return ring_.scrolled_once; }
     bool WindowResetPending() const { return window_reset_pending_; }
+    // The match-finder tree, which the reference also uses as param14's two
+    // hash tables (quirk 72): 3 MB shared between the two passes, cleared by
+    // neither. Lent to the param14 encoder so it starts where the reference's
+    // does.
+    std::uint32_t* ParserArena();
+    std::size_t ParserArenaWords() const;
     const std::uint32_t* LongRangeTable() const;
     std::uint32_t LongRangeMask() const;
 

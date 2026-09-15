@@ -12986,7 +12986,17 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                     std::memcpy(p14in.data(), lz_in, m);
                     p14src = p14in.data();
                 }
-                const std::uint32_t r = NzBwtParam14Encode(p14src, m, stats, &p14buf, &p14side);
+                // NZOPT_P14_ARENA=1: lend param14 the parser's match-finder
+                // tree, which in the reference IS its pair of hash tables
+                // (quirk 72). OFF by default: measured 2026-09-15, it costs two
+                // corpus files (292 -> 290) and fixes none, because the tree we
+                // would lend has itself already diverged -- the two passes feed
+                // each other, so a half-right layout is worse than none.
+                static const bool p14_arena = (NZ_ENV("NZOPT_P14_ARENA") != nullptr);
+                const std::uint32_t r = NzBwtParam14Encode(
+                    p14src, m, stats, &p14buf, &p14side, 0x80000u,
+                    p14_arena ? co.ParserArena() : nullptr,
+                    p14_arena ? co.ParserArenaWords() : 0u);
                 if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
             } else {
                 co.FeedWindow(blk, blk_len);

@@ -577,6 +577,9 @@ void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t l
 
 // The pieces the param15 ENCODER borrows from this engine: the ring it reads
 // its sources from and the long-range index the window feed maintains.
+std::uint32_t* NzOptimumLzDecoder::ParserArena() { return parser_ ? parser_->tree.data() : nullptr; }
+std::size_t NzOptimumLzDecoder::ParserArenaWords() const { return parser_ ? parser_->tree.size() : 0u; }
+
 const std::uint32_t* NzOptimumLzDecoder::LongRangeTable() const { return parser_ ? parser_->lr.data() : nullptr; }
 std::uint32_t NzOptimumLzDecoder::LongRangeMask() const { return parser_ ? parser_->lrmask : 0u; }
 

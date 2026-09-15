@@ -115,8 +115,14 @@ uint32_t NzBwtParam15Encode(const uint8_t* in, uint32_t n,
                             uint32_t ring_fill, bool ring_scrolled,
                             std::vector<uint8_t>* out, std::vector<uint8_t>* side,
                             uint32_t side_cap);
+// `arena`/`arena_words`: the memory the reference's two hash tables actually
+// live in -- the -co/-cO parser's match-finder tree, which they share with it
+// and which nobody clears (quirk 72). Lend it and the pass starts on whatever
+// the parser left there, as the reference does; pass nullptr and it gets a
+// private, zeroed pair instead.
 uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
                             const std::vector<uint16_t>& stats,
                             std::vector<uint8_t>* out,
                             std::vector<uint8_t>* side,
-                            uint32_t side_cap = 0x80000u);
+                            uint32_t side_cap = 0x80000u,
+                            uint32_t* arena = nullptr, std::size_t arena_words = 0);
