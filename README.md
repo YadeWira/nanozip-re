@@ -12,7 +12,7 @@ transforms and an x86 filter. Only stripped Linux and Windows binaries of the la
 
 ## Why
 
-NanoZip's author died more than a decade ago; 0.09 alpha is the last build he published, and the
+NanoZip's author supposedly died around 2013; 0.09 alpha is the last build he published, and the
 closed binary is all that exists of the format. This project is preservation: an executable
 specification that keeps `.nz` archives readable once that binary no longer runs.
 
