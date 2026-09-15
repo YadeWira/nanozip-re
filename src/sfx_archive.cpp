@@ -2635,7 +2635,9 @@ inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
                 progress::Engine& pe = progress::E();
                 std::lock_guard<std::mutex> plk(pe.mu);
                 ClearStatusLine(*e.os);
-                *e.os << '\r' << "Overwrite " << en.path << " (Yes/No/Always)? ";
+                // the same 40/37 elision the progress line uses -- the original
+                // asks about "...<last 37>" for a name over 40 columns
+                *e.os << '\r' << "Overwrite " << progress::Name40(en.path) << " (Yes/No/Always)? ";
                 e.os->flush();
             }
             std::string answer;
@@ -11381,7 +11383,7 @@ int RunLegacyCnExtractOrTest(
                     // must be a lowercase y / n / a -- anything else (uppercase included,
                     // an empty line) asks again.
                     ClearStatusLine(os);
-                    os << '\r' << "Overwrite " << e.path << " (Yes/No/Always)? ";
+                    os << '\r' << "Overwrite " << progress::Name40(e.path) << " (Yes/No/Always)? ";
                     os.flush();
                     std::string answer;
                     if (!std::getline(std::cin, answer)) { write_it = false; break; }
