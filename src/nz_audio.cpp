@@ -25,6 +25,11 @@ namespace {
 
 // NZOPT_TRACE_AUDIO-gated diagnostics, following this project's existing
 // NZOPT_TRACE_* convention (zero cost when the variable is unset).
+static bool BcTrace() {
+    static const bool t = (NZ_ENV("NZ_BCTRACE") != nullptr);
+    return t;
+}
+
 static bool AudioTrace() {
     static const bool on = (NZ_ENV("NZOPT_TRACE_AUDIO") != nullptr);
     return on;
@@ -667,6 +672,7 @@ struct AudioBitcountDecoder {
 
             accum = ~accum & 0x3fu;
             num_zeros = (accum == 0u) ? num_zeros + 1u : 0u;
+            if (BcTrace()) std::fprintf(stderr, "S %u\n", accum);
             *out++ = (uint8_t)accum;
             outsize -= 1u;
             if (outsize == 0u) break;
@@ -687,12 +693,133 @@ struct AudioBitcountDecoder {
                     num_zero_lower = num_zero_lower * 2u + adec.Read(0x8000u);
                 } while (--nn);
                 uint32_t num_zero = std::min(num_zero_upper + num_zero_lower, outsize);
+                if (BcTrace()) std::fprintf(stderr, "R %u k=%u low=%u\n", num_zero, num_zero_bits, num_zero_lower);
                 outsize -= num_zero;
                 while (num_zero) { *out++ = 0; num_zero--; }
                 if (outsize == 0u) break;
             }
         }
         return 2u + insize;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Encoder side: the bit-count coder run backwards (variant A, FUN_0809c070's
+// mirror). Same models, same update order; the arithmetic coder is the usual
+// carry-less range coder this codebase already writes for the post-filters.
+// ---------------------------------------------------------------------------
+struct ArithEncA {
+    uint32_t lo_ = 0, hi_ = 0xffffffffu;
+    std::vector<uint8_t>* out_ = nullptr;
+
+    void Put(uint8_t b) { out_->push_back(b); }
+    // `model` is the 16-bit probability the decoder passes to ArithDec::Read,
+    // which shifts it right by 4 before use.
+    void EncodeModel(bool bit, uint32_t model) { Encode(bit, model >> 4); }
+    void Encode(bool bit, uint32_t p12) {
+        const uint32_t compare = lo_ + ((hi_ - lo_) >> 12) * p12;
+        if (bit) hi_ = compare; else lo_ = compare + 1u;
+        while ((lo_ ^ hi_) < 0x1000000u) {
+            Put((uint8_t)(hi_ >> 24));
+            lo_ <<= 8;
+            hi_ = (hi_ << 8) | 0xffu;
+        }
+    }
+    void Flush() { Put((uint8_t)(hi_ >> 24)); }
+};
+
+struct AudioBitcountEncoder {
+    uint16_t model_a_[64];
+    uint16_t model_b_[576];
+    uint16_t model_c_[32];
+
+    AudioBitcountEncoder() { Reset(); }
+
+    // Identical to AudioBitcountDecoder::Reset.
+    void Reset() {
+        for (uint32_t i = 0; i != 64u; ++i) model_a_[i] = 0x8000u;
+        for (uint32_t i = 0; i != 32u; ++i) model_c_[i] = 0x8000u;
+        model_b_[0] = 0;
+        model_b_[8] = 0xffffu;
+        for (uint32_t i = 1; i != 8u; i++)
+            model_b_[i] = (uint16_t)(16u * kModelLutLookup[512u * i - 1u]);
+        for (uint32_t i = 0; i != 9u * 63u; i++) model_b_[i + 9] = model_b_[i];
+    }
+
+    void EncodeSymbol(ArithEncA& enc, uint32_t value) {
+        // The decoder ends its 6-step descent on accum in [64,127] and answers
+        // `~accum & 0x3f`, so the flags are the complement's bits, top first.
+        const uint32_t bits = (~value) & 0x3fu;
+        uint32_t accum = 1;
+        for (int k = 5; k >= 0; --k) {
+            const bool flag = ((bits >> k) & 1u) != 0u;
+            uint16_t* model_a_ptr = &model_a_[accum];
+            uint16_t* model_b_ptr = &model_b_[(*model_a_ptr >> 13) + 9u * accum];
+            enc.EncodeModel(flag, ((uint32_t)model_b_ptr[0] + model_b_ptr[1] + 1u) >> 1);
+            *model_a_ptr = (uint16_t)(*model_a_ptr +
+                ((((uint32_t)flag * 0x10000u) + 4u - *model_a_ptr) >> 3));
+            model_b_ptr[0] = (uint16_t)(model_b_ptr[0] +
+                ((((uint32_t)flag * 0x1007eu) - model_b_ptr[0]) >> 7));
+            model_b_ptr[1] = (uint16_t)(model_b_ptr[1] +
+                ((((uint32_t)flag * 0x1007eu) - model_b_ptr[1]) >> 7));
+            accum = accum * 2u + flag;
+        }
+    }
+
+    // Writes the u16 length prefix and the coded body. Returns false only if the
+    // body does not fit a 16-bit length, which the format cannot express.
+    bool Encode(const uint8_t* counts, uint32_t n, std::vector<uint8_t>* out) {
+        if (n == 0u) return false;
+        std::vector<uint8_t> body;
+        ArithEncA enc;
+        enc.out_ = &body;
+
+        const uint32_t outsize_bits = BSR(n);
+        uint32_t remaining = n, num_zeros = 0, i = 0;
+        for (;;) {
+            const uint32_t v = counts[i++];
+            if (BcTrace()) std::fprintf(stderr, "S %u\n", v);
+            EncodeSymbol(enc, v);
+            num_zeros = (v == 0u) ? num_zeros + 1u : 0u;
+            remaining -= 1u;
+            if (remaining == 0u) break;
+
+            if (num_zeros > 6u) {
+                // How many zeros follow right here: the decoder emits them in one
+                // run and does NOT feed them back into num_zeros.
+                uint32_t z = 0;
+                while (z < remaining && counts[i + z] == 0u) ++z;
+                const uint32_t k = (z < 2u) ? 0u : BSR(z);
+                uint32_t j = 0;
+                for (; j < k; ++j) {
+                    uint16_t* m = &model_c_[j];
+                    enc.EncodeModel(true, *m);
+                    *m = (uint16_t)(*m + (((0x10000u) + 16u - *m) >> 5));
+                }
+                if (k != outsize_bits) {
+                    uint16_t* m = &model_c_[k];
+                    enc.EncodeModel(false, *m);
+                    *m = (uint16_t)(*m + ((16u - *m) >> 5));
+                }
+                const uint32_t upper = k ? (1u << k) : 0u;
+                uint32_t nn = k + (k == 0u);
+                const uint32_t lower = z - upper;
+                while (nn) {
+                    --nn;
+                    enc.Encode(((lower >> nn) & 1u) != 0u, 0x8000u >> 4);
+                }
+                if (BcTrace()) std::fprintf(stderr, "R %u k=%u low=%u\n", z, k, lower);
+                i += z;
+                remaining -= z;
+                if (remaining == 0u) break;
+            }
+        }
+        enc.Flush();
+        if (body.size() > 0xffffu) return false;
+        out->push_back((uint8_t)(body.size() & 0xffu));
+        out->push_back((uint8_t)(body.size() >> 8));
+        out->insert(out->end(), body.begin(), body.end());
+        return true;
     }
 };
 
@@ -1124,6 +1251,18 @@ struct NzAudioPred::Impl {
         return true;
     }
 };
+
+std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,
+                                     std::uint8_t* out, std::uint32_t n) {
+    AudioBitcountDecoder dec;
+    return dec.Decode(in, in + in_size, out, n);
+}
+
+bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
+                            std::vector<std::uint8_t>* out) {
+    AudioBitcountEncoder enc;
+    return enc.Encode(counts, n, out);
+}
 
 void NzAudioPred::SetContextFlags(std::uint8_t flags) { impl_->ctx_flags_ = flags; }
 

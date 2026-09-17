@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 #include <memory>
 
 // NanoZip decr_param == 2 ("audio") block decoding, ported from the community
@@ -74,6 +75,17 @@ class NzAudioPred {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Encoder side, test hook: writes the bit-count array of ONE channel exactly as
+// a decr_param==2 payload carries it (variant A: the -cO/-cc coder), u16 length
+// prefix included. Appends to `out` and returns true on success.
+// Test hook, decoder half: reads one variant-A bit-count block (u16 length
+// prefix included) and returns the bytes consumed, 0 on failure.
+std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,
+                                     std::uint8_t* out, std::uint32_t n);
+
+bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
+                            std::vector<std::uint8_t>* out);
 
 // NanoZip decr_param == 3 ("image") block decoding, ported from the binary
 // (FUN_080a9ca0 = 64 KB-chunk wrapper, FUN_080a90c0 = per-chunk decoder).
