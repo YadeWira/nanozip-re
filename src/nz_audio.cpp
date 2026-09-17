@@ -192,7 +192,9 @@ struct AudioStereoDecoder {
             return (int32_t)((uint32_t)a - (uint32_t)b);
         }
 
-        int32_t Decode(int32_t value, int32_t other_value) {
+        // One inter-channel step, both ways: `encoding` makes `in_value` the
+        // sample and returns the residual, exactly inverting the decode.
+        int32_t Step(int32_t in_value, int32_t other_value, bool encoding) {
             two_.hist_ptr_[0] = other_value;
             for (uint32_t i = 1, e = two_.hist_order_; i < e; i++)
                 two_.hist_ptr_[i] = WrapSub(other_value, two_.hist_ptr_[i]);
@@ -208,7 +210,9 @@ struct AudioStereoDecoder {
             const int32_t sum_sign = (int32_t)sum_sign64;
             const int64_t mag = (int64_t)(((uint64_t)sum ^ (uint64_t)sum_sign64) - (uint64_t)sum_sign64);
             const int32_t shifted = (int32_t)(((uint32_t)(int32_t)(mag >> shift_)) ^ (uint32_t)sum_sign);
-            const int32_t new_value = WrapAdd(value, WrapSub(shifted, sum_sign));
+            const int32_t pred = WrapSub(shifted, sum_sign);
+            const int32_t value = encoding ? WrapSub(in_value, pred) : in_value;
+            const int32_t new_value = encoding ? in_value : WrapAdd(value, pred);
 
             if (value < 0) {
                 for (uint32_t i = 0, e = one_.order_; i != e; i++)
@@ -242,8 +246,11 @@ struct AudioStereoDecoder {
                 std::memcpy(two_.hist_ptr_ + 1, two_.history_,
                             sizeof(int32_t) * (two_.order_ - 1));
             }
-            return new_value;
+            return encoding ? value : new_value;
         }
+
+        int32_t Decode(int32_t value, int32_t other_value) { return Step(value, other_value, false); }
+        int32_t Encode(int32_t sample, int32_t other_value) { return Step(sample, other_value, true); }
     };
 
     Chan left_, right_;
@@ -288,6 +295,18 @@ struct AudioStereoDecoder {
         for (uint32_t i = 0; i != frames; i++) {
             lp[i] = new_left_value = left_.Decode(lp[i], new_right_value);
             rp[i] = new_right_value = right_.Decode(rp[i], new_left_value);
+        }
+    }
+
+    // The same walk with the samples going in and the residuals coming out.
+    void Encode(int32_t* lp, int32_t* rp, uint32_t frames) {
+        int32_t new_right_value = 0, new_left_value = 0;
+        for (uint32_t i = 0; i != frames; i++) {
+            const int32_t l = lp[i], r = rp[i];
+            lp[i] = left_.Encode(l, new_right_value);
+            new_left_value = l;
+            rp[i] = right_.Encode(r, new_left_value);
+            new_right_value = r;
         }
     }
 };
@@ -598,6 +617,45 @@ struct LinearPredictor {
 
             predicted_value_ = (int32_t)DotI16(cur_ptr_, factors_, order) >> shift_;
         }
+    }
+
+    // Encoder side: the same two loops with the subtraction the other way round.
+    // The state updates see exactly the pair (sample, delta) the decoder sees.
+    void RunForwardBig(int32_t* samples, uint32_t n) {
+        for (; n; n--) {
+            const int32_t sample = *samples;
+            const int32_t delta = (int32_t)((uint32_t)sample - (uint32_t)predicted_value_);
+            *samples++ = delta;
+            UpdateBig(sample, delta);
+        }
+    }
+
+    void RunForwardSmall(int32_t* samples, uint32_t n) {
+        const uint32_t order = order_;
+        for (; n; n--) {
+            const int32_t outvalue = *samples;
+            const int32_t delta = (int32_t)((uint32_t)outvalue - (uint32_t)predicted_value_);
+            *samples++ = delta;
+
+            int16_t* cur_ptr = cur_ptr_;
+            FactorsUpdateWrap(factors_, cur_ptr + 512, order, delta <= 0);
+            cur_ptr_ = cur_ptr - 1;
+            if (cur_ptr_ < hist_) {
+                cur_ptr_ = &hist_[2560 - order];
+                CopyHist(cur_ptr_ + 1, hist_, order - 1);
+                CopyHist(cur_ptr_ + 1 + 512, hist_ + 512, order - 1);
+            }
+
+            cur_ptr_[0] = (int16_t)outvalue;
+            cur_ptr_[512] = (int16_t)((int16_t)outvalue ? (((outvalue >> 14) & 2) - 1) : 0);
+
+            predicted_value_ = (int32_t)DotI16(cur_ptr_, factors_, order) >> shift_;
+        }
+    }
+
+    void RunForward(int32_t* samples, uint32_t n) {
+        if (order_ <= 8) RunForwardSmall(samples, n);
+        else RunForwardBig(samples, n);
     }
 
     void Run(int32_t* samples, uint32_t n) {
@@ -998,6 +1056,54 @@ static void CopyOutSamples(uint8_t* out, uint32_t nframes, const int32_t* sample
                     *out++ = (uint8_t)value;
                 }
             }
+        }
+    }
+}
+
+// The inverse of CopyOutSamples: raw bytes back to the per-channel delta planes
+// the predictors work on. The accumulators are the decoder's, run backwards, so
+// the deltas it will add up reproduce these very bytes.
+static void UnpackSamples(const uint8_t* in, uint32_t nframes, int32_t* samples,
+                          AudioFormat fmt) {
+    const uint32_t nchannels = fmt.channels ? 2u : 1u;
+    int32_t* right_part = samples + nframes;
+    uint32_t left_prev = 0, right_prev = 0;
+
+    for (uint32_t i = 0; i < nframes; ++i) {
+        int32_t values[2] = {0, 0};
+        for (uint32_t c = 0; c < nchannels; ++c) {
+            int32_t v = 0;
+            if (fmt.sample_size == 1) {
+                v = (int32_t)(int8_t)*in++;
+            } else if (fmt.sample_size == 2) {
+                const uint32_t b0 = *in++, b1 = *in++;
+                const uint32_t raw = fmt.little_endian ? (b0 | (b1 << 8)) : (b1 | (b0 << 8));
+                v = (int32_t)(int16_t)(uint16_t)raw;
+            } else {
+                const uint32_t b0 = *in++, b1 = *in++, b2 = *in++;
+                const uint32_t raw = fmt.little_endian ? (b0 | (b1 << 8) | (b2 << 16))
+                                                       : (b2 | (b1 << 8) | (b0 << 16));
+                v = (int32_t)((raw ^ 0x800000u) - 0x800000u);
+            }
+            values[c] = v;
+        }
+
+        uint32_t left_sum, right_sum;
+        if (fmt.channels == 2) {
+            // values[1] is `tt`; values[0] = left_sum + tt, right_sum = tt + (left_sum >> 1)
+            const uint32_t tt = (uint32_t)values[1];
+            left_sum = (uint32_t)values[0] - tt;
+            right_sum = tt + (uint32_t)((int32_t)left_sum >> 1);
+        } else {
+            left_sum = (uint32_t)values[0];
+            right_sum = (uint32_t)values[1];
+        }
+
+        samples[i] = (int32_t)(left_sum - left_prev);
+        left_prev = left_sum;
+        if (fmt.channels) {
+            right_part[i] = (int32_t)(right_sum - right_prev);
+            right_prev = right_sum;
         }
     }
 }
@@ -1473,6 +1579,161 @@ std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size
     }
     AudioBitcountDecoder dec;
     return dec.Decode(in, in + in_size, out, n);
+}
+
+// ---------------------------------------------------------------------------
+// NzAudioEncoder -- one decr_param==2 chunk, written. The decisions (format,
+// inter-channel gate, per-plane predictor flags) come in from the caller for
+// now; picking them the way the reference does is the next piece.
+// ---------------------------------------------------------------------------
+struct NzAudioEncoder::Impl {
+    AudioBitcountEncoder bc_a_[2];
+    AudioBitcountEncoderB bc_b_[2];
+    bool variant_b_{false};
+    uint8_t ctx_flags_{0x03};
+    LinearPredictor linpred_[6];
+    AudioStereoDecoder stereo_dec_;
+    nzr::lzpf::LmsObject lms_[2];
+    std::vector<int32_t> samples_;
+    std::vector<uint8_t> counts_;
+
+    Impl() : stereo_dec_(4, 8), samples_(0x10000), counts_(0x10000) {}
+
+    void SetPlaneOrders(uint32_t p0, uint32_t p1, uint32_t p2) {
+        linpred_[0].Initialize(p0); linpred_[1].Initialize(p0);
+        linpred_[2].Initialize(p1); linpred_[3].Initialize(p1);
+        linpred_[4].Initialize(p2); linpred_[5].Initialize(p2);
+    }
+    void Reset() {
+        bc_a_[0].Reset(); bc_a_[1].Reset();
+        bc_b_[0].Reset(); bc_b_[1].Reset();
+        stereo_dec_.Reset();
+        lms_[0].Init(); lms_[1].Init();
+        for (int i = 0; i < 6; ++i) linpred_[i].Reset();
+    }
+
+    bool EncodeChunk(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
+                     std::vector<uint8_t>* out) {
+        AudioFormat fmt;
+        fmt.stereo_filter = p.stereo_filter;
+        fmt.channels = p.channels;
+        fmt.sample_size = p.sample_size;
+        fmt.little_endian = p.little_endian;
+
+        // The type byte, built the way DecodeChunk takes it apart.
+        uint32_t f = 0;
+        if (p.sample_size != 1u) f = 1u + (((uint32_t)p.sample_size - 2u) << 1) + (p.little_endian ? 1u : 0u);
+        const uint32_t hdr_code = (p.header_bytes >= 6u) ? 6u : p.header_bytes;
+        if (p.header_bytes >= 6u && p.header_bytes - 6u > 0xffu) return false;
+        const uint32_t type = ((hdr_code * 5u + f) * 3u + p.channels) * 2u + (p.stereo_filter ? 1u : 0u);
+        if (type > 0xffu) return false;
+        out->push_back((uint8_t)type);
+        if (p.header_bytes >= 6u) out->push_back((uint8_t)(p.header_bytes - 6u));
+
+        if (p.header_bytes > outsize) return false;
+        out->insert(out->end(), in, in + p.header_bytes);
+        const uint8_t* body = in + p.header_bytes;
+        uint32_t body_size = outsize - p.header_bytes;
+
+        uint32_t sample_count = body_size / fmt.sample_size;
+        if (fmt.channels) sample_count &= ~1u;
+        const uint32_t databytes = sample_count * fmt.sample_size;
+        const uint32_t pad_bytes = body_size - databytes;
+        out->insert(out->end(), body + databytes, body + databytes + pad_bytes);
+
+        const uint32_t nsamples = databytes / fmt.sample_size;
+        uint32_t nframes = nsamples;
+        if (fmt.channels) {
+            if (nsamples & 1u) return false;
+            nframes = nsamples >> 1;
+        }
+        if (nsamples > samples_.size()) return false;
+        int32_t* samples = samples_.data();
+        uint8_t* counts = counts_.data();
+
+        UnpackSamples(body, nframes, samples, fmt);
+
+        // The side bits, in the order the decoder reads them.
+        std::vector<uint32_t> prefix;
+        const bool lms_variant = (ctx_flags_ & 0x10u) != 0u;
+        if (fmt.channels) {
+            prefix.push_back(p.gate ? 1u : 0u); prefix.push_back(1u);
+            if (p.gate) {
+                if (!lms_variant) {
+                    prefix.push_back(p.gate_a); prefix.push_back(4u);
+                    prefix.push_back(p.gate_b); prefix.push_back(4u);
+                    stereo_dec_.SetBits(16u + p.gate_a, 16u + p.gate_b);
+                } else {
+                    prefix.push_back(p.gate_a); prefix.push_back(3u);
+                    prefix.push_back(p.gate_b); prefix.push_back(3u);
+                    lms_[0].shift = (uint8_t)(7u + p.gate_a);
+                    lms_[1].shift = (uint8_t)(7u + p.gate_b);
+                }
+            } else {
+                stereo_dec_.Reset();
+                lms_[0].Init();
+                lms_[1].Init();
+            }
+        }
+        for (int i = 0; i != 3; i++) {
+            for (int j = 0; j < (fmt.channels ? 2 : 1); j++) {
+                const uint8_t flag = p.lp_flag[i][j];
+                prefix.push_back(flag ? 1u : 0u); prefix.push_back(1u);
+                if (flag) {
+                    prefix.push_back(p.lp_bits[i][j]); prefix.push_back(3u);
+                    linpred_[i * 2 + j].SetBits((int)p.lp_bits[i][j] + 8);
+                } else {
+                    linpred_[i * 2 + j].Reset();
+                }
+            }
+        }
+
+        // The inter-channel stage, inverted, then the predictors forward in the
+        // order the decoder undoes them (it runs 2, 1, 0).
+        if (fmt.channels && p.gate) {
+            if (lms_variant)
+                nzr::lzpf::InverseLmsInterChannel(samples, samples + nframes, nframes, &lms_[0], &lms_[1]);
+            else
+                stereo_dec_.Encode(samples, samples + nframes, nframes);
+        }
+        for (int i = 0; i <= 2; i++) {
+            for (int j = 0; j < (fmt.channels ? 2 : 1); j++) {
+                if (p.lp_flag[i][j]) linpred_[i * 2 + j].RunForward(samples + j * nframes, nframes);
+            }
+        }
+
+        std::vector<uint8_t> bits;
+        BitWriter bw;
+        bw.out_ = &bits;
+        for (size_t k = 0; k + 1 < prefix.size(); k += 2) bw.PutBits(prefix[k], prefix[k + 1]);
+        if (!EncodeInt32Array(samples, nsamples, counts, &bw)) return false;
+        bw.Finish();
+
+        // The bit-count arrays come first in the payload, one per channel.
+        const uint32_t per = nframes;
+        for (int ch = 0; ch < (fmt.channels ? 2 : 1); ++ch) {
+            const bool ok = variant_b_ ? bc_b_[ch].Encode(counts + (uint32_t)ch * per, per, out)
+                                       : bc_a_[ch].Encode(counts + (uint32_t)ch * per, per, out);
+            if (!ok) return false;
+        }
+        out->insert(out->end(), bits.begin(), bits.end());
+        return true;
+    }
+};
+
+NzAudioEncoder::NzAudioEncoder() : impl_(new Impl()) {}
+NzAudioEncoder::~NzAudioEncoder() = default;
+void NzAudioEncoder::SetContextFlags(std::uint8_t flags) { impl_->ctx_flags_ = flags; }
+void NzAudioEncoder::SetPlaneOrders(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    impl_->SetPlaneOrders(a, b, c);
+}
+void NzAudioEncoder::SetStereoParam(std::uint32_t param) { impl_->stereo_dec_.Configure((int)param); }
+void NzAudioEncoder::SetBitcountVariantB(bool b) { impl_->variant_b_ = b; }
+void NzAudioEncoder::Reset() { impl_->Reset(); }
+bool NzAudioEncoder::EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
+                                 const NzAudioChunkParams& params,
+                                 std::vector<std::uint8_t>* out) {
+    return impl_->EncodeChunk(in, outsize, params, out);
 }
 
 bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,

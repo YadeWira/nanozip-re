@@ -79,6 +79,42 @@ class NzAudioPred {
 // Encoder side, test hook: writes the bit-count array of ONE channel exactly as
 // a decr_param==2 payload carries it (variant A: the -cO/-cc coder), u16 length
 // prefix included. Appends to `out` and returns true on success.
+// One decr_param==2 chunk, in the writing direction. The decisions still come
+// from the caller; choosing them the way the reference does is the next piece.
+struct NzAudioChunkParams {
+    bool stereo_filter = false;
+    std::uint8_t channels = 0;       // 0 mono, 1 or 2 two-channel (2 = mid/side)
+    std::uint8_t sample_size = 2;
+    bool little_endian = true;
+    std::uint32_t header_bytes = 0;  // leading bytes copied verbatim
+    bool gate = false;               // the inter-channel stage
+    std::uint32_t gate_a = 0, gate_b = 0;
+    std::uint8_t lp_flag[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+    std::uint8_t lp_bits[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+};
+
+class NzAudioEncoder {
+ public:
+    NzAudioEncoder();
+    ~NzAudioEncoder();
+    NzAudioEncoder(const NzAudioEncoder&) = delete;
+    NzAudioEncoder& operator=(const NzAudioEncoder&) = delete;
+
+    void SetContextFlags(std::uint8_t flags);
+    void SetPlaneOrders(std::uint32_t pair0, std::uint32_t pair1, std::uint32_t pair2);
+    void SetStereoParam(std::uint32_t param);
+    void SetBitcountVariantB(bool b);
+    void Reset();
+
+    // `in`/`outsize` are the bytes the decoder would produce for this chunk.
+    bool EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
+                     const NzAudioChunkParams& params, std::vector<std::uint8_t>* out);
+
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // Test hooks for the residual stage: `NzAudioEncodeResiduals` fills `counts`
 // (one class per sample) and appends the magnitude/sign bit stream to `bits`;
 // `NzAudioDecodeResiduals` reads them back.

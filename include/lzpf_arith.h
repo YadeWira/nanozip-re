@@ -449,6 +449,9 @@ struct LmsObject {
 // dot products are widened to i32 via pmaddwd. Shift applied to dot result.
 void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residuals,
                           std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2);
+// The encoding direction of the same stage.
+void InverseLmsInterChannel(std::int32_t* ch1, std::int32_t* ch2,
+                            std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2);
 std::int32_t LmsPredictSample(LmsObject& o, std::int32_t x);           // FUN_080beaa0
 void LmsUpdateSample(LmsObject& o, std::int32_t sample, std::int32_t residual);   // FUN_080beae0
 

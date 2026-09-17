@@ -1801,6 +1801,30 @@ void ApplyLmsInterChannel(std::int32_t* ch1_residuals, std::int32_t* ch2_residua
     }
 }
 
+// The same walk with the samples going in and the residuals coming out: the
+// prediction is a function of the PREVIOUS value only, so subtracting it back
+// out reproduces the decoder's state step for step.
+void InverseLmsInterChannel(std::int32_t* ch1, std::int32_t* ch2,
+                            std::size_t n, LmsObject* obj_ch1, LmsObject* obj_ch2) {
+    if (n == 0 || ch1 == nullptr || ch2 == nullptr || obj_ch1 == nullptr || obj_ch2 == nullptr) return;
+    std::int32_t carry = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::int32_t s1 = ch1[i];
+        const std::int32_t res1 = static_cast<std::int32_t>(static_cast<std::uint32_t>(s1) -
+                                  static_cast<std::uint32_t>(LmsPredict(*obj_ch1, carry)));
+        LmsUpdate(*obj_ch1, s1, res1);
+        ch1[i] = res1;
+        carry = s1;
+
+        const std::int32_t s2 = ch2[i];
+        const std::int32_t res2 = static_cast<std::int32_t>(static_cast<std::uint32_t>(s2) -
+                                  static_cast<std::uint32_t>(LmsPredict(*obj_ch2, carry)));
+        LmsUpdate(*obj_ch2, s2, res2);
+        ch2[i] = res2;
+        carry = s2;
+    }
+}
+
 
 // FUN_080a5bb0 driven by an explicit, caller-owned PrefilterContext: state
 // persists across every chunk of one stream and the codec configuration
