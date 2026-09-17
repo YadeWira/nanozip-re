@@ -1711,11 +1711,13 @@ struct NzAudioEncoder::Impl {
     }
 
 
-    // The reference's plane decisions (FUN_08081c40's two loops): the shift comes
-    // from a search the predictor's own order selects, and the flag from a trial
-    // over up to 0x2000 samples. `pass` is the reference's own second sweep --
-    // the first applies every plane, the second lets the trial decide.
-    void ChoosePlanes(const uint8_t* in, uint32_t outsize, NzAudioChunkParams* p, int pass) {
+    // The reference's plane decisions (FUN_08081c40). Its outer loop is over the
+    // three STAGES and the inner one over the channels, and the stage index is
+    // what selects both the shift rule and the acceptance ratio:
+    //   stage 0  every plane is used, no trial at all;
+    //   stage 1  the trial runs with the 0x40/0x41 ratio (about 1.5 %);
+    //   stage 2  the trial runs with a plain "must be cheaper".
+    void ChoosePlanes(const uint8_t* in, uint32_t outsize, NzAudioChunkParams* p, int /*unused*/) {
         AudioFormat fmt;
         fmt.stereo_filter = p->stereo_filter;
         fmt.channels = p->channels;
@@ -1738,24 +1740,28 @@ struct NzAudioEncoder::Impl {
                 stereo_dec_.Encode(cur.data(), cur.data() + nframes, nframes);
         }
 
-        const uint32_t win = nframes < 0x1000u ? nframes : 0x1000u;
-        for (int j = 0; j < (fmt.channels ? 2 : 1); ++j) {
-            int32_t* chan = cur.data() + (uint32_t)j * nframes;
-            for (int i = 0; i <= 2; ++i) {
-                LinearPredictor& lp = linpred_[i * 2 + j];
-                // Which search sets the shift depends on context bit 0 and on the
-                // long predictor's order (the field at obj+0x1c18 -- linpred_[1]).
+        const uint32_t nch = fmt.channels ? 2u : 1u;
+        const bool long_order = linpred_[1].order_ > 0x40u;   // the field at obj+0x1c18
+        const uint32_t trial_win = long_order ? nframes : std::min<uint32_t>(nframes, 0x1000u);
+        for (int i = 0; i <= 2; ++i) {
+            for (uint32_t j = 0; j < nch; ++j) {
+                LinearPredictor& lp = linpred_[i * 2 + (int)j];
+                int32_t* chan = cur.data() + j * nframes;
+
                 if ((ctx_flags_ & 1u) == 0u) {
                     const uint32_t ord = lp.order_;
                     lp.SetBits((int)(ord > 8u ? std::min<uint32_t>(ord / 20u + 12u, 15u) : 8u));
                 } else if (lp.order_ < 9u) {
-                    if (linpred_[1].order_ < 0x41u) lp.SetBits((int)(8u + (pass == 1 ? 1u : 0u)));
-                    else ShiftSearchSmall(lp, chan, nframes, 8u, pass == 1 ? 0xbu : 0xau);
+                    if (!long_order) lp.SetBits((int)(8u + (i == 1 ? 1u : 0u)));
+                    else ShiftSearchSmall(lp, chan, nframes, 8u, i == 1 ? 0xbu : 0xau);
                 } else {
-                    ShiftSearchBig(lp, chan, nframes, pass == 0 ? win : 0x800u);
+                    ShiftSearchBig(lp, chan, nframes,
+                                   i == 0 ? (((ctx_flags_ & 8u) != 0u) ? 0x800u : 0x100u) : 0x800u);
                 }
 
-                const bool use = (pass == 0) ? true : PlanePays(lp, chan, nframes, 1u, 1u);
+                bool use = true;
+                if (i == 1) use = PlanePays(lp, chan, trial_win, 0x40u, 0x41u);
+                else if (i == 2) use = PlanePays(lp, chan, trial_win, 1u, 1u);
                 p->lp_flag[i][j] = use ? 1u : 0u;
                 p->lp_bits[i][j] = (uint8_t)(use ? (lp.shift_ >= 8u ? lp.shift_ - 8u : 0u) : 0u);
                 if (use) lp.RunForward(chan, nframes);
