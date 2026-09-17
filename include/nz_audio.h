@@ -110,6 +110,12 @@ class NzAudioEncoder {
     bool EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                      const NzAudioChunkParams& params, std::vector<std::uint8_t>* out);
 
+    // A whole decr_param==2 payload: chunks of 0x10000 output bytes with the
+    // models carried across them. `params` carries the format (from ChooseFormat);
+    // everything else is decided per chunk.
+    bool Encode(const std::uint8_t* in, std::uint32_t size,
+                const NzAudioChunkParams& params, std::vector<std::uint8_t>* out);
+
     // Fills the format fields from the shared audio detector.
     void ChooseFormat(const std::uint8_t* in, std::uint32_t size, NzAudioChunkParams* params);
 

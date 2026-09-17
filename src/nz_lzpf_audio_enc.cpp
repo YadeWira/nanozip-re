@@ -6,6 +6,7 @@
 // the side-bit stream, the Huffman side streams). Decompiles in
 // ~/.cache/nzre_tools/encode/decomp/lzpf_{analysis,media_encoders,audio_*}.c.
 #include "nz_lzpf_encoder.h"
+#include "nz_audio.h"
 
 #include <algorithm>
 #include <cstring>
@@ -598,3 +599,25 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src0, std::uint3
 }
 
 }  // namespace nzr::lzpf_enc
+
+// ---------------------------------------------------------------------------
+// The decr_param==2 encoder's format step lives here, next to the detector it
+// reads: `param_5` in the reference's FUN_08081c40 IS this AudioProbe, field for
+// field. Defined in this translation unit so nz_audio.cpp keeps no link-time
+// dependency on the lzpf encoder (the small test targets pull it in alone).
+// ---------------------------------------------------------------------------
+namespace nzr::audio {
+
+void NzAudioEncoder::ChooseFormat(const std::uint8_t* in, std::uint32_t size,
+                                  NzAudioChunkParams* p) {
+    nzr::lzpf_enc::AudioProbe pr;
+    nzr::lzpf_enc::AudioProbeBlock(pr, in, size);
+    p->stereo_filter = pr.signed_ != 0u;
+    p->channels = pr.chans;
+    p->sample_size = pr.width ? pr.width : 1u;
+    p->little_endian = (pr.width > 1u) && (pr.le != 0u);
+    p->header_bytes = pr.prefix;
+}
+
+}  // namespace nzr::audio
+

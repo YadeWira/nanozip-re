@@ -7,7 +7,6 @@
 #endif
 #include "nz_trace.h"
 #include "nz_audio.h"
-#include "nz_lzpf_encoder.h"
 #include "lzpf_arith.h"
 
 #include <algorithm>
@@ -146,6 +145,25 @@ struct AudioStereoDecoder {
         int32_t* hist_ptr_;
         int32_t factors_[128];
         int32_t history_[1024 + 128];
+
+        Part() = default;
+        // hist_ptr_ walks this object's own history_, so a copy has to rebase it.
+        Part(const Part& o)
+            : order_(o.order_), hist_order_(o.hist_order_),
+              hist_ptr_(history_ + (o.hist_ptr_ - o.history_)) {
+            std::memcpy(factors_, o.factors_, sizeof(factors_));
+            std::memcpy(history_, o.history_, sizeof(history_));
+        }
+        Part& operator=(const Part& o) {
+            if (this != &o) {
+                order_ = o.order_;
+                hist_order_ = o.hist_order_;
+                std::memcpy(factors_, o.factors_, sizeof(factors_));
+                std::memcpy(history_, o.history_, sizeof(history_));
+                hist_ptr_ = history_ + (o.hist_ptr_ - o.history_);
+            }
+            return *this;
+        }
 
         void SetOrder(int order) {
             order_ = (uint8_t)order;
@@ -558,6 +576,27 @@ struct LinearPredictor {
     LinearPredictor() : predicted_value_(0), order_(0), shift_(0), cur_ptr_(hist_) {
         std::memset(factors_, 0, sizeof(factors_));
         std::memset(hist_, 0, sizeof(hist_));
+    }
+
+    // `cur_ptr_` walks this object's own hist_, so a default copy would leave the
+    // copy reading and writing the ORIGINAL's history -- which is exactly what a
+    // trial must not do. Rebase it.
+    LinearPredictor(const LinearPredictor& o)
+        : predicted_value_(o.predicted_value_), order_(o.order_), shift_(o.shift_),
+          cur_ptr_(hist_ + (o.cur_ptr_ - o.hist_)) {
+        std::memcpy(factors_, o.factors_, sizeof(factors_));
+        std::memcpy(hist_, o.hist_, sizeof(hist_));
+    }
+    LinearPredictor& operator=(const LinearPredictor& o) {
+        if (this != &o) {
+            predicted_value_ = o.predicted_value_;
+            order_ = o.order_;
+            shift_ = o.shift_;
+            std::memcpy(factors_, o.factors_, sizeof(factors_));
+            std::memcpy(hist_, o.hist_, sizeof(hist_));
+            cur_ptr_ = hist_ + (o.cur_ptr_ - o.hist_);
+        }
+        return *this;
     }
 
     void Initialize(uint32_t order) { order_ = (uint16_t)order; Reset(); }
@@ -1715,20 +1754,32 @@ struct NzAudioEncoder::Impl {
     }
 
 
-    // The format comes from the SHARED detector (FUN_08080e50, already byte-exact
-    // for -cf): its 0x28-byte struct is the `param_5` FUN_08081c40 reads, field
-    // for field -- signed_ is the type byte's bit 0, width and chans pick the
-    // format nibble, prefix is the header-byte count, and hdr says a RIFF/NIST
-    // header was recognised (which is what turns the refinement searches off).
-    void ChooseFormat(const uint8_t* in, uint32_t size, NzAudioChunkParams* p) {
-        nzr::lzpf_enc::AudioProbe pr;
-        nzr::lzpf_enc::AudioProbeBlock(pr, in, size);
-        p->stereo_filter = pr.signed_ != 0u;
-        p->channels = pr.chans;
-        p->sample_size = pr.width ? pr.width : 1u;
-        p->little_endian = (pr.width > 1u) && pr.le != 0u;
-        p->header_bytes = pr.prefix;
-        if (p->sample_size == 1u) p->little_endian = false;   // the reference clears it too
+    // The whole block: chunks of 0x10000 output bytes, the models carried across
+    // them, and the probe's `prefix` updated at each boundary exactly as the
+    // reference does -- after a chunk it holds the ALIGNMENT CARRY, the bytes the
+    // next chunk has to copy verbatim before its samples begin
+    // (`(channels ? 2 : 1) * width - pad`).
+    bool Encode(const uint8_t* in, uint32_t size, NzAudioChunkParams p,
+                std::vector<uint8_t>* out) {
+        uint32_t off = 0;
+        bool first = true;
+        while (off < size) {
+            const uint32_t n = (size - off < 0x10000u) ? (size - off) : 0x10000u;
+            if (!first) p.gate = false;      // decided again below
+            NzAudioChunkParams cp = p;
+            ChoosePlanes(in + off, n, &cp, 0);
+            if (!EncodeChunk(in + off, n, cp, out)) return false;
+            // the carry for the next chunk
+            const uint32_t nch = cp.channels ? 2u : 1u;
+            const uint32_t body = n - cp.header_bytes;
+            uint32_t sample_count = body / cp.sample_size;
+            if (cp.channels) sample_count &= ~1u;
+            const uint32_t pad = body - sample_count * cp.sample_size;
+            p.header_bytes = pad ? (nch * cp.sample_size - pad) : 0u;
+            first = false;
+            off += n;
+        }
+        return true;
     }
 
     // Debug hook: the per-channel arrays as they reach the plane decisions, for
@@ -1785,6 +1836,13 @@ struct NzAudioEncoder::Impl {
         std::vector<int32_t> cur(nsamples);
         UnpackSamples(body, nframes, cur.data(), fmt);
 
+        // Everything below measures on COPIES: the live models belong to the
+        // chunk that is actually written, and they have to carry across chunks.
+        LinearPredictor lp_copy[6] = {linpred_[0], linpred_[1], linpred_[2],
+                                      linpred_[3], linpred_[4], linpred_[5]};
+        AudioStereoDecoder sd_copy = stereo_dec_;
+        nzr::lzpf::LmsObject lms_copy[2] = {lms_[0], lms_[1]};
+
         // FUN_08081af0: the inter-channel stage is used unless one channel is
         // far cheaper than the other -- costs of 100 + sum BSR(|v| + 1), and the
         // stage is skipped when min * 7 < max * 3. Its two parameters are not
@@ -1810,12 +1868,12 @@ struct NzAudioEncoder::Impl {
             // Same parameters the payload will carry (missing them made every
             // decision downstream read different residuals).
             if ((ctx_flags_ & 0x10u) != 0u) {
-                lms_[0].shift = (uint8_t)(7u + p->gate_a);
-                lms_[1].shift = (uint8_t)(7u + p->gate_b);
-                nzr::lzpf::InverseLmsInterChannel(cur.data(), cur.data() + nframes, nframes, &lms_[0], &lms_[1]);
+                lms_copy[0].shift = (uint8_t)(7u + p->gate_a);
+                lms_copy[1].shift = (uint8_t)(7u + p->gate_b);
+                nzr::lzpf::InverseLmsInterChannel(cur.data(), cur.data() + nframes, nframes, &lms_copy[0], &lms_copy[1]);
             } else {
-                stereo_dec_.SetBits(16u + p->gate_a, 16u + p->gate_b);
-                stereo_dec_.Encode(cur.data(), cur.data() + nframes, nframes);
+                sd_copy.SetBits(16u + p->gate_a, 16u + p->gate_b);
+                sd_copy.Encode(cur.data(), cur.data() + nframes, nframes);
             }
         }
 
@@ -1824,7 +1882,7 @@ struct NzAudioEncoder::Impl {
         const uint32_t trial_win = long_order ? nframes : std::min<uint32_t>(nframes, 0x1000u);
         for (int i = 0; i <= 2; ++i) {
             for (uint32_t j = 0; j < nch; ++j) {
-                LinearPredictor& lp = linpred_[i * 2 + (int)j];
+                LinearPredictor& lp = lp_copy[i * 2 + (int)j];
                 int32_t* chan = cur.data() + j * nframes;
 
                 if ((ctx_flags_ & 1u) == 0u) {
@@ -1847,7 +1905,6 @@ struct NzAudioEncoder::Impl {
                 else lp.Reset();
             }
         }
-        Reset();
     }
 
     bool EncodeChunk(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
@@ -1981,9 +2038,10 @@ bool NzAudioEncoder::EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
     return impl_->EncodeChunk(in, outsize, params, out);
 }
 
-void NzAudioEncoder::ChooseFormat(const std::uint8_t* in, std::uint32_t size,
-                                  NzAudioChunkParams* params) {
-    impl_->ChooseFormat(in, size, params);
+bool NzAudioEncoder::Encode(const std::uint8_t* in, std::uint32_t size,
+                            const NzAudioChunkParams& params,
+                            std::vector<std::uint8_t>* out) {
+    return impl_->Encode(in, size, params, out);
 }
 
 void NzAudioEncoder::PreparedPlanes(const std::uint8_t* in, std::uint32_t outsize,
