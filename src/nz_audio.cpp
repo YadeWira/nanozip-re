@@ -290,6 +290,9 @@ struct AudioStereoDecoder {
         right_.one_.Reset(); right_.two_.Reset();
     }
 
+    uint32_t PartOrderOne() const { return left_.one_.order_; }
+    uint32_t PartOrderTwo() const { return left_.two_.order_; }
+
     void Decode(int32_t* lp, int32_t* rp, uint32_t frames) {
         int32_t new_right_value = 0, new_left_value = 0;
         for (uint32_t i = 0; i != frames; i++) {
@@ -1764,6 +1767,28 @@ struct NzAudioEncoder::Impl {
 
         std::vector<int32_t> cur(nsamples);
         UnpackSamples(body, nframes, cur.data(), fmt);
+
+        // FUN_08081af0: the inter-channel stage is used unless one channel is
+        // far cheaper than the other -- costs of 100 + sum BSR(|v| + 1), and the
+        // stage is skipped when min * 7 < max * 3. Its two parameters are not
+        // searched: the stereo predictor takes them from its own part orders and
+        // the LMS variant from a pair of constants.
+        if (fmt.channels) {
+            const uint64_t cl = 100u + BitCost(cur.data(), nframes);
+            const uint64_t cr = 100u + BitCost(cur.data() + nframes, nframes);
+            const uint64_t lo = cl < cr ? cl : cr;
+            const uint64_t hi = cl < cr ? cr : cl;
+            p->gate = !(lo * 7u < hi * 3u);
+            if (p->gate) {
+                if ((ctx_flags_ & 0x10u) != 0u) {
+                    p->gate_a = 0xcu - 7u;
+                    p->gate_b = ((fmt.channels == 2u) ? 0xbu : 0xcu) - 7u;
+                } else {
+                    p->gate_a = ((stereo_dec_.PartOrderOne() >> 2) + 0x14u) - 0x10u;
+                    p->gate_b = ((stereo_dec_.PartOrderTwo() >> 2) + 0x14u) - 0x10u;
+                }
+            }
+        }
         if (fmt.channels && p->gate) {
             // Same parameters the payload will carry (missing them made every
             // decision downstream read different residuals).
