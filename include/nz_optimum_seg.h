@@ -15,6 +15,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <functional>
 
 namespace nzr::opt_enc {
 
@@ -61,6 +62,12 @@ std::uint32_t CoBlockLength(const std::uint8_t* buf, std::uint32_t n, std::uint3
 // the block inside it, and the slack after `Len()` is readable up to
 // `block_size + 0x2000`.
 struct CoBlockFeeder {
+    // The reference's read loop runs the audio/image detector and FORCES a
+    // detected region into its own block (`param_1[0]`/`param_1[1]` in
+    // FUN_0808d0b0), which is why a 64 KB .wav comes out as ONE block there and
+    // the entropy split is never even called for it. The caller installs this to
+    // answer "does a span start here, and how long is it"; 0 means no.
+    std::function<std::uint32_t(const std::uint8_t*, std::uint32_t)> span_probe;
     // What the reader has handed over and the buffer has not taken yet.
     void Feed(const std::uint8_t* p, std::size_t n);
     // Cuts the next block. False means "nothing to code": either the stream has

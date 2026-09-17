@@ -900,11 +900,11 @@ class AudioBitcountEncoderB {
             if (range == 0u) return false;
             scale = range >> 14;
         }
-        // The decoder primes `code` with four bytes and consumes one per
-        // renormalisation, and the last of those four is never compared against
-        // anything: the reference stops at three (measured -- a fourth byte makes
-        // every block one longer than the original's).
-        for (int k = 0; k < 3; ++k) { body.push_back((uint8_t)(lo >> 24)); lo <<= 8; }
+        // FUN_0806bf40: up to FOUR bytes of `lo`, stopping as soon as what is
+        // left is zero -- so a stream whose `lo` ends in zero bytes writes fewer.
+        // A flat three matched two fixtures by luck and came out one byte short
+        // on the first five-chunk one.
+        for (int k = 0; k < 4 && lo != 0u; ++k) { body.push_back((uint8_t)(lo >> 24)); lo <<= 8; }
 
         if (body.size() > 0xffffu) return false;
         out->push_back((uint8_t)(body.size() & 0xffu));

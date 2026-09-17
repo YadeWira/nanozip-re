@@ -608,6 +608,13 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src0, std::uint3
 // ---------------------------------------------------------------------------
 namespace nzr::audio {
 
+void NzAudioEncoder::SpanOf(const std::uint8_t* in, std::uint32_t size,
+                            NzAudioChunkParams* p) {
+    nzr::lzpf_enc::AudioProbe pr;
+    nzr::lzpf_enc::AudioProbeBlock(pr, in, size);
+    p->span_len = (pr.hdr != 0u && pr.audio_end != 0u && pr.audio_end <= size) ? pr.audio_end : 0u;
+}
+
 void NzAudioEncoder::ChooseFormat(const std::uint8_t* in, std::uint32_t size,
                                   NzAudioChunkParams* p) {
     nzr::lzpf_enc::AudioProbe pr;

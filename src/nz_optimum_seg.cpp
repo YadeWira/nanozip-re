@@ -219,7 +219,13 @@ bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
         ring.erase(ring.begin(), ring.begin() + static_cast<std::ptrdiff_t>(take));
         seg.Prime(dst.data() + prev, take);
         total = prev + take;
-        const std::uint32_t split = seg.Split(dst.data(), total, prev);
+        // A detected audio/image span ends the block by itself: the reference
+        // sets the length in the read loop and never reaches the entropy split.
+        std::uint32_t forced = 0;
+        if (prev == 0u && span_probe) forced = span_probe(dst.data(), take);
+        const std::uint32_t split = (forced != 0u && forced <= total)
+                                        ? forced
+                                        : seg.Split(dst.data(), total, prev);
         if (split < total) {                     // LAB_0808d355
             const std::uint32_t tail = total - split;
             started = false;

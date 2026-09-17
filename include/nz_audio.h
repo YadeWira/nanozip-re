@@ -91,6 +91,7 @@ struct NzAudioChunkParams {
     std::uint32_t gate_a = 0, gate_b = 0;
     std::uint8_t lp_flag[3][2] = {{0, 0}, {0, 0}, {0, 0}};
     std::uint8_t lp_bits[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+    std::uint32_t span_len = 0;      // where a recognised audio span ends, 0 = none
 };
 
 class NzAudioEncoder {
@@ -118,6 +119,10 @@ class NzAudioEncoder {
 
     // Fills the format fields from the shared audio detector.
     void ChooseFormat(const std::uint8_t* in, std::uint32_t size, NzAudioChunkParams* params);
+
+    // The same detector, asked only where a recognised span ends (0 = none). The
+    // block driver needs this before any encoder object exists.
+    static void SpanOf(const std::uint8_t* in, std::uint32_t size, NzAudioChunkParams* params);
 
     // Picks the per-plane flags and shifts by a greedy search (metric 0 = sum of
     // |residual|, 1 = sum of class indices). Experimental: which search the

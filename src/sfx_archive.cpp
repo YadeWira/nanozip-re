@@ -12760,6 +12760,16 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
     // order-1 entropy split over what its 1 MB buffer holds, capped at the block
     // size. The buffer spans the calls -- it is filled from the STREAM, not from
     // this one piece -- so a piece that does not fill it codes nothing and waits.
+    if (audio != nullptr && !feeder.span_probe) {
+        // Tell the feeder where a recognised audio span ends, so a block stops
+        // there instead of being cut by the entropy split -- the reference sets
+        // that length in its read loop and never reaches the split at all.
+        feeder.span_probe = [](const std::uint8_t* p, std::uint32_t n) -> std::uint32_t {
+            nzr::audio::NzAudioChunkParams probe;
+            nzr::audio::NzAudioEncoder::SpanOf(p, n, &probe);
+            return probe.span_len;
+        };
+    }
     feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
     while (feeder.Next(block_size, final)) {
         const std::uint8_t* src = feeder.Data();
@@ -12807,7 +12817,12 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                                      ((std::uint64_t)apay.size() * 0x11ull < (std::uint64_t)est * 0x10ull) ? "AUDIO" : "no");
                     if (static_cast<std::uint64_t>(apay.size()) * 0x11ull <
                         static_cast<std::uint64_t>(est) * 0x10ull) {
-                        const std::uint8_t mode2 = audio->in_span ? 0u : 1u;
+                        // mode2_type is "no audio span was in progress" -- and a
+                        // recognised header opens the span before the block is
+                        // coded, which is why a RIFF file writes 0 and a NIST one
+                        // (whose header the detector does not know) writes 1.
+                        const std::uint8_t mode2 =
+                            (audio->in_span || ap.header_bytes != 0u) ? 0u : 1u;
                         put32(static_cast<std::uint32_t>(apay.size()));
                         seg.insert(seg.end(), apay.begin(), apay.end());
                         seg.push_back(2u);          // decr_param: audio
@@ -13195,7 +13210,8 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
 static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
                             nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
                             const unsigned char* data, std::uint32_t len, unsigned stream,
-                            std::vector<unsigned char>& out, bool final) {
+                            std::vector<unsigned char>& out, bool final,
+                            CoAudioState* audio = nullptr) {
     std::vector<unsigned char> seg;
     std::vector<unsigned char> emitted;
     const auto put32 = [&](std::uint32_t v) {
@@ -13208,10 +13224,55 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
         emitted.insert(emitted.end(), seg.begin(), seg.end());
         seg.clear();
     };
+    if (audio != nullptr && !feeder.span_probe) {
+        feeder.span_probe = [](const std::uint8_t* p, std::uint32_t n) -> std::uint32_t {
+            nzr::audio::NzAudioChunkParams probe;
+            nzr::audio::NzAudioEncoder::SpanOf(p, n, &probe);
+            return probe.span_len;
+        };
+    }
     feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
     while (feeder.Next(block_size, final)) {
         const std::uint8_t* src = feeder.Data();
         const std::uint32_t n = feeder.Len();
+
+        // The audio block, exactly as the optimum writers try it (-cc shares the
+        // reference's driver; only the fallback below differs).
+        if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
+            if (!audio->ready) {
+                // -cc's own audio configuration, the one its decode path sets:
+                // context 0x0f, plane orders 384/16/8, stereo parameter 16.
+                audio->enc.SetContextFlags(0x0fu);
+                audio->enc.SetPlaneOrders(384u, 16u, 8u);
+                audio->enc.SetStereoParam(16u);
+                audio->enc.Reset();
+                audio->ready = true;
+            }
+            nzr::audio::NzAudioChunkParams ap;
+            audio->enc.ChooseFormat(src, n, &ap);
+            bool take = audio->done < audio->end;
+            if (!take && ap.header_bytes != 0u) take = true;
+            if (take) {
+                std::vector<std::uint8_t> apay;
+                if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
+                    const std::uint32_t est = nzr::opt_enc::CoEntropyEstimate(src, n);
+                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull <
+                        static_cast<std::uint64_t>(est) * 0x10ull) {
+                        const std::uint8_t mode2 =
+                            (audio->in_span || ap.header_bytes != 0u) ? 0u : 1u;
+                        put32(static_cast<std::uint32_t>(apay.size()));
+                        seg.insert(seg.end(), apay.begin(), apay.end());
+                        seg.push_back(2u);
+                        seg.push_back(mode2);
+                        put32(n);
+                        flush_block();
+                        audio->done += n;
+                        audio->in_span = true;
+                        continue;
+                    }
+                }
+            }
+        }
 
         std::vector<std::uint8_t> exe_buf, exe_side;
         bool exe_on = false;
@@ -13682,7 +13743,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                                         &codec.audio, codec.p0);
         return codec.cc != nullptr &&
                CmEncodeSegment(codec.cc, codec.exe_enc, codec.feeder, codec.co_block, d, n,
-                               stream, payload, final);
+                               stream, payload, final, &codec.audio);
     };
     while (written < total || (total == 0u && written == 0u)) {
         block.clear();
