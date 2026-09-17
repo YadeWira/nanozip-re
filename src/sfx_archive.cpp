@@ -12717,11 +12717,21 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 // The whole post-filter chain and block framing is shared between `-co` and
 // `-cO`: the two differ only in which LZ engine codes the block and samples the
 // LZ-or-BWT decision, exactly as the decode side's own framed loop does.
+// The audio block writer's stream state: the encoder itself (its models carry
+// across blocks) and the span the reference's driver tracks in its probe.
+struct CoAudioState {
+    nzr::audio::NzAudioEncoder enc;
+    std::uint64_t done = 0, end = 0;
+    bool in_span = false;
+    bool ready = false;
+};
+
 template <class Engine>
 static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& exe_enc,
                                  nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
-                                 std::vector<unsigned char>& out, bool final) {
+                                 std::vector<unsigned char>& out, bool final,
+                                 CoAudioState* audio = nullptr, unsigned p0 = 0) {
     // One type-0 DATA record PER BLOCK: the record header is the chain segment's
     // tag, so a stream of N blocks is N records, not one. Walking a two-block
     // archive the original wrote shows exactly that -- 2 type-0 records where a
@@ -12755,9 +12765,66 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
         const std::uint8_t* src = feeder.Data();
         const std::uint32_t n = feeder.Len();
 
-        // FUN_0808da10's block analysis. The image and audio blocks are not
-        // written yet, so a block that would take one of those paths declines
-        // instead of coming out wrong; the exe and text paths are complete.
+        // FUN_0808da10 tries the AUDIO block before anything else: probe the
+        // block, encode it, and keep it when the payload beats an entropy
+        // estimate of the raw bytes by the reference's 17/16 margin. No LZ trial
+        // is involved. `mode2_type` is "no audio span was in progress", which is
+        // what tells the decoder to reset the predictor.
+        if (audio != nullptr && !audio->ready) {
+            // ConfigureOptimumModels' encoder twin: -co runs the second bit-count
+            // class and the shorter predictor, -cO and -cc the default.
+            if (p0 == 5u) {
+                audio->enc.SetContextFlags(0x13u);
+                audio->enc.SetPlaneOrders(64u, 8u, 8u);
+                audio->enc.SetStereoParam(4u);
+                audio->enc.SetBitcountVariantB(true);
+            } else {
+                audio->enc.SetContextFlags(0x03u);
+                audio->enc.SetPlaneOrders(96u, 8u, 8u);
+                audio->enc.SetStereoParam(8u);
+            }
+            audio->enc.Reset();
+            audio->ready = true;
+        }
+        if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
+            nzr::audio::NzAudioChunkParams ap;
+            audio->enc.ChooseFormat(src, n, &ap);
+            const bool span = audio->done < audio->end;
+            // A recognised header opens a span; without one this port does not
+            // take the block (the reference's headerless test, FUN_08081760, is
+            // not ported yet, so those blocks go down the LZ/BWT path as before).
+            bool take = span;
+            if (!take && ap.header_bytes != 0u) take = true;
+            if (NZ_ENV("NZOPT_TRACE_AUDENC"))
+                std::fprintf(stderr, "[audenc] block n=%u hdr=%u take=%d span=%d\n", n, ap.header_bytes, (int)take, (int)span);
+            if (take) {
+                std::vector<std::uint8_t> apay;
+                if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
+                    const std::uint32_t est = nzr::opt_enc::CoEntropyEstimate(src, n);
+                    if (NZ_ENV("NZOPT_TRACE_AUDENC"))
+                        std::fprintf(stderr, "[audenc] n=%u hdr=%u ch=%u payload=%zu est=%u -> %s\n",
+                                     n, ap.header_bytes, ap.channels, apay.size(), est,
+                                     ((std::uint64_t)apay.size() * 0x11ull < (std::uint64_t)est * 0x10ull) ? "AUDIO" : "no");
+                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull <
+                        static_cast<std::uint64_t>(est) * 0x10ull) {
+                        const std::uint8_t mode2 = audio->in_span ? 0u : 1u;
+                        put32(static_cast<std::uint32_t>(apay.size()));
+                        seg.insert(seg.end(), apay.begin(), apay.end());
+                        seg.push_back(2u);          // decr_param: audio
+                        seg.push_back(mode2);       // mode2_type
+                        put32(n);                   // the block's output size
+                        flush_block();
+                        audio->done += n;
+                        audio->in_span = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // FUN_0808da10's block analysis. The image block is not written yet, so
+        // a block that would take that path declines instead of coming out
+        // wrong; the exe and text paths are complete.
         //
         // dece (the exe filter, FUN_08090360) comes FIRST and, when it is kept,
         // the analysis skips the text detector entirely and the block goes down
@@ -13295,6 +13362,11 @@ struct EncodeCodec {
     // state, like the verifier above -- the block boundaries depend on what the
     // whole stream has fed it, not on where the reader's pieces fall.
     nzr::opt_enc::CoBlockFeeder feeder;
+    // The audio block writer (decr_param 2) and the span state the reference's
+    // driver keeps in its probe: how much of the stream has gone by and where
+    // the recognised header says the audio ends. `in_span` is what decides
+    // mode2_type -- the reference sets it when no audio was in progress.
+    CoAudioState audio;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
              : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
@@ -13602,10 +13674,12 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                                  std::uint32_t n, bool final) -> bool {
         if (codec.p0 == 5u)
             return OptimumEncodeSegment(*codec.co, *codec.co_v, codec.exe_enc, codec.feeder,
-                                        codec.co_block, d, n, stream, payload, final);
+                                        codec.co_block, d, n, stream, payload, final,
+                                        &codec.audio, codec.p0);
         if (codec.p0 == 6u)
             return OptimumEncodeSegment(*codec.cO, *codec.cO_v, codec.exe_enc, codec.feeder,
-                                        codec.co_block, d, n, stream, payload, final);
+                                        codec.co_block, d, n, stream, payload, final,
+                                        &codec.audio, codec.p0);
         return codec.cc != nullptr &&
                CmEncodeSegment(codec.cc, codec.exe_enc, codec.feeder, codec.co_block, d, n,
                                stream, payload, final);
