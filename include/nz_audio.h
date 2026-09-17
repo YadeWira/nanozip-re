@@ -110,6 +110,9 @@ class NzAudioEncoder {
     bool EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                      const NzAudioChunkParams& params, std::vector<std::uint8_t>* out);
 
+    // Fills the format fields from the shared audio detector.
+    void ChooseFormat(const std::uint8_t* in, std::uint32_t size, NzAudioChunkParams* params);
+
     // Picks the per-plane flags and shifts by a greedy search (metric 0 = sum of
     // |residual|, 1 = sum of class indices). Experimental: which search the
     // reference runs is still being measured.

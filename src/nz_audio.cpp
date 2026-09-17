@@ -7,6 +7,7 @@
 #endif
 #include "nz_trace.h"
 #include "nz_audio.h"
+#include "nz_lzpf_encoder.h"
 #include "lzpf_arith.h"
 
 #include <algorithm>
@@ -1714,6 +1715,22 @@ struct NzAudioEncoder::Impl {
     }
 
 
+    // The format comes from the SHARED detector (FUN_08080e50, already byte-exact
+    // for -cf): its 0x28-byte struct is the `param_5` FUN_08081c40 reads, field
+    // for field -- signed_ is the type byte's bit 0, width and chans pick the
+    // format nibble, prefix is the header-byte count, and hdr says a RIFF/NIST
+    // header was recognised (which is what turns the refinement searches off).
+    void ChooseFormat(const uint8_t* in, uint32_t size, NzAudioChunkParams* p) {
+        nzr::lzpf_enc::AudioProbe pr;
+        nzr::lzpf_enc::AudioProbeBlock(pr, in, size);
+        p->stereo_filter = pr.signed_ != 0u;
+        p->channels = pr.chans;
+        p->sample_size = pr.width ? pr.width : 1u;
+        p->little_endian = (pr.width > 1u) && pr.le != 0u;
+        p->header_bytes = pr.prefix;
+        if (p->sample_size == 1u) p->little_endian = false;   // the reference clears it too
+    }
+
     // Debug hook: the per-channel arrays as they reach the plane decisions, for
     // diffing against a GDB capture of the reference at FUN_08053780.
     void PreparedPlanes(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
@@ -1962,6 +1979,11 @@ bool NzAudioEncoder::EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                                  const NzAudioChunkParams& params,
                                  std::vector<std::uint8_t>* out) {
     return impl_->EncodeChunk(in, outsize, params, out);
+}
+
+void NzAudioEncoder::ChooseFormat(const std::uint8_t* in, std::uint32_t size,
+                                  NzAudioChunkParams* params) {
+    impl_->ChooseFormat(in, size, params);
 }
 
 void NzAudioEncoder::PreparedPlanes(const std::uint8_t* in, std::uint32_t outsize,
