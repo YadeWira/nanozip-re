@@ -82,10 +82,11 @@ class NzAudioPred {
 // Test hook, decoder half: reads one variant-A bit-count block (u16 length
 // prefix included) and returns the bytes consumed, 0 on failure.
 std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,
-                                     std::uint8_t* out, std::uint32_t n);
+                                     std::uint8_t* out, std::uint32_t n,
+                                     bool variant_b = false);
 
 bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
-                            std::vector<std::uint8_t>* out);
+                            std::vector<std::uint8_t>* out, bool variant_b = false);
 
 // NanoZip decr_param == 3 ("image") block decoding, ported from the binary
 // (FUN_080a9ca0 = 64 KB-chunk wrapper, FUN_080a90c0 = per-chunk decoder).

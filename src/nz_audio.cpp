@@ -728,6 +728,100 @@ struct ArithEncA {
     void Flush() { Put((uint8_t)(hi_ >> 24)); }
 };
 
+// Variant B's encoder (the `-co` coder, FUN_0809bdc0's mirror): a 64-symbol
+// carry-less range coder over the same sliding-window frequency tables.
+class AudioBitcountEncoderB {
+ public:
+    AudioBitcountEncoderB() { Reset(); }
+
+    // Identical to AudioBitcountDecoderB::Reset.
+    void Reset() {
+        std::memset(freq_, 0, sizeof(freq_));
+        for (uint32_t sel = 0; sel < kCtx; sel++) {
+            const int center = (int)(2u * sel);
+            uint32_t w = 0;
+            for (int d = 4; d >= 0; --d) {
+                const uint32_t reps = 1u << (4 - d);
+                for (uint32_t r = 0; r < reps; ++r) {
+                    const int a = center - d, b = center + d;
+                    if (a >= 0 && a < (int)kSym && w < kWindow) ring_[sel][w++] = (uint8_t)a;
+                    if (d != 0 && b >= 0 && b < (int)kSym && w < kWindow)
+                        ring_[sel][w++] = (uint8_t)b;
+                }
+            }
+            cursor_[sel] = w;
+            for (uint32_t k = w; k < kWindow; ++k) ring_[sel][k] = (uint8_t)(k % kSym);
+            for (uint32_t k = 0; k < kWindow; ++k) freq_[sel][ring_[sel][k]] += 8u;
+            for (uint32_t i = 0; i < kSym; ++i) freq_[sel][i] += 1u;
+        }
+        ctx_ = 0;
+    }
+
+    bool Encode(const uint8_t* counts, uint32_t n, std::vector<uint8_t>* out) {
+        if (n == 0u) return false;
+        std::vector<uint8_t> body;
+        uint32_t lo = 0;
+        uint32_t range = 0xffffffffu;
+        uint32_t scale = range >> 14;
+
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t sym = counts[i];
+            if (sym >= kSym) return false;
+            const uint32_t sel = ((ctx_ + 0x80u) >> 9) & (kCtx - 1u);
+            uint32_t* f = freq_[sel];
+
+            uint32_t cum_low = 0;
+            for (uint32_t j = 0; j < sym; ++j) cum_low += f[j];
+            const uint32_t sym_freq = f[sym];
+
+            f[sym] += 8u;
+            const uint32_t pos = cursor_[sel];
+            const uint8_t evicted = ring_[sel][pos];
+            f[evicted] -= 8u;
+            ring_[sel][pos] = (uint8_t)sym;
+            cursor_[sel] = (pos < kWindow - 1u) ? pos + 1u : 0u;
+
+            ctx_ = ((ctx_ * 16u + sym * 256u + 8u) - ctx_) >> 4;
+
+            lo += cum_low * scale;
+            range = scale * sym_freq;
+
+            for (;;) {
+                if (((lo + range) ^ lo) > 0xffffffu) {
+                    if (range > 0x3fffu) break;
+                    range = (0u - lo) & 0x3fffu;
+                }
+                if (range == 0u) return false;
+                body.push_back((uint8_t)(lo >> 24));
+                lo <<= 8;
+                range <<= 8;
+            }
+            if (range == 0u) return false;
+            scale = range >> 14;
+        }
+        // The decoder primes `code` with four bytes and consumes one per
+        // renormalisation, and the last of those four is never compared against
+        // anything: the reference stops at three (measured -- a fourth byte makes
+        // every block one longer than the original's).
+        for (int k = 0; k < 3; ++k) { body.push_back((uint8_t)(lo >> 24)); lo <<= 8; }
+
+        if (body.size() > 0xffffu) return false;
+        out->push_back((uint8_t)(body.size() & 0xffu));
+        out->push_back((uint8_t)(body.size() >> 8));
+        out->insert(out->end(), body.begin(), body.end());
+        return true;
+    }
+
+ private:
+    static constexpr uint32_t kCtx = 32u;
+    static constexpr uint32_t kSym = 64u;
+    static constexpr uint32_t kWindow = 0x7f8u;
+    uint32_t freq_[kCtx][kSym];
+    uint8_t  ring_[kCtx][kWindow];
+    uint32_t cursor_[kCtx];
+    uint32_t ctx_;
+};
+
 struct AudioBitcountEncoder {
     uint16_t model_a_[64];
     uint16_t model_b_[576];
@@ -1253,13 +1347,21 @@ struct NzAudioPred::Impl {
 };
 
 std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,
-                                     std::uint8_t* out, std::uint32_t n) {
+                                     std::uint8_t* out, std::uint32_t n, bool variant_b) {
+    if (variant_b) {
+        AudioBitcountDecoderB dec;
+        return dec.Decode(in, in + in_size, out, n);
+    }
     AudioBitcountDecoder dec;
     return dec.Decode(in, in + in_size, out, n);
 }
 
 bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
-                            std::vector<std::uint8_t>* out) {
+                            std::vector<std::uint8_t>* out, bool variant_b) {
+    if (variant_b) {
+        AudioBitcountEncoderB enc;
+        return enc.Encode(counts, n, out);
+    }
     AudioBitcountEncoder enc;
     return enc.Encode(counts, n, out);
 }
