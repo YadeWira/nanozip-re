@@ -116,6 +116,10 @@ class NzAudioEncoder {
     void ChoosePlanes(const std::uint8_t* in, std::uint32_t outsize,
                       NzAudioChunkParams* params, int metric);
 
+    // Debug: the per-channel arrays as they reach the plane decisions.
+    void PreparedPlanes(const std::uint8_t* in, std::uint32_t outsize,
+                        const NzAudioChunkParams& params, std::vector<std::int32_t>* out);
+
     // Cost proxies of the last chunk, for the decision search.
     std::uint64_t LastClassSum() const;
     std::uint64_t LastAbsSum() const;

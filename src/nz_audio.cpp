@@ -1711,6 +1711,37 @@ struct NzAudioEncoder::Impl {
     }
 
 
+    // Debug hook: the per-channel arrays as they reach the plane decisions, for
+    // diffing against a GDB capture of the reference at FUN_08053780.
+    void PreparedPlanes(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
+                        std::vector<int32_t>* out) {
+        AudioFormat fmt;
+        fmt.stereo_filter = p.stereo_filter;
+        fmt.channels = p.channels;
+        fmt.sample_size = p.sample_size;
+        fmt.little_endian = p.little_endian;
+        const uint8_t* body = in + p.header_bytes;
+        const uint32_t body_size = outsize - p.header_bytes;
+        uint32_t sample_count = body_size / fmt.sample_size;
+        if (fmt.channels) sample_count &= ~1u;
+        const uint32_t nframes = fmt.channels ? (sample_count >> 1) : sample_count;
+        out->assign(sample_count, 0);
+        UnpackSamples(body, nframes, out->data(), fmt);
+        if (fmt.channels && p.gate) {
+            // The stage has to run with the very parameters the payload will
+            // carry, or everything downstream of it sees different residuals.
+            if ((ctx_flags_ & 0x10u) != 0u) {
+                lms_[0].shift = (uint8_t)(7u + p.gate_a);
+                lms_[1].shift = (uint8_t)(7u + p.gate_b);
+                nzr::lzpf::InverseLmsInterChannel(out->data(), out->data() + nframes, nframes, &lms_[0], &lms_[1]);
+            } else {
+                stereo_dec_.SetBits(16u + p.gate_a, 16u + p.gate_b);
+                stereo_dec_.Encode(out->data(), out->data() + nframes, nframes);
+            }
+        }
+        Reset();
+    }
+
     // The reference's plane decisions (FUN_08081c40). Its outer loop is over the
     // three STAGES and the inner one over the channels, and the stage index is
     // what selects both the shift rule and the acceptance ratio:
@@ -1734,10 +1765,16 @@ struct NzAudioEncoder::Impl {
         std::vector<int32_t> cur(nsamples);
         UnpackSamples(body, nframes, cur.data(), fmt);
         if (fmt.channels && p->gate) {
-            if ((ctx_flags_ & 0x10u) != 0u)
+            // Same parameters the payload will carry (missing them made every
+            // decision downstream read different residuals).
+            if ((ctx_flags_ & 0x10u) != 0u) {
+                lms_[0].shift = (uint8_t)(7u + p->gate_a);
+                lms_[1].shift = (uint8_t)(7u + p->gate_b);
                 nzr::lzpf::InverseLmsInterChannel(cur.data(), cur.data() + nframes, nframes, &lms_[0], &lms_[1]);
-            else
+            } else {
+                stereo_dec_.SetBits(16u + p->gate_a, 16u + p->gate_b);
                 stereo_dec_.Encode(cur.data(), cur.data() + nframes, nframes);
+            }
         }
 
         const uint32_t nch = fmt.channels ? 2u : 1u;
@@ -1900,6 +1937,12 @@ bool NzAudioEncoder::EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                                  const NzAudioChunkParams& params,
                                  std::vector<std::uint8_t>* out) {
     return impl_->EncodeChunk(in, outsize, params, out);
+}
+
+void NzAudioEncoder::PreparedPlanes(const std::uint8_t* in, std::uint32_t outsize,
+                                    const NzAudioChunkParams& params,
+                                    std::vector<std::int32_t>* out) {
+    impl_->PreparedPlanes(in, outsize, params, out);
 }
 
 void NzAudioEncoder::ChoosePlanes(const std::uint8_t* in, std::uint32_t outsize,
