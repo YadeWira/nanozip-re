@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -2333,6 +2334,27 @@ uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
     e.hash_mask = (1u << bits) - 1u;
     e.chain_mask = (1u << (bits - 1u)) - 1u;
     const std::size_t need = (std::size_t)e.hash_mask + 1u + (std::size_t)e.chain_mask + 1u;
+    // NZOPT_ARENA_DUMP=<prefix>: write the lent arena before and after this pass,
+    // to diff against the reference's (quirk 72 work).
+    const char* arena_dump = NZ_ENV("NZOPT_ARENA_DUMP");
+    if (arena_dump != nullptr)
+        std::fprintf(stderr, "P14CALL n=%u arena=%p words=%zu need=%zu hm=%#x cm=%#x\n",
+                     n, (const void*)arena, arena_words, need, e.hash_mask, e.chain_mask);
+    if (arena_dump != nullptr && arena != nullptr) {
+        std::string f = std::string(arena_dump) + ".before";
+        if (FILE* fp = std::fopen(f.c_str(), "wb")) { std::fwrite(arena, 4, arena_words, fp); std::fclose(fp); }
+    }
+    // NZOPT_ARENA_LOAD=<file>: overwrite the lent arena with a captured image of
+    // the reference's, to answer "is the arena the whole story?" (quirk 72).
+    if (const char* arena_load = NZ_ENV("NZOPT_ARENA_LOAD")) {
+        if (arena != nullptr) {
+            if (FILE* fp = std::fopen(arena_load, "rb")) {
+                const std::size_t got = std::fread(arena, 4, arena_words, fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "P14CALL loaded %zu arena words from %s\n", got, arena_load);
+            }
+        }
+    }
     if (arena != nullptr && arena_words >= need) {
         // The reference's tables: the parser's arena, never cleared, head first.
         e.head = arena;
@@ -2350,6 +2372,11 @@ uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
     side->assign(side_cap, 0);
     const uint32_t r = e.Run(out->data(), (uint32_t)out->size(),
                              side->data(), side_cap >> 1);
+    if (arena_dump != nullptr && arena != nullptr) {
+        std::string f = std::string(arena_dump) + ".after";
+        if (FILE* fp = std::fopen(f.c_str(), "wb")) { std::fwrite(arena, 4, arena_words, fp); std::fclose(fp); }
+        std::fprintf(stderr, "P14CALL done r=%u\n", r);
+    }
     if (r == 0u) { out->clear(); side->clear(); return 0; }
     out->resize(r);
     side->resize((size_t)(e.enc.cur - side->data()));
