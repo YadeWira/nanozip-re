@@ -393,20 +393,12 @@ void WinCoreCounts(unsigned* physical, unsigned* logical) {
 }
 #endif  // _WIN32
 
-}  // namespace
-
-unsigned HostThreadCount() {
-#if defined(_WIN32)
-    // The original reports 16 on a 16-core/32-thread host, on Linux AND under
-    // wine, where GetLogicalProcessorInformation says 32 cores of one thread
-    // each -- so it takes the count from the CPU itself, not from the OS. Do the
-    // same: logical processors divided by the hyper-threading ratio the CPU
-    // reports (logical per package / cores per package), which is exactly what
-    // the Linux path derives from `siblings` and `cpu cores`.
-    unsigned physical = 0, logical = 0;
-    WinCoreCounts(&physical, &logical);
-    if (logical == 0u) logical = 1u;
-    if (logical > 32u) logical = 32u;
+// The hyper-threading ratio the CPU reports for itself: logical processors per
+// package over cores per package. Taken from CPUID and not from the OS, because
+// the OS can be wrong about it -- under wine GetLogicalProcessorInformation
+// describes this 32-core/64-thread host as 32 cores of one thread each -- and
+// the original's figures follow the CPU. 1 when there is no SMT.
+unsigned SmtRatio() {
     unsigned ratio = 1u;
     unsigned a = 0, b = 0, c = 0, d = 0;
     if (__get_cpuid(1u, &a, &b, &c, &d)) {
@@ -419,6 +411,23 @@ unsigned HostThreadCount() {
         else if ((d & (1u << 28)) != 0u && logical_per_pkg > 1u && cores_per_pkg == 0u)
             ratio = 2u;   // hyper-threading advertised, core count unavailable
     }
+    return ratio == 0u ? 1u : ratio;
+}
+
+}  // namespace
+
+unsigned HostThreadCount() {
+#if defined(_WIN32)
+    // The original says `Threads: 16` on this 32-core/64-thread host, on Linux
+    // AND under wine. Logical processors divided by the SMT ratio, which is what
+    // the Linux path derives from `siblings` and `cpu cores` -- and the cap
+    // comes FIRST here: this host has 64 logical processors and the original
+    // says `Threads: 16`, i.e. 32 (a 32-entry affinity mask) halved.
+    unsigned physical = 0, logical = 0;
+    WinCoreCounts(&physical, &logical);
+    if (logical == 0u) logical = 1u;
+    if (logical > 32u) logical = 32u;
+    const unsigned ratio = SmtRatio();
     if (ratio > 1u && logical / ratio >= 1u) logical /= ratio;
     return logical;
 #else
@@ -439,12 +448,39 @@ unsigned HostThreadCount() {
 }
 
 std::string HostSummaryLine() {
-    // "<model>|<MHz> MHz|#<logical>[+HT]|<available>/<total> MB", the second line
+    // "<model>|<MHz> MHz|#<cores>[+HT]|<available>/<total> MB", the second line
     // the original prints under its banner and the only line `info` shares with it.
 #if defined(_WIN32)
+    // `#<cores>[+HT]` is the count of PHYSICAL cores, and it is NOT capped the
+    // way `Threads:` is: the original prints `#8+HT` on an 8-core/16-thread
+    // E5-2665 (a user's paste of its Windows build) and `#32+HT` on this
+    // 32-core/64-thread host (its Windows build under wine, and its Linux build
+    // natively). This printed the LOGICAL count, so every hyper-threaded machine
+    // saw twice the right number.
+    //
+    // The count comes from GetSystemInfo and the ratio from CPUID, because the
+    // OS's per-core topology can be wrong where the total is not: under wine
+    // GetLogicalProcessorInformation describes this host as 32 cores of one
+    // thread each while GetSystemInfo still says 64.
     unsigned physical = 0, logical_w = 0;
     WinCoreCounts(&physical, &logical_w);
-    if (logical_w > 32u) logical_w = 32u;
+    SYSTEM_INFO si_banner;
+    GetSystemInfo(&si_banner);
+    unsigned logical_total = static_cast<unsigned>(si_banner.dwNumberOfProcessors);
+    if (logical_total < logical_w) logical_total = logical_w;
+    if (logical_total == 0u) logical_total = 1u;
+    const unsigned ratio_w = SmtRatio();
+    unsigned cores_w = logical_total;
+    bool ht_w = false;
+    if (ratio_w > 1u && logical_total >= ratio_w) {
+        cores_w = logical_total / ratio_w;
+        ht_w = true;
+    } else if (physical > 0u && logical_w > physical) {
+        // hyper-threading the CPU did not describe, but the OS did
+        cores_w = physical;
+        ht_w = true;
+    }
+    if (cores_w == 0u) cores_w = 1u;
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     unsigned long long avail_mb = 0, total_mb = 0;
@@ -467,7 +503,7 @@ std::string HostSummaryLine() {
     std::snprintf(wbuf, sizeof(wbuf), "%s|%u MHz|#%u%s|%llu/%llu MB",
                   brand.empty() ? "unknown CPU" : brand.c_str(),
                   MeasuredMhz(std::string()),
-                  logical_w, (logical_w > physical) ? "+HT" : "",
+                  cores_w, ht_w ? "+HT" : "",
                   avail_mb, total_mb);
     return std::string(wbuf);
 #else
@@ -490,16 +526,31 @@ std::string HostSummaryLine() {
             }
         }
     }
-    // The original reports 32 on this 64-thread host. A 32-bit process sees a
-    // 32-entry affinity mask, so cap it the same way -- on any machine with 32 or
-    // fewer logical CPUs this is a no-op and reports the true count.
-    if (logical > 32u) logical = 32u;
+    // The CPU count comes from the kernel when /proc/cpuinfo is unreadable
+    // (measured: the original prints the identical line either way).
+    if (logical == 0u) {
+        const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+        logical = n > 0 ? static_cast<unsigned>(n) : 1u;
+    }
+    // PHYSICAL cores: the original prints `#32+HT` on this 32-core/64-thread host
+    // and `#8+HT` on an 8-core/16-thread one (a user's paste of its Windows
+    // build). Dividing by the SMT ratio is what makes both right; capping the
+    // logical count at 32, which is what this did, only happened to give the
+    // right answer on a host whose physical count is also 32.
+    unsigned ratio = 0u;
+    {
+        const unsigned long sib = siblings.empty() ? 0ul : std::strtoul(siblings.c_str(), nullptr, 10);
+        const unsigned long cor = cores.empty() ? 0ul : std::strtoul(cores.c_str(), nullptr, 10);
+        if (cor > 0ul && sib > cor) ratio = static_cast<unsigned>(sib / cor);
+    }
+    if (ratio == 0u) ratio = SmtRatio();
+    if (ratio > 1u && logical >= ratio) logical /= ratio;
     // The original reports a MEASURED clock (its readings drift around 2653-2752 MHz
     // on a 2.60 GHz part), not the "cpu MHz" field -- that field is a live per-core
     // value and reads the idle floor on a quiet core. Measure the invariant TSC over
     // a short interval, which is what lands in the same place.
     (void)max_mhz;
-    const bool ht = (!siblings.empty() && !cores.empty() && siblings != cores);
+    const bool ht = (ratio > 1u);
 
     // MemFree, not MemAvailable: measured against the original, which reports
     // 10261 MB on a host whose MemFree is 10507332 kB and MemAvailable 49801188 kB.
@@ -511,18 +562,11 @@ std::string HostSummaryLine() {
         if (!a.empty()) avail_kb = std::strtoull(a.c_str(), nullptr, 10);
     }
 
-    // The original takes these from CPUID and the CPU count from the kernel,
-    // not from /proc/cpuinfo (measured: identical line with the file unreadable).
+    // The original takes the model from CPUID, not from /proc/cpuinfo (measured:
+    // identical line with the file unreadable).
     std::string brand = model;
-    bool ht_flag = ht;
+    const bool ht_flag = ht;
     if (brand.empty()) brand = CpuidBrand();
-    if (logical == 0u) {
-        const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
-        logical = n > 0 ? static_cast<unsigned>(n) : 1u;
-        if (logical > 32u) logical = 32u;
-        unsigned a = 0, b = 0, c = 0, d = 0;
-        if (__get_cpuid(1u, &a, &b, &c, &d)) ht_flag = (d & (1u << 28)) != 0u;
-    }
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%s|%u MHz|#%u%s|%llu/%llu MB",
                   brand.empty() ? "unknown CPU" : brand.c_str(),
