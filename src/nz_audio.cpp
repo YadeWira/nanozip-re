@@ -1612,6 +1612,159 @@ struct NzAudioEncoder::Impl {
         for (int i = 0; i < 6; ++i) linpred_[i].Reset();
     }
 
+    uint64_t class_sum_ = 0;     // sum of the per-sample classes of the last chunk
+    uint64_t abs_sum_ = 0;       // and the sum of |residual|
+
+    // ---------------------------------------------------------------------
+    // The reference's decisions (FUN_08081c40 and its two helpers), ported.
+    // ---------------------------------------------------------------------
+
+    // The cost every decision here is made on: the sum of the residuals' bit
+    // lengths, `BSR(|v| + 1)` (FUN_08080690 inlined).
+    static uint64_t BitCost(const int32_t* v, uint32_t n) {
+        uint64_t c = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t m = (uint32_t)((v[i] ^ (v[i] >> 31)) - (v[i] >> 31)) + 1u;
+            c += m ? BSR(m) : 0u;
+        }
+        return c;
+    }
+
+    // FUN_080535e0: try the shifts in [lo, hi] on three windows of up to 0x800
+    // samples taken at 0, n/3 and 2n/3, and keep the cheapest. Gives up once a
+    // candidate is two past the best so far.
+    uint64_t ShiftSearchSmall(LinearPredictor& pred, const int32_t* samples, uint32_t n,
+                              uint32_t lo, uint32_t hi) {
+        const uint32_t win = n < 0x800u ? n : 0x800u;
+        uint64_t best = ~0ull;
+        uint32_t best_shift = 0;
+        std::vector<int32_t> scratch(0x1800u);
+        for (uint32_t cand = lo; cand <= hi; ++cand) {
+            std::fill(scratch.begin(), scratch.end(), 0);
+            for (uint32_t w = 0; w < 3u; ++w) {
+                const uint32_t off = (n / 3u) * w;
+                for (uint32_t k = 0; k < win && off + k < n; ++k) scratch[w * 0x800u + k] = samples[off + k];
+            }
+            LinearPredictor clone = pred;
+            clone.SetBits((int)cand);
+            const uint32_t run = n < 0x1800u ? n : 0x1800u;
+            clone.RunForward(scratch.data(), run);
+            const uint64_t cost = BitCost(scratch.data(), 0x1800u);
+            if (cost < best) {
+                best = cost;
+                best_shift = cand;
+                if (cost == 0u) break;
+            } else if (cand + 2u <= best_shift) {
+                break;
+            }
+        }
+        pred.SetBits((int)best_shift);
+        return best;
+    }
+
+    // FUN_08053780: the same idea for the long predictor, over candidates 12..14
+    // and with the chosen one INCREMENTED by one before it is stored -- which is
+    // why the side bits the reference writes are 5, 6 or 7 and never lower.
+    uint64_t ShiftSearchBig(LinearPredictor& pred, const int32_t* samples, uint32_t n,
+                            uint32_t win_in) {
+        if (pred.order_ == 8u) return ShiftSearchSmall(pred, samples, n, 8u, 0xfu);
+        if (pred.order_ >= 0x100u) { pred.SetBits(15); return 0; }
+        const uint32_t win = win_in < n ? win_in : n;
+        const uint32_t stride = n / 3u;
+        uint64_t best = ~0ull;
+        uint32_t best_shift = 0;
+        std::vector<int32_t> scratch(win ? win : 1u);
+        for (uint32_t cand = 12u; cand != 15u; ++cand) {
+            LinearPredictor clone = pred;
+            clone.SetBits((int)cand);
+            uint64_t cost = 0;
+            for (uint32_t w = 0; w < 3u; ++w) {
+                const uint32_t off = stride * w;
+                if (off >= n) break;
+                const uint32_t take = (off + win <= n) ? win : (n - off);
+                scratch.assign(samples + off, samples + off + take);
+                clone.RunForward(scratch.data(), take);
+                cost += BitCost(scratch.data(), take);
+            }
+            if (cost < best) {
+                best = cost;
+                best_shift = cand;
+                if (cost == 0u) break;
+            }
+        }
+        if (best_shift < 15u) best_shift += 1u;
+        pred.SetBits((int)best_shift);
+        return best;
+    }
+
+    // FUN_08081b70: does this plane pay? Run a clone over up to 0x2000 samples
+    // and compare the cost before and after with the caller's ratio.
+    bool PlanePays(const LinearPredictor& pred, const int32_t* samples, uint32_t n,
+                   uint32_t a, uint32_t b) {
+        const uint32_t take = n < 0x2000u ? n : 0x2000u;
+        std::vector<int32_t> scratch(samples, samples + take);
+        const uint64_t before = BitCost(scratch.data(), take);
+        LinearPredictor clone = pred;
+        clone.RunForward(scratch.data(), take);
+        const uint64_t after = BitCost(scratch.data(), take);
+        return after * a < before * b;
+    }
+
+
+    // The reference's plane decisions (FUN_08081c40's two loops): the shift comes
+    // from a search the predictor's own order selects, and the flag from a trial
+    // over up to 0x2000 samples. `pass` is the reference's own second sweep --
+    // the first applies every plane, the second lets the trial decide.
+    void ChoosePlanes(const uint8_t* in, uint32_t outsize, NzAudioChunkParams* p, int pass) {
+        AudioFormat fmt;
+        fmt.stereo_filter = p->stereo_filter;
+        fmt.channels = p->channels;
+        fmt.sample_size = p->sample_size;
+        fmt.little_endian = p->little_endian;
+        const uint8_t* body = in + p->header_bytes;
+        const uint32_t body_size = outsize - p->header_bytes;
+        uint32_t sample_count = body_size / fmt.sample_size;
+        if (fmt.channels) sample_count &= ~1u;
+        const uint32_t nsamples = sample_count;
+        const uint32_t nframes = fmt.channels ? (nsamples >> 1) : nsamples;
+        if (nframes == 0u) return;
+
+        std::vector<int32_t> cur(nsamples);
+        UnpackSamples(body, nframes, cur.data(), fmt);
+        if (fmt.channels && p->gate) {
+            if ((ctx_flags_ & 0x10u) != 0u)
+                nzr::lzpf::InverseLmsInterChannel(cur.data(), cur.data() + nframes, nframes, &lms_[0], &lms_[1]);
+            else
+                stereo_dec_.Encode(cur.data(), cur.data() + nframes, nframes);
+        }
+
+        const uint32_t win = nframes < 0x1000u ? nframes : 0x1000u;
+        for (int j = 0; j < (fmt.channels ? 2 : 1); ++j) {
+            int32_t* chan = cur.data() + (uint32_t)j * nframes;
+            for (int i = 0; i <= 2; ++i) {
+                LinearPredictor& lp = linpred_[i * 2 + j];
+                // Which search sets the shift depends on context bit 0 and on the
+                // long predictor's order (the field at obj+0x1c18 -- linpred_[1]).
+                if ((ctx_flags_ & 1u) == 0u) {
+                    const uint32_t ord = lp.order_;
+                    lp.SetBits((int)(ord > 8u ? std::min<uint32_t>(ord / 20u + 12u, 15u) : 8u));
+                } else if (lp.order_ < 9u) {
+                    if (linpred_[1].order_ < 0x41u) lp.SetBits((int)(8u + (pass == 1 ? 1u : 0u)));
+                    else ShiftSearchSmall(lp, chan, nframes, 8u, pass == 1 ? 0xbu : 0xau);
+                } else {
+                    ShiftSearchBig(lp, chan, nframes, pass == 0 ? win : 0x800u);
+                }
+
+                const bool use = (pass == 0) ? true : PlanePays(lp, chan, nframes, 1u, 1u);
+                p->lp_flag[i][j] = use ? 1u : 0u;
+                p->lp_bits[i][j] = (uint8_t)(use ? (lp.shift_ >= 8u ? lp.shift_ - 8u : 0u) : 0u);
+                if (use) lp.RunForward(chan, nframes);
+                else lp.Reset();
+            }
+        }
+        Reset();
+    }
+
     bool EncodeChunk(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
                      std::vector<uint8_t>* out) {
         AudioFormat fmt;
@@ -1708,6 +1861,13 @@ struct NzAudioEncoder::Impl {
         for (size_t k = 0; k + 1 < prefix.size(); k += 2) bw.PutBits(prefix[k], prefix[k + 1]);
         if (!EncodeInt32Array(samples, nsamples, counts, &bw)) return false;
         bw.Finish();
+        class_sum_ = 0;
+        abs_sum_ = 0;
+        for (uint32_t k = 0; k < nsamples; ++k) {
+            class_sum_ += counts[k];
+            const int32_t r = samples[k];
+            abs_sum_ += (uint64_t)(r < 0 ? -(int64_t)r : (int64_t)r);
+        }
 
         // The bit-count arrays come first in the payload, one per channel.
         const uint32_t per = nframes;
@@ -1735,6 +1895,14 @@ bool NzAudioEncoder::EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                                  std::vector<std::uint8_t>* out) {
     return impl_->EncodeChunk(in, outsize, params, out);
 }
+
+void NzAudioEncoder::ChoosePlanes(const std::uint8_t* in, std::uint32_t outsize,
+                                  NzAudioChunkParams* params, int metric) {
+    impl_->ChoosePlanes(in, outsize, params, metric);
+}
+
+std::uint64_t NzAudioEncoder::LastClassSum() const { return impl_->class_sum_; }
+std::uint64_t NzAudioEncoder::LastAbsSum() const { return impl_->abs_sum_; }
 
 bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
                             std::vector<std::uint8_t>* out, bool variant_b) {

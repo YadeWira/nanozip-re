@@ -110,6 +110,16 @@ class NzAudioEncoder {
     bool EncodeChunk(const std::uint8_t* in, std::uint32_t outsize,
                      const NzAudioChunkParams& params, std::vector<std::uint8_t>* out);
 
+    // Picks the per-plane flags and shifts by a greedy search (metric 0 = sum of
+    // |residual|, 1 = sum of class indices). Experimental: which search the
+    // reference runs is still being measured.
+    void ChoosePlanes(const std::uint8_t* in, std::uint32_t outsize,
+                      NzAudioChunkParams* params, int metric);
+
+    // Cost proxies of the last chunk, for the decision search.
+    std::uint64_t LastClassSum() const;
+    std::uint64_t LastAbsSum() const;
+
  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
