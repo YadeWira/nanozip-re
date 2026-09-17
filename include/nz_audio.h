@@ -79,6 +79,17 @@ class NzAudioPred {
 // Encoder side, test hook: writes the bit-count array of ONE channel exactly as
 // a decr_param==2 payload carries it (variant A: the -cO/-cc coder), u16 length
 // prefix included. Appends to `out` and returns true on success.
+// Test hooks for the residual stage: `NzAudioEncodeResiduals` fills `counts`
+// (one class per sample) and appends the magnitude/sign bit stream to `bits`;
+// `NzAudioDecodeResiduals` reads them back.
+bool NzAudioEncodeResiduals(const std::int32_t* samples, std::uint32_t n,
+                            std::uint8_t* counts, std::vector<std::uint8_t>* bits,
+                            const std::uint32_t* prefix = nullptr,
+                            std::uint32_t prefix_n = 0);
+bool NzAudioDecodeResiduals(const std::uint8_t* bits, std::size_t bits_size,
+                            const std::uint8_t* counts, std::uint32_t n,
+                            std::int32_t* samples);
+
 // Test hook, decoder half: reads one variant-A bit-count block (u16 length
 // prefix included) and returns the bytes consumed, 0 on failure.
 std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,

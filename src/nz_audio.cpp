@@ -1025,6 +1025,97 @@ static const uint32_t kAudioInt32Base[32] = {
 
 // bitcount classes are produced by AudioBitcountDecoder as `~accum & 0x3f`, so
 // they are always 0..63 and every table index below stays in range.
+// ---------------------------------------------------------------------------
+// Encoder side: the bit writer and the residual coder, mirrors of BitReader and
+// DecodeInt32Array.
+// ---------------------------------------------------------------------------
+struct BitWriter {
+    std::vector<uint8_t>* out_ = nullptr;
+    uint32_t buff_ = 0;     // bits waiting, left-aligned in the low `count_` bits
+    uint32_t count_ = 0;    // how many bits `buff_` holds
+
+    void PutBits(uint32_t value, uint32_t nb) {
+        while (nb) {
+            const uint32_t take = (nb < 32u - count_) ? nb : (32u - count_);
+            const uint32_t chunk = (value >> (nb - take)) & bitmask(take);
+            buff_ = (count_ + take >= 32u) ? ((buff_ << take) | chunk)
+                                           : ((buff_ << take) | chunk);
+            count_ += take;
+            nb -= take;
+            if (count_ == 32u) FlushWord();
+        }
+    }
+    void FlushWord() {
+        // The reader fetches whole big-endian 32-bit words.
+        out_->push_back((uint8_t)(buff_ >> 24));
+        out_->push_back((uint8_t)(buff_ >> 16));
+        out_->push_back((uint8_t)(buff_ >> 8));
+        out_->push_back((uint8_t)buff_);
+        buff_ = 0;
+        count_ = 0;
+    }
+    // The last word goes out only as far as it carries bits: the reader fetches
+    // four bytes and zero-fills whatever the stream does not have, so the
+    // reference stops at the last byte that holds a bit and the payload ends
+    // there (measured: a whole trailing word makes the chunk three bytes long).
+    void Finish() {
+        if (count_ == 0u) return;
+        const uint32_t nbytes = (count_ + 7u) >> 3;
+        uint32_t w = buff_ << (32u - count_);
+        for (uint32_t k = 0; k < nbytes; ++k) { out_->push_back((uint8_t)(w >> 24)); w <<= 8; }
+        buff_ = 0;
+        count_ = 0;
+    }
+};
+
+// The inverse of the class tables. The groups OVERLAP -- `kAudioInt32Tab[23]`
+// says ten bits where four classes over an octave want nine, so classes 42 and
+// 43 cover values that class 44 covers as well and a search for "a class that
+// can carry x" finds the wrong one. The rule that reproduces the reference is
+// the octave: k = BSR(x) picks the group at t = 2k (its base IS 2^k), and the
+// class is that group's first plus the top bits of the offset. Classes 42 and 43
+// are therefore never emitted, which is what the original's own streams show.
+struct AudioInt32Classes {
+    // magnitude-1 -> class index (vm) and the extra bits to write
+    void Split(uint32_t x, uint32_t* vm, uint32_t* extra, uint32_t* nbits) const {
+        if (x == 0u) { *vm = 0; *extra = 0; *nbits = 0; return; }
+        uint32_t k = BSR(x);
+        if (k > 31u) k = 31u;
+        const uint32_t t = 2u * k;
+        const uint32_t nb = kAudioInt32Tab[t + 1];
+        if (nb == 0u) { *vm = x; *extra = 0; *nbits = 0; return; }
+        const uint32_t off = x - kAudioInt32Base[k];
+        *vm = kAudioInt32Tab[t] + (off >> nb);
+        *extra = off & bitmask(nb);
+        *nbits = nb;
+    }
+};
+
+static const AudioInt32Classes& Int32Classes() {
+    static const AudioInt32Classes c;
+    return c;
+}
+
+// Writes the per-sample classes into `counts` and the magnitude/sign bits into
+// the writer. The inverse of DecodeInt32Array: class 0 is a zero sample, and
+// every other class carries `nbits` magnitude bits and then one sign bit.
+static bool EncodeInt32Array(const int32_t* samples, uint32_t n,
+                             uint8_t* counts, BitWriter* bw) {
+    const AudioInt32Classes& tab = Int32Classes();
+    for (uint32_t i = 0; i < n; ++i) {
+        const int32_t v = samples[i];
+        if (v == 0) { counts[i] = 0; continue; }
+        const uint32_t mag = (uint32_t)(v < 0 ? -(int64_t)v : (int64_t)v);
+        uint32_t vm = 0, extra = 0, nbits = 0;
+        tab.Split(mag - 1u, &vm, &extra, &nbits);
+        if (vm > 62u) return false;   // past what a 6-bit class can carry
+        counts[i] = (uint8_t)(vm + 1u);
+        if (nbits) bw->PutBits(extra, nbits);
+        bw->PutBits(v < 0 ? 1u : 0u, 1);
+    }
+    return true;
+}
+
 static bool DecodeInt32Array(int32_t* samples, uint32_t size, const uint8_t* bitcount,
                              BitReader* bit_reader) {
     while (size) {
@@ -1221,16 +1312,19 @@ struct NzAudioPred::Impl {
                 if (!lms_variant) {
                     const uint32_t c0 = bit_reader.GetBits(4);
                     const uint32_t c1 = bit_reader.GetBits(4);
+                    if (BcTrace()) std::fprintf(stderr, "GATE 1 stereo c0=%u c1=%u\n", c0, c1);
                     stereo_dec_.SetBits(16u + c0, 16u + c1);
                     use_stereo_dec = true;
                 } else {
                     const uint32_t s0 = bit_reader.GetBits(3);
                     const uint32_t s1 = bit_reader.GetBits(3);
+                    if (BcTrace()) std::fprintf(stderr, "GATE 1 lms s0=%u s1=%u\n", s0, s1);
                     lms_[0].shift = (uint8_t)(7u + s0);
                     lms_[1].shift = (uint8_t)(7u + s1);
                     use_lms = true;
                 }
             } else {
+                if (BcTrace()) std::fprintf(stderr, "GATE 0\n");
                 stereo_dec_.Reset();
                 lms_[0].Init();
                 lms_[1].Init();
@@ -1242,8 +1336,14 @@ struct NzAudioPred::Impl {
             for (int j = 0; j < (fmt.channels ? 2 : 1); j++) {
                 const uint8_t flag = (uint8_t)bit_reader.GetBits(1);
                 use_lp[i][j] = flag;
-                if (flag) linpred_[i * 2 + j].SetBits((int)bit_reader.GetBits(3) + 8);
-                else linpred_[i * 2 + j].Reset();
+                if (flag) {
+                    const uint32_t sb = bit_reader.GetBits(3);
+                    if (BcTrace()) std::fprintf(stderr, "LP %d %d flag=1 bits=%u\n", i, j, sb);
+                    linpred_[i * 2 + j].SetBits((int)sb + 8);
+                } else {
+                    if (BcTrace()) std::fprintf(stderr, "LP %d %d flag=0\n", i, j);
+                    linpred_[i * 2 + j].Reset();
+                }
             }
         }
 
@@ -1345,6 +1445,25 @@ struct NzAudioPred::Impl {
         return true;
     }
 };
+
+bool NzAudioEncodeResiduals(const std::int32_t* samples, std::uint32_t n,
+                            std::uint8_t* counts, std::vector<std::uint8_t>* bits,
+                            const std::uint32_t* prefix, std::uint32_t prefix_n) {
+    BitWriter bw;
+    bw.out_ = bits;
+    for (std::uint32_t k = 0; k < prefix_n; ++k) bw.PutBits(prefix[2 * k], prefix[2 * k + 1]);
+    if (!EncodeInt32Array(samples, n, counts, &bw)) return false;
+    bw.Finish();
+    return true;
+}
+
+bool NzAudioDecodeResiduals(const std::uint8_t* bits, std::size_t bits_size,
+                            const std::uint8_t* counts, std::uint32_t n,
+                            std::int32_t* samples) {
+    BitReader br;
+    br.Initialize(bits, bits_size);
+    return DecodeInt32Array(samples, n, counts, &br);
+}
 
 std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,
                                      std::uint8_t* out, std::uint32_t n, bool variant_b) {
