@@ -193,6 +193,31 @@ namespace nzr::lzpf_enc {
 // forwards: residual = sample - ((left + 1 + above) >> 1) (mode 2), one
 // residual stream for all planes, one Huffman stream per plane, the side bits
 // last; declined when that is not smaller than the aligned sample bytes.
+// FUN_080b6820's encoder side: load each stage's four-tap history out of ring0.
+static void CascadeLoad(ImageEncModel& m, std::uint32_t stride, std::uint32_t nch) {
+    const std::uint32_t idx0 = (m.r0 - 4u * (stride - 3u * nch)) & 0xfffffu;
+    for (std::uint32_t c = 0; c < 4; ++c) {
+        ImageEncModel::Cascade& st = m.casc[0][c];
+        st.hist[3] = st.hist[2]; st.hist[2] = st.hist[1]; st.hist[1] = st.hist[0];
+        st.hist[0] = m.ring0[idx0 + c * 4u];
+    }
+    std::uint32_t idx = m.r0 + 1u;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        idx = (idx - 4u * stride) & 0xfffffu;
+        for (std::uint32_t c = 0; c < 4; ++c) m.casc[1][c].hist[i] = m.ring0[idx + c * 4u];
+    }
+    idx = m.r0 + 2u;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        idx = (idx - 4u * (stride - nch)) & 0xfffffu;
+        for (std::uint32_t c = 0; c < 4; ++c) m.casc[2][c].hist[i] = m.ring0[idx + c * 4u];
+    }
+    idx = m.r0 + 3u;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        idx = (idx - 4u * (stride + nch)) & 0xfffffu;
+        for (std::uint32_t c = 0; c < 4; ++c) m.casc[3][c].hist[i] = m.ring0[idx + c * 4u];
+    }
+}
+
 std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
                              std::uint32_t len, std::vector<std::uint8_t>& out, std::uintptr_t align) {
     if (len < 0x200u) return 0;   // FUN_0808aac0 gate; FUN_08089a80's verbatim path (< 0x180) is unreachable
@@ -368,11 +393,45 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
                 left[c] = v;
             }
             if (m.flags & 2u) {
-                // the LMS planes: each channel's plane first, then the shared fifth
-                // plane over every channel (FUN_080bddc0 on value and residual)
-                std::int32_t r1v[4] = {0, 0, 0, 0};
-                for (std::uint32_t c = 0; c < nch; ++c) { r1v[c] = d[c] - m.plane[c].pred; std::int32_t rr = r1v[c]; m.plane[c].Run(&rr, 1u); }
-                for (std::uint32_t c = 0; c < nch; ++c) { std::int32_t r2 = r1v[c] - m.plane[4].pred; std::int32_t rr = r2; m.plane[4].Run(&rr, 1u); planes[c * per_ch + pix] = r2; }
+                // the LMS planes: each channel's plane first, then -- when the
+                // cascade is on -- four stages of 4-tap sign-sign LMS, and finally
+                // the shared fifth plane (FUN_080bddc0 on value and residual)
+                std::int32_t lvl[4][4] = {};
+                for (std::uint32_t c = 0; c < nch; ++c) { lvl[0][c] = d[c] - m.plane[c].pred; std::int32_t rr = lvl[0][c]; m.plane[c].Run(&rr, 1u); }
+                std::int32_t lms4[4] = {0, 0, 0, 0};
+                if (m.flags & 4u) {
+                    CascadeLoad(m, stride, nch);
+                    for (std::uint32_t c = 0; c < nch; ++c) {
+                        std::int32_t x = lvl[0][c];
+                        for (int st = 0; st < 4; ++st) {
+                            ImageEncModel::Cascade& cs = m.casc[st][c];
+                            const std::int64_t dot = (std::int64_t)cs.coef[0] * cs.hist[0] + (std::int64_t)cs.coef[1] * cs.hist[1]
+                                                   + (std::int64_t)cs.coef[2] * cs.hist[2] + (std::int64_t)cs.coef[3] * cs.hist[3];
+                            const std::int64_t sg = dot >> 63;
+                            const std::uint64_t mag = (std::uint64_t)((dot ^ sg) - sg);
+                            const std::uint32_t q = (std::uint32_t)(mag >> (m.casc_shift[st * 4 + c] & 0x1fu));
+                            const std::int32_t pred = (std::int32_t)((q ^ (std::uint32_t)sg) - (std::uint32_t)sg);
+                            const std::int32_t in_v = (std::int32_t)((std::uint32_t)x - (std::uint32_t)pred);
+                            if (st < 3) lvl[st + 1][c] = in_v;
+                            if (in_v != 0) {
+                                const std::int32_t sgn = in_v >> 31;
+                                for (int k = 0; k < 4; ++k)
+                                    cs.coef[k] = (std::int32_t)((std::uint32_t)cs.coef[k] + (((std::uint32_t)cs.hist[k] ^ (std::uint32_t)sgn) - (std::uint32_t)sgn));
+                            }
+                            x = in_v;
+                        }
+                        lms4[c] = x;
+                    }
+                } else {
+                    for (std::uint32_t c = 0; c < nch; ++c) lms4[c] = lvl[0][c];
+                }
+                for (std::uint32_t c = 0; c < nch; ++c) { std::int32_t r2 = lms4[c] - m.plane[4].pred; std::int32_t rr = r2; m.plane[4].Run(&rr, 1u); planes[c * per_ch + pix] = r2; }
+                if (m.flags & 4u) {
+                    for (std::uint32_t c = 0; c < nch; ++c)
+                        for (int k = 0; k < 4; ++k)
+                            m.ring0[m.r0 + c * 4u + k] = (std::int16_t)lvl[k][c];
+                    m.r0 = (m.r0 + nch * 4u) & 0xfffffu;
+                }
             } else {
                 for (std::uint32_t c = 0; c < nch; ++c) planes[c * per_ch + pix] = d[c];
             }
@@ -390,7 +449,8 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
 
     // ---- streams ----
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(per_ch) * nch + 8u);
-    ResidualEncode(planes, per_ch * nch, bytes.data(), w);
+    if ((m.flags & 1u) != 0u) ResidualEncodeStereo(planes, per_ch * nch, bytes.data(), w);
+    else                      ResidualEncode(planes, per_ch * nch, bytes.data(), w);
     w.Flush();
     if (w.end <= w.cur) { out.resize(start); return 0; }
     const std::size_t side_bytes = static_cast<std::size_t>(w.cur - w.base) + ((w.nbits + 7u) >> 3u);

@@ -93,6 +93,23 @@ struct ImageEncModel {
     std::vector<std::uint32_t> stack_tbl;
     std::uint32_t flags = 0;    // obj+0x52940: 0 lzpf, 2 lzhd, 0x07/0x0f the optimum family
     bool variant_b = false;     // the -co bit-count class
+    // The 4x4 cascade (flags & 4) and the ring it reads its history from: four
+    // stages of a 4-tap sign-sign LMS per channel, between the per-channel LMS
+    // plane and the shared fifth one.
+    struct Cascade { std::int32_t coef[4]{}; std::int32_t hist[4]{}; };
+    Cascade casc[4][4];
+    std::vector<std::int16_t> ring0;   // *obj: 4 shorts per sample, index & 0xfffff
+    std::uint32_t r0 = 0;
+    std::uint8_t casc_shift[16] = {0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,
+                                   0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c,0x0c};
+    // The optimum family's plane orders (32 on planes 0..3, 48 on plane 4).
+    void Configure(std::uint32_t f, std::uint32_t order03, std::uint32_t order4, bool vb) {
+        flags = f; variant_b = vb;
+        for (int k = 0; k < 4; ++k) plane[k].order = order03;
+        plane[4].order = order4;
+        for (auto& p : plane) p.Reset();
+        if (ring0.empty()) ring0.assign(0x100000u + 16u, 0);
+    }
     // The per-channel bit-count coders (flags & 1), state carried across chunks.
     std::shared_ptr<nzr::audio::NzBitcountEncoderSet> bitcounts;
     nzr::lzpf::LpcBigPredictor plane[5];      // obj+0x10 + k*0x1c10 (FUN_080bddc0 planes), used when flags & 2
@@ -182,6 +199,9 @@ struct BitWriter {
 
 std::size_t EncodeArithAt(const std::uint8_t* src, std::size_t n, std::uint8_t* out, std::size_t limit, std::uintptr_t align);
 void ResidualEncode(const std::int32_t* v, std::uint32_t n, std::uint8_t* bytes, BitWriter& w);
+// The image model's other residual coder (its flag bit 0), the mirror of
+// DecodeResidualsStereo.
+void ResidualEncodeStereo(const std::int32_t* v, std::uint32_t n, std::uint8_t* bytes, BitWriter& w);
 std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src, std::uint32_t len, AudioProbe& pr, std::vector<std::uint8_t>& out, std::uintptr_t align);
 
 // The codec state the block driver keeps across blocks: the window (4 bytes of
