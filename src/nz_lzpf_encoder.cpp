@@ -891,7 +891,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         std::vector<std::uint8_t> hdr;
         WriteBlockHeader(hdr, static_cast<std::uint32_t>(len), 4u, 1u);
         std::vector<std::uint8_t> payload;
-        const std::size_t got = ImageEncodeBlock(st.image, img, block, static_cast<std::uint32_t>(len), payload, (align + hdr.size()) & 3u);
+        const std::size_t got = ImageEncodeChunk(st.image, img, block, static_cast<std::uint32_t>(len), payload, (align + hdr.size()) & 3u);
         if (got == 0u) {
             literal(0u);
             st.BackfillSparse(len);

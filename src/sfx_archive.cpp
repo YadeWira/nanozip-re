@@ -12729,8 +12729,10 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
 // across blocks) and the span the reference's driver tracks in its probe.
 struct CoAudioState {
     nzr::audio::NzAudioEncoder enc;
-    std::uint64_t done = 0, end = 0;
-    bool in_span = false;
+    nzr::lzpf_enc::ImageEncModel img;
+    bool img_ready = false;
+    std::uint64_t pos = 0, end = 0;   // the stream offset and where the recognised header says the audio ends
+    
     bool ready = false;
 };
 
@@ -12782,12 +12784,43 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
     while (feeder.Next(block_size, final)) {
         const std::uint8_t* src = feeder.Data();
         const std::uint32_t n = feeder.Len();
+        // The stream offset of THIS block: the span the audio probe opens is
+        // measured in stream coordinates, so it has to advance on every block,
+        // audio or not.
+        const std::uint64_t bpos = (audio != nullptr) ? audio->pos : 0u;
+        if (audio != nullptr) audio->pos += n;
 
         // FUN_0808da10 tries the AUDIO block before anything else: probe the
         // block, encode it, and keep it when the payload beats an entropy
         // estimate of the raw bytes by the reference's 17/16 margin. No LZ trial
         // is involved. `mode2_type` is "no audio span was in progress", which is
         // what tells the decoder to reset the predictor.
+        // The image block (decr_param 3) is tried before the audio one -- the
+        // reference's driver skips audio entirely once the image path took the
+        // block. Its acceptance test lives inside the encoder (a payload that
+        // does not beat the raw block returns 0), and the record carries no
+        // mode2_type byte.
+        if (audio != nullptr && NZ_ENV("NZOPT_NO_IMAGE") == nullptr) {
+            if (!audio->img_ready) {
+                if (p0 == 5u) audio->img.Configure(0x07u, 32u, 48u, true);
+                else          audio->img.Configure(0x0fu, 32u, 48u, false);
+                audio->img_ready = true;
+            }
+            std::vector<std::uint8_t> ipay;
+            const bool img_taken =
+                nzr::lzpf_enc::ImageEncodeBlock(audio->img, src, n, ipay) != 0u && !ipay.empty();
+            // LAB_0808dcfc: a block the image path does not take resets the image
+            // model (FUN_080b6170) before the audio branch runs.
+            if (!img_taken) audio->img.Reset();
+            if (img_taken) {
+                put32(static_cast<std::uint32_t>(ipay.size()));
+                seg.insert(seg.end(), ipay.begin(), ipay.end());
+                seg.push_back(3u);          // decr_param: image
+                put32(n);                   // the block's output size
+                flush_block();
+                continue;
+            }
+        }
         if (audio != nullptr && !audio->ready) {
             // ConfigureOptimumModels' encoder twin: -co runs the second bit-count
             // class and the shorter predictor, -cO and -cc the default.
@@ -12807,14 +12840,25 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
         if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
             nzr::audio::NzAudioChunkParams ap;
             audio->enc.ChooseFormat(src, n, &ap);
-            const bool span = audio->done < audio->end;
+            if (ap.header_bytes != 0u && ap.hdr_end != 0u) audio->end = bpos + ap.hdr_end;
+            const bool span = bpos < audio->end;
             // A recognised header opens a span; without one this port does not
             // take the block (the reference's headerless test, FUN_08081760, is
             // not ported yet, so those blocks go down the LZ/BWT path as before).
             bool take = span || ap.header_bytes != 0u || ap.is_audio;
             if (NZ_ENV("NZOPT_TRACE_AUDENC"))
                 std::fprintf(stderr, "[audenc] block n=%u hdr=%u take=%d span=%d\n", n, ap.header_bytes, (int)take, (int)span);
+            // The driver resets the model whenever no span is in progress
+            // (LAB_0808f1a5: `local_6b = 1; FUN_080b1950(obj + 0x4c0)`), and that
+            // same flag is the mode2_type byte -- so a block written with
+            // mode2_type 1 is DECODED from a fresh model and must be ENCODED from
+            // one too. Without the reset, a block that follows rejected audio
+            // attempts carries their state into a payload the decoder reads with
+            // none: a .ppm whose third block went down this path decoded to
+            // garbage in the original's binary as well as in ours.
+            const bool fresh = !(span || ap.header_bytes != 0u);
             if (take) {
+                if (fresh) audio->enc.Reset();
                 std::vector<std::uint8_t> apay;
                 if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
                     // The reference's estimate: over the FIRST 64 KB only, scaled
@@ -12824,7 +12868,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                     // bar. Estimating the whole block in one go (what this did
                     // first) accepted audio where the reference declines it.
                     std::uint64_t est = n;
-                    if (!audio->in_span) {
+                    if (!span) {
                         const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
                         const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
                         est = static_cast<std::uint64_t>(
@@ -12843,21 +12887,23 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                         // recognised header opens the span before the block is
                         // coded, which is why a RIFF file writes 0 and a NIST one
                         // (whose header the detector does not know) writes 1.
-                        const std::uint8_t mode2 =
-                            (audio->in_span || ap.header_bytes != 0u) ? 0u : 1u;
+                        const std::uint8_t mode2 = fresh ? 1u : 0u;
                         put32(static_cast<std::uint32_t>(apay.size()));
                         seg.insert(seg.end(), apay.begin(), apay.end());
                         seg.push_back(2u);          // decr_param: audio
                         seg.push_back(mode2);       // mode2_type
                         put32(n);                   // the block's output size
                         flush_block();
-                        audio->done += n;
-                        audio->in_span = true;
                         continue;
                     }
                 }
             }
         }
+        // LAB_0808dcc7: every block that is NOT written as audio resets the
+        // audio model (FUN_080b1950) before the LZ path -- so the model only
+        // ever carries across CONSECUTIVE audio blocks, which is exactly what
+        // the decoder's mode2_type rule assumes.
+        if (audio != nullptr) audio->enc.Reset();
 
         // FUN_0808da10's block analysis. The image block is not written yet, so
         // a block that would take that path declines instead of coming out
@@ -13257,9 +13303,34 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
     while (feeder.Next(block_size, final)) {
         const std::uint8_t* src = feeder.Data();
         const std::uint32_t n = feeder.Len();
+        // The stream offset of THIS block: the span the audio probe opens is
+        // measured in stream coordinates, so it has to advance on every block,
+        // audio or not.
+        const std::uint64_t bpos = (audio != nullptr) ? audio->pos : 0u;
+        if (audio != nullptr) audio->pos += n;
 
         // The audio block, exactly as the optimum writers try it (-cc shares the
         // reference's driver; only the fallback below differs).
+        if (audio != nullptr && NZ_ENV("NZOPT_NO_IMAGE") == nullptr) {
+            if (!audio->img_ready) {
+                audio->img.Configure(0x0fu, 32u, 48u, false);
+                audio->img_ready = true;
+            }
+            std::vector<std::uint8_t> ipay;
+            const bool img_taken =
+                nzr::lzpf_enc::ImageEncodeBlock(audio->img, src, n, ipay) != 0u && !ipay.empty();
+            // LAB_0808dcfc: a block the image path does not take resets the image
+            // model (FUN_080b6170) before the audio branch runs.
+            if (!img_taken) audio->img.Reset();
+            if (img_taken) {
+                put32(static_cast<std::uint32_t>(ipay.size()));
+                seg.insert(seg.end(), ipay.begin(), ipay.end());
+                seg.push_back(3u);          // decr_param: image
+                put32(n);                   // the block's output size
+                flush_block();
+                continue;
+            }
+        }
         if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
             if (!audio->ready) {
                 // -cc's own audio configuration, the one its decode path sets:
@@ -13272,12 +13343,24 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
             }
             nzr::audio::NzAudioChunkParams ap;
             audio->enc.ChooseFormat(src, n, &ap);
-            bool take = (audio->done < audio->end) || ap.header_bytes != 0u || ap.is_audio;
+            if (ap.header_bytes != 0u && ap.hdr_end != 0u) audio->end = bpos + ap.hdr_end;
+            const bool span = bpos < audio->end;
+            bool take = span || ap.header_bytes != 0u || ap.is_audio;
+            // The driver resets the model whenever no span is in progress
+            // (LAB_0808f1a5: `local_6b = 1; FUN_080b1950(obj + 0x4c0)`), and that
+            // same flag is the mode2_type byte -- so a block written with
+            // mode2_type 1 is DECODED from a fresh model and must be ENCODED from
+            // one too. Without the reset, a block that follows rejected audio
+            // attempts carries their state into a payload the decoder reads with
+            // none: a .ppm whose third block went down this path decoded to
+            // garbage in the original's binary as well as in ours.
+            const bool fresh = !(span || ap.header_bytes != 0u);
             if (take) {
+                if (fresh) audio->enc.Reset();
                 std::vector<std::uint8_t> apay;
                 if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
                     std::uint64_t est = n;
-                    if (!audio->in_span) {
+                    if (!span) {
                         const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
                         const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
                         est = static_cast<std::uint64_t>(
@@ -13288,21 +13371,21 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
                                   nzr::opt_enc::CoEntropyEstimate(src + n0, n - n0);
                     }
                     if (static_cast<std::uint64_t>(apay.size()) * 0x11ull < est * 0x10ull) {
-                        const std::uint8_t mode2 =
-                            (audio->in_span || ap.header_bytes != 0u) ? 0u : 1u;
+                        const std::uint8_t mode2 = fresh ? 1u : 0u;
                         put32(static_cast<std::uint32_t>(apay.size()));
                         seg.insert(seg.end(), apay.begin(), apay.end());
                         seg.push_back(2u);
                         seg.push_back(mode2);
                         put32(n);
                         flush_block();
-                        audio->done += n;
-                        audio->in_span = true;
                         continue;
                     }
                 }
             }
         }
+        // LAB_0808dcc7, as in the optimum writer: a block not written as audio
+        // resets the model.
+        if (audio != nullptr) audio->enc.Reset();
 
         std::vector<std::uint8_t> exe_buf, exe_side;
         bool exe_on = false;
@@ -13455,8 +13538,8 @@ struct EncodeCodec {
     nzr::opt_enc::CoBlockFeeder feeder;
     // The audio block writer (decr_param 2) and the span state the reference's
     // driver keeps in its probe: how much of the stream has gone by and where
-    // the recognised header says the audio ends. `in_span` is what decides
-    // mode2_type -- the reference sets it when no audio was in progress.
+    // the recognised header says the audio ends. A span in progress is what
+    // decides mode2_type and whether the model is reset before coding.
     CoAudioState audio;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"

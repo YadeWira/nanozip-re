@@ -6,6 +6,7 @@
 // lzpf_image_encoder.c and image_headers.c.
 #include "nz_lzpf_encoder.h"
 #include "nz_audio.h"
+#include "nz_optimum_text.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -13,6 +14,9 @@
 #include <cstring>
 
 namespace nzr::lzpf_enc {
+
+#define IMGENC_TRACE(...) do { if (std::getenv("NZOPT_TRACE_IMGENC")) std::fprintf(stderr, __VA_ARGS__); } while (0)
+
 
 namespace {
 
@@ -185,6 +189,33 @@ bool ImageDetect(ImageProbe& pr, const std::uint8_t* block, std::uint32_t len) {
     return pr.width != 0u;
 }
 
+// FUN_0808aac0: the whole block, in chunks of 0x10000 output bytes. The detector
+// runs again at the head of every chunk (with the bytes that are LEFT, not with
+// the chunk), a chunk that declines takes the whole block down with it, and the
+// FIRST chunk must also beat a plain entropy estimate of itself.
+std::size_t ImageEncodeBlock(ImageEncModel& m, const std::uint8_t* block,
+                             std::uint32_t len, std::vector<std::uint8_t>& out) {
+    if (len < 0x200u) return 0;
+    const std::size_t start = out.size();
+    const std::uint8_t* p = block;
+    std::uint32_t rem = len;
+    bool first = true;
+    for (;;) {
+        ImageProbe pr;
+        ImageDetect(pr, p, rem);
+        const std::uint32_t chunk = (rem < 0x10000u) ? rem : 0x10000u;
+        const std::size_t before = out.size();
+        const std::size_t got = ImageEncodeChunk(m, pr, p, chunk, out, 0);
+        if (got == 0u || out.size() == before) { IMGENC_TRACE("[imgenc] block decline: chunk at %u declined\n", (unsigned)(len - rem)); out.resize(start); return 0; }
+        if (first && (m.flags & 1u) != 0u &&
+            nzr::opt_enc::CoEntropyEstimate(p, chunk) < got) { IMGENC_TRACE("[imgenc] block decline: est=%u < got=%zu\n", nzr::opt_enc::CoEntropyEstimate(p, chunk), got); out.resize(start); return 0; }
+        first = false;
+        rem -= chunk;
+        if (rem == 0u) return out.size() - start;
+        p += chunk;
+    }
+}
+
 }  // namespace nzr::lzpf_enc
 
 namespace nzr::lzpf_enc {
@@ -218,9 +249,45 @@ static void CascadeLoad(ImageEncModel& m, std::uint32_t stride, std::uint32_t nc
     }
 }
 
-std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
+// FUN_080b6340: a chunk below 0x180 bytes is stored verbatim and the model only
+// advances its rings and counters as if that many zero bytes had been coded.
+void SmallAdvanceEnc(ImageEncModel& m, std::uint32_t n) {
+    if (n == 0u) return;
+    const bool has0 = !m.ring0.empty();
+    std::uint8_t a = m.align;
+    if (a != 0u) {
+        const std::uint8_t g = m.grp;
+        for (;;) {
+            ++a; --n;
+            if (a == g) { m.align = 0; if (n == 0u) return; break; }
+            if (n == 0u) { m.align = a; return; }
+        }
+    }
+    const std::uint32_t g = m.grp ? m.grp : 1u;
+    m.align = static_cast<std::uint8_t>(n % g);
+    std::uint32_t cnt = (g - 1u + n) / g;
+    do {
+        for (std::uint32_t c = 0; c < m.nch; ++c) {
+            m.ring1[m.r1 + c] = 0;
+            if (has0) for (int k = 0; k < 4; ++k) m.ring0[m.r0 + c * 4u + k] = 0;
+        }
+        if (has0) m.r0 = (m.r0 + m.nch * 4u) & 0xfffffu;
+        m.r1 = (m.r1 + m.nch) & 0x7fffu;
+        const std::uint32_t c = m.col + 1u;
+        m.col = c;
+        if (c == m.width) { m.col = 0; ++m.rows_done; }
+    } while (--cnt);
+}
+
+// FUN_08089a80: ONE chunk (at most 0x10000 output bytes).
+std::size_t ImageEncodeChunk(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
                              std::uint32_t len, std::vector<std::uint8_t>& out, std::uintptr_t align) {
-    if (len < 0x200u) return 0;   // FUN_0808aac0 gate; FUN_08089a80's verbatim path (< 0x180) is unreachable
+    if (len < 0x180u) {   // the verbatim path
+        SmallAdvanceEnc(m, len);
+        out.insert(out.end(), block, block + len);
+        m.have = true;
+        return len;
+    }
     std::uint32_t width, nch, bps, endian, prefix;
     if (pr.width != 0u) {
         width = pr.width; nch = pr.nch; bps = pr.bps; endian = pr.w5;
@@ -230,20 +297,25 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
     } else {
         width = m.width; nch = m.nch; bps = m.bps; endian = m.endian;
         if (width < 0x81u || nch * width * bps + 0x80u <= len) {
-            if (m.height <= m.rows_done) return 0;
+            if (m.height <= m.rows_done) { IMGENC_TRACE("[imgenc] decline rows %u/%u (A)\n", m.rows_done, m.height); return 0; }
         } else if (m.rows_done != m.height) {
-            if (m.height <= m.rows_done) return 0;
+            if (m.height <= m.rows_done) { IMGENC_TRACE("[imgenc] decline rows %u/%u (B)\n", m.rows_done, m.height); return 0; }
         } else if (width <= m.col) {
-            return 0;
+            IMGENC_TRACE("[imgenc] decline col %u/%u\n", m.col, width); return 0;
         }
         prefix = (m.align != 0u) ? ((static_cast<std::uint32_t>(m.grp) - m.align) & 0xffffu) : 0u;
     }
-    if (width < 2u) return 0;
+    if (width < 2u) { IMGENC_TRACE("[imgenc] decline width<2 (%u)\n", width); return 0; }
     const std::uint32_t grp = nch * bps;
     std::uint32_t* const tbl = m.stack_tbl.data();
 
-    // ---- the gate: the first min(len, 0x400) bytes (flags & 4 would widen it to 64 KB) ----
-    const std::uint32_t win = len < 0x400u ? len : 0x400u;
+    // ---- the gate: the first min(len, W) bytes, W = 64 KB when flags & 4 (the
+    // optimum family) and 1 KB otherwise -- the reference computes it branchlessly
+    // as (-(flags & 4 == 0) & 0xffff0400) + 0x10000. Fixing this to 1 KB made the
+    // gate decline images the original takes: on a 64 KB window the two code-length
+    // costs are computed over the whole picture, not over its first row.
+    const std::uint32_t wcap = (m.flags & 4u) ? 0x10000u : 0x400u;
+    const std::uint32_t win = len < wcap ? len : wcap;
     if (win > 0x1ffu) {
         const std::uint32_t nb = win - 8u;
         const std::uint8_t* const p = block;
@@ -279,7 +351,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
             }
             i = next;
         }
-        if (nb * 0x32u < vsum && (grp == 3u || grp == 1u)) return 0;
+        if (nb * 0x32u < vsum && (grp == 3u || grp == 1u)) { IMGENC_TRACE("[imgenc] decline vsum=%u nb=%u grp=%u\n", vsum, nb, grp); return 0; }
         if (nb * 5u <= matched * 8u && grp + 4u <= nb) {
             const std::uint32_t n = nb - 4u - grp;
             std::uint32_t hist_a[256] = {}, hist_b[256] = {};
@@ -302,8 +374,8 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
             for (int k = 0; k < 256; ++k) cost_a += lens[k] * hist_a[k];
             BuildCodeLengths(hist_b, 0x100u, lens, codes);
             for (int k = 0; k < 256; ++k) cost_b += lens[k] * hist_b[k];
-            if (cost_a < cost_b) return 0;
-            if (n > 0x3ffu) {   // never with the 1024-byte window (n <= 1011); kept for the record
+            if (cost_a < cost_b) { IMGENC_TRACE("[imgenc] decline cost_a=%u < cost_b=%u\n", cost_a, cost_b); return 0; }
+            if (n > 0x3ffu) {   // reachable once the window is 64 KB
                 std::uint8_t bitmap[2048] = {};
                 std::uint32_t h1 = 0, h2 = 0, nov1 = 0, nov2 = 0;
                 for (std::uint32_t k = 0; k < n - grp; ++k) {
@@ -315,7 +387,7 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
                     nov1 += ((bitmap[i1] >> b1) + 1u) & 1u; bitmap[i1] |= static_cast<std::uint8_t>(1u << b1);
                     nov2 += ((bitmap[i2] >> b2) + 1u) & 1u; bitmap[i2] |= static_cast<std::uint8_t>(1u << b2);
                 }
-                if (nov1 <= nov2) return 0;
+                if (nov1 <= nov2) { IMGENC_TRACE("[imgenc] decline nov1=%u nov2=%u\n", nov1, nov2); return 0; }
             }
         }
     }
@@ -439,10 +511,17 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
             m.r1 = (m.r1 + nch) & 0x7fffu;
         }
     }
-    // FUN_080b64d0: a block that ended inside a pixel accounts it as one zero sample group
+    // FUN_080b64d0: a block that ended inside a pixel accounts it as one zero
+    // sample group -- in BOTH rings. Leaving ring0 and r0 alone put every cascade
+    // history lookup of the next block one group out of step, which is what made
+    // the second and third blocks differ while the first was exact.
     if (m.align != 0u) {
-        for (std::uint32_t c = 0; c < nch; ++c) ring[m.r1 + c] = 0;
+        for (std::uint32_t c = 0; c < nch; ++c) {
+            ring[m.r1 + c] = 0;
+            if (m.flags & 4u) for (int k = 0; k < 4; ++k) m.ring0[m.r0 + c * 4u + k] = 0;
+        }
         m.r1 = (m.r1 + nch) & 0x7fffu;
+        if (m.flags & 4u) m.r0 = (m.r0 + nch * 4u) & 0xfffffu;
         const std::uint32_t c = m.col + 1u;
         m.col = (width == c) ? 0u : c;
     }
@@ -487,9 +566,10 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
     if (std::getenv("NZ_TRACE_LZPFENC"))
         std::fprintf(stderr, "[imgblk] len=%u prefix=%u w=%u nch=%u bps=%u per=%u hdr=%02x rows=%u col=%u align=%u arith=%zu side=%zu produced=%zu aligned=%u\n",
                      len, prefix, width, nch, bps, per_ch, out[start], m.rows_done, m.col, m.align, a_total, side_bytes, produced, aligned);
-    if (produced >= aligned) { out.resize(start); return 0; }
+    if (produced >= aligned) { IMGENC_TRACE("[imgenc] decline produced=%zu >= aligned=%u\n", (std::size_t)produced, aligned); out.resize(start); return 0; }
     out.insert(out.end(), ar.begin(), ar.begin() + static_cast<std::ptrdiff_t>(a_total));
     out.insert(out.end(), side.begin(), side.begin() + static_cast<std::ptrdiff_t>(side_bytes));
+    m.have = true;      // obj+0x52920: a committed chunk makes the next Reset do its heavy half
     return produced;
 }
 

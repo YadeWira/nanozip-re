@@ -119,10 +119,23 @@ struct ImageEncModel {
         for (int k = 0; k < 4; ++k) { plane[k].order = order03; plane[k].Reset(); }
         plane[4].order = order4; plane[4].Reset();
     }
+    // obj+0x52920: set at every chunk commit, cleared by Reset -- the heavy half
+    // of the reset only runs once after something was actually coded.
+    bool have = true;
     void Reset() {                      // FUN_080b6170
         width = 1; col = 0; rows_done = 0; height = 0; align = 0; grp = 1; nch = 1; bps = 1; endian = 0;
-        r1 = 0; std::fill(ring1.begin(), ring1.end(), 0);
-        if (flags & 2u) for (auto& p : plane) p.Reset();
+        if (!have) return;
+        have = false;
+        r1 = 0; r0 = 0;
+        if ((flags & 4u) && !ring0.empty()) std::fill(ring0.begin(), ring0.end(), 0);
+        std::fill(ring1.begin(), ring1.end(), 0);
+        for (auto& s : casc_shift) s = 0x0c;
+        for (auto& pl : plane) pl.shift = 0x0fu;
+        if (flags & 2u) {
+            for (auto& p : plane) p.Reset();
+            for (auto& row : casc) for (auto& st : row) { st = Cascade{}; }
+        }
+        if ((flags & 1u) && bitcounts) bitcounts->Reset();
     }
 };
 
@@ -130,8 +143,10 @@ struct ImageEncModel {
 // to `out`; returns their count, or 0 when the image model declines (the caller
 // then stores a literal). `pr` is this block's detect (width 0 = none: a
 // continuation block); `align` is the output address of the block payload & 3.
-std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
+std::size_t ImageEncodeChunk(ImageEncModel& m, const ImageProbe& pr, const std::uint8_t* block,
                              std::uint32_t len, std::vector<std::uint8_t>& out, std::uintptr_t align);
+std::size_t ImageEncodeBlock(ImageEncModel& m, const std::uint8_t* block,
+                             std::uint32_t len, std::vector<std::uint8_t>& out);
 
 std::uint32_t AudioCost(const std::int32_t* v, std::uint32_t n);
 void AudioUnpack(const std::uint8_t* src, std::uint32_t nbytes, std::int32_t* out, const AudioProbe& pr);

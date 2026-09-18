@@ -691,7 +691,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                     lzpf_enc::ImageProbe ipr;
                     lzpf_enc::ImageDetect(ipr, buf, len);
                     std::vector<std::uint8_t> payload;
-                    const std::size_t got = lzpf_enc::ImageEncodeBlock(st.image, ipr, buf, len, payload, 0u);
+                    const std::size_t got = lzpf_enc::ImageEncodeChunk(st.image, ipr, buf, len, payload, 0u);
                     if (got != 0u) {
                         PutVar(out, 0x80010u, len == 0x8000u ? 0xfu : len * 16u + 0x1fu);
                         out.insert(out.end(), payload.begin(), payload.end());

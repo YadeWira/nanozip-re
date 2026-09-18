@@ -1909,6 +1909,7 @@ struct NzAudioEncoder::Impl {
 
     bool EncodeChunk(const uint8_t* in, uint32_t outsize, const NzAudioChunkParams& p,
                      std::vector<uint8_t>* out) {
+        const size_t chunk_start = out->size();
         AudioFormat fmt;
         fmt.stereo_filter = p.stereo_filter;
         fmt.channels = p.channels;
@@ -2019,6 +2020,12 @@ struct NzAudioEncoder::Impl {
             if (!ok) return false;
         }
         out->insert(out->end(), bits.begin(), bits.end());
+        // FUN_08081c40's own gate (`pcVar16 <= written`): a chunk whose payload
+        // does not come out BELOW the aligned sample bytes is refused, and one
+        // refused chunk takes the whole block with it (FUN_08082d00 returns 0).
+        // Without it this port wrote audio blocks the original declines -- a
+        // speech+noise .wav came out as decr_param 2 against the original's LZ.
+        if (out->size() - chunk_start >= (size_t)databytes) return false;
         return true;
     }
 };
