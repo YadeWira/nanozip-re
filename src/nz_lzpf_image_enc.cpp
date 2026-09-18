@@ -5,6 +5,7 @@
 // cascade, mode 2). Decompiles: ~/.cache/nzre_tools/encode/decomp/
 // lzpf_image_encoder.c and image_headers.c.
 #include "nz_lzpf_encoder.h"
+#include "nz_audio.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -395,11 +396,32 @@ std::size_t ImageEncodeBlock(ImageEncModel& m, const ImageProbe& pr, const std::
     const std::size_t side_bytes = static_cast<std::size_t>(w.cur - w.base) + ((w.nbits + 7u) >> 3u);
     std::vector<std::uint8_t> ar(static_cast<std::size_t>(aligned) + 64u);
     std::size_t a_total = 0;
-    for (std::uint32_t c = 0; c < nch; ++c) {
-        const std::uintptr_t al = (align + (out.size() - start) + a_total) & 3u;
-        const std::size_t got = EncodeArithAt(bytes.data() + static_cast<std::size_t>(c) * per_ch, per_ch, ar.data() + a_total, per_ch, al);
-        if (got == 0u) { out.resize(start); return 0; }
-        a_total += got;
+    if ((m.flags & 1u) != 0u) {
+        // The optimum and CM configurations code the per-channel streams with the
+        // audio block's bit-count coder instead of the lzpf arithmetic buffer
+        // (the decoder's `flags_ & 1` branch), and those coders carry state
+        // across chunks, so they live on the model.
+        if (!m.bitcounts) {
+            m.bitcounts.reset(new nzr::audio::NzBitcountEncoderSet());
+            m.bitcounts->SetVariantB(m.variant_b);
+        }
+        for (std::uint32_t c = 0; c < nch; ++c) {
+            std::vector<std::uint8_t> blk;
+            if (!m.bitcounts->Encode(c, bytes.data() + static_cast<std::size_t>(c) * per_ch, per_ch, &blk)) {
+                out.resize(start);
+                return 0;
+            }
+            if (a_total + blk.size() > ar.size()) { out.resize(start); return 0; }
+            std::memcpy(ar.data() + a_total, blk.data(), blk.size());
+            a_total += blk.size();
+        }
+    } else {
+        for (std::uint32_t c = 0; c < nch; ++c) {
+            const std::uintptr_t al = (align + (out.size() - start) + a_total) & 3u;
+            const std::size_t got = EncodeArithAt(bytes.data() + static_cast<std::size_t>(c) * per_ch, per_ch, ar.data() + a_total, per_ch, al);
+            if (got == 0u) { out.resize(start); return 0; }
+            a_total += got;
+        }
     }
     const std::size_t produced = (out.size() - start) + a_total + side_bytes;
     if (std::getenv("NZ_TRACE_LZPFENC"))

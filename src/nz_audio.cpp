@@ -2058,6 +2058,25 @@ void NzAudioEncoder::ChoosePlanes(const std::uint8_t* in, std::uint32_t outsize,
 std::uint64_t NzAudioEncoder::LastClassSum() const { return impl_->class_sum_; }
 std::uint64_t NzAudioEncoder::LastAbsSum() const { return impl_->abs_sum_; }
 
+struct NzBitcountEncoderSet::Impl {
+    AudioBitcountEncoder a_[4];
+    AudioBitcountEncoderB b_[4];
+    bool variant_b_ = false;
+};
+
+NzBitcountEncoderSet::NzBitcountEncoderSet() : impl_(new Impl()) {}
+NzBitcountEncoderSet::~NzBitcountEncoderSet() = default;
+void NzBitcountEncoderSet::Reset() {
+    for (int k = 0; k < 4; ++k) { impl_->a_[k].Reset(); impl_->b_[k].Reset(); }
+}
+void NzBitcountEncoderSet::SetVariantB(bool b) { impl_->variant_b_ = b; }
+bool NzBitcountEncoderSet::Encode(unsigned ch, const std::uint8_t* counts, std::uint32_t n,
+                                  std::vector<std::uint8_t>* out) {
+    if (ch >= 4u) return false;
+    return impl_->variant_b_ ? impl_->b_[ch].Encode(counts, n, out)
+                             : impl_->a_[ch].Encode(counts, n, out);
+}
+
 bool NzAudioEncodeBitcounts(const std::uint8_t* counts, std::uint32_t n,
                             std::vector<std::uint8_t>* out, bool variant_b) {
     if (variant_b) {

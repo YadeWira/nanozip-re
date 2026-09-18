@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <memory>
+#include "nz_audio.h"
 #include "lzpf_arith.h"
 
 namespace nzr::lzpf_enc {
@@ -89,7 +91,10 @@ struct ImageEncModel {
     std::uint32_t col = 0;             // obj+0x52918 (u16): pixels of the row a block ended inside
     std::uint8_t align = 0, nch = 1, grp = 1, bps = 1, endian = 0;   // obj+0x52921/22/23/24/25
     std::vector<std::uint32_t> stack_tbl;
-    std::uint32_t flags = 0;                  // obj+0x52940: 0 for lzpf, 2 (LMS planes) for lzhd
+    std::uint32_t flags = 0;    // obj+0x52940: 0 lzpf, 2 lzhd, 0x07/0x0f the optimum family
+    bool variant_b = false;     // the -co bit-count class
+    // The per-channel bit-count coders (flags & 1), state carried across chunks.
+    std::shared_ptr<nzr::audio::NzBitcountEncoderSet> bitcounts;
     nzr::lzpf::LpcBigPredictor plane[5];      // obj+0x10 + k*0x1c10 (FUN_080bddc0 planes), used when flags & 2
     ImageEncModel() : ring1(0x8003u, 0), stack_tbl(65543u, 0) {}
     void Configure(std::uint32_t fl, std::uint32_t order03, std::uint32_t order4) {   // FUN_08089a70 -> FUN_080b5f50

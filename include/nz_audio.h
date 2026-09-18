@@ -155,6 +155,25 @@ bool NzAudioDecodeResiduals(const std::uint8_t* bits, std::size_t bits_size,
                             const std::uint8_t* counts, std::uint32_t n,
                             std::int32_t* samples);
 
+// Four persistent bit-count coders, one per image channel: the image model's
+// per-channel streams (flags & 1) are coded with the same two classes the audio
+// block uses, and their state carries across chunks.
+class NzBitcountEncoderSet {
+ public:
+    NzBitcountEncoderSet();
+    ~NzBitcountEncoderSet();
+    NzBitcountEncoderSet(const NzBitcountEncoderSet&) = delete;
+    NzBitcountEncoderSet& operator=(const NzBitcountEncoderSet&) = delete;
+    void Reset();
+    void SetVariantB(bool b);
+    bool Encode(unsigned ch, const std::uint8_t* counts, std::uint32_t n,
+                std::vector<std::uint8_t>* out);
+
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // Test hook, decoder half: reads one variant-A bit-count block (u16 length
 // prefix included) and returns the bytes consumed, 0 on failure.
 std::uint32_t NzAudioDecodeBitcounts(const std::uint8_t* in, std::size_t in_size,

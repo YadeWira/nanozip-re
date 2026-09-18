@@ -9518,6 +9518,14 @@ static bool DecodeOptimumBlockSequence(
                 // resets the image object: the two side models are symmetric here,
                 // unlike lzpf's dispatcher where audio blocks leave the image alone.
                 audio.Reset();
+                if (const char* idp = NZ_ENV("NZOPT_DUMP_IMAGE")) {
+                    static int seq = 0;
+                    char nm[512];
+                    std::snprintf(nm, sizeof(nm), "%s.%d", idp, seq++);
+                    if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(payload, 1, payload_size, f); std::fclose(f); }
+                    std::fprintf(stderr, "[img] dumped image payload (%u bytes, out_size=%u) to %s\n",
+                                 payload_size, audio_out_size, nm);
+                }
                 std::vector<std::uint8_t> ibuf(audio_out_size);
                 const std::size_t iused = image.Decode(payload, payload_size, ibuf.data(), audio_out_size);
                 if (NZ_ENV("NZOPT_TRACE_TDO")) {
