@@ -12293,7 +12293,12 @@ void LegacyScanArgument(const std::string& arg_in, bool recurse, std::vector<Enc
     std::string dir_part, pattern = arg;
     const std::size_t slash = arg.find_last_of('/');
     if (slash != std::string::npos) { dir_part = arg.substr(0, slash); pattern = arg.substr(slash + 1u); if (dir_part.empty()) dir_part = "/"; }
-    const std::string prefix = dir_part.empty() ? std::string() : (dir_part == "." ? std::string() : dir_part + "/");
+    std::string prefix = dir_part.empty() ? std::string() : (dir_part == "." ? std::string() : dir_part + "/");
+    // An ABSOLUTE argument is stored without its leading '/': the original turns
+    // `a x.nz /etc/hostname` into the entry `etc/hostname` (measured), which is
+    // also what keeps an extraction from writing outside the current directory.
+    // The directory to read keeps the slash; only the stored name loses it.
+    prefix.erase(0, prefix.find_first_not_of('/'));
     if (pattern == "." || pattern == "..") {
         if (recurse) LegacyScanDirectory(dir_part.empty() ? pattern : dir_part + "/" + pattern, "*",
                                          pattern == "." ? prefix : prefix + pattern + "/", recurse, out);
