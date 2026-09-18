@@ -92,6 +92,7 @@ struct NzAudioChunkParams {
     std::uint8_t lp_flag[3][2] = {{0, 0}, {0, 0}, {0, 0}};
     std::uint8_t lp_bits[3][2] = {{0, 0}, {0, 0}, {0, 0}};
     std::uint32_t span_len = 0;      // where a recognised audio span ends, 0 = none
+    bool is_audio = false;           // the headerless detector's verdict
 };
 
 class NzAudioEncoder {

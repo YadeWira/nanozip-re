@@ -12803,20 +12803,34 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
             // A recognised header opens a span; without one this port does not
             // take the block (the reference's headerless test, FUN_08081760, is
             // not ported yet, so those blocks go down the LZ/BWT path as before).
-            bool take = span;
-            if (!take && ap.header_bytes != 0u) take = true;
+            bool take = span || ap.header_bytes != 0u || ap.is_audio;
             if (NZ_ENV("NZOPT_TRACE_AUDENC"))
                 std::fprintf(stderr, "[audenc] block n=%u hdr=%u take=%d span=%d\n", n, ap.header_bytes, (int)take, (int)span);
             if (take) {
                 std::vector<std::uint8_t> apay;
                 if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
-                    const std::uint32_t est = nzr::opt_enc::CoEntropyEstimate(src, n);
+                    // The reference's estimate: over the FIRST 64 KB only, scaled
+                    // to the block, and recomputed exactly over the rest only when
+                    // the payload already beats the scaled figure. Inside a span in
+                    // progress there is no estimate at all -- the raw size is the
+                    // bar. Estimating the whole block in one go (what this did
+                    // first) accepted audio where the reference declines it.
+                    std::uint64_t est = n;
+                    if (!audio->in_span) {
+                        const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
+                        const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
+                        est = static_cast<std::uint64_t>(
+                            (static_cast<long double>(n) / static_cast<long double>(n0)) *
+                            static_cast<long double>(e0) + 0.5L);
+                        if (static_cast<std::uint64_t>(apay.size()) < est && n > n0)
+                            est = static_cast<std::uint64_t>(e0) +
+                                  nzr::opt_enc::CoEntropyEstimate(src + n0, n - n0);
+                    }
                     if (NZ_ENV("NZOPT_TRACE_AUDENC"))
                         std::fprintf(stderr, "[audenc] n=%u hdr=%u ch=%u payload=%zu est=%u -> %s\n",
-                                     n, ap.header_bytes, ap.channels, apay.size(), est,
-                                     ((std::uint64_t)apay.size() * 0x11ull < (std::uint64_t)est * 0x10ull) ? "AUDIO" : "no");
-                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull <
-                        static_cast<std::uint64_t>(est) * 0x10ull) {
+                                     n, ap.header_bytes, ap.channels, apay.size(), (unsigned)est,
+                                     ((std::uint64_t)apay.size() * 0x11ull < est * 0x10ull) ? "AUDIO" : "no");
+                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull < est * 0x10ull) {
                         // mode2_type is "no audio span was in progress" -- and a
                         // recognised header opens the span before the block is
                         // coded, which is why a RIFF file writes 0 and a NIST one
@@ -13250,14 +13264,22 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
             }
             nzr::audio::NzAudioChunkParams ap;
             audio->enc.ChooseFormat(src, n, &ap);
-            bool take = audio->done < audio->end;
-            if (!take && ap.header_bytes != 0u) take = true;
+            bool take = (audio->done < audio->end) || ap.header_bytes != 0u || ap.is_audio;
             if (take) {
                 std::vector<std::uint8_t> apay;
                 if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
-                    const std::uint32_t est = nzr::opt_enc::CoEntropyEstimate(src, n);
-                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull <
-                        static_cast<std::uint64_t>(est) * 0x10ull) {
+                    std::uint64_t est = n;
+                    if (!audio->in_span) {
+                        const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
+                        const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
+                        est = static_cast<std::uint64_t>(
+                            (static_cast<long double>(n) / static_cast<long double>(n0)) *
+                            static_cast<long double>(e0) + 0.5L);
+                        if (static_cast<std::uint64_t>(apay.size()) < est && n > n0)
+                            est = static_cast<std::uint64_t>(e0) +
+                                  nzr::opt_enc::CoEntropyEstimate(src + n0, n - n0);
+                    }
+                    if (static_cast<std::uint64_t>(apay.size()) * 0x11ull < est * 0x10ull) {
                         const std::uint8_t mode2 =
                             (audio->in_span || ap.header_bytes != 0u) ? 0u : 1u;
                         put32(static_cast<std::uint32_t>(apay.size()));
