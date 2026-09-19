@@ -694,6 +694,7 @@ void NzAudioEncoder::ChooseFormat(const std::uint8_t* in, std::uint32_t size,
     p->little_endian = (pr.width > 1u) && (pr.le != 0u);
     p->header_bytes = pr.prefix;
     p->hdr_end = pr.audio_end;
+    p->hdr_found = (pr.hdr != 0u);
     // FUN_08081760, the headerless verdict -- and it needed no porting: it IS
     // AudioDecide, which the lzpf writer has been calling byte-exactly all along.
     p->is_audio = (pr.hdr != 0u) || nzr::lzpf_enc::AudioDecide(pr, in, size, size);

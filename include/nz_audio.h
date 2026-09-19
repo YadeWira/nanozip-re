@@ -93,6 +93,10 @@ struct NzAudioChunkParams {
     std::uint8_t lp_bits[3][2] = {{0, 0}, {0, 0}, {0, 0}};
     std::uint32_t span_len = 0;      // where a recognised audio span ends, 0 = none
     std::uint32_t hdr_end = 0;       // the same, UNCAPPED: what the header says, even past this block
+    bool hdr_found = false;          // probe+0x18: a RIFF/AIFF/... header was RECOGNISED in this block.
+                                     // Not the same as header_bytes, which is also the alignment carry
+                                     // a continuing span copies verbatim -- reading that as "a header
+                                     // is here" opened spans on ordinary data.
     bool is_audio = false;           // the headerless detector's verdict
 };
 

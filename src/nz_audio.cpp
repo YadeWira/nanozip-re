@@ -1116,12 +1116,20 @@ static void UnpackSamples(const uint8_t* in, uint32_t nframes, int32_t* samples,
         int32_t values[2] = {0, 0};
         for (uint32_t c = 0; c < nchannels; ++c) {
             int32_t v = 0;
+            // The probe's `signed_` flag (the payload's `sf` bit) says how wide a
+            // sample is to be READ: sign-extended or not. The decoder never needs
+            // it -- it writes back the low byte(s) either way -- but it decides
+            // every delta here, and the two readings differ by a whole 2^width on
+            // any sample past the halfway point. A .SOU (sf=0) and a .ss (sf=1),
+            // both 8-bit mono, pick opposite ways, and each was byte-exact only
+            // under its own.
             if (fmt.sample_size == 1) {
-                v = (int32_t)(int8_t)*in++;
+                const uint32_t raw = *in++;
+                v = fmt.stereo_filter ? (int32_t)(int8_t)(uint8_t)raw : (int32_t)raw;
             } else if (fmt.sample_size == 2) {
                 const uint32_t b0 = *in++, b1 = *in++;
                 const uint32_t raw = fmt.little_endian ? (b0 | (b1 << 8)) : (b1 | (b0 << 8));
-                v = (int32_t)(int16_t)(uint16_t)raw;
+                v = fmt.stereo_filter ? (int32_t)(int16_t)(uint16_t)raw : (int32_t)raw;
             } else {
                 const uint32_t b0 = *in++, b1 = *in++, b2 = *in++;
                 const uint32_t raw = fmt.little_endian ? (b0 | (b1 << 8) | (b2 << 16))
@@ -1682,6 +1690,17 @@ struct NzAudioEncoder::Impl {
         uint64_t best = ~0ull;
         uint32_t best_shift = 0;
         std::vector<int32_t> scratch(0x1800u);
+        const bool trace = NZ_ENV("NZOPT_TRACE_PLANES") != nullptr;
+        if (const char* dp = NZ_ENV("NZOPT_DUMP_PLANEIN")) {
+            static int seq = 0; char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dp, seq++);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(samples, 4, n, f); std::fclose(f); }
+        }
+        if (trace) std::fprintf(stderr, "SS n=%u lo=%u hi=%u first=%d %d %d %d %d %d  [100]=%d [500]=%d [1000]=%d [2000]=%d [6159]=%d [12318]=%d\n", n, lo, hi,
+                                samples[0], samples[1], samples[2], samples[3], samples[4], samples[5],
+                                n > 100u ? samples[100] : 0, n > 500u ? samples[500] : 0,
+                                n > 1000u ? samples[1000] : 0, n > 2000u ? samples[2000] : 0,
+                                n > 6159u ? samples[6159] : 0, n > 12318u ? samples[12318] : 0);
         for (uint32_t cand = lo; cand <= hi; ++cand) {
             std::fill(scratch.begin(), scratch.end(), 0);
             for (uint32_t w = 0; w < 3u; ++w) {
@@ -1693,6 +1712,8 @@ struct NzAudioEncoder::Impl {
             const uint32_t run = n < 0x1800u ? n : 0x1800u;
             clone.RunForward(scratch.data(), run);
             const uint64_t cost = BitCost(scratch.data(), 0x1800u);
+            if (trace) std::fprintf(stderr, "SS   cand=%u cost=%llu out=%d %d %d %d %d %d (order=%u)\n", cand, (unsigned long long)cost,
+                                     scratch[0], scratch[1], scratch[2], scratch[3], scratch[4], scratch[5], clone.order_);
             if (cost < best) {
                 best = cost;
                 best_shift = cand;
