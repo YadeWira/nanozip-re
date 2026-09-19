@@ -13173,7 +13173,12 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
             }
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
-            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, 0x600487u, payload);
+            // FUN_0806c350's capacity argument is `block_size * 5 + 0x100487`,
+            // not a constant: the 0x600487 this used to pass is that formula
+            // frozen at a 1 MB block. With a bigger block the bucket coder
+            // refused outright (its own `cap < n * 5 + ...` guard) and the block
+            // went out STORED -- a 1.9 MB .pbm the original codes 18x smaller.
+            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, block_size * 5u + 0x100487u, payload);
             if (psz == 0u) {
                 // STORED: the bucket coder could not get under the BWT string's
                 // own size, so the block carries it raw. param6 == 0, and then
