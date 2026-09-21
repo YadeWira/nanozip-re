@@ -1008,8 +1008,9 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         for (std::uint32_t k = 0; k < nlim; ++k) {
             const Node& n = nodes[k];
             if (n.tag == TAG || k == 0u)
-                std::fprintf(stderr, "[N2]  node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u\n",
-                             k, n.price, n.back, n.len, n.ctx, n.hist, n.sg, n.dist);
+                std::fprintf(stderr, "[N2]  node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u rep=%u,%u,%u,%u\n",
+                             k, n.price, n.back, n.len, n.ctx, n.hist, n.sg, n.dist,
+                             n.rep[0], n.rep[1], n.rep[2], n.rep[3]);
         }
     }
 
