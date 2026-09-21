@@ -53,21 +53,17 @@ set(RECON_SOURCES
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
 add_executable(nz-re ${RECON_SOURCES})
-add_executable(nz-re-sfx ${RECON_SOURCES})
 
 target_include_directories(nz-re PRIVATE include)
-target_include_directories(nz-re-sfx PRIVATE include)
 
 if(MSVC)
     target_compile_options(nz-re PRIVATE /W4)
-    target_compile_options(nz-re-sfx PRIVATE /W4)
 else()
     # Large-file support: without it a 32-bit build's off_t is 32 bits, so
     # fstat/mmap cannot describe an archive over 2 GB and the windowed reader
     # never opens one. Harmless on 64-bit, where off_t is already 64 bits.
     add_compile_definitions(_FILE_OFFSET_BITS=64)
     target_compile_options(nz-re PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(nz-re-sfx PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Optional unit-test binary for the lzpf arith primitives.
