@@ -441,6 +441,30 @@ bool WildcardMatch(const std::string& pattern, const std::string& text) {
             ok = rec(p + 1u, t) || (t < t_len && rec(p, t + 1u));
         } else if (pattern[p] == '?') {
             ok = (t < t_len) && rec(p + 1u, t + 1u);
+        } else if (pattern[p] == '[') {
+            // A CHARACTER CLASS, the way the original's scan reads it (measured
+            // against it): `[abc]` and `[a-c]`, negated by a leading `!` or `^`,
+            // case-sensitive, and a class that is never closed matches NOTHING
+            // -- `a x.nz 'f[.txt'` answers "No files found" there. A `]` outside
+            // a class is an ordinary character. This port matched the brackets
+            // literally, so a file whose NAME contains them was compressed where
+            // the original finds nothing, and a real class matched nothing where
+            // the original expands it.
+            std::size_t q = p + 1u;
+            bool neg = false;
+            if (q < p_len && (pattern[q] == '!' || pattern[q] == '^')) { neg = true; ++q; }
+            bool hit = false, closed = false;
+            for (; q < p_len; ++q) {
+                if (pattern[q] == ']') { closed = true; break; }
+                if (q + 2u < p_len && pattern[q + 1u] == '-' && pattern[q + 2u] != ']') {
+                    if (t < t_len && (unsigned char)pattern[q] <= (unsigned char)text[t] &&
+                        (unsigned char)text[t] <= (unsigned char)pattern[q + 2u]) hit = true;
+                    q += 2u;
+                } else if (t < t_len && pattern[q] == text[t]) {
+                    hit = true;
+                }
+            }
+            ok = closed && t < t_len && (hit != neg) && rec(q + 1u, t + 1u);
         } else {
             ok = (t < t_len && pattern[p] == text[t]) && rec(p + 1u, t + 1u);
         }
