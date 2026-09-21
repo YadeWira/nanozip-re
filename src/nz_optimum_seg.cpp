@@ -163,8 +163,16 @@ std::uint32_t CoSegmenter::Split(const std::uint8_t* buf, std::uint32_t n, std::
         right += Step(rt);
 
         const std::int64_t total = left + right;
+        if (const char* rp = std::getenv("NZOPT_SPLIT_AT")) {
+            if (pos == static_cast<std::uint32_t>(std::atoi(rp)))
+                std::fprintf(stderr, "[SPLIT] at pos=%u total=%lld (best so far %lld at %u)\n",
+                             pos, (long long)total, (long long)best, best_len);
+        }
         if (total < best) { best = total; best_len = pos; }
     }
+    if (std::getenv("NZOPT_TRACE_SPLIT"))
+        std::fprintf(stderr, "[SPLIT] n=%u lower=%u -> best_len=%u best=%lld cost=%lld\n",
+                     n, lower, best_len, (long long)best, (long long)cost);
     return best_len;
 }
 
@@ -185,6 +193,9 @@ void CoBlockFeeder::Feed(const std::uint8_t* p, std::size_t n) {
 }
 
 bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
+    if (std::getenv("NZOPT_TRACE_FEED"))
+        std::fprintf(stderr, "[FEED] enter block_size=%u final=%d pending=%zu ring=%zu total=%u\n",
+                     block_size, (int)final, pending.size() - pend_off, ring.size(), total);
     if (dst.size() < static_cast<std::size_t>(block_size) + 0x2010u)
         dst.resize(static_cast<std::size_t>(block_size) + 0x2010u, 0u);
     if (!started) { total = 0; budget = block_size; }
@@ -226,6 +237,9 @@ bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
         const std::uint32_t split = (forced != 0u && forced <= total)
                                         ? forced
                                         : seg.Split(dst.data(), total, prev);
+        if (std::getenv("NZOPT_TRACE_FEED"))
+            std::fprintf(stderr, "[FEED] prev=%u take=%u total=%u forced=%u split=%u\n",
+                         prev, take, total, forced, split);
         if (split < total) {                     // LAB_0808d355
             const std::uint32_t tail = total - split;
             started = false;

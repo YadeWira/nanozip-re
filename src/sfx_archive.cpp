@@ -13046,6 +13046,9 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
             std::snprintf(path, sizeof path, "%s.%d", dl, blkno++);
             if (FILE* f = std::fopen(path, "wb")) { std::fwrite(lz_in, 1, m, f); std::fclose(f); }
         }
+        if (NZ_ENV("NZOPT_TRACE_STAGES"))
+            std::fprintf(stderr, "[STG] n=%u -> m=%u exe=%d tt=%d p1=%d p2=%d\n",
+                         n, m, (int)exe_on, (int)tt_on, (int)p1_on, (int)p2_on, 0, 0);
         std::vector<std::uint8_t> payload;
         // A dece block never reaches FUN_0808d7f0 in the reference: the
         // LZ-or-BWT flag it would set is left true, so the block goes LZ.
@@ -13195,6 +13198,8 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 co.FeedWindow(blk, blk_len);
                 verifier.FeedWindow(blk, blk_len);
             }
+            if (NZ_ENV("NZOPT_TRACE_STAGES"))
+                std::fprintf(stderr, "[STG2] m=%u p15=%d p14=%d\n", m, (int)p15_on, (int)p14_on);
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
             // FUN_0806c350's capacity argument is `block_size * 5 + 0x100487`,
