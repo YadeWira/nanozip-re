@@ -114,6 +114,7 @@ struct NzOptimum2LzDecoder::ParserState {
     std::vector<std::uint32_t> head, cache, tree;
     std::vector<std::uint32_t> lr;
     std::uint32_t lrmask = 0, lrhash = 0;
+    bool verbose = false;            // debug: dump one Find's chain walk
     bool ready = false;
     const std::uint8_t* block = nullptr;
     const std::uint8_t* src = nullptr;
@@ -173,6 +174,9 @@ struct NzOptimum2LzDecoder::ParserState {
         const std::uint32_t w = Load32(base + cur);
         const std::uint32_t hidx = ((w >> 19u) ^ w) & headmask;
         std::uint32_t chain = head[hidx];
+        if (verbose)
+            std::fprintf(stderr, "[FIND] cur=%u w=%08x hidx=%u chain=%08x (pos=%u) winsize=%u maxlen=%u depth=%u\n",
+                         cur, w, hidx, chain, chain & maskA, winsize, maxlen, depth);
         const std::uint32_t tagv = static_cast<std::uint32_t>(base[cur + 2u]) << shift;
         std::uint32_t* const cs = &cache[static_cast<std::size_t>(w & 0xffffu) * 4u];
         std::uint32_t bestlen = 1;
@@ -219,7 +223,8 @@ struct NzOptimum2LzDecoder::ParserState {
         std::uint32_t lg = 0, ll = 0;
         while (chain != 0u && --depth != 0u) {
             const std::uint32_t cp = maskA & chain;
-            if (cp >= winsize || !valid(cp)) break;
+            if (verbose) std::fprintf(stderr, "[FIND]   step cp=%u valid=%d\n", cp, (int)valid(cp));
+            if (cp >= winsize || !valid(cp)) { if (verbose) std::fprintf(stderr, "[FIND]   stop: cp>=winsize||!valid\n"); break; }
             std::uint32_t ci = (cp * 2u) & treemask;
             std::uint32_t* ch = (ci < treesize) ? &tree[ci] : &tree[ci - treesize];
             std::uint32_t k = std::min(lg, ll);
@@ -333,7 +338,13 @@ std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
     Wr32(mem, 0x103b988, static_cast<std::int32_t>(cell));
     if (use_cache && v < 0x20u) {
         const std::uint16_t c = Rd16(mem, cell);
-        if (c != 0xffffu) return c;
+        if (c != 0xffffu) {
+            if (const char* cd = NZ_ENV("NZO2_CELLDBG")) {
+                if (cell == (std::size_t)std::atoi(cd))
+                    std::fprintf(stderr, "[CELL] hit cell=%zu L=%u a0=%u -> %u\n", cell, L, a0, c);
+            }
+            return c;
+        }
     }
     std::uint32_t acc = 0;
     std::uint32_t idx = (a0 == 0u ? 1u : 0u) << 4u;
@@ -357,6 +368,10 @@ std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
         persisted = bit + persisted * 2u;
     }
     if (raws != 0u) acc += raws * 0x1cu;
+    if (const char* cd = NZ_ENV("NZO2_CELLDBG")) {
+        if (cell == (std::size_t)std::atoi(cd))
+            std::fprintf(stderr, "[CELL] store cell=%zu L=%u a0=%u acc=%u\n", cell, L, a0, acc);
+    }
     Wr16(mem, cell, static_cast<std::uint16_t>(acc));
     return acc;
 }
@@ -746,6 +761,10 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                 const std::size_t lc = static_cast<std::size_t>(Rd32(mem, 0x103b988));
                 if (lc >= 0x103b380u && lc < 0x103b788u) {
                     const std::uint16_t c = Rd16(mem, lc);
+                    if (NZ_ENV("NZO2_DECAYDBG"))
+                        std::fprintf(stderr, "[DECAY] cell=%zu L=%zu row=%s %u -> %u\n", lc,
+                                     (lc - 0x103b380u) / 4u, ((lc - 0x103b380u) % 4u) ? "r0" : "nd",
+                                     c, c - (c >> 7));
                     Wr16(mem, lc, static_cast<std::uint16_t>(c - (c >> 7)));
                 }
             }
@@ -792,6 +811,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
             if (avail == 0u) continue;
             std::uint32_t len = 0;
             while (len < avail && At(base, cur + len) == At(base, src + len)) ++len;
+            if (trace) std::fprintf(stderr, "[R2] ni=%u rep%u r=%u src=%u len=%u best=%u avail=%u\n",
+                                    ni, i, r, src, len, best, avail);
             if (len <= best || len == 1u) { best = std::max(best, len); continue; }
             best = len;
             std::uint32_t nr[4];
@@ -815,7 +836,15 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
 
         // ---- the bt4 finder, then the long-range index
         std::vector<Cand> cands;
+        if (const char* fd = NZ_ENV("NZO2_FINDDBG"))
+            F.verbose = (cur == static_cast<std::uint32_t>(std::atoi(fd)));
         F.Find(base, cur, cend, remain, cands, 0x100u);
+        if (F.verbose) {
+            std::fprintf(stderr, "[FIND] -> %zu candidates:", cands.size());
+            for (const Cand& cc : cands) std::fprintf(stderr, " {src=%u len=%u dist=%u}", cc.src, cc.len, cur - cc.src);
+            std::fprintf(stderr, "\n");
+            F.verbose = false;
+        }
         {
             const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
             const std::uint32_t lidx = F.lrhash & F.lrmask;
@@ -975,7 +1004,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         for (std::uint32_t L = 2; L <= 34u; ++L)
             std::fprintf(stderr, " %u", Rd16(mem, 0x103b380u + L * 4u));
         std::fprintf(stderr, "\n");
-        for (std::uint32_t k = 0; k < 48u; ++k) {
+        const std::uint32_t nlim = NZ_ENV("NZO2_NODES_N") ? (std::uint32_t)std::atoi(NZ_ENV("NZO2_NODES_N")) : 48u;
+        for (std::uint32_t k = 0; k < nlim; ++k) {
             const Node& n = nodes[k];
             if (n.tag == TAG || k == 0u)
                 std::fprintf(stderr, "[N2]  node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u\n",

@@ -495,6 +495,10 @@ bool NzOptimum2LzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_l
                      out_size, decisions_.size(), mine.size(), first, same ? "IDENTICAL" : "DIFF",
                      mypayload.size(), in_len, paysame ? "EXACT" : "diff", recheck);
         if (!same) {
+            std::size_t offs = 0;
+            for (std::size_t i = 0; i < first && i < decisions_.size(); ++i)
+                offs += decisions_[i].is_literal ? 1u : decisions_[i].len;
+            std::fprintf(stderr, "  first divergence at decision %zu, output byte %zu\n", first, offs);
             for (std::size_t i = (first > 2 ? first - 2 : 0);
                  i < first + 3 && i < std::max(mine.size(), decisions_.size()); ++i) {
                 auto pr = [&](const char* tag, const std::vector<Optimum2Decision>& v) {
