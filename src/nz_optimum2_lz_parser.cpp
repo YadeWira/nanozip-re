@@ -175,8 +175,8 @@ struct NzOptimum2LzDecoder::ParserState {
         const std::uint32_t hidx = ((w >> 19u) ^ w) & headmask;
         std::uint32_t chain = head[hidx];
         if (verbose)
-            std::fprintf(stderr, "[FIND] cur=%u w=%08x hidx=%u chain=%08x (pos=%u) winsize=%u maxlen=%u depth=%u\n",
-                         cur, w, hidx, chain, chain & maskA, winsize, maxlen, depth);
+            std::fprintf(stderr, "[FIND] cur=%u w=%08x hidx=%u chain=%08x (pos=%u) shift=%u winsize=%u maskA=%#x headmask=%#x treemask=%#x treesize=%#x lrmask=%#x maxlen=%u depth=%u\n",
+                         cur, w, hidx, chain, chain & maskA, shift, winsize, maskA, headmask, treemask, treesize, lrmask, maxlen, depth);
         const std::uint32_t tagv = static_cast<std::uint32_t>(base[cur + 2u]) << shift;
         std::uint32_t* const cs = &cache[static_cast<std::size_t>(w & 0xffffu) * 4u];
         std::uint32_t bestlen = 1;
@@ -768,6 +768,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                     Wr16(mem, lc, static_cast<std::uint16_t>(c - (c >> 7)));
                 }
             }
+            if (NZ_ENV("NZO2_RELAXDBG"))
+                std::fprintf(stderr, "[U] node=%u price=%u len=%u slot=%u\n", ni + L, price, L, slot);
             tg.tag = TAG;
             tg.price = static_cast<std::uint16_t>(price);
             tg.back = static_cast<std::uint16_t>(ni);
@@ -785,6 +787,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                              const std::uint32_t* nr) {
             Node& tg = nodes[ni + 1u];
             if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
+            if (NZ_ENV("NZO2_RELAXDBG"))
+                std::fprintf(stderr, "[U] node=%u WHOLE len=%u slot=%u\n", ni + 1u, L, slot);
             tg.tag = TAG;
             tg.back = static_cast<std::uint16_t>(ni);
             tg.len = static_cast<std::uint16_t>(L);

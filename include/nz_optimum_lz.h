@@ -157,6 +157,12 @@ public:
     // find a match reaching back into them. Call this once on the encoding
     // engine right after it is constructed.
     void EnableParser();
+
+    // The match finder's binary tree is sized from the archive's BLOCK size, so
+    // the encoder has to hand it the one it computed: left at the 1 MB default,
+    // the tree is half the size on any larger block and its chains run out early
+    // -- the finder then misses long matches the original finds.
+    void SetBlockSize(std::uint32_t b) { if (b != 0u) blocksize_ = b; }
 private:
     struct ParserState;
     std::shared_ptr<ParserState> parser_;

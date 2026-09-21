@@ -13763,10 +13763,14 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
     if (codec.p0 == 5u && !codec.co) {
         codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+        // BEFORE EnableParser, which is what builds the finder: its tree is
+        // sized from this and the size is fixed once.
+        codec.co->SetBlockSize(codec.co_block);
         // The finder has to exist before the first FeedWindow, or a leading BWT
         // block's bytes reach the window without reaching the hash.
         codec.co->EnableParser();
         codec.co_v = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+        codec.co_v->SetBlockSize(codec.co_block);
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     if (codec.p0 == 7u && !codec.cc) {
@@ -13776,8 +13780,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     }
     if (codec.p0 == 6u && !codec.cO) {
         codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+        codec.cO->SetBlockSize(codec.co_block);
         codec.cO->EnableParser();
         codec.cO_v = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+        codec.cO_v->SetBlockSize(codec.co_block);
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     // The pieces of this range, in the order the reader meets them, then the

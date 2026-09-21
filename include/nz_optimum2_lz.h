@@ -153,6 +153,12 @@ public:
     // is a BWT block would otherwise feed the window without feeding the hash.
     void EnableParser();
 
+    // The match finder's binary tree is sized from the archive's BLOCK size, so
+    // the encoder has to hand it the one it computed: left at the 1 MB default,
+    // the tree is half the size on any larger block and its chains run out early
+    // -- the finder then misses long matches the original finds.
+    void SetBlockSize(std::uint32_t b) { if (b != 0u) blocksize_ = b; }
+
     // Decode one block. `in`/`in_len` is this block's compressed payload
     // (the range-coder bitstream, starting at its very first byte -- no
     // extra header inside this call). Produces exactly `out_size` bytes into
