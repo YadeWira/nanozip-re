@@ -929,11 +929,31 @@ uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
         // The linear route: every rotation is its own, so sorting the suffixes
         // of the block written twice puts them in the same order.
         const uint32_t m = 2u * n + 1u;
-        std::vector<uint16_t> t(m);
-        for (uint32_t i = 0; i < n; ++i) t[i] = t[i + n] = (uint16_t)(in[i] + 1u);
-        t[m - 1u] = 0u;                       // the sentinel, below every byte
         std::vector<uint32_t> sa(m);
-        SaIs<uint16_t>(t.data(), m, 257u, sa.data());
+        // The suffix sort reads its string at random, so its width is what the
+        // cache sees. A block almost never uses all 256 byte values, and the
+        // sentinel is the only reason a byte does not fit: renumbering the
+        // values that ARE present -- an increasing map, so the order is the
+        // same -- leaves 0 free for it and halves the string.
+        uint8_t used[256] = {0};
+        for (uint32_t i = 0; i < n; ++i) used[in[i]] = 1u;
+        uint32_t distinct = 0;
+        uint8_t map8[256];
+        for (uint32_t c = 0; c < 256u; ++c) {
+            map8[c] = (uint8_t)(distinct + 1u);
+            distinct += used[c];
+        }
+        if (distinct < 256u) {
+            std::vector<uint8_t> t(m);
+            for (uint32_t i = 0; i < n; ++i) t[i] = t[i + n] = map8[in[i]];
+            t[m - 1u] = 0u;                   // the sentinel, below every byte
+            SaIs<uint8_t>(t.data(), m, distinct + 1u, sa.data());
+        } else {
+            std::vector<uint16_t> t(m);
+            for (uint32_t i = 0; i < n; ++i) t[i] = t[i + n] = (uint16_t)(in[i] + 1u);
+            t[m - 1u] = 0u;
+            SaIs<uint16_t>(t.data(), m, 257u, sa.data());
+        }
         uint32_t primary = 0, j = 0;
         for (uint32_t k = 1; k < m; ++k) {    // sa[0] is the sentinel's own suffix
             const uint32_t i = sa[k];
