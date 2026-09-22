@@ -2185,8 +2185,36 @@ uint32_t P14Encoder::Run(uint8_t* out, uint32_t out_cap, uint8_t* side, uint32_t
 
             uint32_t match_len = 0, slot = 4, score = 0;
             uint32_t cand = link & off_mask;
+            const uint32_t budget_at_entry = budget;
+            static const char* const dbg_cand = NZ_ENV("NZOPT_TRACE_P14CAND");
+
+            // NZOPT_P14_WATCH=<pos>: the chain as it stands at that position,
+            // read-only -- which candidates are in it, how deep, and whether the
+            // walk would have the probes to reach them.
+            static const char* const watch_env = NZ_ENV("NZOPT_P14_WATCH");
+            if (watch_env != nullptr && pos == (uint32_t)std::atoi(watch_env)) {
+                std::fprintf(stderr, "[P14W] pos=%u v=%08x h=%u budget=%u probes=%u rem=%u\n",
+                             pos, v, h, budget, (budget >> 2) + 1u, rem);
+                uint32_t l = link;
+                for (int k = 0; k < 40; ++k) {
+                    const uint32_t c = l & off_mask;
+                    if (c >= pos) { std::fprintf(stderr, "[P14W]  #%d cand=%u (>=pos, stops)\n", k, c); break; }
+                    uint32_t ml = 0;
+                    const uint8_t* pp = in + c;
+                    while (ml < rem && pp[ml] == inp[ml]) ++ml;
+                    std::fprintf(stderr, "[P14W]  #%d cand=%u dist=%u tag=%s len=%u\n",
+                                 k, c, pos - c, (tag == (l & tag_mask)) ? "ok" : "NO", ml);
+                    if (tag != (l & tag_mask)) break;
+                    l = chain[l & chain_mask];
+                }
+            }
 
             if (cand < pos && tag == (link & tag_mask)) {
+                // The same point the reference's 0x080b9c72 sits at: the budget
+                // as read, before its own increment. Diffing this against a GDB
+                // log of that address is what pins a probe-budget drift.
+                if (dbg_cand != nullptr)
+                    std::fprintf(stderr, "CAND p=%u b=%u\n", pos, budget);
                 const uint32_t budget_old = budget;
                 budget += (budget < 8u) ? 1u : 0u;
                 const uint8_t* p = in + cand;
@@ -2268,7 +2296,7 @@ uint32_t P14Encoder::Run(uint8_t* out, uint32_t out_cap, uint8_t* side, uint32_t
             }
 
             if (dbg != nullptr)
-                std::fprintf(stderr, "EV len=%u slot=%u p=%u\n", match_len, slot, pos);
+                std::fprintf(stderr, "EV len=%u slot=%u p=%u b=%u\n", match_len, slot, pos, budget_at_entry);
             if (take) {
                 const uint32_t tr_off = slot > 3u ? (slot - 4u) : (uint32_t)(-rep[slot]);
                 const uint32_t tr_slot = slot > 3u ? 0u : slot + 1u;
@@ -2594,9 +2622,18 @@ uint32_t NzBwtParam14Encode(const uint8_t* in, uint32_t n,
         e.head = arena;
         e.chain = arena + (std::size_t)e.hash_mask + 1u;
     } else {
+        // The private fallback for the tables the reference carves out of the
+        // block buffer's tail (quirk 72). It must not be ZEROED: a zero head
+        // entry reads as "position 0, tag 0", and `chain[0]` is zero too, so an
+        // empty bucket becomes an ENDLESS chain of phantom candidates at
+        // position 0 -- which burns the probe budget, feeds the budget counter
+        // that decides how deep later walks go, and can crowd out a real
+        // candidate. `~0` puts the offset field at off_mask, which is never
+        // below the current position, so an untouched bucket reads as empty.
         e.own.assign(need, 0u);
         e.head = e.own.data();
         e.chain = e.own.data() + (std::size_t)e.hash_mask + 1u;
+        std::fill(e.head, e.head + (std::size_t)e.hash_mask + 1u, 0xffffffffu);
     }
     e.budget = 0;
 
