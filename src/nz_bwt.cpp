@@ -1187,6 +1187,14 @@ struct BwtBucketEncoder {
     uint16_t model_a_[6146];
     uint16_t model_b_[512];
     BwtUnpackInput::ModelC model_c_[256];
+    // What the run walk hands the coding loop: everything a coded rank needs
+    // that comes from C and P, which the coding itself never touches.
+    struct RankStep {
+        uint32_t delta;
+        uint16_t hash2;
+        uint8_t sym;
+    };
+    std::vector<RankStep> steps_;   // kept across buckets, cleared per bucket
 
     // Returns the arithmetic stream's size (0 = declined: it overflowed), with the
     // raw rank bits in `bits`.
@@ -1256,30 +1264,46 @@ struct BwtBucketEncoder {
             return (c < stop) ? occ_[c] : n;
         };
 
-        // B: the run count at which each symbol runs out, in the order they do.
-        // Found by walking the runs the way the decoder will emit them.
+        // ONE walk of the run machine, not two. What used to be here was the
+        // same state machine twice over -- once on copies of P/C to find the
+        // run count at which each symbol runs out (B), once on the real ones to
+        // code the ranks -- and its `Reinsert` is the most expensive thing in
+        // this coder. The two walks visit the same states in the same order, so
+        // the walk runs once and records what the second pass needed; the two
+        // emissions still happen in their old order, which is what the arith
+        // stream fixes.
+        //
+        // Only C and P decide `delta` and the rank context, and neither is
+        // touched by the coding, so both can be recorded here. The model
+        // context (`ctx`) cannot: it comes from `model_c_`, which the coding
+        // loop itself advances, so it stays where it was.
         uint32_t nb_ = 0;
+        steps_.clear();
         {
             uint32_t cur_b[256];
             std::memcpy(cur_b, occ_start_, sizeof(cur_b));
-            uint32_t Cw[256]; uint8_t Pw[256];
-            std::memcpy(Cw, C, sizeof(Cw)); std::memcpy(Pw, P, sizeof(Pw));
             uint32_t used = ents_used, runs = 0;
-            uint32_t pos = 0;
             while (used != 0u) {
-                const uint8_t sym = Pw[0];
-                const uint32_t run_end = (used > 1u) ? Cw[Pw[1]] : n;
-                pos = run_end;
+                const uint8_t sym = P[0];
+                const uint32_t run_end = (used > 1u) ? C[P[1]] : n;
                 ++runs;
                 // next occurrence of sym at or after run_end
-                const uint32_t next = next_at(cur_b, sym, pos);
+                const uint32_t next = next_at(cur_b, sym, run_end);
                 if (next >= n) {
                     B[nb_++] = runs - 1u;
                     --used;
-                    BwtUnpackInput::MoveUpItem(Pw, Cw, n, used);
+                    BwtUnpackInput::MoveUpItem(P, C, n, used);
                     continue;
                 }
-                Reinsert(Pw, Cw, next, sym);
+                // context, as the decoder computes it before it moves anything
+                const uint32_t hash1 = (uint32_t)(C[P[4]] - C[P[1]] < 4u) +
+                                       (uint32_t)(C[P[3]] - C[P[1]] < 3u) +
+                                       kSomeLut2[(C[P[2]] + ~C[P[1]]) & 0xffu];
+                const uint32_t hash2 = hash1 * 2u + (uint32_t)(C[P[1]] - C[P[0]] < 2u);
+                // move sym to its new rank; delta is what the decoder adds back
+                const uint32_t k = Reinsert(P, C, next, sym);
+                const uint32_t delta = (next - C[P[0]]) - k;
+                steps_.push_back(RankStep{delta, (uint16_t)hash2, sym});
             }
         }
         int_model.bits_to_read_ = (n - ents_used) != 0u ? BSR(n - ents_used) : 0u;
@@ -1292,34 +1316,15 @@ struct BwtBucketEncoder {
         std::memset(model_c_, 0, sizeof(model_c_));
         for (uint32_t i = 0; i != 6146u; ++i) model_a_[i] = 0x8002u;
         for (uint32_t i = 0; i != 512u; ++i) model_b_[i] = 0x8000u;
-        uint32_t used = ents_used;
-        uint32_t cur_r[256];
-        std::memcpy(cur_r, occ_start_, sizeof(cur_r));
-        for (;;) {
-            const uint8_t sym = P[0];
-            const uint32_t run_end = (used > 1u) ? C[P[1]] : n;
-            const uint32_t next = next_at(cur_r, sym, run_end);
-            if (next >= n) {
-                if (--used == 0u) break;
-                BwtUnpackInput::MoveUpItem(P, C, n, used);
-                continue;
-            }
-            // context, as the decoder computes it before it moves anything
-            const uint32_t hash1 = (uint32_t)(C[P[4]] - C[P[1]] < 4u) +
-                                   (uint32_t)(C[P[3]] - C[P[1]] < 3u) +
-                                   kSomeLut2[(C[P[2]] + ~C[P[1]]) & 0xffu];
-            const uint32_t hash2 = hash1 * 2u + (uint32_t)(C[P[1]] - C[P[0]] < 2u);
-            BwtUnpackInput::ModelC* c_ptr = &model_c_[sym];
+        for (const RankStep& st : steps_) {
+            BwtUnpackInput::ModelC* c_ptr = &model_c_[st.sym];
             const uint32_t c_shifted = (c_ptr->x + 0x80u) >> 8;
             const uint32_t ctx = (uint32_t)(c_ptr->x != 0u) + (uint32_t)(c_shifted > 0x800u) +
                                  kSomeLut[std::min<uint32_t>(c_shifted, 0x17Fu)];
-            // move sym to its new rank; delta is what the decoder adds back
-            const uint32_t k = Reinsert(P, C, next, sym);
-            const uint32_t delta = (next - C[P[0]]) - k;
-            CodeRank(enc, bits, sym, hash2, ctx, delta);
+            CodeRank(enc, bits, st.sym, st.hash2, ctx, st.delta);
             const uint32_t y = (3u * c_ptr->y + 5u * c_ptr->x + 259u) >> 3;
             c_ptr->y = y;
-            c_ptr->x = (delta * 1024u + 12u * y + 8u) >> 4;
+            c_ptr->x = (st.delta * 1024u + 12u * y + 8u) >> 4;
         }
         enc.Flush();
         if (enc.overflow) return 0;
