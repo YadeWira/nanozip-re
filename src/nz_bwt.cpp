@@ -798,56 +798,252 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
 // rotations of `in`, write the byte before each rotation's start, and return
 // the row the unrotated block landed on -- which is exactly what
 // NzBwtUntransform takes back. The output is canonical, so any correct
-// rotation sort produces the original's bytes; this one is prefix doubling
-// with two counting sorts per round, O(n log n), early out once every rank is
-// distinct. Rotations that are byte-for-byte equal (a periodic block) stay in
+// rotation sort produces the original's bytes; this one is prefix doubling,
+// early out once every rank is distinct, and each round touches only the
+// groups of rotations that are still tied -- the rest of the block is already
+// in its final order and re-sorting it only re-derives that order. Rotations that are byte-for-byte equal (a periodic block) stay in
 // index order, and the row of rotation 0 is reported.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// SA-IS (Nong, Zhang & Chan, "Linear Suffix Array Construction by Almost Pure
+// Induced-Sorting"), the linear-time replacement for the doubling above.
+//
+// It sorts SUFFIXES and this block wants ROTATIONS, so it runs over the block
+// written twice with a sentinel: a suffix of `s s \0` that starts inside the
+// first copy begins with the whole rotation, so the two orders agree -- unless
+// two rotations are EQUAL, where the suffix order then goes on comparing what
+// the rotation no longer sees. That happens only when the block is periodic,
+// and the caller checks for it and keeps the doubling code for that case, so
+// the order here is the one and only correct one and no tie-break rule of the
+// old code has to be reproduced.
+//
+// `T[n-1]` must be the unique smallest element (the sentinel).
+// ---------------------------------------------------------------------------
+template <typename C>
+static void SaIs(const C* T, uint32_t n, uint32_t sigma, uint32_t* SA) {
+    const uint32_t kUnset = 0xffffffffu;
+    if (n == 1u) { SA[0] = 0; return; }
+    if (n == 2u) { SA[0] = 1u; SA[1] = 0; return; }
+
+    // S-type: the suffix at i is smaller than the one at i+1.
+    std::vector<uint8_t> is_s(n);
+    is_s[n - 1u] = 1u;
+    for (uint32_t i = n - 1u; i-- > 0;)
+        is_s[i] = (T[i] < T[i + 1u] || (T[i] == T[i + 1u] && is_s[i + 1u] != 0u)) ? 1u : 0u;
+    const auto is_lms = [&](uint32_t i) { return i > 0u && is_s[i] != 0u && is_s[i - 1u] == 0u; };
+
+    // bucket c occupies [start[c], start[c+1])
+    std::vector<uint32_t> start(sigma + 1u, 0u), ptr(sigma + 1u);
+    for (uint32_t i = 0; i < n; ++i) ++start[T[i] + 1u];
+    for (uint32_t c = 1; c <= sigma; ++c) start[c] += start[c - 1u];
+
+    std::vector<uint32_t> lms;
+    for (uint32_t i = 1; i < n; ++i)
+        if (is_lms(i)) lms.push_back(i);
+
+    // Seed the LMS suffixes at the ends of their buckets, then induce the
+    // L-type suffixes left to right and the S-type ones right to left.
+    const auto induce = [&](const std::vector<uint32_t>& seeds) {
+        std::fill(SA, SA + n, kUnset);
+        for (uint32_t c = 0; c < sigma; ++c) ptr[c] = start[c + 1u];
+        for (uint32_t k = (uint32_t)seeds.size(); k-- > 0;) {
+            const uint32_t i = seeds[k];
+            SA[--ptr[T[i]]] = i;
+        }
+        for (uint32_t c = 0; c < sigma; ++c) ptr[c] = start[c];
+        for (uint32_t k = 0; k < n; ++k) {
+            const uint32_t j = SA[k];
+            if (j != kUnset && j > 0u && is_s[j - 1u] == 0u) SA[ptr[T[j - 1u]]++] = j - 1u;
+        }
+        for (uint32_t c = 0; c < sigma; ++c) ptr[c] = start[c + 1u];
+        for (uint32_t k = n; k-- > 0;) {
+            const uint32_t j = SA[k];
+            if (j != kUnset && j > 0u && is_s[j - 1u] != 0u) SA[--ptr[T[j - 1u]]] = j - 1u;
+        }
+    };
+
+    induce(lms);
+
+    const uint32_t n1 = (uint32_t)lms.size();
+    // position -> its index in `lms`. Two LMS positions are never adjacent, so
+    // halving the index is still one slot each and halves the array.
+    std::vector<uint32_t> lms_idx(n / 2u + 1u);
+    for (uint32_t t = 0; t < n1; ++t) lms_idx[lms[t] >> 1] = t;
+    std::vector<uint32_t> sorted(n1);
+    {
+        uint32_t m = 0;
+        for (uint32_t k = 0; k < n; ++k) {
+            const uint32_t i = SA[k];
+            if (i != kUnset && is_lms(i)) sorted[m++] = i;
+        }
+    }
+    // Name the LMS substrings: two are the same name only if they run the same
+    // length over the same characters with the same types.
+    const auto same = [&](uint32_t p, uint32_t q) {
+        if (p == n - 1u || q == n - 1u) return false;   // the sentinel is alone
+        const uint32_t pe = lms[lms_idx[p >> 1] + 1u], qe = lms[lms_idx[q >> 1] + 1u];
+        if (pe - p != qe - q) return false;
+        for (uint32_t d = 0; d <= pe - p; ++d)
+            if (T[p + d] != T[q + d] || is_s[p + d] != is_s[q + d]) return false;
+        return true;
+    };
+    std::vector<uint32_t> named(n1);
+    uint32_t name = 0;
+    for (uint32_t k = 0; k < n1; ++k) {
+        if (k > 0u && !same(sorted[k], sorted[k - 1u])) ++name;
+        named[lms_idx[sorted[k] >> 1]] = name;
+    }
+    std::vector<uint32_t> sa1(n1);
+    if (name + 1u == n1) {          // every name distinct: the order is known
+        for (uint32_t t = 0; t < n1; ++t) sa1[named[t]] = t;
+    } else {
+        SaIs<uint32_t>(named.data(), n1, name + 1u, sa1.data());
+    }
+    std::vector<uint32_t> seeds(n1);
+    for (uint32_t t = 0; t < n1; ++t) seeds[t] = lms[sa1[t]];
+    induce(seeds);
+}
+
+// True when no two rotations of `s` are equal, which is what lets the suffix
+// sort above stand in for the rotation sort. Rotations repeat only when the
+// block is a whole number of copies of a shorter one, so the smallest period
+// (from the KMP failure function) settles it in one pass.
+static bool AllRotationsDistinct(const uint8_t* s, uint32_t n) {
+    if (n < 2u) return true;
+    std::vector<uint32_t> fail(n + 1u, 0u);
+    uint32_t k = 0;
+    for (uint32_t i = 1; i < n; ++i) {
+        while (k != 0u && s[i] != s[k]) k = fail[k];
+        if (s[i] == s[k]) ++k;
+        fail[i + 1u] = k;
+    }
+    const uint32_t p = n - fail[n];
+    return !(p < n && n % p == 0u);
+}
+
 uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
     if (n == 0u) return 0;
     if (n == 1u) { out[0] = in[0]; return 0; }
-    std::vector<uint32_t> sa(n), tmp(n), rank(n), rank2(n), cnt;
-    bool distinct = false;
+    if (n >= 1024u && n < 0x40000000u && NZ_ENV("NZOPT_BWT_DOUBLING") == nullptr &&
+        AllRotationsDistinct(in, n)) {
+        // The linear route: every rotation is its own, so sorting the suffixes
+        // of the block written twice puts them in the same order.
+        const uint32_t m = 2u * n + 1u;
+        std::vector<uint16_t> t(m);
+        for (uint32_t i = 0; i < n; ++i) t[i] = t[i + n] = (uint16_t)(in[i] + 1u);
+        t[m - 1u] = 0u;                       // the sentinel, below every byte
+        std::vector<uint32_t> sa(m);
+        SaIs<uint16_t>(t.data(), m, 257u, sa.data());
+        uint32_t primary = 0, j = 0;
+        for (uint32_t k = 1; k < m; ++k) {    // sa[0] is the sentinel's own suffix
+            const uint32_t i = sa[k];
+            if (i >= n) continue;             // a rotation of the second copy
+            if (i == 0u) primary = j;
+            out[j++] = in[(i + n - 1u) % n];
+        }
+        return primary;
+    }
+    // The periodic case, and the small blocks: prefix doubling, which is also
+    // the reference this project's tests compare the route above against.
+    std::vector<uint32_t> sa(n), tmp(n), rank(n), rank2(n), cnt, grp;
+    std::vector<uint64_t> key;
+    // A rank is the FIRST POSITION IN `sa` OF ITS GROUP, not a dense index.
+    // Both number the groups in the same order, but this one leaves room: when
+    // a group splits, every piece gets a number inside the range the group
+    // already owned, so a round can renumber one group without touching -- or
+    // even reading -- any other.
     {   // round 0: by the first byte
         cnt.assign(257u, 0u);
         for (uint32_t i = 0; i < n; ++i) ++cnt[in[i] + 1u];
         for (uint32_t c = 1; c <= 256u; ++c) cnt[c] += cnt[c - 1u];
         for (uint32_t i = 0; i < n; ++i) sa[cnt[in[i]]++] = i;
-        uint32_t r = 0;
+        uint32_t cur = 0;
         rank[sa[0]] = 0;
         for (uint32_t j = 1; j < n; ++j) {
-            if (in[sa[j]] != in[sa[j - 1u]]) ++r;
-            rank[sa[j]] = r;
+            if (in[sa[j]] != in[sa[j - 1u]]) cur = j;
+            rank[sa[j]] = cur;
         }
-        distinct = (r + 1u == n);
     }
     uint32_t rounds_dbg = 0;
-    for (uint32_t k = 1; !distinct && k < n; k <<= 1) {
+    for (uint32_t k = 1; k < n; k <<= 1) {
+        // What is still unsorted?  A group is a maximal run of equal ranks, and
+        // its rank is its own first position, so the run starting at `j` is
+        // exactly the positions carrying the rank `j`.
+        uint32_t work = 0;
+        for (uint32_t j = 0; j < n; ) {
+            uint32_t e = j + 1u;
+            while (e < n && rank[sa[e]] == j) ++e;
+            if (e - j > 1u) work += e - j;
+            j = e;
+        }
+        if (work == 0u) break;  // every rotation already has its own rank
         ++rounds_dbg;
-        // sort by (rank[i], rank[i + k]) with two stable counting passes.
-        // `(i + k) % n` is a DIVISION per element per round -- k < n, so one
-        // conditional subtract does the same job and the round loses a third of
-        // its time.
-        // The order by the SECOND key is the previous round's order shifted back
-        // by k -- reading `sa` and subtracting is a linear pass, where counting
-        // it again was a count, a prefix sum and a random scatter over n.
-        for (uint32_t j = 0; j < n; ++j) {
-            const uint32_t p = sa[j];
-            tmp[j] = (p >= k) ? (p - k) : (p + n - k);
+        if (work * 2u >= n) {
+            // Most of the block is still one big group or a few of them: one
+            // pass over everything beats seeking out the groups.
+            // The order by the SECOND key is the previous round's order shifted
+            // back by k -- reading `sa` and subtracting is a linear pass, where
+            // counting it again was a count, a prefix sum and a random scatter.
+            // `(i + k) % n` is a DIVISION per element per round -- k < n, so one
+            // conditional subtract does the same job.
+            for (uint32_t j = 0; j < n; ++j) {
+                const uint32_t p = sa[j];
+                tmp[j] = (p >= k) ? (p - k) : (p + n - k);
+            }
+            // A group's first slot IS its rank, so the counting sort's prefix
+            // sums are the identity and only the running offsets are needed.
+            cnt.resize(n);
+            for (uint32_t i = 0; i < n; ++i) cnt[i] = i;
+            for (uint32_t j = 0; j < n; ++j) { const uint32_t i = tmp[j]; sa[cnt[rank[i]]++] = i; }
+            uint32_t cur = 0;
+            rank2[sa[0]] = 0;
+            for (uint32_t j = 1; j < n; ++j) {
+                const uint32_t a = sa[j], b = sa[j - 1u];
+                uint32_t ax = a + k, bx = b + k;
+                if (ax >= n) ax -= n;
+                if (bx >= n) bx -= n;
+                if (rank[a] != rank[b] || rank[ax] != rank[bx]) cur = j;
+                rank2[a] = cur;
+            }
+            rank.swap(rank2);
+        } else {
+            // The usual case from the second or third round on: most rotations
+            // are already alone in their group and a global pass would move
+            // them all to re-derive the order they are already in. Sort inside
+            // the groups that are left instead, which is where the work is.
+            rank2 = rank;  // the untouched groups keep their numbers
+            for (uint32_t j = 0; j < n; ) {
+                uint32_t e = j + 1u;
+                while (e < n && rank[sa[e]] == j) ++e;
+                if (e - j == 1u) { j = e; continue; }
+                // One key per member: the second rank in the high half and the
+                // member's slot in the low half, so a plain sort of the packed
+                // values breaks ties towards the earlier slot of the round
+                // before -- which is what the stable counting sorts did when
+                // this was global. Sorting the keys and not the indices keeps
+                // the comparisons free of the two lookups per step.
+                const uint32_t m = e - j;
+                grp.assign(sa.begin() + j, sa.begin() + e);
+                key.resize(m);
+                for (uint32_t t = 0; t < m; ++t) {
+                    uint32_t ax = grp[t] + k;
+                    if (ax >= n) ax -= n;
+                    key[t] = ((uint64_t)rank[ax] << 32) | t;
+                }
+                std::sort(key.begin(), key.end());
+                uint32_t cur = j;
+                sa[j] = grp[(uint32_t)key[0]];
+                rank2[sa[j]] = cur;
+                for (uint32_t t = 1; t < m; ++t) {
+                    const uint32_t i = grp[(uint32_t)key[t]];
+                    if ((key[t] >> 32) != (key[t - 1u] >> 32)) cur = j + t;
+                    sa[j + t] = i;
+                    rank2[i] = cur;
+                }
+                j = e;
+            }
+            rank.swap(rank2);
         }
-        cnt.assign(n + 1u, 0u);
-        for (uint32_t i = 0; i < n; ++i) ++cnt[rank[i] + 1u];
-        for (uint32_t c = 1; c <= n; ++c) cnt[c] += cnt[c - 1u];
-        for (uint32_t j = 0; j < n; ++j) { const uint32_t i = tmp[j]; sa[cnt[rank[i]]++] = i; }
-        uint32_t r = 0;
-        rank2[sa[0]] = 0;
-        for (uint32_t j = 1; j < n; ++j) {
-            const uint32_t a = sa[j], b = sa[j - 1u];
-            if (rank[a] != rank[b] || rank[(a + k) % n] != rank[(b + k) % n]) ++r;
-            rank2[a] = r;
-        }
-        rank.swap(rank2);
-        distinct = (r + 1u == n);
     }
     uint32_t primary = 0;
     for (uint32_t j = 0; j < n; ++j) {

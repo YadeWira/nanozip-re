@@ -1,4 +1,5 @@
 // nz_optimum_seg.cpp -- see the header.
+#include "nz_env.h"
 #include "nz_optimum_seg.h"
 
 #include <algorithm>
@@ -139,6 +140,11 @@ std::uint32_t CoSegmenter::Split(const std::uint8_t* buf, std::uint32_t n, std::
                         0x2000000;
     std::uint32_t best_len = n;
     std::uint32_t pos = n;
+    // Hoisted: this used to be a getenv() per position, which cost more than
+    // the cost model it traces (5 % of a -co encode).
+    const char* const trace_at = NZ_ENV("NZOPT_SPLIT_AT");
+    const std::uint32_t trace_pos =
+        (trace_at != nullptr) ? static_cast<std::uint32_t>(std::atoi(trace_at)) : 0u;
     for (;;) {
         --pos;
         if (pos < lower + 2u) break;
@@ -163,14 +169,12 @@ std::uint32_t CoSegmenter::Split(const std::uint8_t* buf, std::uint32_t n, std::
         right += Step(rt);
 
         const std::int64_t total = left + right;
-        if (const char* rp = std::getenv("NZOPT_SPLIT_AT")) {
-            if (pos == static_cast<std::uint32_t>(std::atoi(rp)))
-                std::fprintf(stderr, "[SPLIT] at pos=%u total=%lld (best so far %lld at %u)\n",
-                             pos, (long long)total, (long long)best, best_len);
-        }
+        if (trace_at != nullptr && pos == trace_pos)
+            std::fprintf(stderr, "[SPLIT] at pos=%u total=%lld (best so far %lld at %u)\n",
+                         pos, (long long)total, (long long)best, best_len);
         if (total < best) { best = total; best_len = pos; }
     }
-    if (std::getenv("NZOPT_TRACE_SPLIT"))
+    if (NZ_ENV("NZOPT_TRACE_SPLIT"))
         std::fprintf(stderr, "[SPLIT] n=%u lower=%u -> best_len=%u best=%lld cost=%lld\n",
                      n, lower, best_len, (long long)best, (long long)cost);
     return best_len;
@@ -181,7 +185,7 @@ std::uint32_t CoBlockLength(const std::uint8_t* buf, std::uint32_t n, std::uint3
     CoSegmenter seg;
     seg.Prime(buf, take);
     const std::uint32_t r = seg.Split(buf, take, 0u);
-    if (std::getenv("NZOPT_TRACE_TDO") != nullptr)
+    if (NZ_ENV("NZOPT_TRACE_TDO") != nullptr)
         std::fprintf(stderr, "[tdo] segment n=%u take=%u -> %u\n", n, take, r);
     return r;
 }
@@ -193,7 +197,7 @@ void CoBlockFeeder::Feed(const std::uint8_t* p, std::size_t n) {
 }
 
 bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
-    if (std::getenv("NZOPT_TRACE_FEED"))
+    if (NZ_ENV("NZOPT_TRACE_FEED"))
         std::fprintf(stderr, "[FEED] enter block_size=%u final=%d pending=%zu ring=%zu total=%u\n",
                      block_size, (int)final, pending.size() - pend_off, ring.size(), total);
     if (dst.size() < static_cast<std::size_t>(block_size) + 0x2010u)
@@ -237,7 +241,7 @@ bool CoBlockFeeder::Next(std::uint32_t block_size, bool final) {
         const std::uint32_t split = (forced != 0u && forced <= total)
                                         ? forced
                                         : seg.Split(dst.data(), total, prev);
-        if (std::getenv("NZOPT_TRACE_FEED"))
+        if (NZ_ENV("NZOPT_TRACE_FEED"))
             std::fprintf(stderr, "[FEED] prev=%u take=%u total=%u forced=%u split=%u\n",
                          prev, take, total, forced, split);
         if (split < total) {                     // LAB_0808d355

@@ -154,6 +154,14 @@ add_executable(test_co_param1
 target_include_directories(test_co_param1 PRIVATE include)
 target_link_libraries(test_co_param1 PRIVATE Threads::Threads)
 
+# the forward BWT: the rotation sort against its own definition, both routes.
+add_executable(test_bwt_transform
+    tests/test_bwt_transform.cpp
+    ${RECON_SOURCES_NO_MAIN}
+)
+target_include_directories(test_bwt_transform PRIVATE include)
+target_link_libraries(test_bwt_transform PRIVATE Threads::Threads)
+
 # dece (the -co exe filter): encoder <-> decoder round trip.
 add_executable(test_co_dece
     tests/test_co_dece.cpp
