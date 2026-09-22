@@ -821,12 +821,20 @@ uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
         }
         distinct = (r + 1u == n);
     }
+    uint32_t rounds_dbg = 0;
     for (uint32_t k = 1; !distinct && k < n; k <<= 1) {
-        // sort by (rank[i], rank[i + k]) with two stable counting passes
-        cnt.assign(n + 1u, 0u);
-        for (uint32_t i = 0; i < n; ++i) ++cnt[rank[(i + k) % n] + 1u];
-        for (uint32_t c = 1; c <= n; ++c) cnt[c] += cnt[c - 1u];
-        for (uint32_t i = 0; i < n; ++i) tmp[cnt[rank[(i + k) % n]]++] = i;
+        ++rounds_dbg;
+        // sort by (rank[i], rank[i + k]) with two stable counting passes.
+        // `(i + k) % n` is a DIVISION per element per round -- k < n, so one
+        // conditional subtract does the same job and the round loses a third of
+        // its time.
+        // The order by the SECOND key is the previous round's order shifted back
+        // by k -- reading `sa` and subtracting is a linear pass, where counting
+        // it again was a count, a prefix sum and a random scatter over n.
+        for (uint32_t j = 0; j < n; ++j) {
+            const uint32_t p = sa[j];
+            tmp[j] = (p >= k) ? (p - k) : (p + n - k);
+        }
         cnt.assign(n + 1u, 0u);
         for (uint32_t i = 0; i < n; ++i) ++cnt[rank[i] + 1u];
         for (uint32_t c = 1; c <= n; ++c) cnt[c] += cnt[c - 1u];
@@ -847,7 +855,10 @@ uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
         if (i == 0u) primary = j;
         out[j] = in[(i + n - 1u) % n];
     }
+    if (std::getenv("NZOPT_TRACE_BWTROUNDS"))
+        std::fprintf(stderr, "[BWT] n=%u rondas=%u\n", n, rounds_dbg);
     return primary;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,10 +1035,37 @@ struct BwtBucketEncoder {
             int_model.Write(enc, C[P[j]] - prev - 1u);
         }
 
+        // Both walks below ask the same question over and over -- "the next
+        // position at or after `pos` holding `sym`" -- and both used to answer it
+        // by scanning forward one byte at a time, which is quadratic on a block
+        // with long runs and was 17% of a `-co` encode. The queries are monotone
+        // per symbol, so one counting-sort index over the bucket plus a cursor
+        // per symbol answers every one of them in amortised O(1). Same answers,
+        // so the coded output is unchanged.
+        std::vector<uint32_t> occ_;
+        occ_.resize(n);
+        uint32_t occ_start_[257] = {0};
+        {
+            for (uint32_t i = 0; i < n; ++i) ++occ_start_[d[i] + 1u];
+            for (uint32_t c = 1; c <= 256u; ++c) occ_start_[c] += occ_start_[c - 1u];
+            uint32_t fill[256];
+            std::memcpy(fill, occ_start_, sizeof(fill));
+            for (uint32_t i = 0; i < n; ++i) occ_[fill[d[i]]++] = i;
+        }
+        const auto next_at = [&](uint32_t* cur, uint8_t sym, uint32_t pos) -> uint32_t {
+            uint32_t c = cur[sym];
+            const uint32_t stop = occ_start_[sym + 1u];
+            while (c < stop && occ_[c] < pos) ++c;
+            cur[sym] = c;
+            return (c < stop) ? occ_[c] : n;
+        };
+
         // B: the run count at which each symbol runs out, in the order they do.
         // Found by walking the runs the way the decoder will emit them.
         uint32_t nb_ = 0;
         {
+            uint32_t cur_b[256];
+            std::memcpy(cur_b, occ_start_, sizeof(cur_b));
             uint32_t Cw[256]; uint8_t Pw[256];
             std::memcpy(Cw, C, sizeof(Cw)); std::memcpy(Pw, P, sizeof(Pw));
             uint32_t used = ents_used, runs = 0;
@@ -1038,8 +1076,7 @@ struct BwtBucketEncoder {
                 pos = run_end;
                 ++runs;
                 // next occurrence of sym at or after run_end
-                uint32_t next = pos;
-                while (next < n && d[next] != sym) ++next;
+                const uint32_t next = next_at(cur_b, sym, pos);
                 if (next >= n) {
                     B[nb_++] = runs - 1u;
                     --used;
@@ -1060,11 +1097,12 @@ struct BwtBucketEncoder {
         for (uint32_t i = 0; i != 6146u; ++i) model_a_[i] = 0x8002u;
         for (uint32_t i = 0; i != 512u; ++i) model_b_[i] = 0x8000u;
         uint32_t used = ents_used;
+        uint32_t cur_r[256];
+        std::memcpy(cur_r, occ_start_, sizeof(cur_r));
         for (;;) {
             const uint8_t sym = P[0];
             const uint32_t run_end = (used > 1u) ? C[P[1]] : n;
-            uint32_t next = run_end;
-            while (next < n && d[next] != sym) ++next;
+            const uint32_t next = next_at(cur_r, sym, run_end);
             if (next >= n) {
                 if (--used == 0u) break;
                 BwtUnpackInput::MoveUpItem(P, C, n, used);
