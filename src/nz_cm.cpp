@@ -1318,6 +1318,15 @@ static void CM_B_Init(CM_B* cmb) {
 static void CM_Init(CM* cm) {
     cm->ptrs8[0] = cm->modelv;
     cm->ptrs8[1] = cm->modelw;
+    // The hash table has to be cleared BEFORE the lookup below: CM_GetHashSlot
+    // picks one of four slots by comparing the bytes it finds there, and the
+    // pointer it returns outlives the clear at the end of this function. On
+    // fresh zeroed pages it is always slot 0; on reused heap memory it could be
+    // any of the four, so a second CM object in the same process (the next
+    // worker of a -pN container, encode or decode) started from a slot chosen
+    // by the previous one's leftovers. Found by valgrind; it made `a -cc -p16`
+    // write an unreadable stream and `t -t1` refuse the original's own -p12.
+    memset(cm->some_ptr, 0, cm->some_mask + 16449);
     uint8_t* vv  = CM_GetHashSlot(cm, 0);
     cm->ptrs8[2] = vv;
     cm->ptrs8[3] = vv;
