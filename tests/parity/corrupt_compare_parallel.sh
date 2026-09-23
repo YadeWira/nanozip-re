@@ -1,12 +1,18 @@
 #!/bin/bash
 # damaged PARALLEL containers: original vs ours, files written (size+sha) and report lines
+#
+# usage: W=<workdir> tests/parity/corrupt_compare_parallel.sh [tag...]
+#   tags name fixtures in $NZ_PARITY_FIXTURES (pf_c pf_d pf_Du pf_f pf_Fu from make_fixtures.sh);
+#   NZ_ORIG, NZ_RECON as elsewhere. A missing fixture is fatal: it used to compare two
+#   empty trees and call them identical.
 W=${W:-/tmp/nzre_corrupt_pf}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 ORIG=${NZ_ORIG:-$HERE/../linux32/nz}; OURS=${NZ_RECON:-$HERE/bin/nz-re}
 PKG=${NZ_PARITY_FIXTURES:-/tmp/nzre_parity_fx}
 [ -x "$ORIG" ] || { echo "SKIP: no original at $ORIG"; exit 0; }
 [ -d "$PKG" ] || { echo "SKIP: no fixtures in $PKG (run tests/parity/make_fixtures.sh)"; exit 0; }
-TAGS=${*:-"pf_c pf_d pf_D_D pf_f pf_F_F"}; for tag in $TAGS; do
+TAGS=${*:-"pf_c pf_d pf_Du pf_f pf_Fu"}; for tag in $TAGS; do
+  [ -f "$PKG/$tag.nz" ] || { echo "FATAL: no fixture $PKG/$tag.nz (arguments are fixture tags; the workdir is W)"; exit 1; }
   A=$W/$tag; rm -rf $A; mkdir -p $A/src; cp $PKG/$tag.nz $A/p.nz; (cd $A/src && $ORIG x -y ../p.nz >/dev/null 2>&1)
   for spec in 0.30 0.50 0.60 0.80 0.90 0.99 trunc; do python3 - $A/p.nz $A/c_$spec.nz $spec <<'PY'
 import sys; b=bytearray(open(sys.argv[1],'rb').read()); f=sys.argv[3]
