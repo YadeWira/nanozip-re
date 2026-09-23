@@ -13958,15 +13958,36 @@ struct EncodeCodec {
     // 2 MB analysis object; the store has just its window.
     std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
         if (p0 == 0u) return window;
-        // -co reports 18 MB for both blocks a budget of 16 MB or less can pick
-        // (16 and 17 units of 64 KB), measured on both. It is NOT the decode
-        // console's working set for the same archive, which comes to 13 MB: the
-        // compressor also carries the match finder and the analysis object, and
-        // splitting that difference into its terms waits on the block driver.
-        // -cO is -co plus exactly 16 MB at every budget the two were measured at
-        // (18/34, 59/75, 62/78 MB) -- its model object is ~0x1083000 bytes where
-        // the compact engine's is 0x3f700.
-        if (p0 == 5u || p0 == 6u) { (void)threads; (void)window; return (18ull + (p0 == 6u ? 16ull : 0ull)) << 20u; }
+        // FUN_0808d4d0, the optimum encoder's memory method: the window object
+        // FUN_080c0070 (the same term the DECODE figure starts from, with the
+        // block as its primary buffer) + the image object 0x210000 + 0x80000 +
+        // the LZ engine's own method (vtable slot 2: 0x0806f4a0 compact,
+        // 0x08083130 large) + 0x3f740 + 0x8b640 (-co) or 0x110e2c0 (-cO) + the
+        // BWT object FUN_0808c400 = 0x201000. The LZ engine's method is its ring
+        // (0 -- it borrows the window) + 0x100008 + 4 * (H + T): T the
+        // FUN_08082e50 table, 2^16 - 1 below a 512 KB window and 2^(bits-4) - 1
+        // from there (bits = bsr(W - 1) + 1), H the FUN_08059b20 hash, 2^19 - 1
+        // below a 16 MB window and 2^(bsr(W/32 - 1) + 1) - 1 from there. Every term
+        // read with GDB at those addresses (W = 64 KB, 320 KB, 3 MB, 30 MB, both
+        // engines). Against the decode figure that comes to exactly LZ + 0x200080
+        // for both codecs. It used to be a flat 18/34 MB, right only for a budget
+        // of 16 MB or less (the original prints 37/53 MB at -m64m on 4 MB).
+        if (p0 == 5u || p0 == 6u) {
+            (void)threads;
+            LegacyCnContext ctx;
+            ctx.legacy_method = 0x3bu;
+            ctx.legacy_method_p0 = p0;
+            ctx.legacy_method_p2 = static_cast<std::uint8_t>(LegacyByteFloatEncode(co_block) - 1u);
+            const std::uint64_t W = window;
+            const auto bsr = [](std::uint64_t v) -> unsigned { unsigned e = 0; while (v >>= 1) ++e; return e; };
+            const unsigned bits = bsr(std::max<std::uint64_t>(W - 1u, 0x3ffu)) + 1u;
+            const unsigned tb = bits < 20u ? 16u : bits - 4u;
+            const std::uint64_t T = (1ull << tb) - 1u;
+            const std::uint64_t hx = std::max<std::uint64_t>(W >> 5u, 0x80000u) - 0x80000u + 0x7ffffu;
+            const std::uint64_t H = (1ull << (bsr(hx) + 1u)) - 1u;
+            const std::uint64_t lz = 0x100008ull + 4ull * (H + T);
+            return LegacyCmFamilyWorkingSet(ctx, W) + lz + 0x200080ull;
+        }
         if (p0 == 7u) {
             // -cc reports the DECODE working set of the object it just sized --
             // the same FUN_080aafb0 the console prints when reading such an
