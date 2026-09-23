@@ -13052,7 +13052,11 @@ template <> struct OptimumDecisionOf<nzr::optimum2::NzOptimum2LzDecoder> {
 
 static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
     const std::uint32_t sample = (n >> 3) < 0x80000u ? (n >> 3) : 0x80000u;
-    if (sample == 0u) return true;
+    // Under 8 bytes the sample is empty and FUN_0808d7f0 compares two sizes of
+    // nothing: the block goes BWT (measured: `a -co` of 1..7 bytes writes a
+    // stored BWT block). Calling it LZ declined every such input, since no LZ
+    // payload comes out smaller than the block.
+    if (sample == 0u) return false;
     std::vector<std::uint8_t> lzpay;
     {
         // 1 MB, read out of the running binary: its ring descriptor says
