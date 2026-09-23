@@ -267,8 +267,9 @@ CliOptions ParseCli(int argc, char** argv) {
     }
 
     // No file arguments: the original scans "*" (measured: `nz a new.nz` in a
-    // directory holding one file archives that file).
-    if ((out.command == Command::kAdd || out.command == Command::kSimulate) && out.positional.empty()) {
+    // directory holding one file archives that file; `nz w32c s.exe` does the same).
+    if ((out.command == Command::kAdd || out.command == Command::kW32c || out.command == Command::kSimulate) &&
+        out.positional.empty()) {
         out.positional.push_back("*");
     }
 
