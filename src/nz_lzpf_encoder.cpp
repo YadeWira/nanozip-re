@@ -34,8 +34,13 @@ inline void StoreU32(std::uint8_t* p, std::uint32_t v) { std::memcpy(p, &v, 4); 
 void State::Init(bool vb, std::size_t cap) {
     variant_b = vb;
     capacity = cap;
-    window_alloc.assign(cap + 0x9004u, 0u);
-    window = window_alloc.data();
+    // Sixteen zeroed bytes in front: after a wrap the cursor is 0 and the parse's
+    // first hash (LoadU32(block - 2)) and the backfill (p - 2, p - 3) read the two
+    // or three bytes BEFORE the window. Without them that was the malloc chunk
+    // header -- zeros on 64-bit glibc, which is why the corpora came out exact,
+    // but not on a 32-bit or Windows heap. The decoder keeps the same left pad.
+    window_alloc.assign(cap + 0x9004u + 16u, 0u);
+    window = window_alloc.data() + 16;
     cursor = 4;
     dirty = true;
     if (variant_b) {

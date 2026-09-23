@@ -225,7 +225,7 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src, std::uint32
 struct State {
     bool variant_b = false;
     std::size_t capacity = 0;
-    std::vector<std::uint8_t> window_alloc;   // capacity + 0x9004 (FUN_080b6a00)
+    std::vector<std::uint8_t> window_alloc;   // 16 zeroed bytes + capacity + 0x9004 (FUN_080b6a00)
     std::uint8_t* window = nullptr;           // the base; data starts at cursor 4
     std::size_t cursor = 4;                   // FUN_080b6bb0's +0x10058
     bool dirty = true;                        // +0x1005c: something was written since the last wrap
