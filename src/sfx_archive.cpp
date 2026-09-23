@@ -4921,7 +4921,15 @@ bool DecodeLzpfMember(
     // `derived_cap_only` -- a second dictionary candidate would have to redo
     // output already handed over -- and a `verify` that accepts anything, since
     // there is no assembled buffer left to check. `out`/`direct_out` are unused.
-    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr) {
+    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr,
+    // With `stream_out`: hand the output over one whole MEMBER (data record) at a
+    // time instead of block by block, and drop the member in flight when the
+    // decode fails. That is the single-container original's unit: flipped inside
+    // a record, it writes exactly the records before it (4 194 304 bytes for a
+    // flip 88 % into record 4 of a 1 MB-record chain, not the ~0.9 MB of blocks
+    // before the flip). The buffer grows to the largest member instead of
+    // rolling, which is at most 1 MB for any archive the original writes.
+    bool stream_members = false) {
     const ArcPos in_end = (input_end != 0u && input_end <= bytes.size()) ? input_end : bytes.size();
     // A corrupt header can declare any output size, and the buffer below IS that
     // size, so an implausible one reached the allocator: ASan aborted with
@@ -5046,6 +5054,13 @@ bool DecodeLzpfMember(
         const auto roll_room = [&](std::size_t need) {
             if (!rolling) return;
             if (total_written - decoded_base + need <= decoded_store.size()) return;
+            if (stream_members) {
+                // A member goes out whole: grow, keeping what it holds so far.
+                const std::size_t used = total_written - decoded_base;
+                decoded_store.resize(std::max(decoded_store.size() * 2u, used + need));
+                decoded = decoded_store.data();
+                return;
+            }
             if (total_written > decoded_base)
                 (*stream_out)(decoded_store.data(), total_written - decoded_base);
             decoded_base = total_written;
@@ -5092,6 +5107,12 @@ bool DecodeLzpfMember(
             if (input_pos >= stream_data_end) {
                 if (input_pos != stream_data_end) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
                 member_done = total_written;
+                // A member is complete: it is out even if reading the next
+                // record's tag fails, as it is in the original.
+                if (stream_members && total_written > decoded_base) {
+                    (*stream_out)(decoded_store.data(), total_written - decoded_base);
+                    decoded_base = total_written;
+                }
                 // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
                 // + width) before the next stream tag.
                 while (input_pos < in_end) {
@@ -5400,7 +5421,9 @@ bool DecodeLzpfMember(
         // flushes a block the moment it has it (measured on a damaged -cf -p4
         // container: it writes 110 of 114 MB where a member-at-a-time reader
         // writes 1), so a failing block loses only itself.
-        if (rolling && total_written > decoded_base) {
+        // (Per member: only a decode that finished completes its last member; a
+        // failed one loses the member it was in.)
+        if (rolling && total_written > decoded_base && (!stream_members || decode_ok)) {
             (*stream_out)(decoded_store.data(), total_written - decoded_base);
             decoded_base = total_written;
         }
@@ -5421,11 +5444,10 @@ bool DecodeLzpfMember(
                     (unsigned long long)total,
                     (decode_ok && total_written == total) ? (int)run_verify() : -1);
         }
+        const bool this_is_first = first_candidate;
         if (first_candidate) {
             first_candidate = false;
             if (out_member_done != nullptr) *out_member_done = member_done;
-            if (member_done > 0 && member_done < total && direct_out == nullptr && !rolling)
-                first_prefix.assign(decoded, decoded + member_done);
         }
         if (decode_ok && total_written == total && run_verify()) {
             // Which dictionary capacity actually decoded: candidate 0 is the value
@@ -5438,6 +5460,21 @@ bool DecodeLzpfMember(
             else *out = std::move(decoded_store);
             pscope.Commit();
             return true;
+        }
+        // The members the first candidate completed are what the original has
+        // flushed when a later one fails. Kept only now that this candidate has
+        // failed: it used to be copied before the verdict, so every successful
+        // decode of a multi-record chain paid a copy of nearly its whole output
+        // (127 MB of a 128 MB file). The store is this candidate's own, so it is
+        // trimmed and moved rather than copied.
+        if (this_is_first && member_done > 0 && member_done < total && direct_out == nullptr && !rolling) {
+            decoded_store.resize(member_done);
+            // Give back the rest of the allocation: `resize` keeps the capacity
+            // of the whole output, which the candidates still to run would pay
+            // for on top of their own. This copies member_done bytes -- what the
+            // old code copied -- but only on this failing path.
+            decoded_store.shrink_to_fit();
+            first_prefix = std::move(decoded_store);
         }
     }
     if (out != nullptr && !first_prefix.empty()) *out = std::move(first_prefix);
@@ -8084,11 +8121,97 @@ bool TryParseLegacyCnArchive(
                     const bool use_splice = spliced_map->total != 0u;
                     const ByteView chain_src = use_splice ? bytes.Spliced(spliced_map.get()) : bytes;
                     const ArcPos chain_sp = use_splice ? (sp - payload_start) : sp;
+                    // Stream the chain to disk, one whole data record at a time, the
+                    // way the single-container original writes it: the output never
+                    // exists whole (a 128 MB -cf file held 433 MB here against the
+                    // original's 134). Only where the outcome cannot differ from the
+                    // buffered path below:
+                    //  - the sink is up (not `l`, not NZ_SAFE);
+                    //  - the entries tile the output exactly, since the sink's slices
+                    //    are the entries and it clamps at their total;
+                    //  - every entry that has a checksum is judged on its own (or there
+                    //    are none, -hn/-nm); the whole-output checksum search of
+                    //    member_verify needs the whole output, so that case stays
+                    //    buffered;
+                    //  - the output fits size_t.
+                    // It decodes the DERIVED capacity only. The fallback candidates
+                    // never decided an outcome that was measured: 31 of 31 adoptions on
+                    // intact archives were candidate 0, and on all 12 damaged -cf/-cF
+                    // cases of the corruption suite candidate 0 either completed or
+                    // failed at the same byte count as the rest. If it hands nothing
+                    // over -- the first record already fails, or the sink will not take
+                    // the layout -- nothing was published or written, and the buffered
+                    // decode below runs exactly as before.
+                    bool chain_streamed = false;
+                    {
+                        std::uint64_t tiled = 0;
+                        for (const LegacyCnEntry& e : entries) tiled += e.size;
+                        const bool chain_sink = psink::Available() && !entries.empty() &&
+                                                tiled == total_data_size &&
+                                                (entries_have_checksum || checksum_mode == ChecksumMode::kNone) &&
+                                                total_data_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+                        if (NZ_ENV("NZ_TRACE_SINK"))
+                            std::fprintf(stderr, "[sink] lzpf chain: available=%d entries=%zu tiled=%d checksums=%d -> %s\n",
+                                         (int)psink::Available(), entries.size(), (int)(tiled == total_data_size),
+                                         (int)(entries_have_checksum || checksum_mode == ChecksumMode::kNone),
+                                         chain_sink ? "stream" : "buffer");
+                        if (chain_sink) {
+                            bool tried = false, published = false;
+                            std::uint64_t streamed = 0;
+                            // Published on the FIRST byte handed over, not before the
+                            // decode: StreamBegin creates the first output file, and a
+                            // decode that completes no record must leave none -- and must
+                            // leave the sink unpublished for the buffered retry.
+                            const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                                [&](const unsigned char* q, std::size_t n) {
+                                    if (!tried) {
+                                        tried = true;
+                                        std::vector<psink::Stream> pstreams(1);
+                                        for (std::size_t i = 0; i < entries.size(); ++i) {
+                                            const LegacyCnEntry& en = entries[i];
+                                            psink::Slice sl;
+                                            sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                                            sl.cmode = checksum_mode; sl.cval = en.checksum;
+                                            // judged exactly when the extractor would judge it
+                                            sl.has_cksum = en.has_checksum && checksum_verification_supported;
+                                            sl.group = i;   // one group per entry, as for -co/-cc
+                                            pstreams[0].slices.push_back(sl);
+                                        }
+                                        published = psink::Publish(entries, std::move(pstreams),
+                                                                   psink::Policy::kProduced, 0u, psink::Family::kLzpf);
+                                        if (published) psink::StreamBegin(0u);
+                                    }
+                                    if (!published) return;
+                                    psink::StreamWrite(0u, q, n);
+                                    streamed += n;
+                                };
+                            const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
+                            std::vector<unsigned char> unused;
+                            std::size_t mdone = 0;
+                            const bool okd = DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
+                                                              total_data_size, is_variant_b, method_p1,
+                                                              /*derived_cap_only=*/true, accept_all, &unused,
+                                                              /*direct_out=*/nullptr, truncated_input, &mdone,
+                                                              /*lenient=*/false, /*input_end=*/0u, &to_sink,
+                                                              /*stream_members=*/true);
+                            if (published && streamed > 0u) {
+                                psink::StreamEnd(0u, nullptr, streamed, okd, false);
+                                // The failing position is reported in payload space, as
+                                // the buffered path below does for its partial prefix.
+                                if (!okd && !use_splice && nzr::derr::t_state.has_pos &&
+                                    nzr::derr::t_state.input_pos >= payload_start)
+                                    nzr::derr::t_state.input_pos -= payload_start;
+                                chain_streamed = sink_adopt();
+                            }
+                        }
+                    }
                     // With no checksum stored (-hn / -nm) there is nothing to
                     // adjudicate between capacity candidates, so use only the
                     // derived one -- and accept it, which is what member_verify
                     // does for ChecksumMode::kNone.
-                    if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
+                    if (chain_streamed) {
+                        // written (or, for `t`, verified) by the sink
+                    } else if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
                                          total_data_size, is_variant_b, method_p1,
                                          /*derived_cap_only=*/checksum_mode == ChecksumMode::kNone,
                                          member_verify, &member_out, nullptr, truncated_input)) {
