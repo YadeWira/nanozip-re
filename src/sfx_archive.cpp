@@ -14575,12 +14575,29 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     } discard_buf;
     std::ostream discard(&discard_buf);
     const fs::path out_path = ResolveArchivePath(options);
+    // An archive that already exists is not touched until its replacement is
+    // complete: the new one is written next to it and renamed over it at the
+    // end. Truncating it first meant that a compressor declining halfway (or a
+    // write error) deleted the old archive and left nothing in its place --
+    // `a -r old.nz folder` lost old.nz whenever -co could not write the folder.
+    // It also keeps the old archive readable when the scan picked it up as an
+    // input (`a -y x.nz` with no file arguments, in x.nz's directory).
+    std::error_code exists_ec;
+    const bool replace_existing = !simulate && fs::exists(out_path, exists_ec);
+    const fs::path write_path = replace_existing ? fs::path(out_path.native() + fs::path(".nzre-part").native())
+                                                 : out_path;
     std::ofstream file_out;
     if (!simulate) {
         if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
-        file_out.open(out_path, std::ios::binary | std::ios::trunc);
+        file_out.open(write_path, std::ios::binary | std::ios::trunc);
         if (!file_out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
     }
+    const auto discard_output = [&]() {
+        if (simulate) return;
+        file_out.close();
+        std::error_code ec;
+        fs::remove(write_path, ec);
+    };
     std::ostream& out = simulate ? discard : static_cast<std::ostream&>(file_out);
     // `w32c` writes the Windows self-extractor stub first and the ordinary
     // archive after it -- measured byte for byte: the original's output is
@@ -14594,7 +14611,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             // written, and it still exits 0.
             ClearStatusLine(os);
             os << "Cannot open: " << stub.string() << '\n';
-            if (!simulate) { file_out.close(); std::error_code rc; fs::remove(out_path, rc); }
+            discard_output();
             return 1;
         }
         char buf[1 << 16];
@@ -14641,11 +14658,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // as "Data corrupted while reading headers!", so remove the partial file
     // and say plainly what happened.
     const auto decline = [&]() -> int {
-        if (!simulate) {
-            file_out.close();
-            std::error_code ec;
-            fs::remove(out_path, ec);
-        }
+        discard_output();
         os << "This compressor cannot yet write this input; no archive was created.\n";
         return 1;
     };
@@ -14717,9 +14730,25 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             timed_write(body);
         }
     }
-    if (!out) { os << "Error: write failure while building archive.\n"; return 1; }
+    if (!out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
     const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
     out.flush();
+    if (replace_existing) {
+        file_out.close();
+        if (!file_out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
+        std::error_code ec;
+        fs::rename(write_path, out_path, ec);
+        if (ec) {   // a rename that will not replace an existing file (some Windows runtimes)
+            std::error_code rm;
+            fs::remove(out_path, rm);
+            ec.clear();
+            fs::rename(write_path, out_path, ec);
+        }
+        if (ec) {
+            os << "Cannot write: " << out_path.string() << '\n';
+            return 1;
+        }
+    }
     const std::uint64_t total_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - add_start).count());
     PrintStoreEncodeFooter(os, stored, produced, total_ms, read_ms, write_ms, options.verbose);
     return 0;
