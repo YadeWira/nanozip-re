@@ -1,3 +1,4 @@
+#include "nz_zeroed.h"
 #include "nz_env.h"
 #include "nz_trace.h"
 #include "nz_decode_error.h"
@@ -2156,6 +2157,10 @@ struct LegacyCnContext {
         if (!payload_is_view) return data;
         if (flat_cache.empty() && payload_view.size() != 0u) {
             std::vector<unsigned char> v;
+            // One allocation of the final size: appended piece by piece into an
+            // empty vector, the payload was reallocated and copied again at
+            // every doubling.
+            v.reserve(payload_view.size());
             payload_view.AppendTo(&v, 0u, payload_view.size());
             flat_cache = ByteBuffer(std::move(v));
         }
@@ -7266,7 +7271,7 @@ bool TryParseLegacyCnArchive(
                                         if (&kv.second.chunks == &chunks && kv.second.hasparams) { sp1 = kv.second.p1; break; }
                                     const std::uint32_t units = LegacyCdRingUnitsFromP1(sp1);
                                     const std::uint32_t ring_size = units * 0x10000u;
-                                    std::vector<std::uint8_t> ring(ring_size, 0u);
+                                    nzr::ZeroedBytes ring(ring_size);   // zero, untouched
                                     std::uint32_t ring_pos = 0u;
                                     std::vector<std::uint8_t> ctx;
                                     std::uint32_t ctx_index = 0u;
@@ -8435,7 +8440,10 @@ static bool TryDecodeLegacyLzhd(
     }
     if (ring_units == 0u) ring_units = 1u;
     const std::uint32_t ring_size = ring_units * 0x10000u;
-    std::vector<std::uint8_t> ring(ring_size, 0u);
+    // Sized for the whole archive and zero where nothing has been written yet --
+    // which the linear match copy past the ring end relies on -- but zeroed
+    // without being touched (nz_zeroed.h).
+    nzr::ZeroedBytes ring(ring_size);
     std::uint32_t ring_pos = 0u;
 
     // `-cD` (method_p0==4, nz_lzhds) selects the per-context MTF+adaptive-
@@ -8595,7 +8603,12 @@ static bool TryDecodeLegacyLzhd(
             cursor += n;
         }
     }
-    out_data->assign(window_base, window_base + total_out);
+    // Hand the window over instead of copying it: a second buffer the size of
+    // the whole output, allocated and written only to be read once, cost a full
+    // pass of page faults. The pad in front goes with an in-place move.
+    buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(kWindowPad));
+    buf.resize(static_cast<std::size_t>(total_out));
+    out_data->swap(buf);
     pscope.Commit();
     return true;
 }

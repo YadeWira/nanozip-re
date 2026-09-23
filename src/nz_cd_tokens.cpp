@@ -1,5 +1,6 @@
 // Native linux32 `-cd` token pipeline. See nz_cd_tokens.h for the contract and
 // the reverse-engineering provenance (FUN_08099050 / FUN_080aa070).
+#include "nz_zeroed.h"
 #include "nz_env.h"
 #include "nz_decode_error.h"
 #include "nz_trace.h"
@@ -615,9 +616,12 @@ std::uint32_t NzCdTextPipeline(const std::uint8_t* src, std::uint32_t size,
     // 32 KB text chunk (89 % of a -cd decode). They persist per thread instead,
     // and the bytes a stage wrote are zeroed again afterwards, so every call still
     // sees all-zero buffers exactly as before.
-    static thread_local std::vector<std::uint8_t> sa, sb;
-    if (sa.size() < static_cast<std::size_t>(out_cap) + 64u) { sa.assign(static_cast<std::size_t>(out_cap) + 64u, 0u); }
-    if (sb.size() < static_cast<std::size_t>(out_cap) + 64u) { sb.assign(static_cast<std::size_t>(out_cap) + 64u, 0u); }
+    // They are sized for the whole REMAINING stream, which a text chunk never
+    // comes near writing, so they come zeroed without being touched
+    // (nz_zeroed.h): only the pages a stage actually writes are ever backed.
+    static thread_local nzr::ZeroedBytes sa, sb;
+    if (sa.size() < static_cast<std::size_t>(out_cap) + 64u) sa.Reset(static_cast<std::size_t>(out_cap) + 64u);
+    if (sb.size() < static_cast<std::size_t>(out_cap) + 64u) sb.Reset(static_cast<std::size_t>(out_cap) + 64u);
     std::uint8_t* bufs[2] = {sa.data(), sb.data()};
     std::uint32_t dirty[2] = {0u, 0u};   // bytes to re-zero in each buffer on exit
     struct Rezero {
