@@ -1,14 +1,25 @@
 # nanozip-re
 
-A byte-exact, native C++17 reimplementation of the **NanoZip 0.09 alpha** archiver's decoder (`nz`
-commands `l`, `t`, `x`), with a console identical to the original's. No original binary is needed or
-used at runtime.
+A native C++17 reimplementation of the **NanoZip 0.09 alpha** archiver `nz`, decoder and encoder, with
+a console identical to the original's. It lists, tests and extracts (`l`, `t`, `x`) archives of all
+eight compressor settings byte-exact, and it compresses (`a`, `s`, `w32c`) with all eight, writing the
+original's archive byte for byte on most inputs measured so far; the exceptions are under
+[Known limits](#known-limits). No original binary is needed or used at runtime, except that `w32c`
+copies the original's `nz_w32c.sfx` stub (see [Usage](#usage)).
 
 NanoZip (Sami Runsas, 2008–2011) is a closed-source archiver with five compressors of its own —
 `nz_lzpf`, `nz_lzhd`, `nz_lzhds`, `nz_optimum1/2`, `nz_cm` — plus audio and image models, text
 transforms and an x86 filter. Only stripped Linux and Windows binaries of the last alpha exist.
 
 📖 **[Wiki](https://github.com/YadeWira/nanozip-re/wiki)** · 📋 **[Original quirks catalogue](docs/ORIGINAL_QUIRKS.md)** · ⬇️ **[Releases](https://github.com/YadeWira/nanozip-re/releases)**
+
+<!-- TEMPORARY notice (v0.17.0-pre / v0.17.1-pre, 2026-09-23): remove when the maintainer decides -->
+> **Temporary notice.** Two kinds of archive written by `a` or `w32c` with `-co`, `-cO` or `-cc` (`-co` is the
+> default) may be unreadable, by this port and by the original: multi-file archives from v0.15.2-pre to v0.16.0-pre,
+> and archives of 8 MB or more made with more than one thread from v0.15.0-pre (`-cc`) or v0.15.1-pre (`-co`,
+> `-cO`) to v0.17.0-pre. Test them with `nz-re t` and re-create any that fail from the source files with
+> v0.17.1-pre or later ([release notes](https://github.com/YadeWira/nanozip-re/releases/tag/v0.17.1-pre)).
+<!-- end of TEMPORARY notice -->
 
 ## Why
 
@@ -20,76 +31,139 @@ The rule that follows is **fidelity first**. Format and output bytes are identic
 messages and switches are identical except where timing makes them unobservable; behaviour is
 identical *including the alpha's defects*, so the two binaries can be compared on equal terms and
 every difference is a bug on this side. The defects are catalogued in
-[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md); which to keep and which to fix is a decision for
-the community once the decoder is complete. Until then the only escape hatches are environment
-variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few deliberate departures
-(a path-traversal guard, no crash on an archive of empty files, no infinite prompt on a closed stdin)
+[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md) (77 numbered items); which to keep and which to fix
+is a decision for the community once the encoder is complete. The decode phase closed with v0.9.9-pre;
+every release stays a pre-release until the encoder is complete too. Meanwhile the only escape hatches are environment
+variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few deliberate departures (a
+path-traversal guard, no crash on an archive of empty files, no infinite prompt on a closed stdin)
 are marked `[pending]` in the catalogue.
 
 ## Status
 
-Everything is measured against the original binary as the oracle: it compresses the fixtures, its
-extraction is the reference, and stdout/stderr/exit status/written trees are compared byte for byte.
+The original binary is the oracle. For decoding, it compresses the fixtures, its extraction is the
+reference, and stdout/stderr/exit status/written trees are compared byte for byte. For compression,
+its own `a` on the same inputs with the same switches (`-t1`) is the reference, archive against archive.
+
+### Decode
 
 | what | result |
 |---|---|
-| Synthetic fixtures, 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact |
-| Multi-file archives, 12 selectors × 9 shapes, whole trees + listings (`tests/multifile_v2.sh`) | 144/144 + 72/72 |
-| Self-extracting `.exe` archives of the eight codecs (`tests/sfx_exe.sh`) | 8/8 byte-exact |
-| Shapes measured one by one: 70 000 entries, the same file twice, a `-pN` container of duplicates, files of 0 bytes, names of 250 characters | listings, trees, modes and timestamps identical to the original |
-| Real-world corpus, 61 files × 8 codecs (`tests/real_corpus_sweep.sh`) | 488/488 |
-| Real-world corpus, 155 files × 8 codecs | 1240/1240 |
-| Stratified sweep, 3037 real files × 8 codecs (`tests/corpus_select.sh` + `sweep_run.sh`) | 24 272/24 272 byte-exact (6 decode bugs found and fixed on the way) |
-| **Encode**, `a -cn`, `a -cf/-cF`, `a -cd` and `a -cD` against the original's `a` on the same inputs and switches (`tests/encode/oracle.sh`: file order in its four `-s` modes, `-r`, `-sp`, `-x` and unreadable files, `-nt`/`-np`/`-nm`/`-fo`, every checksum kind, block boundaries, 1 MB multi-block inputs, `-pN -t1` worker splits with slices, one-byte and empty inputs; for lzpf: text, random, an ELF, a 700 KB text+random mix, PCM audio as WAV/raw, TIFF/TGA/PGM/BMP images alone and mixed with text and audio; for lzhd and lzhds the same shapes plus block-RLE data, CRLF text, a PGN game, the 16 KB piece rule over seven files and a whole directory tree with an unreadable file in it) | 132/135 archives byte-identical, each read by the other binary, consoles identical once timing figures are removed (the 3 left are the two codecs not yet ported and the one `-co` shape whose text transform is not written yet); 54 corpus audio files, 64 mixed-type files and 24 images byte-identical under `-cd` and `-cD` as well as under `-cf`/`-cF` |
-| Release package, 72 archives (incl. single- and multi-file parallel containers and self-extracting `.exe`s of every codec), all four binaries | 184/184 hashes |
-| Console matrices, 182 cases, and the pty prompt harness (`tests/parity/`) | 92 byte-identical, 84 differing only in status-line writes (how many `N MB` figures fit depends on the seconds the decode crosses, and the original's footer adds an `IO-out` clause), and 6 real: two are the compression commands the encode phase will bring, four are the documented departures ([quirks 3, 28, 29](docs/ORIGINAL_QUIRKS.md)) |
-| Directory trees: deep paths, symlinks, unreadable files, setuid/sticky modes, UTF-8 and space names, extreme timestamps, `-fo` (`tests/sweep_dirs.sh`) | 16/16 archives extract identically (contents, mode, mtime, links) |
-| Archives made by the **Windows** original, 8 codecs, and our Windows build's console against it (`tests/windows_original.sh` through wine, `tests/parity/windows_vm_check.ps1` on a real Windows 10 machine) | 24/24 through wine; on Windows 47/48 identical and one progress-tick difference, contents, sizes and the restored file **attributes** included |
-| The `[N MB]` memory figure, `-co`/`-cO`/`-cc` at six `-m` settings | identical to the original in all 18 |
-| Damaged archives, 8 codecs × 6 corruptions (`x`, `l`, `t`) (`tests/parity/corrupt_compare_all.sh`) | 42/48 identical trees on the release fixtures and 47/48 on the ones the harness builds; the `Archive corrupted` / `Internal error` report identical in 38/48 (`l`: 47/48); the rest are the original's crashes and uninitialised memory ([quirks 26, 27, 47](docs/ORIGINAL_QUIRKS.md)) and four `-cf`/`-cF` garbage divergences |
-| One entry over 4 GB: the reporter's 4.6 GB `-cO` archive (a 4600 MB MPG), and a 4.5 GB entry of real corpus material written by the original with each of `-cn -cf -cF -cd -cD -cc` (`/mnt/IA_LAB/agentes/NZ-RE/{xman,big4g_multi}`, `NZ_BIG_OUT=… tests/huge_archive.sh`) | all **eight** codecs `t` OK and extract **byte-identical**; `-cc` also clean under ASan over the whole decode. `-co` first stopped on a param15 defect independent of size (offsets are LZ-ring positions and were resolved against a flat copy of the stream; reproduced at 180 MB, fixed). Before this the 32-bit-wrapped post-filter caps called all of them corrupt past 4 GB |
-| Large files, 20-300 MB, 8 codecs, four shards of the same script with a frozen binary (`tests/real_corpus_sweep.sh`, `NZ_SHARD`, `NZ_RECON`) | 744 file x codec pairs; the run's four failures were all closed by that day's commits (three by earlier fixes, one by the stored-block model reset a 130 MB `.cab` exposed) and re-verified byte-exact with the current binary |
-| Every checksum setting (`-hn`, `-hc`, `-hC`, `-hf`, default) × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240: every listing, every `t` run and every extracted tree identical, the listing order of parallel containers included ([quirk 52](docs/ORIGINAL_QUIRKS.md)) |
-| Truncated archives, 8 codecs x 19 cut points around and across the first data record (`tests/parity/truncation_sweep.sh`) | 105/152 identical report lines; the rest are cuts beyond the first data record of the LZ families, where the original decodes the cut block's garbage ([quirk 51](docs/ORIGINAL_QUIRKS.md)), and the store truncation of quirk 26 |
-| Damaged **parallel** containers, 8 codecs × 7 corruptions, single- and multi-file (`x`) | 104/112 identical trees (holes, short files, files created and left empty exactly where the original's workers leave them, [quirk 41](docs/ORIGINAL_QUIRKS.md)); report line identical in 102/112, the rest being `-cd`/`-cD` and `-cO` detection differences, one segfault of the original and the plain-vs-shifted code of four early failures |
-| Fuzzing, ASan + UBSan, 1358 corrupt and non-archive inputs (`~/.cache/nzre_tools/fuzz/fuzz.sh`) | 1358/1358 clean, worst case 8.1 s (a 4-stream `-cc` archive under ASan) |
-| Decode speed vs the original, 137 MB mixed tar × 6 codecs and a 2.29 GB archive ([Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance)) | faster on `-co`, `-cd`, `-cf` and the 2.29 GB test; 1.07× on `-cO`, 1.16× `-cc`, 1.3× `-cD` |
+| Synthetic fixtures, 12 × 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact (2026-09-23) |
+| Multi-file archives, 12 selectors × 9 shapes, trees + listings (`tests/multifile_v2.sh`); multi-block `-t1` attribute records (`tests/parity/multiblock_attrs.sh`) | 144/144 + 72/72; 105/105, the original's `l` mode shift reproduced ([quirk 76](docs/ORIGINAL_QUIRKS.md)) (2026-09-23) |
+| Release verification package: 86 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers), plus one whose stored name is not valid UTF-8, checked by content | 243/243 checks on each of the four v0.17.1-pre binaries, the Windows two on a real Windows 10 (2026-09-23) |
+| Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
+| One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
+| Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
+| Archives made by the **Windows** original, 8 codecs (`tests/windows_original.sh` through wine, `tests/parity/windows_vm_check.ps1` on Windows 10) | 24/24 through wine; on Windows 47/48 identical, one progress-tick difference, file attributes included (2026-09-04) |
+| Damaged and truncated archives, 8 codecs (`tests/parity/`) | 48 damaged variants of the fixtures the harness builds (`make_fixtures.sh`): 47/48 identical file sets, report lines identical in `x` 34/48, `l` 47/48, `t` 34/48; on the release package's fixtures v0.14.2-pre gave 42/48 and `x` 38/48, and `-cf`/`-cF` gave 9/12 identical file sets there on 2026-09-22, before 5be60d5 moved their single containers to the streaming path; file filters on a damaged archive 8/8 (`filter_checksum.sh`); 105/152 identical reports over 19 cut points in the release run (103 to 105 across that night's runs), ours stable run to run, the original's not on two cut `-cd` archives (2026-09-23); damaged parallel containers, five `-p4` fixtures × seven damages: 34/35 extract the original's tree, reports identical in v0.16.0-pre, v0.17.0-pre and v0.17.1-pre (2026-09-23). The rest include the original's crashes, uninitialised memory and garbage decodes ([quirks 26, 27, 47, 51](docs/ORIGINAL_QUIRKS.md)) |
+| Writing the files (`tests/parity/sink_files.sh`): many files, name collisions, empty entries, a full disk; 4 codecs, single and `-p4` | 28/28 identical (2026-09-23); a 3000-file archive extracts whole on Windows 10. `-forceout` over a parallel container still differs; there the original's own result varies run to run |
+| Fuzzing, ASan + UBSan, corrupt and non-archive inputs | 2242 inputs: 0 sanitizer findings, 0 timeouts, 0 signals; 31 end in the reproduced `Internal error` exit (255) (2026-09-23) |
+| Console (`tests/parity/`) | 35-case CLI matrix: two known differences, `argv[0]` in the usage line and a progress interleaving (v0.15.1-pre); `a` and `s` at four budgets × three codecs identical (v0.15.0-pre); banner core count and `Threads:` identical (v0.15.3-pre) |
 
-Decoding of parallel (`-pN`) archives is multi-threaded (one thread per worker stream, `-t<n>` caps
-it). Four static binaries per release (Linux and Windows, 64- and 32-bit), verified on a real Windows
-machine. The archive itself is mapped, not copied into the heap, on Windows as well as on Linux. Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
-[Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity),
-[Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status),
-[Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
+### Encode
 
-**Not there yet:** `a -co`, `a -cO` and `a -cc` write plain-LZ, exe-filtered, text-transformed and BWT blocks, with the param1 and param2 post-filters, param14 on BWT blocks and stored (param6 == 0) BWT blocks, byte-identical to the original -- 292 of 294 corpus files for `-co` and for `-cO` (the same two files in both) and **294 of 294** for `-cc`, none of the 294 declined -- verified at every budget from 4 MB to 256 MB, and, over the same corpus in groups of four files, 45 of 45 archives for `-co` and `-cc` and 44 of 45 for `-cO`; what they do not write is the image and audio block kinds and the stored LZ form -- a file the original would code that way still comes out as a valid archive the ORIGINAL reads back byte-exact, just not the same bytes (a 108 KB .wav: 68 366 against its 67 614). A block that cannot be written at all is declined with a message and no archive is left behind, and every block that is written is proved readable by our own decoder before it is committed; `a -cn` (single and `-pN`), `a -cf/-cF`, `a -cd` and `a -cD` (plain data, the exe and block-RLE filters, the text pipeline with its word dictionary, the audio and image models, under `-t1`, at every `-m`) are byte-exact. No compressor is left that `a` refuses. Known limits: the
-`IO-out` footer figure and the progress redraw count are timing-dependent; a single-stream archive is
-assembled in memory and written after the decode, and a parallel one is written by its worker streams as
-each finishes, like the original, but every worker still holds its whole stream (a 16-stream 2.5 GB
-archive peaks at 6.7 GB of RAM), so the 32-bit builds cannot decode archives above about 1 GB and no
-build can address one above 4 GB in 32 bits at all -- an archive this reader cannot hold is now
-reported as `Out of memory!` rather than called corrupt, which is what a user's 4.5 GB archive first
-looked like. Measured on that reporter's own archive -- 4 617 294 329 bytes of `-cO`, 4600 MB of MPG
-inside -- a 64-bit build tests it and extracts it byte-identically to the original, in 38 minutes
-against the original's 38, at a peak of **16 860 MB** against the original's **129 MB**: the whole
-archive and the whole output are held at once where the original streams both ends and has neither
-limit. On a Windows machine with **8 GB** the 64-bit build decodes 2 GB of that file and then prints
-`Out of memory!` (clean; no crash, nothing called corrupt) -- so "use the 64-bit build" holds only
-with about 17 GB of RAM for a file this size. Until this reader streams too, its `IO-in` footer figure reports the mapping rather than a read
-(`0.00s` and a nonsense rate on a large archive) where the original reports real IO. Format constructs the encoder never emits (`0xd`/`0xe` sub-chunks, image predictor modes other
-than 2) are ported but unexercised.
+| what | result |
+|---|---|
+| Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 134/135, the other differing only in extra progress redraws of ours; which case differs changes from run to run (2026-09-23, v0.17.1-pre) |
+| 45 BMP/TGA/TIFF/PNM images | `-cn`, `-cF`, `-cD` 45/45 (v0.16.0-pre); `-cf`, `-cd`, `-cc` 45/45, `-co` 44/45, `-cO` 43/45 (2026-09-22) |
+| 127 mixed real files | `-co` 125/127, `-cO` 126/127, `-cc` 126/127 (2026-09-22) |
+| 294 corpus files at `-m4m`; 45 groups of four consecutive corpus files | `-co` 292, `-cO` 292, `-cc` 294, 0 declined; groups 45/44/45 of 45 (last measured at v0.15.2-pre) |
+| Multi-file archives of real size: five shapes, from two 3 MB files to an 18-file tree, × 8 codecs (`tests/encode/multifile_sizes.sh`) | 40/40 byte-identical at `-t1` and read by the original, which also reads the default-thread-count archives (2026-09-23) |
+| Above the automatic split (8 MB): `a -t4` of 20 MB × 8 codecs read back and extracted by the original, with its compressor count; `-t1 -p3`/`-p16` for `-co`/`-cO`/`-cc`; the original's `-cc -p12`/`-p16` read at `-t1` (`tests/encode/parallel_readback.sh`) | 16/16 (v0.17.0-pre: 6/16) (2026-09-23) |
+| `-cd` across the 128 MB window (`tests/encode/large_window.sh`), and real files to 328 MB | byte-identical, memory line included, from 132 087 807 bytes to 328 MB; `-cD` too (2026-09-23) |
+| Real audio, mixed-type and image files | 54 audio, 64 mixed-type and 24 image files byte-identical under `-cf`, `-cF`, `-cd` (v0.10.0-pre) and `-cD` (v0.11.0-pre) |
+| Memory budgets (`-m`) | 100/100 archives identical over five codecs × twenty budgets (v0.11.0-pre); `-co` sizing 552/552 points (v0.14.0-pre); `-cc` sizing 91/91 and 16/64/256 MB × 3 codecs × 5 files 45/45 (v0.15.0-pre) |
+| Other builds | 32-bit Linux writes the 64-bit build's bytes on the 294 files (v0.15.0-pre); both Windows builds against the Windows original, 7 files × 3 codecs: 21/21 each (v0.15.1-pre) |
+| Round trip through the original | the original extracts every archive written for the image and mixed corpora and matches the source, except a name containing `[1]`, which it cannot extract from its own archive either: it reads `[...]` as a character class (2026-09-22) |
+
+### Speed
+
+128 MB of distinct real corpus files (text, documents, images, executables, audio), one thread
+(`-t1`), best of 2, v0.17.0-pre, measured 2026-09-23. nz-re's time divided by the original's.
+**Single-threaded, this port compresses slower than the original on every method; it decompresses
+level with it on `-cn` and `-cF` and slower on the rest.**
+
+| method | compress | decompress |
+|---|---|---|
+| `-cn` | 1.70× | 1.02× |
+| `-cf` | 1.65× | 1.16× |
+| `-cF` | 1.64× | 0.99× |
+| `-cd` | 1.47× | 1.59× |
+| `-cD` | 1.80× | 1.41× |
+| `-co` | 1.85× | 1.31× |
+| `-cO` | 1.54× | 1.19× |
+| `-cc` | 1.29× | 1.08× |
+
+Every extraction matched the source. The `-cn`, `-cf`, `-cF`, `-cD` and `-cc` archives are the
+original's bytes. The `-cd` one was not, at v0.17.0-pre: from an input of 132 087 808 bytes the `-cd`
+window rounds to 128 MB, and a window that size gives the original's match finder a second table the
+port did not have. Fixed in v0.17.1-pre: byte-identical from just below that size up to 328 MB. The
+`-co` and `-cO` archives differ from the original's; on a 16 MB fixture the difference is the last
+block only ([quirk 72](docs/ORIGINAL_QUIRKS.md), below), and on this one it has not been traced.
+
+Parallel (`-pN`) archives decode on one thread per worker stream (`-t<n>` caps it). Method and full
+tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
+[Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity), [Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status), [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
+
+### Known limits
+
+- **A few `-co`/`-cO`/`-cc` archives are not the original's bytes** (counts above); the ones checked
+  round-trip. Three traced cases (`i19_lighthouse_rgb48.ppm`, `150_menu.tbk_` at `-m4m`, the 16 MB
+  fixture's last block) are [quirk 72](docs/ORIGINAL_QUIRKS.md): the original keeps param14's hash tables
+  in the block buffer's tail, so each pass starts on the last one's leftovers; partial emulation does not
+  converge, so it is left unreproduced on purpose. Also open: `i36_fax2d.tif` under `-cO` (our match
+  finder returns candidates the original's does not) and `081_AWSOFTWA.PLA_` (param1's first probes
+  read the previous block's bytes in the original, zeros here, [quirk 75](docs/ORIGINAL_QUIRKS.md)).
+  The 127-file mixed corpus differences are not attributed here; on 2026-09-19 the two outside the
+  parser class were a clean `-co` decline (`PowerPacker.pp`) and the `[1]` name.
+- **The stored LZ block form** of the `-co` family is not written, and real inputs do need it: a 12 MB
+  folder of 21 corpus files and an 8 MB slice of real data are declined under `-co` (2026-09-23;
+  `-cO` and `-cc` write them). 3 MB of random data, 8 packed executables and an E8-seeded adversary
+  had not reached it the day before.
+- **Declines.** A block `a` cannot write is declined in one line and no archive is left behind; an
+  existing archive of the same name is left as it was (before v0.17.1-pre it was truncated first, and
+  a decline deleted it). Every
+  `-co`/`-cO` LZ or BWT block is decoded back and compared before it is committed (the LZ payload
+  through a second engine, the BWT payload through the bucket decoder), which the original does not do;
+  that is about 10 % of a `-co` image encode. The check reads the block, not the file table, so it
+  missed the multi-file table defect fixed in v0.17.0-pre (e7c8973) and the parallel-container header
+  fixed in v0.17.1-pre. Image and audio blocks, and the `-cc`, lzpf and lzhd writers, are not read back.
+- **Threads.** `-t` above 1 still compresses on one thread (stated at v0.10.0-pre and v0.11.0-pre), and `a` lays the
+  archive out the `-t1` way at every thread count. From 8 MB of input it splits into worker streams by
+  the original's rule (since v0.17.1-pre: `-cn`, `-cO` and `-cc` keep one compressor unless the input is
+  mostly media files), and it writes them one after another. The original's own output above one thread changes
+  from run to run ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison needs `-t1` on both sides.
+- **Decode memory** is above the original's: 128 MB of real files, `-t1` (v0.17.0-pre), `-cd` 359 MB
+  (original 109 MB), `-cD` 352 MB (109), `-cf` 179 MB (133), `-cF` 239 MB (195). `-cf`/`-cF` single
+  containers stream to disk one data record at a time, as the original does, except under `NZ_SAFE=1`
+  or when checksums cannot be judged entry by entry (those still buffer the whole output); the rest
+  of their gap is the flat mapping of the archive.
+- **Console.** The banner's MHz field is a measured figure in the original, not the clock, and is not
+  matched. The `[N MB]` compressor line of `-co`/`-cO` is a fixed 18/34 MB, right only for a budget of
+  16 MB or less (the original says 37/53 MB at `-m64m`). On a mapped archive the footer's `IO-in` figure is the mapping call (0.00 s, an enormous
+  rate) where the original times a read.
+- **Unexercised.** Format constructs the original's encoder never emits (`0xd`/`0xe` sub-chunks, image
+  predictor modes other than 2) are ported but unexercised.
 
 ## Usage
 
 ```
-nz-re x -y archive.nz        # extract (-y: overwrite without asking)
-nz-re l archive.nz           # list
-nz-re t archive.nz           # test: decode and verify, write nothing
-nz-re x -y -oout/ archive.nz # into a directory; -sp strips paths; -x<glob> excludes
+nz-re x -y archive.nz            # extract (-y: overwrite without asking)
+nz-re l archive.nz               # list
+nz-re t archive.nz               # test: decode and verify, write nothing
+nz-re x -y -oout/ archive.nz     # into a directory; -sp strips paths; -x<glob> excludes
+nz-re a archive.nz files...      # compress with the default compressor, -co (nz_optimum1)
+nz-re a -cd -r archive.nz dir    # choose one of -cn -cf -cF -cd -cD -co -cO -cc; -r recurses
+nz-re a -cO -m1.2g archive.nz f  # -m: memory budget (default 512m)
+nz-re s -cc files...             # simulate: compress and report the size, write nothing
+nz-re w32c archive files...      # self-extractor archive.exe: nz_w32c.sfx + the archive
 ```
 
 Switches, messages, prompts and the exit status follow the original exactly (exit status is always 0,
-as in the original). Environment variables, all optional:
+as in the original); `nz-re help` lists the advanced options, and `*`, `?` and (since v0.17.0-pre)
+`[...]` in names match as in the original. `w32c` reads the original's `nz_w32c.sfx` from the directory
+of the `nz-re` binary; the stub is not included here. Before v0.13.0-pre the binary was called
+`nz_recon`. Environment variables, all optional:
 
 | variable | effect |
 |---|---|
@@ -104,32 +178,31 @@ as in the original). Environment variables, all optional:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-Produces `bin/nz-re`. Static release builds: `g++ -std=c++17 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows, which add `-D_WIN32_WINNT=0x0600`). `-D_FILE_OFFSET_BITS=64` is not optional: without it a 32-bit build's `off_t` is 32 bits and an archive over 2 GB cannot even be measured, so the code refuses to compile without it.
+Produces `bin/nz-re`; Release is the default build type since v0.15.0-pre (a build with no `-O` flag
+ran 4-5× slower). Each release ships four static binaries (Linux and Windows, 64- and 32-bit) with
+`SHA256SUMS.txt`, built as `g++ -std=c++17 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows). `-D_FILE_OFFSET_BITS=64` is required: with a 32-bit `off_t` an archive over 2 GB cannot even be measured, so the code refuses to compile without it.
 
-**Minimum Windows version: Vista (NT 6.0).** The two `.exe` builds pin `_WIN32_WINNT=0x0600` and
-declare subsystem 6.00 in their PE header, so no newer API can creep in unnoticed and an older
-machine gets a clean refusal rather than a confusing failure. Nothing in the port needs anything
-past Vista: the binaries import only `kernel32.dll` and `msvcrt.dll`, and the only Vista-era entry
-points among them are the four `CONDITION_VARIABLE` functions that libstdc++ pulls in through
-`<filesystem>` -- not through threading, which this port's own code reaches for without ever naming
-a `std::condition_variable`. Anything older than Vista is out of scope: it cannot be tested here, so
-it is not claimed. Linux builds have no such floor.
+**Minimum Windows version: Vista (NT 6.0).** The `.exe` builds pin `_WIN32_WINNT=0x0600` and declare
+subsystem 6.00, so an older machine gets a clean refusal. They import only `kernel32.dll` and
+`msvcrt.dll`; their only Vista-era entry points are the four `CONDITION_VARIABLE` functions libstdc++ pulls
+in through `<filesystem>`. Older Windows cannot be tested here, so it is not claimed. Linux builds have no such floor.
 
-The 32-bit builds add `-m32 -msse2`: the SSE2 paths (audio predictor, `-cO` mixer) are compiled only when the target has SSE2, and on a 137 MB mixed tar that is a 19 % shorter `-cO` decode for a Pentium 4-class minimum (the original needed MMX).
+The 32-bit builds add `-m32 -msse2`, which compiles the SSE2 paths (audio predictor, `-cO` mixer): a 19 % shorter `-cO` decode on a 137 MB mixed tar, for a Pentium 4-class minimum (the original needed MMX).
 
 ## Tests
 
 See [tests/README.md](tests/README.md). The regression set before every commit: `tests/native_only_v2.sh`,
-`tests/multifile_v2.sh`, `tests/real_corpus_sweep.sh` (needs the original binary at `../linux32/nz`
-or `NZ_LEGACY_ORACLE`), plus the release-package hash check and the console matrices kept with the
-project's private tooling.
+`tests/multifile_v2.sh`, `tests/real_corpus_sweep.sh` and, for compression, `tests/encode/oracle.sh`
+(the last two need the original binary at `../linux32/nz`, or `NZ_LEGACY_ORACLE` / `NZ_ORIG`), plus
+the release-package hash check and the console matrices kept with the project's private tooling.
 
 ## How it was done
 
 Ghidra (headless decompile), GDB tracing against the real `linux32/nz` (golden vectors, watchpoints,
 per-stage dumps), differential decoding between codecs that share a front end, and diffs against the
-community reference decoder where it exists (`encode_su/nzdec_v0`, incomplete). The tools, workflow
-and every finding (addresses, formulas, table contents) are in the wiki's
+community reference decoder where it exists (`encode_su/nzdec_v0`, incomplete). Encoder differences
+were run down the same way, the same state dumped from both binaries and diffed. The tools,
+workflow and every finding (addresses, formulas, table contents) are in the wiki's
 [Reverse Engineering Notes](https://github.com/YadeWira/nanozip-re/wiki/Reverse-Engineering-Notes);
 the source layout is in [Architecture](https://github.com/YadeWira/nanozip-re/wiki/Architecture).
 
