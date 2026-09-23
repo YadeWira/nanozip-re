@@ -14110,13 +14110,19 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     std::size_t pend_a_from = pieces.size(), pend_a_to = 0;
     std::size_t pend_c_from = pieces.size(), pend_c_to = 0;
     const auto flush_pending_meta = [&]() {
-        if (pend_a_from > pend_a_to) pend_a_from = pend_a_to;
-        if (pend_c_from > pend_c_to) pend_c_from = pend_c_to;
-        if (pend_a_from == pend_a_to && pend_c_from == pend_c_to) return;
-        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, pend_a_from, pend_a_to,
-                                pend_c_from, pend_c_to, ckmode, options);
+        // The ranges are normalised into LOCALS. Doing it in place left an empty
+        // pair at [0,0) when there was nothing to write -- a block that ends in the
+        // middle of a file -- and the next merge then took min(0, k): the run
+        // re-announced every entry from the first one, so a file that spans two
+        // blocks was listed in the next table a second time and its checksum
+        // written twice. Neither the original nor this port could read the
+        // archive back (`a -co` of two 3 MB files; -cO and -cc too).
+        const std::size_t a0 = std::min(pend_a_from, pend_a_to), c0 = std::min(pend_c_from, pend_c_to);
+        const std::size_t a1 = pend_a_to, c1 = pend_c_to;
         pend_a_from = pieces.size(); pend_a_to = 0;
         pend_c_from = pieces.size(); pend_c_to = 0;
+        if (a0 == a1 && c0 == c1) return;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a0, a1, c0, c1, ckmode, options);
     };
     const auto run_optimum = [&](std::vector<unsigned char>& payload, const unsigned char* d,
                                  std::uint32_t n, bool final) -> bool {
