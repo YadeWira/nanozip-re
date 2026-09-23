@@ -2578,15 +2578,32 @@ struct NzImageModel::Impl {
     }
 };
 
-NzImageModel::NzImageModel() : impl_(new Impl()) {}
+NzImageModel::NzImageModel() = default;
 NzImageModel::~NzImageModel() = default;
-void NzImageModel::Reset() { impl_->Reset(); }
+
+NzImageModel::Impl& NzImageModel::Get() {
+    if (!impl_) {
+        impl_.reset(new Impl());
+        for (const PendingOp& op : pending_) {
+            if (op.is_reset) impl_->Reset();
+            else impl_->Configure(op.flags, op.order03, op.order4, op.variant_b);
+        }
+        pending_.clear();
+        pending_.shrink_to_fit();
+    }
+    return *impl_;
+}
+void NzImageModel::Reset() {
+    if (impl_) { impl_->Reset(); return; }
+    if (pending_.empty() || !pending_.back().is_reset) pending_.push_back(PendingOp{true, 0u, 0u, 0u, false});
+}
 void NzImageModel::Configure(std::uint8_t flags, std::uint32_t order03, std::uint32_t order4, bool vb) {
-    impl_->Configure(flags, order03, order4, vb);
+    if (impl_) { impl_->Configure(flags, order03, order4, vb); return; }
+    pending_.push_back(PendingOp{false, flags, order03, order4, vb});
 }
 std::size_t NzImageModel::Decode(const std::uint8_t* in, std::size_t in_size,
                                  std::uint8_t* out, std::size_t out_size) {
-    return impl_->Decode(in, in_size, out, out_size);
+    return Get().Decode(in, in_size, out, out_size);
 }
 
 }  // namespace audio

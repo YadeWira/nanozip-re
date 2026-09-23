@@ -250,7 +250,25 @@ class NzImageModel {
 
  private:
     struct Impl;
+    // Built on the first Decode, not with the object: every -cf/-cF/-cd/-cD
+    // decode and every optimum stream owns one, a few MB of rings and models
+    // zeroed up front, and most archives never carry an image block. That
+    // zeroing was a quarter of a -cf decode's page faults.
+    //
+    // Until then Configure and Reset are recorded and replayed IN ORDER on the
+    // new object, so its state is exactly what the eager one would have had.
+    // Only a run of Resets is collapsed -- there is one per non-prefilter block
+    // -- and that is exact: the second finds `have_` already clear, so it only
+    // redoes the cheap half, with the same values.
+    struct PendingOp {
+        bool is_reset;
+        std::uint8_t flags;
+        std::uint32_t order03, order4;
+        bool variant_b;
+    };
+    Impl& Get();
     std::unique_ptr<Impl> impl_;
+    std::vector<PendingOp> pending_;
 };
 
 }  // namespace audio
