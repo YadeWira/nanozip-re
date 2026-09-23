@@ -11211,6 +11211,18 @@ std::string FormatCompressorLine(const LegacyCnContext& ctx, std::size_t k, bool
     const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
     const std::uint8_t p1 = (ctx.parallel_p1.empty() || k >= ctx.parallel_p1.size()) ? ctx.legacy_method_p1 : ctx.parallel_p1[k];
     const std::uint64_t bytes = LegacyEngineWorkingSetP1(ctx, p1);
+    // The original builds the decompressor before it prints this line, so a
+    // working set that does not fit ends the run with "Out of memory!" right
+    // after `Threads:` and no compressor line (measured: 32-bit build, a 3.75 GiB
+    // window). The port allocates later, inside the decoder; asking for the
+    // same amount here, and handing it straight back, puts the failure where
+    // the original's is. A large calloc is only an address-space reservation.
+    if (bytes != 0u) {
+        if (bytes > static_cast<std::uint64_t>(SIZE_MAX)) throw std::bad_alloc();
+        void* probe = std::calloc(static_cast<std::size_t>(bytes), 1u);
+        if (probe == nullptr) throw std::bad_alloc();
+        std::free(probe);
+    }
     std::string line = "Compressor #" + std::to_string(k) + ": " + label + " [" + std::to_string(((bytes >> 19) + 1u) >> 1) + " MB]";
     if (verbose) line += std::string(" IO-buffers: 0+") + (test_mode ? "1" : "4") + " MB.";
     line += '\n';
