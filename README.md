@@ -16,8 +16,8 @@ transforms and an x86 filter. Only stripped Linux and Windows binaries of the la
 <!-- TEMPORARY notice (v0.17.0-pre / v0.17.1-pre, 2026-09-23): remove when the maintainer decides -->
 > **Temporary notice.** Two kinds of archive written by `a` or `w32c` with `-co`, `-cO` or `-cc` (`-co` is the
 > default) may be unreadable, by this port and by the original: multi-file archives from v0.15.2-pre to v0.16.0-pre,
-> and archives of 8 MB or more made with more than one thread from v0.15.0-pre (`-cc`) or v0.15.1-pre (`-co`,
-> `-cO`) to v0.17.0-pre. Test them with `nz-re t` and re-create any that fail from the source files with
+> and, from v0.15.0-pre (`-cc`) or v0.15.1-pre (`-co`, `-cO`) to v0.17.0-pre, archives of an input of 8 MB or more
+> made with more than one thread, or of any input with `-p2` or more. Test them with `nz-re t` and re-create any that fail from the source files with
 > v0.17.1-pre or later ([release notes](https://github.com/YadeWira/nanozip-re/releases/tag/v0.17.1-pre)).
 <!-- end of TEMPORARY notice -->
 
