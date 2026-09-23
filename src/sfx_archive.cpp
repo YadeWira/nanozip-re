@@ -14060,6 +14060,15 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
         else if (rbuf)      os << ", IO-read-buffer: " << mb(rbuf) << " MB";
         else if (wbuf)      os << ", IO-write-buffer: " << mb(wbuf) << " MB";
     }
+    // A budget above the free memory the banner shows ends the line with a
+    // warning, in `a` and `s` alike (measured: -m8937m with 8877 MB free warns,
+    // -m8817m does not; `Threads: 16, memory: 61440 MB, IO-buffers: 20+4 MB -
+    // Warning: only 8570 MB free!`).
+    {
+        const std::uint64_t free_mb = HostFreeMemoryMB();
+        if (free_mb != 0u && mb(options.memory_bytes) > free_mb)
+            os << " - Warning: only " << free_mb << " MB free!";
+    }
     os << '\n';
     if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
     for (unsigned k = 0; k < workers; ++k) {

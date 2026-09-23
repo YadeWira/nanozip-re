@@ -579,6 +579,24 @@ std::string HostSummaryLine() {
 #endif
 }
 
+// The free memory the banner shows (`<free>/<total> MB`): MemFree on Linux,
+// rounded to the nearest MB; ullAvailPhys on Windows, saturated at 4096 MB in a
+// 32-bit build as the original's GlobalMemoryStatus does. `a` and `s` compare
+// the -m budget against it.
+std::uint64_t HostFreeMemoryMB() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return 0u;
+    if (sizeof(void*) == 4u && ms.ullAvailPhys > 0xffffffffull) return 4096u;
+    return ms.ullAvailPhys / (1024ull * 1024ull);
+#else
+    const std::string a = ProcField("/proc/meminfo", "MemFree");
+    if (a.empty()) return 0u;
+    return (std::strtoull(a.c_str(), nullptr, 10) + 512u) / 1024u;
+#endif
+}
+
 void PrintBanner(std::ostream& os) {
     // Layout matched to the original, which prints the product line and then the
     // host summary with no leading blank. The build tag names the platform the way

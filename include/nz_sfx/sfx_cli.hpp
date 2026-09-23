@@ -123,6 +123,8 @@ void ClearStatusLine(std::ostream& os);
 
 // The banner's second line: "<cpu model>|<MHz> MHz|#<n>[+HT]|<avail>/<total> MB".
 std::string HostSummaryLine();
+// MemFree / available physical memory in MB, the figure the banner prints.
+std::uint64_t HostFreeMemoryMB();
 
 // The thread count the original reports (and the `#N` in the host line): the number
 // of logical CPUs, capped at 32 the way a 32-bit process's affinity mask caps it.
