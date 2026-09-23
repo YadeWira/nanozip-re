@@ -359,11 +359,20 @@ static thread_local std::uint32_t g_rare_pos = 0;
 // exact bit that decodes wrong (see optimum2_gdb/README.md).
 static thread_local long g_mixbits = 0;
 
+// Only the top of the 32-bit range is a small negative offset (a prediction
+// reaching 1..4 bytes before position 0, into the headroom in front of the
+// ring); every other value is an unsigned position. Casting the whole range to
+// int32 made each position past 2 GiB negative, and a window of 2 GiB or more
+// -- the original writes up to 3.75 GiB with a large -m and one worker, and its
+// Win64 build decodes it -- crashed at the first byte. No window reaches
+// 0xfffff000, so that bound is unambiguous.
 inline std::uint8_t& RingAt(std::uint8_t* base, std::uint32_t logical_pos) {
-    return base[static_cast<std::int32_t>(logical_pos)];
+    return logical_pos >= 0xfffff000u ? *(base - static_cast<std::size_t>(0u - logical_pos))
+                                      : base[static_cast<std::size_t>(logical_pos)];
 }
 inline std::uint8_t RingAt(const std::uint8_t* base, std::uint32_t logical_pos) {
-    return base[static_cast<std::int32_t>(logical_pos)];
+    return logical_pos >= 0xfffff000u ? *(base - static_cast<std::size_t>(0u - logical_pos))
+                                      : base[static_cast<std::size_t>(logical_pos)];
 }
 
 }  // namespace
