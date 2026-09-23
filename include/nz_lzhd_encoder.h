@@ -35,12 +35,14 @@ struct Window {
     void Append(const std::uint8_t* s, std::uint32_t n); // FUN_080bd480
 };
 
-// FUN_0805c260: buckets of four entries `(pos << shift) | tag`.
+// FUN_0805c260: buckets of four entries `(pos << shift) | tag`; a window of
+// 128 MB or more adds a second table of single entries (FUN_0805c530).
 struct Finder {
     std::uint32_t win = 0, bmask = 0, mask2 = 0;
     std::uint32_t shift = 0;
     std::uint8_t tagmask = 0;
     std::vector<std::uint32_t> table;
+    std::vector<std::uint32_t> table2;   // empty below a 128 MB window
     void Init(std::uint32_t window);
     void Clear();
 };

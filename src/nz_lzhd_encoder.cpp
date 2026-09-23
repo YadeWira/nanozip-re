@@ -16,6 +16,7 @@ namespace nzr::lzhd_enc {
 namespace {
 
 inline std::uint32_t LoadU32(const std::uint8_t* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
+inline std::uint32_t Rotl(std::uint32_t v, unsigned k) { return (v << k) | (v >> (32u - k)); }
 inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0 (the original's masked bsr)
     if (v == 0u) return 0u;
     std::uint32_t k = 31u;
@@ -109,12 +110,42 @@ void Finder::Init(std::uint32_t window) {
     bmask = m & 0xfffffffcu;
     mask2 = m >> 3u;
     table.assign(bmask + 16u, 0u);
+    table2.clear();
+    if (0x7ffffffu < window) table2.assign(static_cast<std::size_t>(mask2) + 1u, 0u);
 }
-void Finder::Clear() { std::fill(table.begin(), table.end(), 0u); }
+void Finder::Clear() {   // FUN_0805c4d0
+    std::fill(table.begin(), table.end(), 0u);
+    std::fill(table2.begin(), table2.end(), 0u);
+}
 
-std::uint64_t FinderTableBytes(std::uint32_t window) {
-    Finder f; f.Init(window);
-    return static_cast<std::uint64_t>(f.bmask) * 4u + 0x10u;   // FUN_0805c4b0 (no second table below 128 MB)
+std::uint64_t FinderTableBytes(std::uint32_t window) {   // FUN_0805c4b0
+    std::uint32_t c = window - 1u; if (c < 0xffffu) c = 0xffffu;
+    const std::uint32_t m = (1u << ((BitLen1(c) - 3u) & 31u)) - 1u;
+    const std::uint64_t main = static_cast<std::uint64_t>(m & 0xfffffffcu) * 4u;
+    if (0x7ffffffu < window) return main + 0x14u + static_cast<std::uint64_t>(m >> 3u) * 4u;
+    return main + 0x10u;
+}
+
+// FUN_0805c530: the second table's probe, at one position in sixteen when there
+// are 64 bytes or more left. Its key hashes the 16 bytes at the position; the
+// entry is replaced whatever it held, and the offset is written as soon as the
+// candidate passes the tag and range checks, before its length is known.
+static std::uint32_t ProbeLong(Finder& f, const std::uint8_t* base, std::uint32_t size, std::uint32_t pos,
+                        std::uint32_t vend, std::uint32_t remaining, std::uint32_t h, std::uint32_t& off) {
+    if (remaining <= 0x3fu) return 0u;
+    const std::uint8_t* const cur = base + pos;
+    const std::uint32_t s = Rotl(LoadU32(cur + 4), 5u) + Rotl(LoadU32(cur + 8), 7u) + h + Rotl(LoadU32(cur + 12), 11u);
+    const std::uint32_t k = (s >> 19u) ^ s;
+    const std::uint32_t tag = ((s >> 24u) ^ k) & f.tagmask;
+    std::uint32_t& slot = f.table2[k & f.mask2];
+    const std::uint32_t old = slot;
+    slot = tag + (pos << (f.shift & 31u));
+    if (old == 0u || (f.tagmask & old) != tag) return 0u;
+    const std::uint32_t cpos = old >> (f.shift & 31u);
+    if (!(vend <= cpos || cpos < pos)) return 0u;
+    const std::uint8_t* const cand = base + cpos;
+    off = static_cast<std::uint32_t>(cur - cand);
+    return MatchLen(cand, cur, cand + std::min(remaining, size - cpos));
 }
 
 void State::Init(std::uint32_t window, bool lzhds) {
@@ -174,7 +205,7 @@ void SparseAppend(State& st, std::uint32_t n) {
 // ---------------------------------------------------------------- FUN_0805f640
 std::uint32_t LzEncodeChunk(State& st, std::uint32_t n) {
     Window& w = st.win;
-    const Finder& f = st.finder;
+    Finder& f = st.finder;
     std::uint32_t* const table = st.finder.table.data();
     const std::uint8_t* const skip = SkipTable();
     st.tb.Reset();
@@ -272,7 +303,12 @@ std::uint32_t LzEncodeChunk(State& st, std::uint32_t n) {
                 std::uint32_t* bucket = &table[h & f.bmask];
                 const std::uint32_t head = bucket[0];
                 std::uint32_t best = 0;
-                if (head != 0u && tag == (f.tagmask & head)) {
+                // a match of 8 or more from the second table is taken as it is:
+                // the main table is neither searched nor updated
+                if (!f.table2.empty() && 0xf0u <= static_cast<std::uint8_t>(tag + h) &&
+                    8u <= (mlen = ProbeLong(f, base, size, pos, vend, remaining, h, off))) {
+                    inserted_skip = true;
+                } else if ((mlen = 0u, head != 0u) && tag == (f.tagmask & head)) {
                     std::uint32_t cpos = head >> (f.shift & 31u);
                     if (cpos < pos || vend <= cpos) {
                         std::uint32_t* e = bucket;
