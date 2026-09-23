@@ -20,6 +20,7 @@
 #include "nz_bwt.h"
 #include "nz_audio.h"
 #include <atomic>
+#include <cerrno>
 #include <cpuid.h>
 #include <memory>
 #include <mutex>
@@ -1750,29 +1751,34 @@ inline const unsigned char* ByteView::ResidentSpan(ArcPos off, ArcPos len) const
 // a >4 GB payload cannot give -- and what makes a 32-bit build say "Out of
 // memory!" on an archive it has already decoded. Chunked at the mapping window
 // so a windowed or spliced payload serves every piece from one window.
+// `*err`, when given, receives errno on a failure (ENOSPC is reported apart).
 bool WriteExtractedFileRange(const fs::path& path, const ByteView& src, ArcPos off, ArcPos len,
-                             std::uint32_t mode, long owner_uid = -1, long owner_gid = -1) {
+                             std::uint32_t mode, long owner_uid = -1, long owner_gid = -1,
+                             int* err = nullptr) {
     static constexpr ArcPos kPiece = 8ull << 20;
+    if (err != nullptr) *err = 0;
 #if defined(_WIN32)
     (void)mode; (void)owner_uid; (void)owner_gid;
     const auto w0 = std::chrono::steady_clock::now();
+    errno = 0;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
+    if (!out) { if (err != nullptr) *err = errno; return false; }
     for (ArcPos done = 0; done < len; ) {
         const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
         const unsigned char* q = src.Span(off + done, take);
         if (q == nullptr) return false;
         out.write(reinterpret_cast<const char*>(q), static_cast<std::streamsize>(take));
-        if (!out) return false;
+        if (!out) { if (err != nullptr) *err = errno; return false; }
         done += take;
     }
     out.close();
     NoteDecodeWrite(static_cast<std::size_t>(len), w0);
+    if (!out && err != nullptr) *err = errno;
     return static_cast<bool>(out);
 #else
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
                           static_cast<mode_t>(mode & 07777u));
-    if (fd < 0) return false;
+    if (fd < 0) { if (err != nullptr) *err = errno; return false; }
     if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
     const auto w0 = std::chrono::steady_clock::now();
     for (ArcPos done = 0; done < len; ) {
@@ -1782,12 +1788,13 @@ bool WriteExtractedFileRange(const fs::path& path, const ByteView& src, ArcPos o
         ArcPos w_done = 0;
         while (w_done < take) {
             const ssize_t w = ::write(fd, q + w_done, static_cast<std::size_t>(take - w_done));
-            if (w <= 0) { ::close(fd); return false; }
+            if (w <= 0) { if (err != nullptr) *err = (w < 0) ? errno : ENOSPC; ::close(fd); return false; }
             w_done += static_cast<ArcPos>(w);
         }
         done += take;
     }
     const bool closed = (::close(fd) == 0);
+    if (!closed && err != nullptr) *err = errno;
     NoteDecodeWrite(static_cast<std::size_t>(len), w0);
     return closed;
 #endif
@@ -2552,6 +2559,16 @@ struct FileState {
     bool decided = false;             // prompt asked / path judged
     bool created = false;
     bool cannot_write = false;
+    // Every file used to stay open until Finish: a -co archive of 2000 files,
+    // extracted under a 256-descriptor limit, wrote 253 of them and printed
+    // "Cannot write" for the other 1747 (the original writes all 2000; the usual
+    // soft limit on Linux is 1024). A file is now closed the moment its last byte
+    // is written, with its timestamp and attributes applied then, and opened
+    // again, without truncating, if a rewound stream writes it once more.
+    std::uint64_t remaining = 0;      // bytes of its slices not written yet
+    bool closed = false;              // opened, written whole and closed
+    bool write_failed = false;        // a write failed: no further ones are tried
+    const LegacyCnEntry* entry = nullptr;
     fs::path path;
     std::string display;              // as the original names it: relative unless -o gave a root
     int fd = -1;
@@ -2578,6 +2595,8 @@ struct Engine {
     std::size_t unsafe = 0;
     std::size_t cannot = 0;
     bool stream_failed = false;
+    std::atomic<std::size_t> write_errors{0};       // failed writes, outside e.mu
+    std::atomic<bool> disk_full_reported{false};    // "Out of disk space!" is printed once
     bool plain_code = false;          // report the status without the slot (see Stream::last_record_start)
     bool truncated = false;           // the archive itself is cut short
 };
@@ -2598,6 +2617,7 @@ inline void Reset() {
     std::lock_guard<std::mutex> lk(e.mu);
     e.configured = e.published = e.committed = false;
     e.entries = nullptr; e.streams.clear(); e.files.clear();
+    e.write_errors = 0; e.disk_full_reported = false;
 }
 // Available to a parallel path of the parser: configured and not yet used.
 inline bool Available() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.configured && !e.published; }
@@ -2631,10 +2651,52 @@ inline bool Publish(const std::vector<LegacyCnEntry>& entries, std::vector<Strea
         auto f = std::make_unique<FileState>();
         const LegacyCnEntry& en = entries[i];
         f->selected = MatchesAnyPattern(en.path, e.opt->positional) && !IsExcluded(en.path, e.opt->exclude_patterns);
+        f->entry = &en;
         e.files.push_back(std::move(f));
     }
+    for (const Stream& st : e.streams)
+        for (const Slice& sl : st.slices) e.files[sl.entry]->remaining += sl.len;
     e.published = true;
     return true;
+}
+
+// Close a file that has all its bytes and give it its timestamp and attributes
+// now -- the original sets them file by file, and a later file written to the
+// same path (-sp, -forceout) must be the one whose stamp survives. With f.io
+// held, or before any writer can see the file.
+inline void CloseFileIo(FileState& f) {
+    if (f.fd < 0) return;
+#if defined(_WIN32)
+    ::_close(f.fd);
+#else
+    ::close(f.fd);
+#endif
+    f.fd = -1;
+    f.closed = true;
+    if (f.entry != nullptr) {
+        if (f.entry->has_mtime) (void)SetExtractedMtime(f.path, f.entry->mtime_unix);
+        if (f.entry->has_win_attr) SetExtractedWinAttributes(f.path, f.entry->win_attr);
+    }
+}
+
+// A write that failed. The original prints "Out of disk space!" once for a full
+// disk and goes on with the other files (measured with two outputs symlinked to
+// /dev/full: one line, and every other file written); a write failing for any
+// other reason is reported the way a file that cannot be created is. Either way
+// it counts as a failed entry. Here a failure used to be dropped in silence.
+inline void ReportWriteError(FileState& f, int err) {
+    Engine& e = E();
+    ++e.write_errors;
+    progress::Engine& pe = progress::E();
+    if (err == ENOSPC) {
+        if (e.disk_full_reported.exchange(true)) return;
+        std::lock_guard<std::mutex> plk(pe.mu);
+        ClearStatusLine(*e.os);
+        *e.os << "Out of disk space!" << '\n';
+        return;
+    }
+    std::lock_guard<std::mutex> plk(pe.mu);
+    *e.os << '\n' << "Cannot write: " << f.display << '\n';
 }
 
 // Under e.mu. Decide the file's path and, when needed, ask the overwrite
@@ -2717,29 +2779,48 @@ inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
         progress::Engine& pe = progress::E();
         std::lock_guard<std::mutex> plk(pe.mu);
         *e.os << '\n' << "Cannot write: " << f.display << '\n';
+        return;
     }
+    // Nothing to write into it (an empty entry): done already. No writer can
+    // hold f.io yet -- the file did not exist a moment ago.
+    if (f.remaining == 0u) CloseFileIo(f);
 }
 
 // Positional write, outside e.mu (per-file lock; workers of a split file share
 // the descriptor).
 inline void WriteAtImpl(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
-    if (f.fd < 0 || n == 0u) return;
+    if (n == 0u) return;
     std::lock_guard<std::mutex> lk(f.io);
+    if (f.write_failed) return;
+    if (f.fd < 0) {
+        if (!f.closed) return;            // never opened: not written, or it could not be created
+        // written whole once and closed; a rewound stream writes it again
 #if defined(_WIN32)
-    if (::_lseeki64(f.fd, static_cast<long long>(off), SEEK_SET) < 0) return;
+        f.fd = ::_wopen(f.path.wstring().c_str(), _O_WRONLY | _O_BINARY);
+#else
+        f.fd = ::open(f.path.c_str(), O_WRONLY);
+#endif
+        if (f.fd < 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
+        f.closed = false;
+    }
+    const std::size_t total = n;
+#if defined(_WIN32)
+    if (::_lseeki64(f.fd, static_cast<long long>(off), SEEK_SET) < 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
     while (n > 0u) {
         const unsigned piece = static_cast<unsigned>(std::min<std::size_t>(n, std::size_t{1} << 28));
         const int w = ::_write(f.fd, p, piece);
-        if (w <= 0) return;
+        if (w <= 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
         p += w; n -= static_cast<std::size_t>(w); 
     }
 #else
     while (n > 0u) {
         const ssize_t w = ::pwrite(f.fd, p, n, static_cast<off_t>(off));
-        if (w <= 0) return;
+        if (w <= 0) { f.write_failed = true; ReportWriteError(f, w < 0 ? errno : ENOSPC); return; }
         p += w; n -= static_cast<std::size_t>(w); off += static_cast<std::uint64_t>(w);
     }
 #endif
+    f.remaining = (total >= f.remaining) ? 0u : f.remaining - total;
+    if (f.remaining == 0u) CloseFileIo(f);
 }
 inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
     const auto w0 = std::chrono::steady_clock::now();
@@ -2753,6 +2834,25 @@ inline void MismatchLine(Engine& e, const Slice& sl, std::uint32_t got) {
     ClearStatusLine(*e.os);
     *e.os << "Checksum mismatch [" << FormatChecksum(sl.cmode, sl.cval) << ' '
           << FormatChecksum(sl.cmode, got) << "]: " << (*e.entries)[sl.entry].path << '\n';
+}
+
+// Under e.mu: an EMPTY entry the stream's cursor has passed. It is created in
+// entry order -- after the entries before it, before the ones after it -- where
+// it used to be created at StreamEnd, after everything: its O_TRUNC then wiped a
+// same-named file written meanwhile (-sp, -forceout; a -co archive of two empty
+// files and five others left `-forceout` a 0-byte file where the original leaves
+// the last entry's 2 000 000). Its checksum is judged in `x` and NOT in `t`,
+// which is what the original does with an empty file's damaged checksum.
+// Returns true, with the computed value, when it mismatches.
+inline bool EmptySliceLocked(Engine& e, Slice& sl, std::uint32_t* got, std::unique_lock<std::mutex>& lk) {
+    CreateLocked(e, sl.entry, lk);
+    if (sl.checked) return false;
+    sl.checked = true;
+    if (e.test_mode || !sl.has_cksum || e.opt->checksum == ChecksumMode::kNone) return false;
+    *got = ComputeBufferChecksum(sl.cmode, nullptr, 0u);
+    if (*got == sl.cval) return false;
+    ++e.mismatches;
+    return true;
 }
 
 // A worker starts stream k: the first file of its first group is created.
@@ -2787,6 +2887,14 @@ inline void StreamRewind(std::size_t k) {
     Stream& s = e.streams[k];
     if (e.mismatches >= s.pending_bad.size()) e.mismatches -= s.pending_bad.size();
     s.pending_bad.clear();
+    // What this stream wrote will be written again: its files owe those bytes
+    // once more (and a file that completed and closed is reopened for them).
+    for (const Slice& sl : s.slices) {
+        if (sl.len == 0u || s.flushed <= sl.spos) continue;
+        FileState& f = *e.files[sl.entry];
+        std::lock_guard<std::mutex> fl(f.io);
+        f.remaining += std::min<std::uint64_t>(s.flushed - sl.spos, sl.len);
+    }
     s.produced = 0;
     s.flushed = 0;
     s.hold.clear(); s.hold.shrink_to_fit(); s.held_base = 0;
@@ -2841,11 +2949,17 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     }
     s.produced = to;
     const std::uint64_t safe = SafeFlushPoint(e, s, to);
-    struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
-    std::vector<Piece> pieces;
+    // Each slice is created AND written before the next one is created, in entry
+    // order, as the original writes them: creating every file the range reached
+    // first and writing them all afterwards let a later O_TRUNC of the same path
+    // (-forceout, -sp) land in the middle of an earlier file's bytes.
     for (std::size_t i = 0; i < s.slices.size(); ++i) {
         Slice& sl = s.slices[i];
-        if (sl.len == 0u) continue;
+        if (sl.len == 0u) {
+            std::uint32_t got = 0;
+            if (sl.spos < safe && EmptySliceLocked(e, sl, &got, lk)) s.pending_bad.emplace_back(i, got);
+            continue;
+        }
         // Checksums follow the bytes as they pass, whatever the flush rule does
         // with them: the original checks a slice it decoded, not one it wrote.
         const std::uint64_t ca = std::max(sl.spos, from);
@@ -2856,10 +2970,13 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
         if (a < b) {
             CreateLocked(e, sl.entry, lk);
             FileState& f = *e.files[sl.entry];
-            if (f.write_it && f.fd >= 0)
-                pieces.push_back({&f, sl.file_off + (a - sl.spos),
-                                  (hold_back ? s.hold.data() : buf) + static_cast<std::size_t>(a - s.held_base),
-                                  static_cast<std::size_t>(b - a)});
+            if (f.write_it && !f.cannot_write) {
+                const unsigned char* src = (hold_back ? s.hold.data() : buf) + static_cast<std::size_t>(a - s.held_base);
+                e.committed = true;
+                lk.unlock();   // only this worker touches stream s and its hold
+                WriteAt(f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a));
+                lk.lock();
+            }
         }
         // kProduced reports a slice the moment its last byte has passed; kGroup
         // waits for StreamEnd, because a failure can still take those bytes back.
@@ -2872,10 +2989,6 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
         }
     }
     s.flushed = std::max(s.flushed, safe);
-    e.committed = e.committed || !pieces.empty();
-    lk.unlock();
-    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);
-    lk.lock();
     if (hold_back && safe > s.held_base) {
         s.hold.erase(s.hold.begin(), s.hold.begin() + static_cast<std::size_t>(safe - s.held_base));
     }
@@ -2938,9 +3051,9 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
     const bool trace = NZ_ENV("NZ_TRACE_SINK") != nullptr;
     if (trace) std::fprintf(stderr, "[sink] stream %zu produced=%llu ok=%d clean=%d flush_to=%llu code=%u\n", k,
                             (unsigned long long)produced, (int)ok, (int)clean_end, (unsigned long long)flush_to, nzr::derr::Current().code);
-    // Files the flushed bytes reach, then the group the cursor stands in.
-    struct Piece { FileState* f; std::uint64_t off; const unsigned char* p; std::size_t n; };
-    std::vector<Piece> pieces;
+    // Files the flushed bytes reach, in entry order (each created and written
+    // before the next is created, as in StreamWrite), then the group the cursor
+    // stands in.
     std::vector<std::pair<const Slice*, std::uint32_t>> bad;
     for (const auto& pb : s.pending_bad) bad.emplace_back(&s.slices[pb.first], pb.second);
     for (std::size_t si = 0; si < s.slices.size(); ++si) {
@@ -2951,14 +3064,25 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
         // that is the group in flight, which a failure cuts back to a quantum.
         const std::uint64_t a = std::max(sl.spos, s.flushed);
         const std::uint64_t b = std::min(sl.spos + sl.len, flush_to);
-        if (sl.len == 0u) continue;
+        if (sl.len == 0u) {
+            // Empty files inside the flushed range exist too.
+            std::uint32_t got = 0;
+            if (sl.spos <= flush_to && (ok || sl.spos < produced || sl.spos == 0u) &&
+                EmptySliceLocked(e, sl, &got, lk))
+                bad.emplace_back(&sl, got);
+            continue;
+        }
         if (a < b) {
             CreateLocked(e, sl.entry, lk);
             FileState& f = *e.files[sl.entry];
             const unsigned char* src = inc ? (s.hold.data() + static_cast<std::size_t>(a - s.held_base))
                                            : (buf + a);
-            if (f.write_it && f.fd >= 0)
-                pieces.push_back({&f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a)});
+            if (f.write_it && !f.cannot_write) {
+                e.committed = true;
+                lk.unlock();   // `src` may point into s.hold, which only this worker touches
+                WriteAt(f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a));
+                lk.lock();
+            }
         }
         // A stored slice is checked over whatever arrived (a cut one over 0 bytes:
         // the original prints "ffffffff" for those).
@@ -2987,14 +3111,9 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
             for (const Slice& sl : s.slices) if (sl.group == i) { CreateLocked(e, sl.entry, lk); break; }
         }
         s.entered_group = std::max(s.entered_group, g + 1u);
-        // Empty files inside the flushed range exist too.
     }
-    for (const Slice& sl : s.slices)
-        if (sl.len == 0u && sl.spos <= flush_to && (ok || sl.spos < produced || sl.spos == 0u)) CreateLocked(e, sl.entry, lk);
-    e.committed = e.committed || !pieces.empty();
     std::vector<std::pair<const Slice*, std::uint32_t>> bad_copy = bad;
     lk.unlock();
-    for (const Piece& pc : pieces) WriteAt(*pc.f, pc.off, pc.p, pc.n);   // `pieces` may point into s.hold
     for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
     if (inc) { lk.lock(); s.hold.clear(); s.hold.shrink_to_fit(); }
 }
@@ -3007,22 +3126,17 @@ inline Outcome Finish() {
     std::lock_guard<std::mutex> lk(e.mu);
     Outcome o;
     if (!e.published) return o;
+    // What is still open is what never got all its bytes (a stream that stopped
+    // part-way): close it and stamp it, as before. Files that completed were
+    // closed and stamped when their last byte went out.
     for (std::size_t i = 0; i < e.files.size(); ++i) {
         FileState& f = *e.files[i];
-        if (f.fd >= 0) {
-#if defined(_WIN32)
-            ::_close(f.fd);
-#else
-            ::close(f.fd);
-#endif
-            f.fd = -1;
-            const LegacyCnEntry& en = (*e.entries)[i];
-            if (en.has_mtime) (void)SetExtractedMtime(f.path, en.mtime_unix);
-            if (en.has_win_attr) SetExtractedWinAttributes(f.path, en.win_attr);
-        }
+        std::lock_guard<std::mutex> fl(f.io);
+        CloseFileIo(f);
     }
     o.committed = e.committed; o.stream_failed = e.stream_failed; o.plain_code = e.plain_code;
-    o.mismatches = e.mismatches; o.failed_entries = e.mismatches + e.unsafe + e.cannot;
+    o.mismatches = e.mismatches;
+    o.failed_entries = e.mismatches + e.unsafe + e.cannot + e.write_errors.load();
     e.published = false;   // one container per run
     return o;
 }
@@ -11333,6 +11447,7 @@ int RunLegacyCnExtractOrTest(
     // exactly at the start of) is the last one touched -- it is created with the
     // bytes that were completed, 0 of them included -- and nothing follows.
     bool stopped = false;
+    bool disk_full_reported = false;
     for (const LegacyCnEntry& e : legacy.entries) {
         if (stopped) break;
         bool last_partial = false;
@@ -11372,7 +11487,11 @@ int RunLegacyCnExtractOrTest(
         // is reported the way the original reports it and NOT written; the run
         // continues with the other entries and exits with status 2.
         bool checksum_bad = false;
-        if (!last_partial && e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
+        // An EMPTY entry is judged in `x` and not in `t`: with an empty file's
+        // stored checksum damaged the original prints the mismatch when it
+        // extracts and says nothing when it tests.
+        const bool judge_empty = !(test_mode && e.size == 0u);
+        if (!last_partial && judge_empty && e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
             const std::size_t idx = static_cast<std::size_t>(&e - legacy.entries.data());
             const bool known_bad = legacy.checksums_verified && idx < legacy.entry_checksum_ok.size() && !legacy.entry_checksum_ok[idx];
             if (known_bad || !legacy.checksums_verified) {
@@ -11439,13 +11558,22 @@ int RunLegacyCnExtractOrTest(
                 if (out_path.has_parent_path()) {
                     MakeDirs0700(out_path.parent_path());
                 }
+                int werr = 0;
                 if (!WriteExtractedFileRange(out_path, payload, entry_off, n,
                                         e.has_permissions ? e.permissions : 0600u,
                                         (options.restore_ownership && e.has_owner) ? static_cast<long>(e.uid) : -1L,
-                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L)) {
+                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L,
+                                        &werr)) {
                     // Measured: "Cannot write: <path>" on a fresh line, per file, and
-                    // the run goes on to the footer.
-                    os << '\n' << "Cannot write: " << (options.output_path.empty() ? safe_rel.string() : out_path.string()) << '\n';
+                    // the run goes on to the footer -- except for a full disk, which
+                    // the original reports as "Out of disk space!" on a cleared line,
+                    // ONCE however many files it hits, and then goes on too.
+                    if (werr == ENOSPC) {
+                        if (!disk_full_reported) { ClearStatusLine(os); os << "Out of disk space!" << '\n'; }
+                        disk_full_reported = true;
+                    } else {
+                        os << '\n' << "Cannot write: " << (options.output_path.empty() ? safe_rel.string() : out_path.string()) << '\n';
+                    }
                     ++failed;
                     bytes_ok += e.size;
                     progress.Advance(e.size);
