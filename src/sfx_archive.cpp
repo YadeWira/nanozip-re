@@ -1361,6 +1361,10 @@ struct LegacyCnEntry {
     bool checksum_na = false;
     std::uint32_t permissions = 0;
     bool has_permissions = false;
+    // What the original's `l` prints in the mode column, which is not always
+    // `permissions`: see ApplyLegacyAttributeRecords (quirk 76).
+    std::uint32_t listed_permissions = 0;
+    bool has_listed_permissions = false;
     // An archive made by the WINDOWS original stores file attributes (record
     // type 3) instead of POSIX modes: one nibble per entry, `8 | R | H<<1 | S<<2`
     // where 8 is the archive bit. The Linux original maps them to a mode -- 0400
@@ -3323,13 +3327,18 @@ std::uint32_t ReadU32LE(const unsigned char* p);
 // all covers exactly one value per entry.  It never guesses: on false nothing
 // is written, so callers fall back to the older per-shape heuristics and, more
 // importantly, no half-parsed checksum can be mistaken for a real one.
+// Per stream: {table start, entries named by the stream through that table}.
+using LegacyTableMarks = std::map<unsigned, std::vector<std::pair<ArcPos, std::size_t>>>;
+
 bool ApplyLegacyAttributeRecords(
     const ByteView& bytes,
     // {stream, type, begin, end} -- begin/end are FILE offsets, so ArcPos.
     const std::vector<std::array<ArcPos, 4>>& records,
     const std::map<unsigned, std::vector<std::size_t>>& stream_named,
     const std::set<std::string>& split_paths,
-    std::vector<LegacyCnEntry>* entries) {
+    std::vector<LegacyCnEntry>* entries,
+    // Where each table starts, to place a permission record in its own block.
+    const LegacyTableMarks* table_marks = nullptr) {
     if (entries == nullptr || entries->empty()) {
         return false;
     }
@@ -3339,6 +3348,7 @@ bool ApplyLegacyAttributeRecords(
     struct StreamAcc {
         std::vector<std::int64_t> mtimes;
         std::vector<std::uint32_t> perms;
+        std::vector<std::uint32_t> listed;   // the same values, NOT aligned to their blocks
         std::vector<std::uint32_t> checksums;
         std::vector<std::uint32_t> uids;
         std::vector<std::uint32_t> gids;
@@ -3411,6 +3421,29 @@ bool ApplyLegacyAttributeRecords(
             }
             case 4u: {
                 if ((rsize % 2u) != 0u) return false;
+                // The record is OMITTED for a block whose files are all 0600
+                // (the same rule as for a whole archive, applied block by
+                // block), so it covers the files of its OWN block only: the
+                // blocks before it that left theirs out are 0600. Measured on
+                // `a -cf -t1` of a 0664 file and a 0600 one, a table each: one
+                // type-4 record, and the original lists the second file 0600.
+                // Without this the record covered one entry of two, the whole
+                // record set was refused, and the heuristics that followed
+                // called an intact archive corrupt (-cf) or gave every file
+                // mode 0664 and a date in 1997 (-cd).
+                if (table_marks != nullptr) {
+                    const auto tm = table_marks->find(sid);
+                    std::size_t before = 0;   // entries named by the tables before this block's
+                    if (tm != table_marks->end()) {
+                        std::size_t through = 0;
+                        for (const auto& mark : tm->second) {
+                            if (mark.first >= rbegin) break;
+                            before = through;
+                            through = mark.second;
+                        }
+                    }
+                    if (a.perms.size() < before) a.perms.resize(before, 0600u);
+                }
                 for (ArcPos p = rbegin; p + 1u < rend; p += 2u) {
                     const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
                                             (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
@@ -3424,6 +3457,7 @@ bool ApplyLegacyAttributeRecords(
                     }
                     if (run > n - a.perms.size()) return false;
                     a.perms.insert(a.perms.end(), run, mode);
+                    a.listed.insert(a.listed.end(), std::min(run, n - std::min(n, a.listed.size())), mode);
                 }
                 break;
             }
@@ -3469,6 +3503,17 @@ bool ApplyLegacyAttributeRecords(
         }
     }
 
+    // The blocks after the last permission record left theirs out too: 0600.
+    if (table_marks != nullptr) {
+        for (auto& kv : acc) {
+            const auto named_it = stream_named.find(kv.first);
+            if (named_it == stream_named.end()) return false;
+            StreamAcc& a = kv.second;
+            if (!a.perms.empty() && a.perms.size() < named_it->second.size())
+                a.perms.resize(named_it->second.size(), 0600u);
+        }
+    }
+
     bool any = false;
     for (const auto& kv : acc) {
         const auto named_it = stream_named.find(kv.first);
@@ -3508,7 +3553,18 @@ bool ApplyLegacyAttributeRecords(
         for (std::size_t i = 0; i < named.size(); ++i) {
             LegacyCnEntry& e = (*entries)[named[i]];
             if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
-            if (!a.perms.empty()) { e.permissions = a.perms[i]; e.has_permissions = true; }
+            if (!a.perms.empty()) {
+                e.permissions = a.perms[i]; e.has_permissions = true;
+                // The original's LISTER hands the stored modes out in order,
+                // without the block alignment its extractor applies, and gives
+                // the entries left over 0600: a block that omitted its record
+                // (all 0600) shifts every later block's modes up the listing.
+                // Measured: a -cf -t1 archive whose f2.txt (0600) block omits
+                // the record lists f2.txt 0644 and f5.txt 0600 -- f5's mode,
+                // then the pad -- and still extracts f2.txt 0600, f5.txt 0644.
+                e.listed_permissions = (i < a.listed.size()) ? a.listed[i] : 0600u;
+                e.has_listed_permissions = true;
+            }
             if (!a.attrs.empty()) {
                 e.win_attr = static_cast<std::uint8_t>(a.attrs[i]);
                 e.has_win_attr = true;
@@ -5891,6 +5947,10 @@ bool TryParseLegacyCnArchive(
     // Parallel to stream_named: whether that table entry is a slice of a split
     // file (its table is followed by a type-10 offset record).
     std::map<unsigned, std::vector<bool>> stream_split;
+    // Per stream, where each of its tables starts and how many entries that
+    // stream has named once the table is read: an attribute record belongs to
+    // the block of the last table before it (see ApplyLegacyAttributeRecords).
+    LegacyTableMarks table_marks;
     for (std::size_t table_index = 0; table_index < all_tables.size(); ++table_index) {
     const auto& table_span = all_tables[table_index];
     const bool table_split = table_index < table_has_off.size() && table_has_off[table_index];
@@ -5965,6 +6025,7 @@ bool TryParseLegacyCnArchive(
         }
         return false;
     }
+    table_marks[table_stream].push_back({table_span[1], stream_named[table_stream].size()});
     }  // for each filename table
 
     if (entries.empty()) {
@@ -6204,7 +6265,14 @@ bool TryParseLegacyCnArchive(
     // compressed payload made `l` print a 0664 column the original does not.
     const bool metadata_run_parsed =
         attr_records.empty() ||
-        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries);
+        // Read as one run per stream first -- how every layout that parsed
+        // before is read, parallel containers included, where a stream's single
+        // permission record covers all its tables at once. Only when that is not
+        // consistent, read each permission record as covering its own block
+        // (the -t1 multi-block layout, where a block of all-0600 files omits it).
+        // Nothing is written on a false return, so the second try starts clean.
+        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries) ||
+        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks);
     const ArcPos run_metadata_end = first_data_record;
 
     // Some decodes run here, at parse time; the progress engine prints the
@@ -8452,7 +8520,8 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
             }
             os << attr << ' ';
 #else
-            os << std::setw(4) << std::right << FormatMode(e.permissions) << ' ';
+            os << std::setw(4) << std::right
+               << FormatMode(e.has_listed_permissions ? e.listed_permissions : e.permissions) << ' ';
 #endif
         }
         if (show_owner) {
