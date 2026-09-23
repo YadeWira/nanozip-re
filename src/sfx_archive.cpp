@@ -13995,7 +13995,8 @@ struct EncodeCodec {
     }
 };
 
-void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window, const EncodeCodec& codec) {
+void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window, const EncodeCodec& codec,
+                            bool archive_line_printed = false) {
     const unsigned host = HostThreadCount();
     unsigned threads = host;
     if (options.threads > 0u && options.threads < host) threads = options.threads;
@@ -14031,7 +14032,7 @@ void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigne
     const std::uint64_t wbuf = options.write_buffer_set ? options.write_buffer_bytes
                                                         : (auto_write_mb(options.compressor) << 20u);
     if (workers > threads) os << "Warning: number of compressors set is higher than the number of threads!\n";
-    os << "Archive: " << options.archive_path << '\n';
+    if (!archive_line_printed) os << "Archive: " << options.archive_path << '\n';
     os << "Threads: " << threads << ", memory: " << mb(options.memory_bytes) << " MB";   // the -m budget, half-up MB (-m256k prints 0)
     if (threads > 1u) {
         if (rbuf && wbuf)   os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
@@ -14596,6 +14597,36 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // input (`a -y x.nz` with no file arguments, in x.nz's directory).
     std::error_code exists_ec;
     const bool replace_existing = !simulate && fs::exists(out_path, exists_ec);
+    // Over an existing archive the original asks first, the same question `x`
+    // asks per file (quirk 3), right after the `Archive:` line (measured through a
+    // pty): the status line is cleared once, then '\r' and the question; the
+    // answer is a line whose first character must be a lowercase y, n or a
+    // (anything else, uppercase and an empty line included, asks again with just
+    // '\r' and the question); `n` prints `Cannot open archive!` and leaves the
+    // archive alone. End of input counts as No, as in `x` -- the original would
+    // ask forever there. -y skips the question.
+    bool archive_line_printed = false;
+    if (replace_existing && !options.yes_to_all) {
+        os << "Archive: " << options.archive_path << '\n';
+        archive_line_printed = true;
+        ClearStatusLine(os);
+        bool go = false, answered = false;
+        for (;;) {
+            os << '\r' << "Overwrite " << progress::Name40(options.archive_path) << " (Yes/No/Always)? ";
+            os.flush();
+            std::string answer;
+            if (!std::getline(std::cin, answer)) break;
+            answered = true;
+            const char k = answer.empty() ? '\0' : answer[0];
+            if (k == 'y' || k == 'a') { go = true; break; }
+            if (k == 'n') break;
+        }
+        if (!go) {
+            if (!answered) os << '\n';
+            os << "Cannot open archive!\n";
+            return 1;
+        }
+    }
     const fs::path write_path = replace_existing ? fs::path(out_path.native() + fs::path(".nzre-part").native())
                                                  : out_path;
     std::ofstream file_out;
@@ -14676,7 +14707,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     };
     EncodeCodec header_codec; header_codec.p0 = p0; header_codec.co_block = co_block;
     header_codec.cm_a_bits = cm_a_bits; header_codec.cm_b_bits = cm_b_bits;
-    PrintStoreEncodeHeader(os, options, workers, window, header_codec);
+    PrintStoreEncodeHeader(os, options, workers, window, header_codec, archive_line_printed);
     // one codec state per worker stream (the original's workers own their windows)
     std::vector<EncodeCodec> codecs(workers);
     for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block;
