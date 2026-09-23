@@ -11358,13 +11358,12 @@ int RunLegacyCnExtractOrTest(
 
         // The original decodes the whole stream whatever the file filter says, so
         // its progress display and the "Decompressed N bytes" footer cover EVERY
-        // entry; the filter only decides what gets written and checked.
+        // entry -- and it CHECKS every entry too: the filter only decides what
+        // gets written. Measured: `x bad.nz a.txt`, with b.txt's stored checksum
+        // damaged, writes a.txt alone and still prints b.txt's mismatch line, and
+        // so does a filter naming only an entry after it. (The streaming sink,
+        // psink, already judged unselected entries; this loop skipped them.)
         progress.Begin(e.path);
-        if (!selected) {
-            bytes_ok += e.size;
-            progress.Advance(e.size);
-            continue;
-        }
 
         // Measured: "Checksum mismatch [<stored> <computed>]: <path>" on its own
         // cleared line, then the run CONTINUES (the file is still written, the
@@ -11386,15 +11385,13 @@ int RunLegacyCnExtractOrTest(
                 }
             }
         }
-        if (checksum_bad) {
-            ++failed;
-            if (SafeMode()) {
-                bytes_ok += e.size;
-                progress.Advance(e.size);
-                continue;
-            }
-            // Default: the original writes the file anyway -- so do we.
+        if (checksum_bad) ++failed;
+        if (!selected || (checksum_bad && SafeMode())) {
+            bytes_ok += e.size;
+            progress.Advance(e.size);
+            continue;
         }
+        // Default: a mismatching entry is written anyway, as the original does.
         StageMark("entry checksum");
 
         if (!test_mode) {
