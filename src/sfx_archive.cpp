@@ -14061,39 +14061,50 @@ void PrintStoreEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint6
     os << '\n';
 }
 
+// A worker stream's header: the checksum-kind record, then the codec record.
+// Its length depends on the codec: two bytes (p0, the window's byte-float) for
+// store/lzpf/lzhd, a third for the optimum family (the block size's byte-float)
+// and a fourth for -cc (its two hash widths). The last worker's header is
+// written ahead of every other stream in a parallel container, and writing it
+// with the two-byte form made every `-co`/`-cO`/`-cc` parallel archive
+// unreadable -- including the default `a` of a large file, which the thread
+// count alone turns into one.
+static void LegacyWriteStreamHeader(std::vector<unsigned char>& out, unsigned stream, std::uint64_t window,
+                                    ChecksumMode ckmode, const EncodeCodec& codec) {
+    std::vector<unsigned char> hdr;
+    if (ckmode != ChecksumMode::kNone) {
+        const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
+    }
+    const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
+    if (codec.p0 == 7u) {
+        // -cc adds a FOURTH byte: the two hash-table widths, packed as
+        // (a - 20) << 4 | (b - 18).
+        const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+        const unsigned char cd = static_cast<unsigned char>(((codec.cm_a_bits - 20) << 4) |
+                                                            (codec.cm_b_bits - 18));
+        const unsigned char rec[4] = {7u, static_cast<unsigned char>(p1),
+                                      static_cast<unsigned char>(p2), cd};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 4u); hdr.insert(hdr.end(), rec, rec + 4);
+    } else if (codec.p0 >= 5u) {
+        // the optimum family adds the block-size byte-float as a third byte
+        const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+        const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
+                                      static_cast<unsigned char>(p1),
+                                      static_cast<unsigned char>(p2)};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 3u); hdr.insert(hdr.end(), rec, rec + 3);
+    } else {
+        const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
+    }
+    out.insert(out.end(), hdr.begin(), hdr.end());
+}
+
 bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
                             const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
                             std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
                             bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec) {
-    if (with_header) {
-        std::vector<unsigned char> hdr;
-        if (ckmode != ChecksumMode::kNone) {
-            const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
-            WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
-        }
-        const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
-        if (codec.p0 == 7u) {
-            // -cc adds a FOURTH byte: the two hash-table widths, packed as
-            // (a - 20) << 4 | (b - 18).
-            const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
-            const unsigned char cd = static_cast<unsigned char>(((codec.cm_a_bits - 20) << 4) |
-                                                                (codec.cm_b_bits - 18));
-            const unsigned char rec[4] = {7u, static_cast<unsigned char>(p1),
-                                          static_cast<unsigned char>(p2), cd};
-            WriteLegacyRecordHeader(&hdr, 11u, stream, 4u); hdr.insert(hdr.end(), rec, rec + 4);
-        } else if (codec.p0 >= 5u) {
-            // the optimum family adds the block-size byte-float as a third byte
-            const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
-            const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
-                                          static_cast<unsigned char>(p1),
-                                          static_cast<unsigned char>(p2)};
-            WriteLegacyRecordHeader(&hdr, 11u, stream, 3u); hdr.insert(hdr.end(), rec, rec + 3);
-        } else {
-        const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
-        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
-        }
-        out.insert(out.end(), hdr.begin(), hdr.end());
-    }
+    if (with_header) LegacyWriteStreamHeader(out, stream, window, ckmode, codec);
     if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
     if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
     if (codec.p0 == 5u && !codec.co) {
@@ -14430,12 +14441,18 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     // worker whose range is empty writes its kind+codec records and nothing
     // else (measured: `-p3 -t1 tiny` -> s2 header, s1 header, s2 body, s0 header).
     unsigned workers = (options.workers > 1u) ? options.workers : 1u;
-    // The automatic split (FUN_0804f360): the store never splits; a compressing
-    // codec with 8 MB or more of input gets one worker per thread (T = min(-t,
-    // host)), or, when 90 % or more of the bytes are "media" by extension (aif,
-    // bmp, pgm, pnm, ppm, tga, tif, wav -- FUN_0804de80) and no other file is
-    // bigger than a tenth of the total, min(files, T).
-    if (options.workers == 0u && p0 != 0u && total >= 0x800000ull) {
+    // The automatic split (FUN_0804f360), from 8 MB of input: when 90 % or more
+    // of the bytes are "media" by extension (aif, bmp, pgm, pnm, ppm, tga, tif,
+    // wav -- FUN_0804de80) and no other file is bigger than a tenth of the total,
+    // min(files, T) workers (T = min(-t, host)), whatever the method, the store
+    // included (measured: three 3 MB .bmp files, `a -cn` -> 3 workers). Otherwise
+    // it switches on the method, through the tables FUN_080ad340 fills it from
+    // (0x8132f40: method, 0x8132f80: the p/P variant): -cf, -cF, -co and plain
+    // -cd/-cD get T workers; -cn, -cO, -cc and -cdp/-cdP/-cDp/-cDP keep ONE
+    // (measured, 20 MB, 16 threads: -cO one nz_optimum2 [160 MB], -cc one nz_cm
+    // [441 MB]). Splitting -cO and -cc anyway wrote sixteen small compressors
+    // where the original writes one.
+    if (options.workers == 0u && total >= 0x800000ull) {
         const unsigned host = HostThreadCount();
         unsigned threads = host;
         if (options.threads > 0u && options.threads < host) threads = options.threads;
@@ -14454,7 +14471,11 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             else { if (rest10 < e.size) { big_other = true; break; } rest10 -= e.size; }
         }
         const bool media_heavy = !big_other && (media * 100u / (total + 1u) >= 90u);
-        workers = media_heavy ? static_cast<unsigned>(std::min<std::uint64_t>(sources.size(), threads)) : threads;
+        const Compressor c = options.compressor;
+        const bool splits = c == Compressor::kLzpf || c == Compressor::kLzpfLarge || c == Compressor::kLzhd ||
+                            c == Compressor::kLzhds || c == Compressor::kOptimum1;
+        workers = media_heavy ? static_cast<unsigned>(std::min<std::uint64_t>(sources.size(), threads))
+                              : (splits ? threads : 1u);
         if (workers == 0u) workers = 1u;
     }
     const std::uint64_t per = total / workers;
@@ -14666,13 +14687,7 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms, codecs[workers - 1u])) return decline();
             // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
             std::vector<unsigned char> hdr_only;
-            if (ckmode != ChecksumMode::kNone) {
-                const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
-                WriteLegacyRecordHeader(&hdr_only, kind_type, workers - 1u, 0u);
-            }
-            const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);
-            const unsigned char codec_rec[2] = {static_cast<unsigned char>(p0), static_cast<unsigned char>(p1)};
-            WriteLegacyRecordHeader(&hdr_only, 11u, workers - 1u, 2u); hdr_only.insert(hdr_only.end(), codec_rec, codec_rec + 2);
+            LegacyWriteStreamHeader(hdr_only, workers - 1u, window, ckmode, codecs[workers - 1u]);
             timed_write(hdr_only);
         }
         for (unsigned k = 1u; k < workers; ++k) {
