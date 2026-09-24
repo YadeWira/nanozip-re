@@ -27,9 +27,10 @@ every difference is a bug on this side. The defects are catalogued in
 (2026-09-24) is that all of them are reproduced; fixes belong to a future separate project. The decode
 phase closed with v0.9.9-pre;
 every release stays a pre-release until the encoder is complete too. Meanwhile the only escape hatches are environment
-variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few departures still in the code (a
-path-traversal guard, no crash on an archive of empty files, no infinite prompt on a closed stdin)
-are marked `[pending]` in the catalogue.
+variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches. Three harmful defects are the permanent exceptions: the extractor never writes
+outside the directory it extracts into (the original follows `../` in a stored name, quirk 29), an
+archive of only empty files extracts instead of crashing (quirk 28), and the overwrite question
+takes the end of input as No instead of asking forever (quirk 3).
 
 ## Status
 
