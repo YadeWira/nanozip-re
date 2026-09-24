@@ -116,15 +116,22 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   could not DECODE some original `-co` archives: a stored block that reaches the end of the window's
   ring, whose 32 KB pieces do not happen to end where the port's window feed left the cursor, followed
   by an LZ block (`tests/encode/stored_lz_block.sh`).
-- **Declines.** A block `a` cannot write is declined in one line and no archive is left behind; an
-  existing archive of the same name is left as it was (before v0.17.1-pre it was truncated first, and
-  a decline deleted it). Every coded
-  `-co`/`-cO` LZ or BWT block is decoded back and compared before it is committed (a stored block is
-  copied raw) (the LZ payload
-  through a second engine, the BWT payload through the bucket decoder), which the original does not do;
-  that is about 10 % of a `-co` image encode. The check reads the block, not the file table, so it
-  missed the multi-file table defect fixed in v0.17.0-pre (e7c8973) and the parallel-container header
-  fixed in v0.17.1-pre. Image and audio blocks, and the `-cc`, lzpf and lzhd writers, are not read back.
+- **Declines and the self-check.** A block `a` cannot write is declined in one line and no archive is
+  left behind; an existing archive of the same name is left as it was (before v0.17.1-pre it was
+  truncated first, and a decline deleted it). Every coded `-co`/`-cO` LZ or BWT block is decoded back
+  and compared before it is committed (the LZ payload through a second engine, the BWT payload through
+  the bucket decoder). Since 2026-09-24 (after v0.17.3-pre) `a` and `w32c` also decode the WHOLE archive
+  they have just written, in-process, before it takes its name, and compare every entry with what was
+  read from disk: the same names, the same sizes, the same CRC-64 of the content. That covers what the
+  per-block check could not see -- the multi-file table defect fixed in v0.17.0-pre (e7c8973) and the
+  worker header fixed in v0.17.1-pre both went out as archives nothing could read. On success it prints
+  nothing and the footer's time is still the compression's; on failure it prints `Self-check failed:
+  the archive does not read back (...); no archive was created.` and writes nothing (an archive it was
+  replacing stays as it was); when the archive cannot be read back here at all (not enough memory), it
+  is kept and a `Note:` line says it was not checked. The original does no such check. It costs a
+  decode: on 12 MB of real files at `-t1`, `-cn` +14 %, `-cf` +59 %, `-cF` +100 %, `-cd` +34 %, `-cD`
+  +17 %, `-co` +17 %, `-cO` +21 %, `-cc` +92 % (the CM decodes as slowly as it encodes);
+  `NZ_NO_SELFCHECK=1` turns it off. `s` writes nothing, so it has nothing to check.
 - **Threads.** `-t` above 1 still compresses on one thread (stated at v0.10.0-pre and v0.11.0-pre), and `a` lays the
   archive out the `-t1` way at every thread count. From 8 MB of input it splits into worker streams by
   the original's rule (since v0.17.1-pre: `-cn`, `-cO` and `-cc` keep one compressor unless the input is
@@ -167,6 +174,9 @@ of the `nz-re` binary; the stub is not included here. Before v0.13.0-pre the bin
 | `NZ_STRICT_EXIT=1` | distinct exit codes for damage and usage errors |
 | `NZ_THREADS=n` | decode thread count (default: `-t<n>`, else the CPU count) |
 | `NZ_TRACE_CONSTRUCTS=1` | print each format construct met, once (`[construct] k=v` on stderr) |
+| `NZ_NO_SELFCHECK=1` | `a`/`w32c`: skip the whole-archive self-check |
+| `NZ_TRACE_SELFCHECK=1` | `a`/`w32c`: one `[selfcheck]` line on stderr with the verdict, entries, bytes and time |
+| `NZ_SELFCHECK_FAULT=flip\|trunc\|name\|hdr` | tests only: damage the archive `a` writes (a byte, the last byte, a stored name, a `-pN` worker header) so the self-check can be shown to catch it |
 
 ## Build
 

@@ -51,6 +51,7 @@
 #include <map>
 #include <numeric>
 #include <sstream>
+#include "nz_selfcheck.h"
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1818,6 +1819,22 @@ std::uint32_t ChecksumRange(ChecksumMode mode, const ByteView& src, ArcPos off, 
     return cs.Finish();
 }
 
+// The self-check's CRC-64 of [off, off+len) of a payload view; *whole = false
+// when part of the range is not there.
+std::uint64_t SelfCheckCrcRange(const ByteView& src, ArcPos off, ArcPos len, bool* whole) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+    nzr::selfcheck::Crc64 c;
+    *whole = true;
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) { *whole = false; break; }
+        c.Update(q, static_cast<std::size_t>(take));
+        done += take;
+    }
+    return c.Final();
+}
+
 // A range in splice space. Inside one record it is the file's own bytes; across
 // a record boundary it has to be gathered, so a small per-thread scratch holds
 // it -- two slots, for the same reason a thread keeps several windows.
@@ -2545,6 +2562,10 @@ struct Stream {
     std::vector<unsigned char> hold;
     std::uint64_t held_base = 0;                // hold covers [held_base, produced)
     std::vector<ChecksumStream> sck;            // one per slice, fed as bytes pass
+    // The self-check's CRC-64 per slice (fed with sck, only while a check runs)
+    // and, once the stream has ended, what it decoded per slice.
+    std::vector<nzr::selfcheck::Crc64> sdig;
+    std::vector<nzr::selfcheck::Item> dig_items;
     std::vector<std::pair<std::size_t, std::uint32_t>> pending_bad;  // slice index, computed value
 };
 enum class Policy { kProduced, kGroup, kStore };
@@ -2607,10 +2628,12 @@ struct Engine {
 inline Engine& E() { static Engine e; return e; }
 inline void MarkTruncated() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); e.truncated = true; }
 
-inline void Configure(const CliOptions& opt, bool test_mode, std::ostream& os, const fs::path& root) {
+// `force`: available even under NZ_SAFE. The self-check writes nothing, so safe
+// mode's reason to buffer (never write unverified bytes) does not apply to it.
+inline void Configure(const CliOptions& opt, bool test_mode, std::ostream& os, const fs::path& root, bool force = false) {
     Engine& e = E();
     std::lock_guard<std::mutex> lk(e.mu);
-    e.configured = !SafeMode();
+    e.configured = force || !SafeMode();
     e.published = e.committed = e.stream_failed = e.plain_code = e.truncated = false;
     e.opt = &opt; e.test_mode = test_mode; e.os = &os; e.root = root;
     e.entries = nullptr; e.streams.clear(); e.files.clear();
@@ -2903,6 +2926,7 @@ inline void StreamRewind(std::size_t k) {
     s.flushed = 0;
     s.hold.clear(); s.hold.shrink_to_fit(); s.held_base = 0;
     s.sck.clear();
+    s.sdig.clear(); s.dig_items.clear();
     for (Slice& sl : s.slices) sl.checked = false;
 }
 
@@ -2939,6 +2963,8 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
         s.sck.resize(s.slices.size());
         for (std::size_t i = 0; i < s.slices.size(); ++i) s.sck[i].Reset(s.slices[i].cmode);
     }
+    const bool digest = nzr::selfcheck::Recorder::Get().Active();
+    if (digest && s.sdig.size() != s.slices.size()) s.sdig.assign(s.slices.size(), nzr::selfcheck::Crc64());
     const std::uint64_t from = s.produced;
     std::uint64_t to = from + n;
     if (to > s.total) to = s.total;               // the caller overran its declared size
@@ -2969,6 +2995,7 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
         const std::uint64_t ca = std::max(sl.spos, from);
         const std::uint64_t cb = std::min(sl.spos + sl.len, to);
         if (ca < cb) s.sck[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+        if (digest && ca < cb) s.sdig[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
         const std::uint64_t a = std::max(sl.spos, s.held_base);
         const std::uint64_t b = std::min(sl.spos + sl.len, safe);
         if (a < b) {
@@ -3116,6 +3143,22 @@ inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t pro
         }
         s.entered_group = std::max(s.entered_group, g + 1u);
     }
+    // The self-check: what each slice decoded to. Rebuilt on every end of the
+    // stream (a stream can be rewound and decoded again), harvested by Finish.
+    if (nzr::selfcheck::Recorder::Get().Active()) {
+        s.dig_items.clear();
+        const std::uint64_t have = (e.policy == Policy::kStore) ? received : produced;
+        for (std::size_t si = 0; si < s.slices.size(); ++si) {
+            const Slice& sl = s.slices[si];
+            const std::uint64_t avail = (have > sl.spos) ? std::min<std::uint64_t>(sl.len, have - sl.spos) : 0u;
+            std::uint64_t crc = nzr::selfcheck::Crc64::Empty();
+            if (sl.len != 0u) {
+                if (inc) crc = (si < s.sdig.size()) ? s.sdig[si].Final() : nzr::selfcheck::Crc64::Empty();
+                else if (buf != nullptr && avail != 0u) crc = nzr::selfcheck::Crc64::Of(buf + sl.spos, static_cast<std::size_t>(avail));
+            }
+            s.dig_items.push_back({(*e.entries)[sl.entry].path, sl.file_off, sl.len, crc, ok && avail == sl.len});
+        }
+    }
     std::vector<std::pair<const Slice*, std::uint32_t>> bad_copy = bad;
     lk.unlock();
     for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
@@ -3140,6 +3183,9 @@ inline Outcome Finish() {
     }
     o.committed = e.committed; o.stream_failed = e.stream_failed; o.plain_code = e.plain_code;
     o.mismatches = e.mismatches;
+    if (nzr::selfcheck::Recorder::Get().Active())
+        for (const Stream& st : e.streams)
+            for (const nzr::selfcheck::Item& it : st.dig_items) nzr::selfcheck::Recorder::Get().Add(it);
     o.failed_entries = e.mismatches + e.unsafe + e.cannot + e.write_errors.load();
     e.published = false;   // one container per run
     return o;
@@ -4997,7 +5043,9 @@ bool DecodeLzpfMember(
         // The old guesses stay as a fallback for a shape the derived value might
         // not cover -- but only where a checksum can adjudicate between them,
         // which is exactly where they were safe before.
-        if (!derived_cap_only) {
+        // Not during the self-check: the original's reader has no such guesses,
+        // so an archive only they could read is not one it can read.
+        if (!derived_cap_only && !nzr::selfcheck::Recorder::Get().Strict()) {
             const std::size_t t = static_cast<std::size_t>(total);
             const std::size_t u64 = t / 0x10000u;
             const std::size_t u128 = t / 0x20000u;
@@ -11713,6 +11761,11 @@ int RunLegacyCnExtractOrTest(
                               !IsExcluded(e.path, options.exclude_patterns);
         const ArcPos entry_off = cursor;
         cursor += n;
+        if (nzr::selfcheck::Recorder::Get().Active()) {
+            bool whole = true;
+            const std::uint64_t crc = SelfCheckCrcRange(payload, entry_off, n, &whole);
+            nzr::selfcheck::Recorder::Get().Add({e.path, 0u, n, crc, whole && !last_partial && n == e.size});
+        }
 
         // The original decodes the whole stream whatever the file filter says, so
         // its progress display and the "Decompressed N bytes" footer cover EVERY
@@ -14011,6 +14064,9 @@ struct EncodeCodec {
     // the recognised header says the audio ends. A span in progress is what
     // decides mode2_type and whether the model is reset before coding.
     CoAudioState audio;
+    // What this stream actually read, piece by piece (stored name, offset in the
+    // file, length, CRC-64), for the whole-archive self-check after `a`.
+    std::vector<nzr::selfcheck::Item> expected;
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
              : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
@@ -14195,14 +14251,22 @@ static void LegacyWriteStreamHeader(std::vector<unsigned char>& out, unsigned st
                                                             (codec.cm_b_bits - 18));
         const unsigned char rec[4] = {7u, static_cast<unsigned char>(p1),
                                       static_cast<unsigned char>(p2), cd};
-        WriteLegacyRecordHeader(&hdr, 11u, stream, 4u); hdr.insert(hdr.end(), rec, rec + 4);
+        // NZ_SELFCHECK_FAULT=hdr: the -cc form of quirk 77's short header, two bytes short.
+        const char* const fault = NZ_ENV("NZ_SELFCHECK_FAULT");
+        const bool short_hdr = stream != 0u && fault != nullptr && std::strcmp(fault, "hdr") == 0;
+        WriteLegacyRecordHeader(&hdr, 11u, stream, short_hdr ? 2u : 4u); hdr.insert(hdr.end(), rec, rec + (short_hdr ? 2 : 4));
     } else if (codec.p0 >= 5u) {
         // the optimum family adds the block-size byte-float as a third byte
         const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
         const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
                                       static_cast<unsigned char>(p1),
                                       static_cast<unsigned char>(p2)};
-        WriteLegacyRecordHeader(&hdr, 11u, stream, 3u); hdr.insert(hdr.end(), rec, rec + 3);
+        // NZ_SELFCHECK_FAULT=hdr (tests only): a worker header one byte short, the
+        // defect v0.15.0-pre to v0.17.0-pre wrote (quirk 77), for the self-check
+        // test to prove it is caught.
+        const char* const fault = NZ_ENV("NZ_SELFCHECK_FAULT");
+        const bool short_hdr = stream != 0u && fault != nullptr && std::strcmp(fault, "hdr") == 0;
+        WriteLegacyRecordHeader(&hdr, 11u, stream, short_hdr ? 2u : 3u); hdr.insert(hdr.end(), rec, rec + (short_hdr ? 2 : 3));
     } else {
         const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
         WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
@@ -14279,6 +14343,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     std::uint64_t total = 0;   // the bytes this stream stores
     for (std::size_t k = 0; k < pieces.size(); ++k) { piece_pos[k] = total; total += pieces[k].len; }
     std::vector<std::uint32_t> piece_ck(pieces.size(), 0u);
+    // The self-check's view of the same bytes: a CRC-64 per piece, independent
+    // of the archive's own checksum mode (which may be none, or 16 bits).
+    std::vector<std::uint64_t> piece_crc(pieces.size(), nzr::selfcheck::Crc64::Empty());
+    nzr::selfcheck::Crc64 pcrc;
     // "started" / "finished" are decided in READING order but emitted in list
     // order; the original's list is what its emitters walk, so mark per piece.
     std::vector<bool> announced(pieces.size(), false), summed(pieces.size(), false);
@@ -14415,6 +14483,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             if (cur_off == 0u) {
                 in.close(); in.clear(); in.open(e.fs_path, std::ios::binary); in.seekg(static_cast<std::streamoff>(pc.file_off));
                 ck = LegacyFileChecksum(ckmode);
+                pcrc = nzr::selfcheck::Crc64();
                 status.FileStart(os, e.display);
             }
             const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
@@ -14423,9 +14492,14 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             *read_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_read).count());
             if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << e.fs_path.string() << '\n'; return false; }
             ck.Update(iobuf.data(), n);
+            pcrc.Update(iobuf.data(), n);
             block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
             cur_off += n;
-            if (cur_off == pc.len) { piece_ck[piece_of[cur_met]] = ck.Final(); ++cur_met; cur_off = 0; }
+            if (cur_off == pc.len) {
+                piece_ck[piece_of[cur_met]] = ck.Final();
+                piece_crc[piece_of[cur_met]] = pcrc.Final();
+                ++cur_met; cur_off = 0;
+            }
             if (ghost_budget != 0u) { ghost_budget -= n; if (ghost_budget == 0u) budget_end = true; }
         }
         budget_end = false;
@@ -14531,6 +14605,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, 0u);
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
+    for (std::size_t k = 0; k < pieces.size(); ++k)
+        codec.expected.push_back({src[pieces[k].src].archive_name, pieces[k].file_off, pieces[k].len, piece_crc[k], true});
     return true;
 }
 
@@ -14540,6 +14616,135 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
 // not yet written, then its body), then worker 0. Other thread counts make the
 // original's interleaving scheduler-dependent (measured: three runs, three
 // different archives), so this order is what we always write.
+// The whole-archive self-check `a` runs on what it has just written, before the
+// archive takes its name. The per-block read-back of -co/-cO proves each block
+// decodes, but never saw the container: a table that re-announced a file
+// (v0.15.2-pre to v0.16.0-pre) and a worker header one byte short (v0.15.0-pre
+// to v0.17.0-pre, quirk 77) both went out as archives nothing could read. So the
+// file is decoded here as `t` would decode it, quietly and strictly, and what
+// every entry decoded to is compared with what was read from disk: the same
+// names, the same sizes, the same CRC-64 of the content. The archive's own
+// checksums are not the reference -- they come from the same read, and under -hn
+// there are none.
+struct SelfCheckOutcome {
+    enum Verdict { kOk, kFailed, kSkipped } verdict = kOk;
+    std::string reason;
+    std::size_t entries = 0;
+    std::uint64_t bytes = 0;
+};
+
+static SelfCheckOutcome SelfCheckWrittenArchive(const fs::path& path, const CliOptions& add_options,
+                                                const std::vector<nzr::selfcheck::Item>& expected) {
+    SelfCheckOutcome out;
+    struct NullBuf : std::streambuf {
+        int overflow(int c) override { return c == EOF ? 0 : c; }
+        std::streamsize xsputn(const char*, std::streamsize n) override { return n; }
+    } null_buf;
+    std::ostream quiet(&null_buf);
+    // A fresh set of options: `a`'s own would filter entries by its file
+    // arguments and -x patterns, and switch the checksums off under -hn.
+    CliOptions o;
+    o.command = Command::kTest;
+    o.archive_path = NativeBytesFromPath(path);
+    o.no_filename_ext = true;
+    o.threads = add_options.threads;
+    o.memory_bytes = add_options.memory_bytes;
+    nzr::selfcheck::Recorder& rec = nzr::selfcheck::Recorder::Get();
+    struct RecStop { nzr::selfcheck::Recorder& r; ~RecStop() { if (r.Active()) (void)r.Stop(); } } rec_stop{rec};
+    std::vector<nzr::selfcheck::Item> got;
+    std::map<std::string, std::uint64_t> entry_bytes;
+    int rc = 0;
+    std::uint32_t code = 0;
+    std::string err;
+    try {
+        // Leftovers of the encode on this thread must not decide the verdict.
+        nzr::derr::Clear();
+        nzr::cd::NzCdExeFilterReset();
+        LegacyCnContext ctx;   // holds the mapping: gone before the file is renamed
+        psink::Configure(o, /*test_mode=*/true, quiet, fs::path("."), /*force=*/true);
+        struct SinkEnd { ~SinkEnd() { psink::Reset(); } } sink_end;
+        rec.Start();
+        if (!TryParseLegacyCnArchive(o.archive_path, &ctx, &err)) {
+            (void)rec.Stop();
+            out.verdict = (err == "Out of memory!") ? SelfCheckOutcome::kSkipped : SelfCheckOutcome::kFailed;
+            out.reason = (out.verdict == SelfCheckOutcome::kSkipped) ? std::string("not enough memory to read it back")
+                                                                      : "it does not open (" + err + ")";
+            return out;
+        }
+        rc = RunLegacyCnExtractOrTest(o, ctx, /*test_mode=*/true, quiet, std::chrono::steady_clock::now());
+        code = nzr::derr::Current().code;
+        for (const LegacyCnEntry& e : ctx.entries) { entry_bytes[e.path] += e.size; ++out.entries; out.bytes += e.size; }
+        got = rec.Stop();
+    } catch (const std::bad_alloc&) {
+        out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out;
+    } catch (const std::length_error&) {
+        out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out;
+    } catch (const std::exception& ex) {
+        out.verdict = SelfCheckOutcome::kFailed; out.reason = std::string("the reader failed: ") + ex.what(); return out;
+    }
+    nzr::derr::Clear();
+    const auto fail = [&](std::string why) { out.verdict = SelfCheckOutcome::kFailed; out.reason = std::move(why); return out; };
+    if (rc == kLegacyNeedCompat || rc != 0) {
+        return fail(code != 0u ? "it does not decode (code " + std::to_string(code) + ")" : std::string("it does not decode"));
+    }
+    for (const nzr::selfcheck::Item& it : got)
+        if (!it.complete) return fail("an entry decodes short: " + it.name);
+    // The entry list: the same names, each with as many bytes as were read.
+    std::map<std::string, std::uint64_t> want_bytes;
+    for (const nzr::selfcheck::Item& it : expected) want_bytes[it.name] += it.len;
+    for (const auto& kv : want_bytes) {
+        const auto g = entry_bytes.find(kv.first);
+        if (g == entry_bytes.end()) return fail("an entry is missing: " + kv.first);
+        if (g->second != kv.second) return fail("an entry has the wrong size: " + kv.first);
+    }
+    for (const auto& kv : entry_bytes)
+        if (want_bytes.find(kv.first) == want_bytes.end()) return fail("an entry was not in the input: " + kv.first);
+    // The content, name by name.
+    const auto want_runs = nzr::selfcheck::Runs(expected);
+    const auto got_runs = nzr::selfcheck::Runs(got);
+    for (const auto& kv : want_runs) {
+        const auto g = got_runs.find(kv.first);
+        if (g == got_runs.end() || g->second != kv.second) return fail("an entry decodes to other bytes: " + kv.first);
+    }
+    if (got_runs.size() != want_runs.size()) return fail("the decoded entries do not match the input");
+    return out;
+}
+
+// NZ_SELFCHECK_FAULT (tests only): damage the finished archive before the check,
+// so the test can prove the check catches it. flip: one byte two thirds in;
+// trunc: the last byte cut; name: one character of the first stored name.
+static void SelfCheckInjectFault(const fs::path& path, const std::vector<nzr::selfcheck::Item>& expected) {
+    const char* const kind = NZ_ENV("NZ_SELFCHECK_FAULT");
+    if (kind == nullptr) return;
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(path, ec);
+    if (ec || size < 32u) return;
+    const std::string k(kind);
+    if (k == "trunc") { fs::resize_file(path, size - 1u, ec); return; }
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) return;
+    std::uintmax_t at = 0;
+    if (k == "flip") {
+        at = size - size / 3u;
+    } else if (k == "name" && !expected.empty() && !expected.front().name.empty()) {
+        std::vector<char> all(static_cast<std::size_t>(size));
+        f.read(all.data(), static_cast<std::streamsize>(size));
+        const std::string& nm = expected.front().name;
+        const auto it = std::search(all.begin(), all.end(), nm.begin(), nm.end());
+        if (it == all.end()) return;
+        at = static_cast<std::uintmax_t>(it - all.begin()) + nm.size() - 1u;
+        f.clear();
+    } else {
+        return;
+    }
+    f.seekg(static_cast<std::streamoff>(at));
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(c ^ 0x01);
+    f.seekp(static_cast<std::streamoff>(at));
+    f.write(&c, 1);
+}
+
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
                          const std::chrono::steady_clock::time_point& add_start, unsigned p0) {
     // Ghosts count here (the split and the window are sized before anything is
@@ -14869,9 +15074,48 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     if (!out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
     const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
     out.flush();
-    if (replace_existing) {
+    // The footer reports the compression, as the original's does, so its time is
+    // taken before the self-check.
+    const std::uint64_t total_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - add_start).count());
+    SelfCheckOutcome check;
+    if (!simulate) {
         file_out.close();
         if (!file_out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
+        // The engines are done; their memory goes back before the archive is read
+        // (the -cc model alone is the size of the decoder's).
+        std::vector<nzr::selfcheck::Item> expected;
+        for (EncodeCodec& c : codecs) {
+            expected.insert(expected.end(), std::make_move_iterator(c.expected.begin()),
+                            std::make_move_iterator(c.expected.end()));
+            if (c.cc != nullptr) { NzCmDestroy(c.cc); c.cc = nullptr; }
+        }
+        codecs.clear();
+        codecs.shrink_to_fit();
+        // Tests only: the damage is done with the check off too, so a test can
+        // prove the archive really is broken before counting the check's verdict.
+        SelfCheckInjectFault(write_path, expected);
+        // NZ_NO_SELFCHECK=1 skips it (timings against the original, for one).
+        if (NZ_ENV("NZ_NO_SELFCHECK") == nullptr) {
+            const auto t0 = std::chrono::steady_clock::now();
+            check = SelfCheckWrittenArchive(write_path, options, expected);
+            if (NZ_ENV("NZ_TRACE_SELFCHECK")) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "[selfcheck] %s entries=%zu bytes=%llu items=%zu ms=%lld%s%s\n",
+                             check.verdict == SelfCheckOutcome::kOk ? "ok" : check.verdict == SelfCheckOutcome::kFailed ? "FAILED" : "skipped",
+                             check.entries, static_cast<unsigned long long>(check.bytes), expected.size(),
+                             static_cast<long long>(ms), check.reason.empty() ? "" : ": ", check.reason.c_str());
+            }
+            if (check.verdict == SelfCheckOutcome::kFailed) {
+                // What this port wrote does not read back: nothing is left behind
+                // (an archive it was replacing stays as it was).
+                discard_output();
+                ClearStatusLine(os);
+                os << "Self-check failed: the archive does not read back (" << check.reason << "); no archive was created.\n";
+                return 1;
+            }
+        }
+    }
+    if (replace_existing) {
         std::error_code ec;
         fs::rename(write_path, out_path, ec);
         if (ec) {   // a rename that will not replace an existing file (some Windows runtimes)
@@ -14885,8 +15129,11 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             return 1;
         }
     }
-    const std::uint64_t total_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - add_start).count());
     PrintStoreEncodeFooter(os, stored, produced, total_ms, read_ms, write_ms, options.verbose);
+    // Too big to read back here (a 32-bit build's address space, for one): the
+    // archive is kept, and the reader is told it was not checked.
+    if (check.verdict == SelfCheckOutcome::kSkipped)
+        os << "Note: the archive was not checked (" << check.reason << ").\n";
     return 0;
 }
 
