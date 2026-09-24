@@ -13,14 +13,6 @@ transforms and an x86 filter. Only stripped Linux and Windows binaries of the la
 
 📖 **[Wiki](https://github.com/YadeWira/nanozip-re/wiki)** · 📋 **[Original quirks catalogue](docs/ORIGINAL_QUIRKS.md)** · ⬇️ **[Releases](https://github.com/YadeWira/nanozip-re/releases)**
 
-<!-- TEMPORARY notice (v0.17.0-pre / v0.17.1-pre, 2026-09-23): remove when the maintainer decides -->
-> **Temporary notice.** Two kinds of archive written by `a` or `w32c` with `-co`, `-cO` or `-cc` (`-co` is the
-> default) may be unreadable, by this port and by the original: multi-file archives from v0.15.2-pre to v0.16.0-pre,
-> and, from v0.15.0-pre (`-cc`) or v0.15.1-pre (`-co`, `-cO`) to v0.17.0-pre, archives of an input of 8 MB or more
-> made with more than one thread, or of any input with `-p2` or more. Test them with `nz-re t` and re-create any that fail from the source files with
-> v0.17.1-pre or later ([release notes](https://github.com/YadeWira/nanozip-re/releases/tag/v0.17.1-pre)).
-<!-- end of TEMPORARY notice -->
-
 ## Why
 
 NanoZip's author supposedly died around 2013; 0.09 alpha is the last build he published, and the
@@ -31,10 +23,11 @@ The rule that follows is **fidelity first**. Format and output bytes are identic
 messages and switches are identical except where timing makes them unobservable; behaviour is
 identical *including the alpha's defects*, so the two binaries can be compared on equal terms and
 every difference is a bug on this side. The defects are catalogued in
-[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md) (77 numbered items); which to keep and which to fix
-is a decision for the community once the encoder is complete. The decode phase closed with v0.9.9-pre;
+[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md) (78 numbered items), and the maintainer's decision
+(2026-09-24) is that all of them are reproduced; fixes belong to a future separate project. The decode
+phase closed with v0.9.9-pre;
 every release stays a pre-release until the encoder is complete too. Meanwhile the only escape hatches are environment
-variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few deliberate departures (a
+variables (`NZ_SAFE=1`, `NZ_STRICT_EXIT=1`), never new switches, and the few departures still in the code (a
 path-traversal guard, no crash on an archive of empty files, no infinite prompt on a closed stdin)
 are marked `[pending]` in the catalogue.
 
