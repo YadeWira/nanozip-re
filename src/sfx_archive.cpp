@@ -5944,6 +5944,31 @@ bool TryParseLegacyCnArchive(
         return false;
     }
 
+    // An archive of NO files: every input was excluded (-x) or could not be
+    // opened. The original still writes the prologue and one stream header -- a
+    // checksum-kind record and the codec record, 27 or 28 bytes in all -- and
+    // no table and no data record. Its `t` and `x` read that back as
+    // "Decompressed 0 bytes" and its `l` as "Total of 0 files, 0 bytes.", with
+    // no compressor line (no data record, so no decompressor is ever created).
+    // This reader called it "Legacy filename table encoding is not recognized."
+    // With -pN it is one such header per worker (33 to 37 bytes), read the same.
+    if (found_codec && !found_table && !saw_data_record && !truncated_input) {
+        LegacyCnContext ctx;
+        ctx.archive_path = archive_path;
+        ctx.checksum_mode = checksum_mode;
+        ctx.checksum_verification_supported = checksum_verification_supported;
+        ctx.legacy_method = method;
+        ctx.legacy_method_p0 = method_p0;
+        ctx.legacy_method_p1 = method_p1;
+        ctx.legacy_method_p2 = method_p2;
+        ctx.native_payload_supported = true;
+        ctx.payload_mode = LegacyPayloadMode::kStore;
+        ctx.saw_data_record = false;
+        ctx.total_data_size = 0u;
+        *out_context = std::move(ctx);
+        if (out_error_message != nullptr) out_error_message->clear();
+        return true;
+    }
     if (!found_codec || !found_table) {
         if (out_error_message != nullptr) {
             *out_error_message =
@@ -8585,17 +8610,21 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     // Layout matched to the original: archive name, column header, one row per
     // entry, total. It prints no compressor or payload line here.
     os << "Archive: " << legacy.archive_path << '\n';
+    // The column header comes with the first entry: an archive of no files (all
+    // inputs excluded or unreadable) lists as the Archive line and the total
+    // alone, measured on the original's own 27-byte archive of that kind.
+    std::ostringstream hdr;
     if (has_checksum) {
-        os << "checksum ";
+        hdr << "checksum ";
     }
     if (has_perm) {
         // A Windows build names the column "attr." and shows the file's
         // attributes there instead of a mode; note the original's own header
         // word is one character wider than the values under it.
 #if defined(_WIN32)
-        os << "attr. ";
+        hdr << "attr. ";
 #else
-        os << "perm ";
+        hdr << "perm ";
 #endif
     }
     // Measured: `-fo` adds a "user/grp." column only when the archive carries
@@ -8604,13 +8633,14 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
     for (const LegacyCnEntry& e : legacy.entries) if (e.has_owner) { has_owner = true; break; }
     const bool show_owner = options.restore_ownership && has_owner;
     if (show_owner) {
-        os << "user/grp. ";
+        hdr << "user/grp. ";
     }
     if (has_date) {
-        os << "yyyy-mmm-dd hh:mm:ss";
+        hdr << "yyyy-mmm-dd hh:mm:ss";
     }
     // -v widens the size column to exact, space-grouped byte counts (%15s).
-    os << (options.verbose ? "           size  file\n" : "     size  file\n");
+    hdr << (options.verbose ? "           size  file\n" : "     size  file\n");
+    if (!legacy.entries.empty()) os << hdr.str();
 
     std::uint64_t total_size = 0;
     std::size_t total_files = 0;
