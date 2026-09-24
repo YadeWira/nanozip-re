@@ -58,8 +58,13 @@ std::uint32_t LzhdsReadBits(LzhdsBitReader& r, std::uint32_t n) {
         std::uint32_t nb = 32u - (n - bits);
         std::uint32_t neww;
         if (r.cur < r.end) {
-            std::uint32_t raw;
-            std::memcpy(&raw, r.cur, 4);  // may read up to 3 bytes past the logical end
+            // A stream whose length is not a multiple of 4 ends in a partial
+            // word: its bytes, then zeros. The whole-word load read up to 3 bytes
+            // past the buffer (ASan, on a -cD archive of the same text twice, in
+            // the self-check's decode); a well-formed stream never uses those bits.
+            std::uint32_t raw = 0;
+            const std::size_t have = static_cast<std::size_t>(r.end - r.cur);
+            std::memcpy(&raw, r.cur, have < 4u ? have : 4u);
             neww = LzhdsBSwap32(raw);
         } else {
             neww = nb;
