@@ -132,6 +132,14 @@ public:
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
 
+    // A STORED LZ block's bytes into the window (FUN_0809e4e0). Not FeedWindow:
+    // the original copies them the way DecodeBlock writes its output, in chunks
+    // of at most 0x8000 behind a headroom check each, so the cursor ends at
+    // (pos + len) modulo the ring and the scroll flag survives. FeedWindow keeps
+    // only the last `capacity` bytes and leaves the cursor at `capacity`; both
+    // agree only when the block ends on a 32 KB boundary of the ring.
+    void StoreBlock(const std::uint8_t* data, std::uint32_t len);
+
     // The -co optimal parser (FUN_0806f8e0, the DAT_08183620 == 0 / -t1 path):
     // turn one block's bytes into the decision list the original's parser would
     // pick, using the models in their CURRENT state (pricing only reads them;

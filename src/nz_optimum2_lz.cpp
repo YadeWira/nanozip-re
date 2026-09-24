@@ -1572,5 +1572,23 @@ void NzOptimum2LzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len
     window_reset_pending_ = false;
 }
 
+void NzOptimum2LzDecoder::StoreBlock(const std::uint8_t* data, std::uint32_t len) {
+    // Transcription of FUN_080a5c70, instruction for instruction the -co
+    // engine's FUN_0809e4e0 (see NzOptimumLzDecoder::StoreBlock) except that a
+    // wrap calls FUN_080b9150, which zeroes the LZP table exactly as the chunk
+    // loop of DecodeBlock does on the same condition.
+    if (data == nullptr || ring_.capacity == 0u) return;
+    std::uint8_t* mem = mem_.data();
+    while (len != 0u) {
+        const std::uint32_t chunk = std::min(len, 0x8000u);
+        if (ring_.EnsureHeadroom(chunk) == 0u)
+            std::memset(mem + 0x1042c00, 0, 0x40000u);
+        std::memcpy(ring_.Base() + ring_.cursor, data, chunk);
+        ring_.cursor += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+}
+
 }  // namespace optimum2
 }  // namespace nzr

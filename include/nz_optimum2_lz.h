@@ -213,6 +213,11 @@ public:
     // window for those.
     void FeedWindow(const std::uint8_t* data, std::uint32_t len);
 
+    // A STORED LZ block's bytes into the window (FUN_080a5c70, see the -co
+    // sibling's StoreBlock): the chunked copy DecodeBlock makes, with the LZP
+    // table cleared on each wrap (FUN_080b9150) as the chunk loop does.
+    void StoreBlock(const std::uint8_t* data, std::uint32_t len);
+
     // Cold-start the adaptive model again, keeping the window (see the -co sibling).
     void ResetModel();
 

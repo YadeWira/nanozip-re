@@ -1251,5 +1251,30 @@ void NzOptimumLzDecoder::FeedWindow(const std::uint8_t* data, std::uint32_t len)
     FeedFinder(cursor_before, fed);
 }
 
+void NzOptimumLzDecoder::StoreBlock(const std::uint8_t* data, std::uint32_t len) {
+    // Transcription of FUN_0809e4e0, the engine's store for a block the
+    // compressor gave up on (decr_param 1, param6 0). It is DecodeBlock's chunk
+    // loop without the decoding: min(len, 0x8000) bytes at a time, the same
+    // FUN_080bd380 headroom check (a wrap calls FUN_080bcc00, a no-op), then a
+    // dword copy whose overrun past the chunk end is undone by saving and
+    // restoring the 4 bytes there -- so exactly the chunk lands at the cursor.
+    // It never goes through the ring feed (FUN_080bcc10): the write helper that
+    // feed uses (FUN_080bd480) is the only code that sets the descriptor's
+    // +0xc, and GDB on the original shows +0xc unchanged across a stored block
+    // while +8 walks 0, 32768, 65536, 0, ... (a 578206-byte block into a
+    // 65536-byte ring, entered at 65536, leaves the cursor at 53918 with the
+    // scroll flag still set). No model state is touched; the cold start after
+    // a stored block is the caller's ResetModel (FUN_0809e5d0).
+    if (data == nullptr || ring_.capacity == 0u) return;
+    while (len != 0u) {
+        const std::uint32_t chunk = std::min(len, 0x8000u);
+        ring_.EnsureHeadroom(chunk);
+        std::memcpy(ring_.Base() + ring_.cursor, data, chunk);
+        ring_.cursor += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+}
+
 }  // namespace optimum
 }  // namespace nzr

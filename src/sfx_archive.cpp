@@ -10258,13 +10258,20 @@ static bool DecodeOptimumBlockSequence(
             // sure).
             if (stored_block) {
                 // Stored LZ block: the payload IS the block output. It still has
-                // to go through the window, exactly as the BWT branch above does
-                // -- the original advances its shared accumulated-block buffer
-                // for every block, so a later LZ block whose match reaches back
-                // into this one must find these bytes there.
+                // to go into the window -- the original advances its shared
+                // accumulated-block buffer for every block, so a later LZ block
+                // whose match reaches back into this one must find these bytes
+                // there. But NOT through FeedWindow, as the BWT branch above does:
+                // the engine's own store (FUN_0809e4e0 / FUN_080a5c70) writes them
+                // in DecodeBlock's 32 KB chunks, which leaves the cursor at
+                // (pos + len) modulo the ring where FeedWindow leaves it at the
+                // capacity. The two agree whenever the block ends on a 32 KB
+                // boundary, which is why 1 MB -m4m blocks never showed it; a
+                // 578206-byte stored block of a multi-file -co archive did, the
+                // next LZ block decoding garbage from its first match.
                 work.assign(payload, payload + payload_size);
                 cur_size = payload_size;
-                dec.FeedWindow(work.data(), cur_size);
+                dec.StoreBlock(work.data(), cur_size);
                 // ...and the adaptive model starts cold again. A stored block is
                 // the compressor giving up on a block, and it takes its model
                 // with it: the NEXT LZ block of the stream decodes from a cold
