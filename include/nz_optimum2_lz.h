@@ -270,7 +270,9 @@ private:
     std::uint32_t blocksize_ = 0x100000u;
     std::vector<Optimum2Decision> decisions_;
     bool record_ = false;
-    bool window_reset_pending_ = false;   // 1 after a model reset, 0 after a feed
+    // codec+0x1082c48: raised by the set-up reset (FUN_08083160), cleared by the
+    // first feed or encode (FUN_08088100); see the -co sibling.
+    bool window_reset_pending_ = true;
     std::vector<std::uint8_t> mem_;  // the "large" subengine's ~0x1083000-byte state
 };
 

@@ -13423,10 +13423,33 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 }
                 ++enc_blk;
             }
-            // A block the parser cannot beat would be stored (param6 zero), which
-            // this writer does not emit yet -- declining keeps a wrong archive from
-            // ever reaching the disk.
-            if (payload.empty() || payload.size() >= m) return false;
+            // A block the engine cannot shrink goes out STORED. FUN_0808da10 calls
+            // the engine's encode (vtable +0x24) and, when it gives back nothing,
+            // vtable +0x1c (FUN_08073be0): a cold start of the model and nothing
+            // else -- the finder, the long-range index and the reset flag stay as
+            // the attempt left them -- the same cold start the decoder makes after
+            // a stored LZ block, while the window keeps the bytes. So: the block raw, decr_param 1, param6 0 and NO size18, and
+            // one stage check fewer, since the payload IS the LZ input. The encode
+            // above has already run the block through this engine's window, in the
+            // same 32 KB chunks the decoder's store (StoreBlock) uses; the
+            // verifier never saw it, so it gets the decoder's stored branch.
+            if (payload.empty() || payload.size() >= m) {
+                co.ResetModel();
+                verifier.StoreBlock(lz_in, m);
+                verifier.ResetModel();
+                put32(m);
+                seg.insert(seg.end(), lz_in, lz_in + m);
+                seg.push_back(1u);                       // decr_param: LZ
+                seg.push_back(0u);                       // param6: stored, no size18
+                seg.push_back(static_cast<unsigned char>(1u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                         (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+                if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+                if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+                goto block_tail;
+            }
             {
                 // prove the block reads back before committing it
                 std::vector<std::uint8_t> chk(m);
@@ -13479,9 +13502,10 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 // param15's output with the same table.
                 std::vector<std::uint16_t> stats;
                 NzBwtParam14Stats(blk, blk_len, &stats);
-                // param15 first (FUN_08083570), skipped only right after a model
-                // reset (codec+0x3f738, see WindowResetPending); on a fresh window
-                // it simply finds nothing and reports 0. The pass reads up to 256
+                // param15 first (FUN_08083570), skipped while the engine's set-up
+                // flag is up (codec+0x3f738, see WindowResetPending: raised once at
+                // set-up, cleared by the first feed or LZ encode -- so only a BWT
+                // block that opens the stream skips it). The pass reads up to 256
                 // bytes past the block -- the bytes that follow it in the
                 // original's input buffer -- so hand it those where they exist
                 // and zeros where the segment ends.

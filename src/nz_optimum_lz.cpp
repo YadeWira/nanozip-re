@@ -309,7 +309,12 @@ NzOptimumLzDecoder::NzOptimumLzDecoder(std::uint32_t window_capacity) {
 }
 
 void NzOptimumLzDecoder::ResetModel() {
-    window_reset_pending_ = true;   // codec+0x3f738 <- 1 (FUN_0806f4d0)
+    // The reset after a stored block is the MODEL only, on both sides: the
+    // decoder's FUN_0809e5d0 and the encoder's vtable +0x1c, FUN_08073be0, both
+    // end in FUN_080bcd10 on the ring-side model. The encoder's full reset,
+    // FUN_0806f4d0 (+0x18), which also empties the finder and the long-range
+    // index and raises codec+0x3f738, runs once, when the engine is set up --
+    // GDB on the original: one call per engine, none after a stored block.
     mem_ = OptimumColdState();
     mem_.resize(kTotalMemSize, 0);
     for (std::size_t i = 0; i < kAlignTableSize; i += 2) {
@@ -1194,6 +1199,11 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
     const bool ok = RunBlock(io, nullptr, 0u, tmp.data(), size);
     feed_ = nullptr;
     chunk_begin_ = nullptr;
+    // The encode entry (vtable +0x24, FUN_080737e0) clears codec+0x3f738 after the
+    // parse whatever it returns, as the window feed does: the flag the set-up
+    // reset raised is down from the stream's first block on, whatever its kind,
+    // and only a BWT block that opens the stream skips param15.
+    window_reset_pending_ = false;
     if (!ok || !parse_ok) return false;
     RangeEncodePairs(q, payload);
     return true;

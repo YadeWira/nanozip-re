@@ -66,7 +66,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 |---|---|
 | Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 134/135, the other differing only in extra progress redraws of ours; which case differs changes from run to run (2026-09-23, v0.17.1-pre) |
 | 45 BMP/TGA/TIFF/PNM images | `-cn`, `-cF`, `-cD` 45/45 (v0.16.0-pre); `-cf`, `-cd`, `-cc` 45/45, `-co` 44/45, `-cO` 43/45 (2026-09-22) |
-| 127 mixed real files | `-co` 125/127, `-cO` 126/127, `-cc` 126/127 (2026-09-22) |
+| 127 mixed real files | `-co` 126/127, `-cO` 126/127, `-cc` 126/127 (2026-09-23) |
 | 294 corpus files at `-m4m`; 45 groups of four consecutive corpus files | `-co` 292, `-cO` 292, `-cc` 294, 0 declined; groups 45/44/45 of 45 (last measured at v0.15.2-pre) |
 | Multi-file archives of real size: five shapes, from two 3 MB files to an 18-file tree, × 8 codecs (`tests/encode/multifile_sizes.sh`) | 40/40 byte-identical at `-t1` and read by the original, which also reads the default-thread-count archives (2026-09-23) |
 | Above the automatic split (8 MB): `a -t4` of 20 MB × 8 codecs read back and extracted by the original, with its compressor count; `-t1 -p3`/`-p16` for `-co`/`-cO`/`-cc`; the original's `-cc -p12`/`-p16` read at `-t1` (`tests/encode/parallel_readback.sh`) | 16/16 (v0.17.0-pre: 6/16) (2026-09-23) |
@@ -115,11 +115,13 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   finder returns candidates the original's does not) and `081_AWSOFTWA.PLA_` (param1's first probes
   read the previous block's bytes in the original, zeros here, [quirk 75](docs/ORIGINAL_QUIRKS.md)).
   The 127-file mixed corpus differences are not attributed here; on 2026-09-19 the two outside the
-  parser class were a clean `-co` decline (`PowerPacker.pp`) and the `[1]` name.
-- **The stored LZ block form** of the `-co` family is not written, and real inputs do need it: a 12 MB
-  folder of 21 corpus files and an 8 MB slice of real data are declined under `-co` (2026-09-23;
-  `-cO` and `-cc` write them). 3 MB of random data, 8 packed executables and an E8-seeded adversary
-  had not reached it the day before.
+  parser class were a clean `-co` decline (`PowerPacker.pp`, which needed the stored LZ form and is
+  byte-identical since 2026-09-23) and the `[1]` name.
+- **The stored LZ block form** (the raw block the original writes when its LZ engine cannot shrink
+  one) is written since 2026-09-23, after v0.17.2-pre; before, `-co` declined the inputs that need it
+  (a 12 MB folder of 21 corpus files, an 8 MB slice of real data). Up to v0.17.2-pre this port also
+  could not DECODE an original `-co`/`-cO` archive in which such a block, not ending on a 32 KB
+  boundary of the window, is followed by an LZ block (`tests/encode/stored_lz_block.sh`).
 - **Declines.** A block `a` cannot write is declined in one line and no archive is left behind; an
   existing archive of the same name is left as it was (before v0.17.1-pre it was truncated first, and
   a decline deleted it). Every
@@ -139,8 +141,7 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   or when checksums cannot be judged entry by entry (those still buffer the whole output); the rest
   of their gap is the flat mapping of the archive.
 - **Console.** The banner's MHz field is a measured figure in the original, not the clock, and is not
-  matched. The `[N MB]` compressor line of `-co`/`-cO` is a fixed 18/34 MB, right only for a budget of
-  16 MB or less (the original says 37/53 MB at `-m64m`). On a mapped archive the footer's `IO-in` figure is the mapping call (0.00 s, an enormous
+  matched. On a mapped archive the footer's `IO-in` figure is the mapping call (0.00 s, an enormous
   rate) where the original times a read.
 - **Unexercised.** Format constructs the original's encoder never emits (`0xd`/`0xe` sub-chunks, image
   predictor modes other than 2) are ported but unexercised.

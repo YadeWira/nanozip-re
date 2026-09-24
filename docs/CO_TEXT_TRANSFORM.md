@@ -354,9 +354,19 @@ stage list loses one entry with it, since the payload and the BWT output are the
 same bytes. One more field disappears: **param7 exists only when param6 is set**,
 so a stored block goes straight from the staged bytes to `bwt_start_pos`.
 
-The LZ kind can be stored too (the parser giving up), and the decoder handles it
--- a stored LZ block feeds the window and then COLD-STARTS the model. The writer
-does not emit that form yet; it declines instead.
+The LZ kind can be stored too: when the engine's encode (vtable +0x24) gives
+nothing back, the block driver `FUN_0808da10` writes the LZ input raw --
+`decr_param 1`, `param6 0`, no size18, one stage check fewer -- and calls the
+engine's +0x1c, `FUN_08073be0`, which cold-starts the MODEL and nothing else: the
+match finder, the long-range index and the "just reset" flag at codec+0x3f738
+stay as the attempt left them (the full reset, `FUN_0806f4d0` at +0x18, runs once,
+when the engine is set up). The attempt has already run the block through the
+ring. The decoder mirrors it with the engine's own store, `FUN_0809e4e0` (`-cO`:
+`FUN_080a5c70`), which copies the block into the ring in DecodeBlock's 32 KB
+chunks, not through the window feed: the two leave the cursor in different
+places unless the block ends on a 32 KB boundary, so until 2026-09-23 this port
+could not decode an original archive with such a block followed by an LZ block
+(`tests/encode/stored_lz_block.sh`). The writer emits the form since then.
 
 Two things had to be fixed before large BWT blocks worked at all. The bucket
 coder's rank walk had been ported from the reference's ENCODER, which uses a
@@ -402,9 +412,10 @@ out a few bytes off, which is enough to flip a block from LZ to BWT.
 `a -co -t1 -m4m` is byte-identical to the original on the twelve text-transform
 oracle inputs (three of them BWT blocks), on **47 of 47** corpus XML/HTML/SVG
 files, **62 of 62** executables and DLLs and **178 of 180** mixed corpus files --
-**287 of 289** -- and over all 289 of them it declines NOTHING. Not written yet:
-the stored LZ form, image and audio blocks, the multi-threaded bucket layout, and
-budgets above 16 MB.
+**287 of 289** -- and over all 289 of them it declines NOTHING. Not written at
+the time: the stored LZ form, image and audio blocks, the multi-threaded bucket
+layout, and budgets above 16 MB (image and audio blocks came in v0.16.0-pre, the
+stored LZ form on 2026-09-23).
 
 The two that remain are both traced. One is [quirk 72](ORIGINAL_QUIRKS.md): the
 original's parser tree is scratch another coder writes over between blocks, and

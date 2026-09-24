@@ -403,7 +403,8 @@ NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
 }
 
 void NzOptimum2LzDecoder::ResetModel() {
-    window_reset_pending_ = true;
+    // The model only (FUN_080b9290, reached from the decoder's FUN_080a5d60 and
+    // the encoder's vtable +0x1c, FUN_080885a0); see the -co sibling.
     mem_ = Optimum2ColdState();
     mem_.resize(kTotalMemSize, 0);
     for (std::size_t i = 0; i < kTier2AlignSize; i += 2) {
@@ -593,6 +594,11 @@ bool NzOptimum2LzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint3
     const bool ok = RunBlock(io, nullptr, 0u, tmp.data(), size);
     feed_ = nullptr;
     chunk_begin_ = nullptr;
+    // The encode entry (vtable +0x24, FUN_08088100) clears codec+0x1082c48 after the
+    // parse whatever it returns, as the window feed does: the flag the set-up
+    // reset raised is down from the stream's first block on, whatever its kind,
+    // and only a BWT block that opens the stream skips param15.
+    window_reset_pending_ = false;
     if (!ok || !parse_ok) return false;
     if (const char* qd = NZ_ENV("NZO2_QDUMP")) {
         FILE* f = std::fopen((std::string(qd) + ".parsed").c_str(), "wb");

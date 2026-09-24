@@ -198,7 +198,10 @@ private:
                                       std::uint8_t* out, std::uint32_t out_size);
     std::vector<OptimumDecision> decisions_;
     bool record_ = false;
-    bool window_reset_pending_ = false;   // codec+0x3f738: 1 after a model reset, 0 after a feed
+    // codec+0x3f738: raised by the engine's set-up reset (FUN_0806f4d0), cleared
+    // by the first feed (FUN_0806f530) or encode (FUN_080737e0); param15 is
+    // skipped while it is up.
+    bool window_reset_pending_ = true;
 public:
 
     // Cold-start the adaptive model again, keeping the window. The original
