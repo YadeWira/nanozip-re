@@ -10263,10 +10263,12 @@ static bool DecodeOptimumBlockSequence(
                 // whose match reaches back into this one must find these bytes
                 // there. But NOT through FeedWindow, as the BWT branch above does:
                 // the engine's own store (FUN_0809e4e0 / FUN_080a5c70) writes them
-                // in DecodeBlock's 32 KB chunks, which leaves the cursor at
-                // (pos + len) modulo the ring where FeedWindow leaves it at the
-                // capacity. The two agree whenever the block ends on a 32 KB
-                // boundary, which is why 1 MB -m4m blocks never showed it; a
+                // in DecodeBlock's 32 KB chunks, which can leave the cursor
+                // elsewhere than FeedWindow does (for a block longer than the
+                // ring the feed parks it at the capacity). They agree when the
+                // block is written in place or the chunks happen to end where
+                // the feed does, which is why the whole -m4m blocks tested before
+                // (1114112 bytes, entered at the ring's end) never showed it; a
                 // 578206-byte stored block of a multi-file -co archive did, the
                 // next LZ block decoding garbage from its first match.
                 work.assign(payload, payload + payload_size);

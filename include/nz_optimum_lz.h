@@ -135,9 +135,11 @@ public:
     // A STORED LZ block's bytes into the window (FUN_0809e4e0). Not FeedWindow:
     // the original copies them the way DecodeBlock writes its output, in chunks
     // of at most 0x8000 behind a headroom check each, so the cursor ends at
-    // (pos + len) modulo the ring and the scroll flag survives. FeedWindow keeps
-    // only the last `capacity` bytes and leaves the cursor at `capacity`; both
-    // agree only when the block ends on a 32 KB boundary of the ring.
+    // (pos + len) modulo the ring (when it starts on a 32 KB boundary) and the
+    // scroll flag stays up. FeedWindow, given a block longer than the ring, keeps
+    // only the last `capacity` bytes and leaves the cursor at `capacity`; the two
+    // agree only when the block is written in place or the pieces happen to end
+    // where the feed leaves the cursor.
     void StoreBlock(const std::uint8_t* data, std::uint32_t len);
 
     // The -co optimal parser (FUN_0806f8e0, the DAT_08183620 == 0 / -t1 path):
