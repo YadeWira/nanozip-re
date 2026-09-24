@@ -50,7 +50,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 |---|---|
 | Synthetic fixtures, 12 × 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact (2026-09-23) |
 | Multi-file archives, 12 selectors × 9 shapes, trees + listings (`tests/multifile_v2.sh`); multi-block `-t1` attribute records (`tests/parity/multiblock_attrs.sh`) | 144/144 + 72/72; 105/105, the original's `l` mode shift reproduced ([quirk 76](docs/ORIGINAL_QUIRKS.md)) (2026-09-23) |
-| Release verification package: 86 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers), plus one whose stored name is not valid UTF-8, checked by content | 243/243 checks on each of the four v0.17.1-pre binaries, the Windows two on a real Windows 10 (2026-09-23) |
+| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.3-pre binaries, the Windows two on a real Windows 10 (2026-09-23) |
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
@@ -118,7 +118,7 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   parser class were a clean `-co` decline (`PowerPacker.pp`, which needed the stored LZ form and is
   byte-identical since 2026-09-23) and the `[1]` name.
 - **The stored LZ block form** (the raw block the original writes when its LZ engine cannot shrink
-  one) is written since 2026-09-23, after v0.17.2-pre; before, `-co` declined the inputs that need it
+  one) is written since v0.17.3-pre; before, `-co` declined the inputs that need it
   (a 12 MB folder of 21 corpus files, an 8 MB slice of real data). Up to v0.17.2-pre this port also
   could not DECODE an original `-co`/`-cO` archive in which such a block, not ending on a 32 KB
   boundary of the window, is followed by an LZ block (`tests/encode/stored_lz_block.sh`).
