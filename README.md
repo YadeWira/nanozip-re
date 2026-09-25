@@ -122,7 +122,8 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   truncated first, and a decline deleted it). Every coded `-co`/`-cO` LZ or BWT block is decoded back
   and compared before it is committed (the LZ payload through a second engine, the BWT payload through
   the bucket decoder). Since v0.17.4-pre `a` and `w32c` also decode the WHOLE archive
-  they have just written, in-process, before it takes its name, and compare every entry with what was
+  they have just written, in-process, before keeping it (a replacement is renamed over the old archive
+  only after it passes), and compare every entry with what was
   read from disk: the same names, the same sizes, the same CRC-64 of the content. That covers what the
   per-block check could not see -- the multi-file table defect fixed in v0.17.0-pre (e7c8973) and the
   worker header fixed in v0.17.1-pre both went out as archives nothing could read. On success it prints
