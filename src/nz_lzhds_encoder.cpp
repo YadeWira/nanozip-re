@@ -32,29 +32,35 @@ inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for 0
 
 // DAT_08171d40: c * K^256, what leaves the 256-byte window (FUN_08059b20 builds it).
 const std::uint32_t* OutTable() {
-    static std::uint32_t t[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint32_t t[256];
+        Holder() : t{} {
         std::uint32_t k = 1;
         for (int i = 0; i < 0x100; ++i) k *= kK;
         std::uint32_t v = 0;
         for (int i = 0; i < 256; ++i) { t[i] = v; v += k; }
-        done = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 // DAT_081b3e20 (FUN_080bf140): the residual code, 2r for r >= 0 and 2(-1-r)|1 below.
 const std::uint8_t* ResidualCode() {
-    static std::uint8_t t[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t t[256];
+        Holder() : t{} {
         for (int u = 0; u < 256; ++u) {
             const std::int8_t r = static_cast<std::int8_t>(u);
             t[u] = (r >= 0) ? static_cast<std::uint8_t>(r * 2) : static_cast<std::uint8_t>(((-1 - r) * 2) | 1);
         }
-        done = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 // DAT_081b4020 / DAT_081b4120 (FUN_080bf2d0): the cost of a residual byte and of a
 // rank code, a saturating curve over |value|.
@@ -305,8 +311,10 @@ static std::uint32_t HdsEstimateImpl(State& st, const std::uint8_t* p, std::uint
 }
 
 // ---------------------------------------------------------------- FUN_08061d00
-static int g_hds_chunk_no = 0;
-static bool g_trace_ms = false;
+// Trace-only (NZ_TRACE_LZHDS_MS picks a chunk by number), but written on every
+// chunk: per thread, so concurrent workers do not race on it.
+static thread_local int g_hds_chunk_no = 0;
+static thread_local bool g_trace_ms = false;
 std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
     Hds& h = *st.hds;
     ++g_hds_chunk_no;

@@ -10201,9 +10201,12 @@ static bool DecodeOptimumBlockSequence(
         // its descriptor fields on stderr. A BWT block (decr_param 0) also gets
         // <path>.N.bwt, the bucket decoder's output -- the byte string the bucket
         // ENCODER has to turn back into <path>.N, which is how it is verified.
-        static int payload_dump_seq = 0;
+        // (The counter moves only while dumping: the stream workers of a parallel
+        // container run this concurrently, and ThreadSanitizer caught the old
+        // unconditional ++ racing. Dumps are numbered in run order, so use -t1.)
+        static std::atomic<int> payload_dump_seq{0};
         const char* const dpp = NZ_ENV("NZOPT_DUMP_PAYLOAD");
-        const int payload_dump_n = payload_dump_seq++;
+        const int payload_dump_n = (dpp != nullptr) ? payload_dump_seq.fetch_add(1) : 0;
         if (dpp != nullptr) {
             char nm[600];
             std::snprintf(nm, sizeof(nm), "%s.%d", dpp, payload_dump_n);

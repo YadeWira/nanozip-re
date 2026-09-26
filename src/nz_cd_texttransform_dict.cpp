@@ -5504,9 +5504,12 @@ std::uint32_t nzr::cd::NzCdDictBucketIndex(unsigned char c_e60, unsigned char c_
 // list: entry i = words in buckets below i + ..., shifted one up as the original
 // memcpy does, so entry[i+1] - entry[i] is bucket i's size.
 const std::uint16_t* nzr::cd::NzCdDictBucketStarts() {
-    static std::uint16_t table[0x2dc];
-    static bool built = false;
-    if (!built) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint16_t table[0x2dc];
+        Holder() : table{} {
         std::uint16_t counts[0x2dc]; std::memset(counts, 0, sizeof(counts));
         for (int i = 0; i < 16384; ++i) {
             const std::uint32_t c0 = (kCharDictBig_Initial[i] >> 8) & 0xffu, c1 = kCharDictBig_Initial[i] & 0xffu;
@@ -5523,9 +5526,9 @@ const std::uint16_t* nzr::cd::NzCdDictBucketStarts() {
         // `zz`) then got lo == hi and its single word was unreachable. `jazz`
         // came out as four literal bytes where the original codes it in two.
         for (int i = 0; i < 0x2da; ++i) table[i] = table[i + 1];
-        built = true;
-    }
-    return table;
+        }
+    } holder;
+    return holder.table;
 }
 void nzr::cd::NzCdDictRefArrays(NzCdDictRef* r) {
     r->big_initial = kCharDictBig_Initial; r->big_lo = kCharDictBig_Lo; r->big_hi = kCharDictBig_Hi;

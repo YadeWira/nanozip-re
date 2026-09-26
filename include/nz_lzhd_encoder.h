@@ -122,6 +122,14 @@ struct State {
     lzpf_enc::AudioModel audio;        // ctx+0x40: the -cd prefilter model (8 taps, 3 stages)
     lzpf_enc::ImageEncModel image;     // ctx+0x38800 (profile 0x10/0x10/2)
     std::uint64_t exe_pos = 4;         // ctx[0]: the exe filter's position base
+    // FUN_08064bb0's two 32 KB chunk buffers (0x40 prefix, 0x8000, 0x100 slack
+    // each), 64-byte aligned by CompressPiece. They belong to the compressor, as
+    // the original's do, not to the thread: the detectors read past a short
+    // chunk, so a buffer shared by the thread carried one worker's leftovers into
+    // the next (neutral on every input measured -- zeroing or poisoning them at
+    // each new worker left 14/14 archives unchanged -- and nondeterministic once
+    // workers run concurrently).
+    std::vector<std::uint8_t> chunk_mem;
     void Init(std::uint32_t window, bool lzhds = false);
 };
 

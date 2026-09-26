@@ -56,9 +56,12 @@ constexpr int kTier2AlignOff = static_cast<int>(kMemSize);
 // FUN_080749a0 / DAT_08172500: the bit-cost table, byte for byte the one the
 // `-co` parser builds (both engines price through the same table).
 const std::uint8_t* CostTable() {
-    static std::uint8_t t[0x400];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t t[0x400];
+        Holder() : t{} {
         int i6 = 0x118;
         unsigned b = 0;
         for (;;) {
@@ -76,9 +79,9 @@ const std::uint8_t* CostTable() {
             if (i6 == 0) break;
         }
         t[0] = t[1];
-        done = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 inline std::uint32_t Cost(const std::uint8_t* T, std::uint32_t bit, std::uint32_t prob) {
     return T[(((prob >> 2) ^ (0u - (bit ^ 1u))) - bit) & 0x3ffu];
@@ -259,16 +262,19 @@ namespace {
 
 // DAT_08171d40: c * K^256, what leaves the 256-byte rolling window.
 const std::uint32_t* LrOut() {
-    static std::uint32_t t[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint32_t t[256];
+        Holder() : t{} {
         std::uint32_t k = 1;
         for (int i = 0; i < 0x100; ++i) k *= 0x104070bu;
         std::uint32_t v = 0;
         for (int i = 0; i < 256; ++i) { t[i] = v; v += k; }
-        done = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 
 // FUN_08088660: the dispatch probability, both APM stages, no update. The

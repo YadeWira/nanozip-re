@@ -1,3 +1,4 @@
+#include <mutex>
 #include "nz_cm.h"
 #include <algorithm>
 #include <cstdint>
@@ -1458,9 +1459,16 @@ static void CM_Free(CM* cm) {
 // ---------------------------------------------------------------------------
 
 void NzCmInitAll() {
-    Build_kModelInterpolation();
-    LzCreateTables();
-    CM_InitTables();
+    // Once per process. main() builds the tables before any thread exists; every
+    // -cc stream of `a` calls this again, and with workers running concurrently a
+    // rebuild would rewrite tables other threads are reading (LzCreateTables stores
+    // kLzPredSumLookup[0]/[255] and corrects them afterwards).
+    static std::once_flag once;
+    std::call_once(once, [] {
+        Build_kModelInterpolation();
+        LzCreateTables();
+        CM_InitTables();
+    });
 }
 
 NzCmDecoder* NzCmCreate(int a_bits, int b_bits, uint32_t window_size) {

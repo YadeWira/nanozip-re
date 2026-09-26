@@ -390,9 +390,12 @@ std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32
         if (r != 0u) {
             run(r, 0x08u);
             if (reorder_ascii) {
-                static std::uint8_t inv[256];
-                static bool built = false;
-                if (!built) { const unsigned char* f = nzr::cd::NzCdReorderAscii(); for (unsigned c = 0; c < 256u; ++c) inv[f[c]] = (std::uint8_t)c; built = true; }
+                // built once, thread-safe (the workers of a parallel `a` get here concurrently)
+                static const struct InvHolder {
+                    std::uint8_t inv[256];
+                    InvHolder() : inv{} { const unsigned char* f = nzr::cd::NzCdReorderAscii(); for (unsigned c = 0; c < 256u; ++c) inv[f[c]] = (std::uint8_t)c; }
+                } inv_holder;
+                const std::uint8_t* const inv = inv_holder.inv;
                 for (std::uint32_t i = 0; i < n; ++i) buf[i] = inv[buf[i]];
             }
         }

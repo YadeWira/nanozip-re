@@ -30,9 +30,12 @@ inline std::uint32_t Base(std::uint32_t k) { return k == 0u ? 0u : (1u << k); }
 // walk; entry i (16..255) is 1 when the walk's low byte is below a threshold
 // that grows with i.
 const std::uint8_t* SkipTable() {
-    static std::uint8_t tbl[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t tbl[256];
+        Holder() : tbl{} {
         for (int i = 0; i < 16; ++i) tbl[i] = 0;
         std::uint32_t crc = 0xffffffffu;
         for (std::uint32_t i = 16; i < 256; ++i) {
@@ -41,9 +44,9 @@ const std::uint8_t* SkipTable() {
             const std::uint32_t thr = (i >> 2u) + (i >> 1u) + ((i - 0x81u) < 0x3fu ? 0x40u : 0x20u);
             tbl[i] = (x < thr) ? 1u : 0u;
         }
-        done = true;
-    }
-    return tbl;
+        }
+    } holder;
+    return holder.tbl;
 }
 
 // The word-wise compare every matcher here uses: bytes equal from `a`/`b` up to
@@ -645,8 +648,12 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
     // the two 64-byte-aligned 32 KB chunk buffers (their alignment feeds the RLE detector)
     // (the original's buffers sit 0x40 bytes into an aligned allocation; the image
     // gate's context hash reads the two bytes before a chunk, so keep a prefix)
-    alignas(64) static thread_local std::uint8_t bufA_[0x40 + 0x8000 + 0x100];
-    alignas(64) static thread_local std::uint8_t bufB_[0x40 + 0x8000 + 0x100];
+    // (in the State: see chunk_mem; 0x8140 is a multiple of 64, so both stay aligned)
+    constexpr std::size_t kChunkBuf = 0x40 + 0x8000 + 0x100;
+    if (st.chunk_mem.size() != 2u * kChunkBuf + 64u) st.chunk_mem.assign(2u * kChunkBuf + 64u, 0u);
+    std::uint8_t* const mem0 = st.chunk_mem.data();
+    std::uint8_t* const bufA_ = mem0 + ((64u - (reinterpret_cast<std::uintptr_t>(mem0) & 63u)) & 63u);
+    std::uint8_t* const bufB_ = bufA_ + kChunkBuf;
     std::uint8_t* const bufA = bufA_ + 0x40; std::uint8_t* const bufB = bufB_ + 0x40;
     std::uint32_t off = 0;
     while (off < n) {

@@ -195,16 +195,19 @@ struct ArithEnc {
 // (dumped from the original): the hex letters by case, and the three joiners a
 // decimal number may run across.
 static const u8* HexClass() {
-    static u8 t[256];
-    static bool built = false;
-    if (!built) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        u8 t[256];
+        Holder() : t{} {
         memset(t, 0, sizeof(t));
         for (int c = 'A'; c <= 'F'; ++c) t[c] = 1;
         for (int c = 'a'; c <= 'f'; ++c) t[c] = 2;
         t[(u8)'-'] = t[(u8)'.'] = t[(u8)':'] = 4;
-        built = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 static inline bool IsDigit(u32 b) { return (u32)(b - '0') <= 9u; }
 

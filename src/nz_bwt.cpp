@@ -2437,16 +2437,19 @@ const P15Tables& P15T() { static const P15Tables t; return t; }
 // DAT_08171d40: b * K^256, what leaves the 256-byte rolling window (the parser
 // keeps its own copy; the pass needs one here too).
 const uint32_t* P15LrOut() {
-    static uint32_t t[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        uint32_t t[256];
+        Holder() : t{} {
         uint32_t k = 1;
         for (int i = 0; i < 0x100; ++i) k *= 0x104070bu;
         uint32_t v = 0;
         for (int i = 0; i < 256; ++i) { t[i] = v; v += k; }
-        done = true;
-    }
-    return t;
+        }
+    } holder;
+    return holder.t;
 }
 
 }  // namespace
