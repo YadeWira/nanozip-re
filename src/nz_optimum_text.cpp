@@ -1,5 +1,6 @@
 // nz_optimum_text.cpp -- see the header.
 #include "nz_optimum_text.h"
+#include "nz_env.h"
 #include "nz_lzhd_text.h"
 #include "nz_cd_texttransform_dict.h"
 #include "nz_text_transform.h"
@@ -168,7 +169,7 @@ std::uint32_t CoTextFlags(const std::uint8_t* buf, std::uint32_t n, std::uint8_t
                           bool cm, bool* number_route) {
     using nzr::lzhd_enc::DictFits;
     using nzr::lzhd_enc::LineRleFits;
-    const bool tr = std::getenv("NZOPT_TRACE_TDO") != nullptr;
+    const bool tr = NZ_ENV("NZOPT_TRACE_TDO") != nullptr;
     bool route = false;
     if (number_route != nullptr) *number_route = false;
 
@@ -343,7 +344,7 @@ std::uint32_t EstimateChunk(const std::uint8_t* d, std::uint32_t n) {
     }
     std::uint32_t nsyms = 0;
     const std::uint32_t bits = HuffmanCost(hist, &nsyms);
-    if (std::getenv("NZOPT_TRACE_HIST")) {
+    if (NZ_ENV("NZOPT_TRACE_HIST")) {
         std::fprintf(stderr, "[hist] n=%u bits=%u nsyms=%u:", n, bits, nsyms);
         for (unsigned c = 0; c < 256u; ++c) if (hist[c]) std::fprintf(stderr, " %u:%u", c, hist[c]);
         std::fprintf(stderr, "\n");
@@ -372,7 +373,7 @@ std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32
     std::uint8_t done = 0;
     tt2->clear();
     tt16->clear();
-    const bool trp = std::getenv("NZOPT_TRACE_PIPE") != nullptr;
+    const bool trp = NZ_ENV("NZOPT_TRACE_PIPE") != nullptr;
     auto run = [&](std::uint32_t r, std::uint8_t bit) {
         if (trp) std::fprintf(stderr, "[pipe] bit=0x%02x n=%u -> %u%s\n", bit, n, r, r ? "" : " (skip)");
         if (r != 0u) { std::swap(buf, tmp); n = r; done |= bit; } };
@@ -414,7 +415,7 @@ std::uint32_t CoTextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32
             const std::uint32_t est_out = CoEntropyEstimate(tmp, t);
             const std::uint32_t aux = static_cast<std::uint32_t>(side.size());
             go = ((est_out + aux) * 0x20u < est_in * 0x21u) || (est_out <= est_in && aux < 0x200u);
-            if (std::getenv("NZOPT_TRACE_TDO"))
+            if (NZ_ENV("NZOPT_TRACE_TDO"))
                 std::fprintf(stderr, "[tdo] num n=%u half=%u len=%u t=%u est_in=%u est_out=%u aux=%u go=%d\n",
                              n, half, len, t, est_in, est_out, aux, (int)go);
         }
@@ -469,7 +470,7 @@ bool CoTrialGate(const std::uint8_t* buf, std::uint32_t n, std::uint32_t mask, b
         if (c != 0u) candidate = c + CoSideStreamBytes(applied, tt2, tt16, &side);
     }
     const bool refuse = baseline <= candidate + (candidate >> 10);
-    if (std::getenv("NZOPT_TRACE_TDO"))
+    if (NZ_ENV("NZOPT_TRACE_TDO"))
         std::fprintf(stderr, "[tdo] gate n=%u sample=%u mask=0x%02x baseline=%u candidate=%u (%s, applied=0x%02x)\n",
                      n, sample, mask, baseline, candidate, refuse ? "REFUSED" : "accepted", applied);
     return !refuse;

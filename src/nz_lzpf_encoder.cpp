@@ -2,6 +2,7 @@
 // original's (linux32/nz); the decompiles live in
 // ~/.cache/nzre_tools/encode/decomp/lzpf_encoder_*.c.
 #include "nz_lzpf_encoder.h"
+#include "nz_env.h"
 
 #include <algorithm>
 #include <cstring>
@@ -882,7 +883,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         st.exe_pos += len;
         st.probe_ctx.bytes_done += static_cast<std::uint32_t>(len);
     };
-    if (std::getenv("NZ_TRACE_LZPFENC")) {
+    if (NZ_ENV("NZ_TRACE_LZPFENC")) {
         const AudioProbe& q = st.probe;
         std::fprintf(stderr, "[lzpfenc] len=%zu score=%u probe{s=%u le=%u w=%u ch=%u pfx=%u hdr=%u code=%x conf=%u lz=%u pf=%u done=%u end=%u} dec=%d exe=%u\n",
                      len, score, q.signed_, q.le, q.width, q.chans, q.prefix, q.hdr, q.code, q.conf, q.lz_cost, q.pf_cost, q.bytes_done, q.audio_end, (int)audio_decision, exe_metric);
@@ -942,7 +943,7 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
     LzParse(st, static_cast<std::size_t>(block - st.window), len, bc);
     // NZ_DUMP_LZBC=<prefix>: this block's LZ bytecode, one file per block, for
     // diffing two builds against each other.
-    if (const char* bp = std::getenv("NZ_DUMP_LZBC")) {
+    if (const char* bp = NZ_ENV("NZ_DUMP_LZBC")) {
         static int bn = 0;
         char path[512];
         std::snprintf(path, sizeof path, "%s.%d", bp, bn++);

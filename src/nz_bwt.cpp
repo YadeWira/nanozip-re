@@ -1071,7 +1071,7 @@ uint32_t NzBwtTransform(const uint8_t* in, uint32_t n, uint8_t* out) {
         if (i == 0u) primary = j;
         out[j] = in[(i + n - 1u) % n];
     }
-    if (std::getenv("NZOPT_TRACE_BWTROUNDS"))
+    if (NZ_ENV("NZOPT_TRACE_BWTROUNDS"))
         std::fprintf(stderr, "[BWT] n=%u rondas=%u\n", n, rounds_dbg);
     return primary;
 

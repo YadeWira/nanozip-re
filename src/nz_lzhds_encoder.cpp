@@ -9,6 +9,7 @@
 // goto structure of FUN_08061d00 is kept as labelled states because the
 // decoder (nz_lzhds.cpp) mirrors the same odd corners.
 #include "nz_lzhd_encoder.h"
+#include "nz_env.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -161,7 +162,7 @@ void HdsBitWriter::Flush() {   // FUN_080b2030
     }
 }
 void HdsBitWriter::PutEG(std::uint32_t v) {   // FUN_080c09f0 -> FUN_080c0970 -> FUN_080c0750
-    if (std::getenv("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] EG %u\n", v);
+    if (NZ_ENV("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] EG %u\n", v);
     const std::uint32_t nb = (v != 0u ? BitLen1(v) : 0u) + 1u;   // bit length of v (1 for 0)
     const std::uint32_t k = nb - 1u;
     const std::uint32_t kn = (k != 0u ? BitLen1(k) : 0u) + 1u;   // bit length of k
@@ -250,7 +251,7 @@ void HdsAppend(State& st, std::uint32_t n) {
     }
     h.lr.hash = hash;
     w.pos = endpos;
-    if (std::getenv("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] append pos=%u n=%u hash_out=%08x\n", w.pos - n, n, hash);
+    if (NZ_ENV("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] append pos=%u n=%u hash_out=%08x\n", w.pos - n, n, hash);
 }
 
 // ---------------------------------------------------------------- FUN_0805e6a0
@@ -259,7 +260,7 @@ void HdsAppend(State& st, std::uint32_t n) {
 static std::uint32_t HdsEstimateImpl(State& st, const std::uint8_t* p, std::uint32_t n);
 std::uint32_t HdsEstimate(State& st, const std::uint8_t* p, std::uint32_t n) {
     const std::uint32_t r = HdsEstimateImpl(st, p, n);
-    if (std::getenv("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] estimate n=%u -> %u\n", n, r);
+    if (NZ_ENV("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] estimate n=%u -> %u\n", n, r);
     return r;
 }
 static std::uint32_t HdsEstimateImpl(State& st, const std::uint8_t* p, std::uint32_t n) {
@@ -318,7 +319,7 @@ static thread_local bool g_trace_ms = false;
 std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
     Hds& h = *st.hds;
     ++g_hds_chunk_no;
-    { const char* e = std::getenv("NZ_TRACE_LZHDS_MS"); g_trace_ms = e && std::atoi(e) == g_hds_chunk_no; }
+    { const char* e = NZ_ENV("NZ_TRACE_LZHDS_MS"); g_trace_ms = e && std::atoi(e) == g_hds_chunk_no; }
     Window& w = st.win;
     std::uint8_t* const base = w.base;
     const std::uint32_t size = w.size;          // local_5c
@@ -332,7 +333,7 @@ std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
     std::uint32_t* const lrt = h.lr.table.data();
     const std::uint32_t lrmask = h.lr.mask;
     std::uint32_t hash = 0;                     // local_38 = 0: the chunk's hash starts fresh (the object's slot is copied in and back, never read)
-    if (std::getenv("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] chunk pos=%u n=%u depth=%u hash_in=%08x ctx=%u\n", pos, n, depth, hash, h.ctx_index);
+    if (NZ_ENV("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] chunk pos=%u n=%u depth=%u hash_in=%08x ctx=%u\n", pos, n, depth, hash, h.ctx_index);
     const std::uint32_t* const T = OutTable();
     const std::uint8_t* const RC = ResidualCode();
     const CostTables& C = Costs();
@@ -567,7 +568,7 @@ std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
             state = SEARCH; break;
         }
         case LITERAL: {   // LAB_08062977
-            if (std::getenv("NZ_TRACE_LZHDS")) { std::fprintf(stderr, "L rc=%u ec=%u f0=%u f8=%d f4=%u e4=%u e8=%u sum=%u ridx=%u c=", h.rowctr, h.ec, h.f0, h.f8, h.f4, h.e4, h.e8, h.ring_sum, h.ring_idx); for (int i = 0; i < 17; ++i) std::fprintf(stderr, "%u ", h.counters[i]); std::fprintf(stderr, "\n"); }
+            if (NZ_ENV("NZ_TRACE_LZHDS")) { std::fprintf(stderr, "L rc=%u ec=%u f0=%u f8=%d f4=%u e4=%u e8=%u sum=%u ridx=%u c=", h.rowctr, h.ec, h.f0, h.f8, h.f4, h.e4, h.e8, h.ring_sum, h.ring_idx); for (int i = 0; i < 17; ++i) std::fprintf(stderr, "%u ", h.counters[i]); std::fprintf(stderr, "\n"); }
             c = base[pos];
             if (((ctxp[0x20u + (c >> 3u)] >> (c & 7u)) & 1u) == 0u) {
                 code = c;
@@ -587,7 +588,7 @@ std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
             state = RAW; break;
         }
         case RUN_END: {   // LAB_0806252e
-            if (std::getenv("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] run_end pos=%u litctr=%u predrun=%u curdist=%u lastflush=%u f8=%d ec=%u\n", pos, litctr, predrun, curdist, lastflush, h.f8, h.ec);
+            if (NZ_ENV("NZ_TRACE_LZHDS")) std::fprintf(stderr, "[hds] run_end pos=%u litctr=%u predrun=%u curdist=%u lastflush=%u f8=%d ec=%u\n", pos, litctr, predrun, curdist, lastflush, h.f8, h.ec);
             if (predrun < 200u) {
                 std::uint32_t k = litctr - predrun;
                 do {
@@ -682,7 +683,7 @@ std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
                 }
                 h.e8 = old_e4;
                 if (--h.f4 == 0u) {
-                    if (std::getenv("NZ_TRACE_LZHDS")) { std::fprintf(stderr, "[hds] resel pos=%u counters", pos); for (int i = 0; i < 17; ++i) std::fprintf(stderr, " %u", (h.counters[i] + 0x40u) >> 7u); std::fprintf(stderr, " ec=%u f0=%u f8=%d\n", h.ec, h.f0, h.f8); }
+                    if (NZ_ENV("NZ_TRACE_LZHDS")) { std::fprintf(stderr, "[hds] resel pos=%u counters", pos); for (int i = 0; i < 17; ++i) std::fprintf(stderr, " %u", (h.counters[i] + 0x40u) >> 7u); std::fprintf(stderr, " ec=%u f0=%u f8=%d\n", h.ec, h.f0, h.f8); }
                     const std::uint32_t old_ec = h.ec;
                     const std::uint32_t old_f8 = static_cast<std::uint32_t>(h.f8);
                     h.ec = 0x10; h.f0 = 0xf;

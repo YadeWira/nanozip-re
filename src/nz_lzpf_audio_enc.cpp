@@ -6,6 +6,7 @@
 // the side-bit stream, the Huffman side streams). Decompiles in
 // ~/.cache/nzre_tools/encode/decomp/lzpf_{analysis,media_encoders,audio_*}.c.
 #include "nz_lzpf_encoder.h"
+#include "nz_env.h"
 #include "nz_audio.h"
 
 #include <algorithm>
@@ -548,7 +549,7 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src0, std::uint3
                 for (std::uint32_t i = 0; i < per; ++i) s += BitLen(AbsPlus1(buf[i])) + BitLen(AbsPlus1(buf[per + i]));
                 cost[c] = s;
             }
-            if (std::getenv("NZ_TRACE_LZPFENC")) std::fprintf(stderr, "[audioblk] phase cost0=%u cost1=%u prefix=%u\n", cost[0], cost[1], prefix);
+            if (NZ_ENV("NZ_TRACE_LZPFENC")) std::fprintf(stderr, "[audioblk] phase cost0=%u cost1=%u prefix=%u\n", cost[0], cost[1], prefix);
             if (cost[1] * 0x21u < (cost[0] << 5u)) {
                 if (pr.prefix < width) pr.prefix = static_cast<std::uint16_t>(pr.prefix + width);
                 else pr.prefix = static_cast<std::uint16_t>(pr.prefix - width);
@@ -653,12 +654,12 @@ std::size_t AudioEncodeBlock(AudioModel& m, const std::uint8_t* src0, std::uint3
     } else {
         const std::size_t a1 = EncodeArithAt(bytes.data(), per, ar.data(), per, al);
         const std::size_t a2 = a1 ? EncodeArithAt(bytes.data() + per, per, ar.data() + a1, per, (al + a1) & 3u) : 0u;
-        if (std::getenv("NZ_TRACE_LZPFENC")) std::fprintf(stderr, "[audioblk] stereo arith a1=%zu a2=%zu per=%u prefix=%u\n", a1, a2, per, prefix);
+        if (NZ_ENV("NZ_TRACE_LZPFENC")) std::fprintf(stderr, "[audioblk] stereo arith a1=%zu a2=%zu per=%u prefix=%u\n", a1, a2, per, prefix);
         if (a1 == 0u || a2 == 0u) { out.resize(start); return 0u; }
         a_total = a1 + a2;
     }
     const std::size_t produced = (out.size() - start) + a_total + side_bytes;
-    if (std::getenv("NZ_TRACE_LZPFENC"))
+    if (NZ_ENV("NZ_TRACE_LZPFENC"))
         std::fprintf(stderr, "[audioblk] len=%u prefix=%u carry=%u nsmp=%u per=%u hdr=%02x arith=%zu side=%zu produced=%zu aligned=%u ovf=%d\n",
                      len, prefix, pr.prefix, nsmp, per, out[start], a_total, side_bytes, produced, aligned, (int)side_overflow);
     if (aligned <= produced || side_overflow) { out.resize(start); return 0u; }

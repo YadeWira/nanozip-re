@@ -1,6 +1,7 @@
 // nz_lzhd_encoder.cpp -- see the header. Every routine mirrors one function of
 // the original; the comments name it.
 #include "nz_lzhd_encoder.h"
+#include "nz_env.h"
 #include "nz_lzpf_encoder.h"
 #include "nz_cd_tokens.h"
 #include "nz_audio.h"
@@ -379,7 +380,7 @@ finish:
     st.tb.trailing_lit = since;
     nlit += since;
     w.pos = pos;
-    if (std::getenv("NZ_TRACE_LZHD")) {
+    if (NZ_ENV("NZ_TRACE_LZHD")) {
         std::fprintf(stderr, "[lzhd] chunk n=%u tokens=%zu lits=%u trailing=%u cont=%u\n", n, tok.size() / 3u, nlit, since, cont);
         for (std::size_t i = 0; i < tok.size() / 3u; ++i) std::fprintf(stderr, "  T%zu %u %u %u\n", i, tok[3*i], tok[3*i+1], tok[3*i+2]);
     }
@@ -665,7 +666,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
         std::vector<std::uint8_t> rle_side;
         std::uint8_t text_param = 0;
         const bool in_span = st.probe_ctx.bytes_done < st.probe_ctx.audio_end;
-        if (std::getenv("NZ_TRACE_LZHD")) std::fprintf(stderr, "[piece] chunk off=%u len=%u in_span=%d probe{done=%u end=%u conf=%u code=%x}\n", off, len0, (int)in_span, st.probe_ctx.bytes_done, st.probe_ctx.audio_end, st.probe_ctx.conf, st.probe_ctx.code);
+        if (NZ_ENV("NZ_TRACE_LZHD")) std::fprintf(stderr, "[piece] chunk off=%u len=%u in_span=%d probe{done=%u end=%u conf=%u code=%x}\n", off, len0, (int)in_span, st.probe_ctx.bytes_done, st.probe_ctx.audio_end, st.probe_ctx.conf, st.probe_ctx.code);
         if (!in_span) {
             // the analysis: probe, exe metric + filter
             lzpf_enc::AudioProbeBlock(st.probe_ctx, buf, len);
@@ -726,7 +727,7 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                         std::uint8_t* b2 = buf; std::uint8_t* t2 = tmpb;
                         const std::uint32_t r = TextPipeline(bits, b2, len, t2, 0x8040u, &applied, false);
                         if (r != 0u) { buf = b2; tmpb = t2; len = r; flags = 8u; text_param = applied; }
-                        if (const char* dp = std::getenv("NZ_DUMP_LZHD_TEXT")) { if (FILE* f = std::fopen(dp, "ab")) { std::fwrite(buf, 1, len, f); std::fclose(f); } }
+                        if (const char* dp = NZ_ENV("NZ_DUMP_LZHD_TEXT")) { if (FILE* f = std::fopen(dp, "ab")) { std::fwrite(buf, 1, len, f); std::fclose(f); } }
                     }
                 }
                 if (0x1ffu < len && flags == 0u) {

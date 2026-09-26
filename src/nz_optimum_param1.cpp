@@ -5,6 +5,7 @@
 // included -- the frequency table the LZP estimator shares with its own "match"
 // counter (bin 128) and the truncating x87 entropy among them.
 #include "nz_optimum_param1.h"
+#include "nz_env.h"
 
 #include <cmath>
 #include <cstdio>
@@ -748,7 +749,7 @@ bool Driver::Run(std::vector<std::uint8_t>* side, std::uint32_t cap) {
             if (--countdown != 0) continue;
 
             // the 100-byte re-evaluation
-            if (std::getenv("NZOPT_TRACE_P1DEC") != nullptr)
+            if (NZ_ENV("NZOPT_TRACE_P1DEC") != nullptr)
                 std::fprintf(stderr, "DEC p=%d run=%u mode=%u d=[%u,%u,%u] offs=[%u,%u]\n",
                              (int)(p - data), runlen, mode,
                              distinct[0], distinct[1], distinct[2], offs[1], offs[2]);
@@ -798,7 +799,7 @@ bool Driver::Run(std::vector<std::uint8_t>* side, std::uint32_t cap) {
             if (lo < lastEnd) lo = lastEnd;
             std::uint32_t nd = 0;
             const std::uint8_t* pos = PlaceRegion(lo, regionStart, off, &nd);
-            const bool tr = std::getenv("NZOPT_TRACE_P1") != nullptr;
+            const bool tr = NZ_ENV("NZOPT_TRACE_P1") != nullptr;
             if (tr)
                 std::fprintf(stderr, "PLACE lo=%d regionStart=%d off=%u\n  POS=%d nd=%u\n",
                              (int)(lo - data), (int)(regionStart - data), off, (int)(pos - data), nd);
@@ -824,7 +825,7 @@ bool Driver::Run(std::vector<std::uint8_t>* side, std::uint32_t cap) {
                     for (std::uint32_t i = 0; i < total; ++i)
                         out[at + i] = static_cast<std::uint8_t>(
                             out[at + i] - rstart[static_cast<std::int32_t>(i) - static_cast<std::int32_t>(off)]);
-                    if (std::getenv("NZOPT_TRACE_P1") != nullptr)
+                    if (NZ_ENV("NZOPT_TRACE_P1") != nullptr)
                         std::fprintf(stderr, "TRIPLE copy_offset=%u start=%u num_delta=%u\n",
                                      off, static_cast<unsigned>(at), total - 8u);
                     w.Emit(off, static_cast<std::uint32_t>(at), total - 8u);

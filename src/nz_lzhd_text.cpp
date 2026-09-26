@@ -1,5 +1,6 @@
 // nz_lzhd_text.cpp -- see the header. Decompiles: ~/.cache/nzre_tools/encode/decomp/lzhd_text.c
 #include "nz_lzhd_text.h"
+#include "nz_env.h"
 #include "nz_cd_tokens.h"
 #include "nz_cd_texttransform_dict.h"
 
@@ -195,7 +196,7 @@ finish:
 std::uint32_t TextDetect(const std::uint8_t* buf, std::uint32_t n, std::uint8_t* scratch) {
     TextHist h;
     HistBuild(h, buf, n >> 3u);
-    const bool tr = std::getenv("NZ_TRACE_LZHD") != nullptr;
+    const bool tr = NZ_ENV("NZ_TRACE_LZHD") != nullptr;
     if (tr) std::fprintf(stderr, "[textdet] n=%u hist_n=%u score=%u istext=%d\n", n, h.n, h.score, (int)HistIsText(h));
     if (!HistIsText(h)) return 0u;
     std::uint32_t bits = 0;
@@ -534,7 +535,7 @@ dispatch:
                     lo = mid + 1u;
                 }
                 const std::uint32_t code = ~found;   // 0 when not found
-                if (const char* dtr = std::getenv("NZ_TRACE_DICT")) {
+                if (const char* dtr = NZ_ENV("NZ_TRACE_DICT")) {
                     char w[16]; for (std::uint32_t i = 0; i < L && i < 15u; ++i) w[i] = (char)wbuf[i]; w[L < 15u ? L : 15u] = 0;
                     if (std::strstr(w, dtr) != nullptr)
                         std::fprintf(stderr, "[dict] '%s' L=%u k1=%08x k2=%08x bucket=%u lo=%u hi=%u found=%u hit=%d code=%u sep=%02x\n",

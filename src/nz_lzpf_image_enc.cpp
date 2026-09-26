@@ -5,6 +5,7 @@
 // cascade, mode 2). Decompiles: ~/.cache/nzre_tools/encode/decomp/
 // lzpf_image_encoder.c and image_headers.c.
 #include "nz_lzpf_encoder.h"
+#include "nz_env.h"
 #include "nz_audio.h"
 #include "nz_optimum_text.h"
 
@@ -15,7 +16,7 @@
 
 namespace nzr::lzpf_enc {
 
-#define IMGENC_TRACE(...) do { if (std::getenv("NZOPT_TRACE_IMGENC")) std::fprintf(stderr, __VA_ARGS__); } while (0)
+#define IMGENC_TRACE(...) do { if (NZ_ENV("NZOPT_TRACE_IMGENC")) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 
 namespace {
@@ -563,7 +564,7 @@ std::size_t ImageEncodeChunk(ImageEncModel& m, const ImageProbe& pr, const std::
         }
     }
     const std::size_t produced = (out.size() - start) + a_total + side_bytes;
-    if (std::getenv("NZ_TRACE_LZPFENC"))
+    if (NZ_ENV("NZ_TRACE_LZPFENC"))
         std::fprintf(stderr, "[imgblk] len=%u prefix=%u w=%u nch=%u bps=%u per=%u hdr=%02x rows=%u col=%u align=%u arith=%zu side=%zu produced=%zu aligned=%u\n",
                      len, prefix, width, nch, bps, per_ch, out[start], m.rows_done, m.col, m.align, a_total, side_bytes, produced, aligned);
     if (produced >= aligned) { IMGENC_TRACE("[imgenc] decline produced=%zu >= aligned=%u\n", (std::size_t)produced, aligned); out.resize(start); return 0; }
