@@ -44,7 +44,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 |---|---|
 | Synthetic fixtures, 12 × 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact (2026-09-23) |
 | Multi-file archives, 12 selectors × 9 shapes, trees + listings (`tests/multifile_v2.sh`); multi-block `-t1` attribute records (`tests/parity/multiblock_attrs.sh`) | 144/144 + 72/72; 105/105, the original's `l` mode shift reproduced ([quirk 76](docs/ORIGINAL_QUIRKS.md)) (2026-09-23) |
-| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.4-pre binaries, the Windows two on a real Windows 10 (2026-09-23) |
+| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.5-pre binaries, the Windows two on a real Windows 10 (2026-09-25) |
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
@@ -59,7 +59,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 
 | what | result |
 |---|---|
-| Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 134/135, the other differing only in extra progress redraws of ours; which case differs changes from run to run (2026-09-23, v0.17.1-pre) |
+| Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 135/135 on 2026-09-24 (134/135 on other runs: an extra progress redraw of ours, a different case each time) |
 | 45 BMP/TGA/TIFF/PNM images | `-cn`, `-cF`, `-cD` 45/45 (v0.16.0-pre); `-cf`, `-cd`, `-cc` 45/45, `-co` 44/45, `-cO` 43/45 (2026-09-22) |
 | 127 mixed real files | `-co` 126/127, `-cO` 126/127, `-cc` 126/127 (2026-09-23) |
 | 294 corpus files at `-m4m`; 45 groups of four consecutive corpus files | `-co` 292, `-cO` 292, `-cc` 294, 0 declined; groups 45/44/45 of 45 (last measured at v0.15.2-pre) |
