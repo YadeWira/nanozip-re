@@ -1475,6 +1475,7 @@ public:
     // former `begin() + a, begin() + b` pairs; one range request instead of two
     // loose pointers into the whole file.
     void AppendTo(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const {
+        if (smap_ != nullptr) { AppendSpliced(dst, off, len); return; }
         const unsigned char* q = Span(off, len);
         if (q != nullptr && len != 0u) dst->insert(dst->end(), q, q + static_cast<std::size_t>(len));
     }
@@ -1536,6 +1537,11 @@ public:
 private:
     const unsigned char* ResidentSpan(ArcPos off, ArcPos len) const;   // needs WindowedFile
     const unsigned char* SplicedSpan(ArcPos off, ArcPos len) const;
+    // AppendTo over a splice, a record at a time straight into `dst`: through
+    // Span() a range that straddles records is gathered into a thread-local
+    // scratch first, which for the whole payload (PayloadFlat) was a second copy
+    // of it -- 31 MB on a 128 MB -cc entry -- kept alive for the rest of the run.
+    void AppendSpliced(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const;
     const unsigned char* p_ = nullptr;
     WindowedFile* src_ = nullptr;
     const SpliceMap* smap_ = nullptr;
@@ -1841,6 +1847,23 @@ std::uint64_t SelfCheckCrcRange(const ByteView& src, ArcPos off, ArcPos len, boo
 // A range in splice space. Inside one record it is the file's own bytes; across
 // a record boundary it has to be gathered, so a small per-thread scratch holds
 // it -- two slots, for the same reason a thread keeps several windows.
+inline void ByteView::AppendSpliced(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const {
+    if (off > n_ || len > n_ - off) return;
+    while (len != 0u) {
+        const std::size_t k = smap_->Find(off);
+        if (k >= smap_->rec.size()) return;
+        const ArcPos ko = off - smap_->start[k];
+        ArcPos take = smap_->rec[k].second - ko;
+        if (take > len) take = len;
+        if (take == 0u) return;
+        const ArcPos file_off = smap_->rec[k].first + ko;
+        const unsigned char* q = src_ != nullptr ? src_->Resident(base_ + file_off, take) : p_ + file_off;
+        if (q == nullptr) return;
+        dst->insert(dst->end(), q, q + static_cast<std::size_t>(take));
+        off += take; len -= take;
+    }
+}
+
 inline const unsigned char* ByteView::SplicedSpan(ArcPos off, ArcPos len) const {
     if (len == 0u) len = 1u;
     const std::size_t i = smap_->Find(off);
@@ -8780,7 +8803,14 @@ int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, st
 static bool TryDecodeLegacyLzhd(
     const LegacyCnContext& legacy,
     std::vector<unsigned char>* out_data,
-    std::string* out_error_message) {
+    std::string* out_error_message,
+    // Hand each data record's output over as soon as the record is decoded,
+    // instead of assembling the whole entry: the original flushes per record (1 MB
+    // multiples, measured), so a record that fails is the one lost either way.
+    // Memory is then one record, not the whole output (`t` of 128 MB: 359 MB ->
+    // see below). `out_data` stays empty; nothing is handed over for a record
+    // that did not finish cleanly.
+    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr) {
     progress::Scope pscope;
     if (out_data == nullptr) return false;
     out_data->clear();
@@ -8788,28 +8818,36 @@ static bool TryDecodeLegacyLzhd(
     if (NZ_ENV("NZOPT_TRACE_CD")) {
         fprintf(stderr, "[LZHD] enter: method=0x%x p0=%u p1=%u total=%llu data=%zu\n",
                 legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1,
-                (unsigned long long)legacy.total_data_size, legacy.PayloadFlat().size());
+                (unsigned long long)legacy.total_data_size, (size_t)legacy.Payload().size());
     }
     if (legacy.legacy_method != 0x2bu ||
         (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u)) {
         if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
         return false;
     }
-    const ByteBuffer& payload_flat = legacy.PayloadFlat();
-    if (payload_flat.empty()) {
+    // The payload as a range source: a record at a time out of the archive's
+    // mapping, where it used to be flattened first -- a copy of the whole payload,
+    // made twice over while the flat buffer was built.
+    const ByteView payload = legacy.Payload();
+    if (payload.empty()) {
         if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
         return false;
     }
-
-    const auto* raw = payload_flat.data();
-    const std::size_t raw_len = payload_flat.size();
+    const ArcPos raw_len = payload.size();
 
     // Pre-allocate full output with 16-byte zero prefix for safe history reads
-    // (DecLZ reads cur_ptr[-5] etc. from the first byte).
+    // (DecLZ reads cur_ptr[-5] etc. from the first byte). Streaming, the output
+    // is one decode unit instead (the ring holds the history; the parallel
+    // container's workers have decoded this way since e97f245): a unit of 1 MB
+    // plus 64 KB of headroom, a chunk's output being at most 32 KB.
     static constexpr std::size_t kWindowPad = 16u;
+    static constexpr std::size_t kUnit = 0x100000u, kUnitHeadroom = 0x10000u;
     const std::uint64_t total_out = legacy.total_data_size;
-    std::vector<unsigned char> buf(kWindowPad + total_out, 0u);
+    const bool streaming = (stream_out != nullptr);
+    std::vector<unsigned char> buf(kWindowPad + (streaming ? std::min<std::uint64_t>(kUnit + kUnitHeadroom, total_out)
+                                                           : total_out), 0u);
     unsigned char* const window_base = buf.data() + kWindowPad;
+    std::vector<unsigned char> record;   // streaming: the record being decoded
 
     std::size_t pos = 0u;
     std::size_t written = 0u;
@@ -8885,13 +8923,13 @@ static bool TryDecodeLegacyLzhd(
         std::uint64_t stream_tag = 0u;
         {
             unsigned shift = 7u;
-            unsigned char c = raw[pos++];
+            unsigned char c = payload[pos++];
             stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
             while ((c & 0x80u) != 0u) {
                 if (pos >= raw_len || shift >= 63u) {
                     ok = false; break;
                 }
-                c = raw[pos++];
+                c = payload[pos++];
                 stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
                 shift += 7u;
             }
@@ -8907,8 +8945,10 @@ static bool TryDecodeLegacyLzhd(
             cut_stream = true;
         }
 
-        const std::uint8_t* block_in  = raw + pos;
+        const std::size_t block_off = static_cast<std::size_t>(pos);
+        const std::uint8_t* block_in  = payload.Span(pos, stream_bytes);
         const std::uint32_t block_in_size = static_cast<std::uint32_t>(stream_bytes);
+        if (block_in == nullptr) { ok = false; break; }
         pos += static_cast<std::size_t>(stream_bytes);
 
         // Native -cd LZ block decode (NzCdDecodeBlock): loops the block's 32 KB
@@ -8927,28 +8967,56 @@ static bool TryDecodeLegacyLzhd(
         const std::uint64_t block_left = static_cast<std::uint64_t>(total_out) - static_cast<std::uint64_t>(written);
         const std::uint32_t block_cap = block_left > 0xffffffffull ? 0xffffffffu
                                                                   : static_cast<std::uint32_t>(block_left);
-        std::uint32_t produced = nzr::cd::NzCdDecodeStream(
-            block_in, block_in_size, window_base + written, block_cap,
-            ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
-            is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
-            &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img);
+        std::uint32_t produced = 0u;
+        if (!streaming) {
+            produced = nzr::cd::NzCdDecodeStream(
+                block_in, block_in_size, window_base + written, block_cap,
+                ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
+                is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
+                &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img);
+        } else {
+            // The record in units, each stopping softly at 1 MB: the ring, the -cD
+            // context table and the prefilter/LMS/image state persist across the
+            // calls, so N unit calls are byte for byte the one call above. A unit
+            // that stops unclean ends the record the way the one call would have
+            // (NzCdLastStreamClean reads that unit's verdict).
+            record.clear();
+            std::size_t in_off = 0u;
+            while (in_off < block_in_size && record.size() < block_cap) {
+                const std::uint64_t room = std::min<std::uint64_t>(kUnit + kUnitHeadroom, block_cap - record.size());
+                const std::uint32_t cap = static_cast<std::uint32_t>(room);
+                const std::uint32_t soft = room > kUnitHeadroom ? static_cast<std::uint32_t>(room - kUnitHeadroom) : cap;
+                std::size_t consumed = 0u;
+                const std::uint32_t n = nzr::cd::NzCdDecodeStream(
+                    block_in + in_off, block_in_size - in_off, window_base, cap,
+                    ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written + record.size()),
+                    is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
+                    &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img, soft, &consumed);
+                if (n == 0u) break;             // nothing more: the checks below judge the record
+                record.insert(record.end(), window_base, window_base + n);
+                if (!nzr::cd::NzCdLastStreamClean() || consumed == 0u) break;
+                in_off += consumed;
+            }
+            produced = static_cast<std::uint32_t>(record.size());
+        }
         if (NZ_ENV("NZOPT_TRACE_CD")) {
             fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
                     block_in_size, block_cap, produced, written + produced, (size_t)total_out);
         }
-        if (produced == 0u) { nzr::derr::SetAt(16u, static_cast<std::size_t>(block_in - raw)); ok = false; break; }   // header read past the stream end: -0x10
+        if (produced == 0u) { nzr::derr::SetAt(16u, block_off); ok = false; break; }   // header read past the stream end: -0x10
         if (!nzr::cd::NzCdLastStreamClean()) {
             // A chunk that failed inside a cut-off stream: nz_lzhd's header reader
             // runs out of input first (-0x10) whatever the chunk decoder noticed.
             // (nz_lzhds behaves differently there -- it reaches its reconstruct
             // assertion on the garbage -- and is not modelled.)
-            if (cut_stream && !is_lzhds) { nzr::derr::Clear(); nzr::derr::SetAt(16u, static_cast<std::size_t>(block_in - raw)); }
-            else nzr::derr::SetAt(5u, static_cast<std::size_t>(block_in - raw));
+            if (cut_stream && !is_lzhds) { nzr::derr::Clear(); nzr::derr::SetAt(16u, block_off); }
+            else nzr::derr::SetAt(5u, block_off);
             // The stream stopped on a malformed chunk: the original reports the
             // error here (code 5) and has flushed only the streams before it.
             if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
             ok = false; break;
         }
+        if (streaming) (*stream_out)(record.data(), record.size());
         written += produced;
         progress::Add(produced);
     }
@@ -8960,10 +9028,10 @@ static bool TryDecodeLegacyLzhd(
     if (!ok) {
         if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
         if (out_error_message) *out_error_message = "lzhd: malformed block stream";
-        out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
+        if (!streaming) out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
         return false;
     }
-    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
+    if (const char* dp = streaming ? nullptr : NZ_ENV("NZOPT_DUMP_PRECHECK")) {
         // Dump before BOTH the size check and the checksum gate, so a short
         // decode is diffable too (its prefix is still meaningful) -- not just a
         // full-size wrong-bytes one.
@@ -8977,9 +9045,10 @@ static bool TryDecodeLegacyLzhd(
         // flushed all of it (the last file cut short) and reports "Archive
         // corrupted. Unexpected end of file." instead of an error code.
         if (out_error_message) *out_error_message = "lzhd: unexpected end of file";
-        out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
+        if (!streaming) out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
         return false;
     }
+    if (streaming) { pscope.Commit(); return true; }   // the sink judges each entry's checksum
     // Verify the decoded output against the archive's stored per-file checksum(s).
     // The native -cd ring model is byte-exact for the common case but has a residual
     // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
@@ -9550,17 +9619,20 @@ static bool TryDecodeLegacyCm(
         // holds 554 MB. Start block-proportional and fall back to the full cap
         // only when the transform says it did not fit; a transform returns 0
         // both for bad data and for no room, so no valid block can be lost.
+        // `slack`: bytes past `cap` the transform may write beyond its logical
+        // output (the dictionary's fixed-width words, CR/CRLF's one extra byte).
         const auto cm_tt_scratch = [&](std::vector<std::uint8_t>* buf,
-                                       const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run)
+                                       const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run,
+                                       std::uint32_t slack = 0u)
                                    -> std::uint32_t {
             std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
             if (want > remaining) want = remaining;
             std::uint32_t cap = static_cast<std::uint32_t>(want);
-            buf->assign(cap, 0u);
+            buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
             std::uint32_t n = run(buf->data(), cap);
             if (n == 0u && cap < remaining) {
                 cap = remaining;
-                buf->assign(cap, 0u);
+                buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
                 n = run(buf->data(), cap);
             }
             return n;
@@ -9595,9 +9667,15 @@ static bool TryDecodeLegacyCm(
             // slack is more than the max possible per-word overshoot (7
             // bytes) and costs nothing since the buffer is resized down
             // immediately after.
-            std::vector<std::uint8_t> tbuf(remaining + 16u);
-            const std::uint32_t expanded = NzTextTransformDict(
-                work.data(), cur_size, tbuf.data(), static_cast<std::uint32_t>(tbuf.size()));
+            // Sized like the other transforms (small first, the whole remaining
+            // output only on a retry): a buffer of `remaining` per block was
+            // 126 MB, zero-filled, for the first block of a 128 MB entry, and
+            // two of them at a time (this and CR/CRLF) put -cc's decode at 866 MB
+            // against the original's 448.
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t expanded = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformDict(work.data(), cur_size, o, cap + 16u);
+            }, 16u);
             if (expanded == 0 || expanded > remaining) { ok = false; break; }
             tbuf.resize(expanded);
             work.swap(tbuf);
@@ -9671,8 +9749,10 @@ static bool TryDecodeLegacyCm(
             // and 0x40). One byte of slack: the reference's output budget is
             // out_cap + 1 and it writes that extra byte before noticing the
             // overrun (see NzTextTransformCrToCrLf's header comment).
-            std::vector<std::uint8_t> tbuf(static_cast<std::size_t>(remaining) + 1u);
-            const std::uint32_t n = NzTextTransformCrToCrLf(work.data(), cur_size, tbuf.data(), remaining);
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformCrToCrLf(work.data(), cur_size, o, cap);
+            }, 1u);
             if (n == 0) { ok = false; break; }
             tbuf.resize(n);
             work.swap(tbuf);
@@ -11466,7 +11546,62 @@ int RunLegacyCnExtractOrTest(
     if (!legacy.native_payload_supported) {
         std::vector<unsigned char> bridged_data;
         std::string lzhd_decode_error;
-        if (TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error)) {
+        // -cd/-cD: straight to the files, one data record at a time, as the
+        // optimum and CM paths below do; the entry's output never exists whole.
+        const bool lzhd_codec = (legacy.legacy_method == 0x2bu) &&
+                                (legacy.legacy_method_p0 == 3u || legacy.legacy_method_p0 == 4u);
+        if (lzhd_codec && psink::Available() && !legacy.entries.empty()) {
+            std::vector<psink::Stream> pstreams;
+            psink::Stream ps;
+            for (std::size_t i = 0; i < legacy.entries.size(); ++i) {
+                const LegacyCnEntry& en = legacy.entries[i];
+                psink::Slice sl;
+                sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
+                sl.has_cksum = en.has_checksum; sl.group = i;   // one group per entry (see the optimum path)
+                ps.slices.push_back(sl);
+            }
+            pstreams.push_back(std::move(ps));
+            if (psink::Publish(legacy.entries, std::move(pstreams), psink::Policy::kProduced, 0u, psink::Family::kCd)) {
+                std::uint64_t streamed = 0;
+                const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                    [&streamed](const unsigned char* q, std::size_t n) {
+                        if (n == 0u) return;
+                        if (streamed == 0u) psink::StreamBegin(0u);   // the first file on the first byte
+                        psink::StreamWrite(0u, q, n);
+                        streamed += n;
+                    };
+                const bool lz_ok = TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error, &to_sink);
+                if (lz_ok || (streamed != 0u && IsCorruptStreamFailure(lzhd_decode_error))) {
+                    psink::StreamEnd(0u, nullptr, streamed, lz_ok, false);
+                    LegacyCnContext done = CloneLegacyMeta(legacy);
+                    const psink::Outcome so = psink::Finish();
+                    done.sink_handled = true;
+                    done.sink_failed_entries = so.failed_entries;
+                    done.sink_plain_code = so.plain_code;
+                    if (lz_ok) {
+                        done.native_payload_supported = true;
+                        done.decode_failed = so.stream_failed;
+                        return RunLegacyCnExtractOrTest(options, done, test_mode, os, run_start);
+                    }
+                    // The records completed before the failure are on disk, as in
+                    // the original; report the way the buffered path below does.
+                    done.decode_failed = true;
+                    done.decode_eof = (lzhd_decode_error == "lzhd: unexpected end of file");
+                    AdoptDecodeError(done);
+                    return PrintCorruptLine(os, done);
+                }
+                // Nothing handed over: give the sink back unused and fall through
+                // to the paths below exactly as before.
+                psink::Reset();
+                psink::Configure(options, test_mode, os,
+                                 options.output_path.empty() ? fs::current_path()
+                                                             : PathFromNativeBytes(options.output_path));
+                bridged_data.clear();
+            }
+        }
+        if (bridged_data.empty() && lzhd_decode_error.empty() &&
+            TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error)) {
             LegacyCnContext bridged = CloneLegacyMeta(legacy);
             bridged.native_payload_supported = true;
             bridged.data_offset = 0u;

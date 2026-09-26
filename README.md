@@ -162,11 +162,13 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   files of each stream grouped the `-t1` way. `NZ_THREADS=n` sets only how many run at once, never N.
   The original's own output above one thread changes from run to run
   ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison needs `-t1` on the original's side.
-- **Decode memory** is above the original's: 128 MB of real files, `-t1` (v0.17.0-pre), `-cd` 359 MB
-  (original 109 MB), `-cD` 352 MB (109), `-cf` 179 MB (133), `-cF` 239 MB (195). `-cf`/`-cF` single
-  containers stream to disk one data record at a time, as the original does, except under `NZ_SAFE=1`
-  or when checksums cannot be judged entry by entry (those still buffer the whole output); the rest
-  of their gap is the flat mapping of the archive.
+- **Decode memory** is above the original's. Peak resident memory, 128 MB of real files, `x -t1`,
+  2026-09-25 (the original / this port): `-cn` 129 / 132 MiB, `-cf` 133 / 180, `-cF` 196 / 239, `-cd`
+  110 / 152, `-cD` 110 / 152, `-co` 222 / 333, `-cO` 238 / 367, `-cc` 448 / 585 (v0.17.5-pre: `-cd`
+  359, `-cD` 353, `-cc` 866). The `-cd`/`-cD` single container now streams to disk one data record at
+  a time, as `-cf`/`-cF`, `-co`/`-cO` and `-cc` already did and as the original does, except under
+  `NZ_SAFE=1` or when checksums cannot be judged entry by entry (those still buffer the whole output). Most of what is left is the archive's mapping, which the
+  original reads through a buffer instead, and, for `-co`/`-cO`, the output of one large block.
 - **Console.** The banner's MHz field is a measured figure in the original, not the clock, and is not
   matched. On a mapped archive the footer's `IO-in` figure is the mapping call (0.00 s, an enormous
   rate) where the original times a read.
