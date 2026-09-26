@@ -61,19 +61,37 @@ const WordTables& Words() { static WordTables w; return w; }
 // DAT_08185860: the inverse of the decoder's kReorderAscii, which the dictionary
 // step applies to its own output for every codec but the CM one.
 const std::uint8_t* ReorderAsciiInverse() {
-    static std::uint8_t inv[256];
-    static bool built = false;
-    if (!built) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t inv[256];
+        Holder() : inv{} {
         const std::uint8_t* fwd = nzr::cd::NzCdReorderAscii();
         for (unsigned c = 0; c < 256u; ++c) inv[fwd[c]] = static_cast<std::uint8_t>(c);
-        built = true;
-    }
-    return inv;
+        }
+    } holder;
+    return holder.inv;
 }
 // FUN_080b7120 runs from the dictionary encoder's initialisation (FUN_08055000 ->
 // FUN_080b7770 -> FUN_080b7210), so until the process has encoded one dictionary
 // chunk the detector FUN_08055150 reads an all-zero continuation table.
 bool g_word_tables_built = false;
+// the calling worker's view of it, when workers run concurrently (see the header)
+thread_local DictTableView* t_dict_view = nullptr;
+bool WordTablesBuilt() {
+    DictTableView* v = t_dict_view;
+    if (v == nullptr) return g_word_tables_built;
+    if (!v->resolved) { v->built = v->resolve ? v->resolve() : false; v->resolved = true; }
+    return v->built;
+}
+void MarkWordTablesBuilt() {
+    DictTableView* v = t_dict_view;
+    if (v == nullptr) { g_word_tables_built = true; return; }
+    v->built = true;
+    v->resolved = true;
+    if (!v->did_set) { v->did_set = true; if (v->on_set) v->on_set(); }
+}
 const std::uint8_t kZeroCont[256] = {};
 
 }  // namespace
@@ -106,7 +124,7 @@ static bool HistCrlf(const TextHist& h) {
 bool DictFits(const std::uint8_t* p, std::uint32_t n) {
     if (n <= 0xfu) return false;
     const std::uint8_t* t0 = Traits0();
-    const std::uint8_t* const cont = g_word_tables_built ? Words().cont : kZeroCont;
+    const std::uint8_t* const cont = WordTablesBuilt() ? Words().cont : kZeroCont;
     const std::uint16_t* bucket_start = nzr::cd::NzCdDictBucketStarts();   // DAT_08189880[0x2da]
     std::uint32_t words = 1, rich = 0;
     std::int32_t left = static_cast<std::int32_t>(n) - 4;
@@ -389,7 +407,7 @@ const DictTables& Dict() { static DictTables d; return d; }
 // read-ahead; `dst` is written up to `cap`.
 std::uint32_t TextDictEncode(const std::uint8_t* src0, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap) {
     if (n == 0u) return 0u;
-    g_word_tables_built = true;   // FUN_08055000's table build happens before the size test's effects matter
+    MarkWordTablesBuilt();   // FUN_08055000's table build happens before the size test's effects matter
     const DictTables& D = Dict();
     const WordTables& W = Words();
     const std::uint8_t* t0 = Traits0();
@@ -605,9 +623,12 @@ next_word:
 // The chess (PGN) transform's byte classes, built exactly as the original walks
 // the byte values downwards with its two running counters.
 static const std::uint8_t* ChessTable() {
-    static std::uint8_t tbl[256];
-    static bool done = false;
-    if (!done) {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t tbl[256];
+        Holder() : tbl{} {
         const std::uint8_t* t0 = Traits0();
         std::uint32_t c = 0xff, u3 = 0xce, u5 = 0x41;
         for (;;) {
@@ -637,9 +658,9 @@ static const std::uint8_t* ChessTable() {
             if (c == 0u) break;
             --c; --u3; --u5;
         }
-        done = true;
-    }
-    return tbl;
+        }
+    } holder;
+    return holder.tbl;
 }
 
 std::uint32_t TextChessEncode(const std::uint8_t* src, std::uint32_t n, std::uint8_t* dst, std::uint32_t cap) {
@@ -773,5 +794,9 @@ std::uint32_t TextPipeline(std::uint32_t bits, std::uint8_t*& buf, std::uint32_t
     *applied = done;
     return n;
 }
+
+void SetThreadDictTableView(DictTableView* view) { t_dict_view = view; }
+bool ProcessDictTablesBuilt() { return g_word_tables_built; }
+void SetProcessDictTablesBuilt(bool built) { g_word_tables_built = built; }
 
 }  // namespace nzr::lzhd_enc

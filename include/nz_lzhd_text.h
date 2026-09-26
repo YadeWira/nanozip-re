@@ -6,6 +6,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace nzr::lzhd_enc {
@@ -34,5 +35,24 @@ std::uint32_t TextChessEncode(const std::uint8_t* src, std::uint32_t n, std::uin
 // TextChessEncode(buf, n - 0x40, scratch, n) guarded by n >= 0x80.
 bool DictFits(const std::uint8_t* p, std::uint32_t n);
 bool LineRleFits(const std::uint8_t* src, std::uint32_t n);
+
+// Quirk 56 under concurrent workers. The detector reads a word-continuation table
+// that the dictionary transform fills the first time it runs in the PROCESS, so in
+// the original's serial order ([1..N-1, 0], measured) a worker stream sees it
+// filled exactly when an earlier worker ran the transform. Workers compressed
+// concurrently each get a view of that flag: `resolve` (set by the driver)
+// yields the value the worker inherits, called at the worker's first read unless
+// the worker has already filled the table itself; `on_set` tells the driver the
+// worker has filled it. Without a view (one thread), the process-wide flag.
+struct DictTableView {
+    bool resolved = true;
+    bool built = false;
+    bool did_set = false;
+    std::function<bool()> resolve;
+    std::function<void()> on_set;
+};
+void SetThreadDictTableView(DictTableView* view);
+bool ProcessDictTablesBuilt();
+void SetProcessDictTablesBuilt(bool built);
 
 }  // namespace nzr::lzhd_enc

@@ -20,6 +20,8 @@
 #include "nz_bwt.h"
 #include "nz_audio.h"
 #include <atomic>
+#include <exception>
+#include <condition_variable>
 #include <cerrno>
 #include <cpuid.h>
 #include <memory>
@@ -52,6 +54,7 @@
 #include <numeric>
 #include <sstream>
 #include "nz_selfcheck.h"
+#include "nz_lzhd_text.h"
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -13089,7 +13092,11 @@ void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, c
 struct EncodeStatus {
     std::vector<std::uint64_t> done, total;
     std::time_t writer_sec = 0, worker_sec = 0;
-    explicit EncodeStatus(std::size_t workers) : done(workers, 0u), total(workers, 0u) {}
+    // Worker streams compressed concurrently all tick this: every method takes the
+    // lock, and so does Line(), the one way a buffered message reaches the console
+    // while they run, so a redraw never lands in the middle of a line.
+    mutable std::mutex mu;
+    explicit EncodeStatus(std::size_t workers) : done(workers, 0u), total(workers, 0u), pending(workers, 0u) {}
     static std::string Pct(std::uint64_t d, std::uint64_t t) {
         return std::to_string((((d >> 10u) | 1u) * 100u) / ((t >> 10u) | 1u)) + "%";
     }
@@ -13108,6 +13115,7 @@ struct EncodeStatus {
         os.flush();
     }
     void FileStart(std::ostream& os, const std::string& name) {
+        std::lock_guard<std::mutex> lk(mu);
         const std::time_t sec = std::time(nullptr);
         if (sec == writer_sec) return;
         writer_sec = sec;
@@ -13119,9 +13127,20 @@ struct EncodeStatus {
     // the first block shows an empty field even after "Cannot open"): the slot
     // counts what the worker has consumed of its range, block by block.
     std::vector<std::uint64_t> pending;
-    void Passed(std::size_t k, std::uint64_t bytes) { if (pending.size() < done.size()) pending.resize(done.size(), 0u); if (k < done.size()) pending[k] += bytes; }
+    void Passed(std::size_t k, std::uint64_t bytes) { std::lock_guard<std::mutex> lk(mu); if (k < done.size()) pending[k] += bytes; }
+    // a chunked codec's ghost leaves its slot's total (see the stream writer)
+    void DropFromTotal(std::size_t k, std::uint64_t bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (k < total.size()) total[k] -= std::min<std::uint64_t>(total[k], bytes);
+    }
+    // a whole message line, written while no redraw can interleave
+    void Line(std::ostream& os, const std::string& text) {
+        std::lock_guard<std::mutex> lk(mu);
+        os << text;
+        os.flush();
+    }
     void BlockDone(std::ostream& os, std::size_t k, std::uint64_t bytes) {
-        if (pending.size() < done.size()) pending.resize(done.size(), 0u);
+        std::lock_guard<std::mutex> lk(mu);
         if (k < done.size()) { done[k] += bytes + pending[k]; pending[k] = 0u; }
         const std::time_t sec = std::time(nullptr);
         if (sec == worker_sec) return;
@@ -14293,7 +14312,12 @@ static void LegacyWriteStreamHeader(std::vector<unsigned char>& out, unsigned st
 bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
                             const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
                             std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
-                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec) {
+                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec,
+                            std::ostream* live_os = nullptr) {
+    // `os` takes the permanent lines ("Cannot open:", "Error: cannot read"); the
+    // status redraws go to `live` -- the same stream on one thread, the console
+    // itself while `os` is a worker's buffer, replayed in the serial order later.
+    std::ostream& live = (live_os != nullptr) ? *live_os : os;
     if (with_header) LegacyWriteStreamHeader(out, stream, window, ckmode, codec);
     if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
     if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
@@ -14403,11 +14427,11 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 // = 30000 of 35100, the ghost not yet met at that tick)
                 if (!chunked) status.Passed(stream, src[met[cur_met].src].size);
                 else {
-                    if (stream < status.total.size()) status.total[stream] -= std::min<std::uint64_t>(status.total[stream], met[cur_met].planned);
+                    status.DropFromTotal(stream, met[cur_met].planned);
                     if (ghost_budget == 0u) ghost_budget = met[cur_met].planned;
                 }
             } else {
-                status.FileStart(os, src[met[cur_met].src].display);   // an empty file is opened too
+                status.FileStart(live, src[met[cur_met].src].display);   // an empty file is opened too
                 piece_ck[piece_of[cur_met]] = LegacyFileChecksum(ckmode).Final();
             }
             ++cur_met; cur_off = 0;
@@ -14500,7 +14524,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 in.close(); in.clear(); in.open(e.fs_path, std::ios::binary); in.seekg(static_cast<std::streamoff>(pc.file_off));
                 ck = LegacyFileChecksum(ckmode);
                 pcrc = nzr::selfcheck::Crc64();
-                status.FileStart(os, e.display);
+                status.FileStart(live, e.display);
             }
             const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
             const auto t_read = std::chrono::steady_clock::now();
@@ -14594,7 +14618,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), data.begin(), data.end());
         }
         written = block_end;
-        status.BlockDone(os, stream, block.size());
+        status.BlockDone(live, stream, block.size());
         if (total == 0u) break;
     }
     if (chunked && codec.p0 >= 5u) {
@@ -14759,6 +14783,149 @@ static void SelfCheckInjectFault(const fs::path& path, const std::vector<nzr::se
     c = static_cast<char>(c ^ 0x01);
     f.seekp(static_cast<std::streamoff>(at));
     f.write(&c, 1);
+}
+
+// The worker streams of a -pN container compressed concurrently (see the call in
+// RunAddStoreContainer), with everything the one-thread run decides by ORDER kept:
+//
+// * The write order is the serial one: worker N-1's header, then workers 1..N-1,
+//   then worker 0. Jobs are handed out in that processing order P = [1..N-1, 0]
+//   and the main thread writes each body as soon as the ones before it in P are
+//   written, so at most the unwritten suffix is held in memory.
+// * Quirk 56: the text detector's word-continuation table is filled the first
+//   time the dictionary transform runs in the process, and the original's serial
+//   order is P (measured: -p3 -t1, text in worker 0 / 1 / 2 / all, 20/20
+//   identical, each input sensitive to the table's state). So the worker at P[i]
+//   inherits "filled" exactly when one of P[0..i-1] runs the transform. Each job
+//   gets its own view of the flag; at its first read (unless it filled the table
+//   itself first) it waits until an earlier job has filled it or all earlier jobs
+//   have finished without doing so. Jobs start in P order, so every job it waits
+//   for is already running: no deadlock, and no work is repeated.
+// * The permanent console lines of a job ("Cannot open:", "Error: cannot read")
+//   go to its own buffer and are replayed, in P order, just before its body is
+//   written; the status redraws go straight to the console under EncodeStatus's
+//   lock (they are timing-dependent in the original too, quirk 58).
+// * A failure is the FIRST in P order, as serially: the lines up to and including
+//   that job's are shown and the caller declines. An exception is rethrown the
+//   same way.
+// * The BWT read-back's own thread pool is held at one thread meanwhile.
+template <class RangeOf, class TimedWrite>
+static bool RunWorkersConcurrently(unsigned workers, unsigned pool, const RangeOf& range_of,
+                                   const std::vector<EncodeSource>& sources, const std::vector<std::uint64_t>& start,
+                                   std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
+                                   std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms,
+                                   std::vector<EncodeCodec>& codecs, const TimedWrite& timed_write) {
+    {
+        std::vector<unsigned char> hdr_only;
+        LegacyWriteStreamHeader(hdr_only, workers - 1u, window, ckmode, codecs[workers - 1u]);
+        timed_write(hdr_only);
+    }
+    (void)LegacyLocalUtcOffsetSeconds();   // fixed once, before any worker stamps a file
+    std::vector<unsigned> order;
+    for (unsigned k = 1u; k < workers; ++k) order.push_back(k);
+    order.push_back(0u);
+    struct Job {
+        std::vector<unsigned char> body;
+        std::ostringstream lines;
+        std::uint64_t read_ms = 0;
+        bool ok = false;
+        bool finished = false;
+        std::exception_ptr err;
+        nzr::lzhd_enc::DictTableView view;
+    };
+    std::vector<Job> jobs(workers);   // by worker index
+    // quirk 56, by position in P
+    std::mutex chain_mu;
+    std::condition_variable chain_cv;
+    std::vector<char> set_at(order.size(), 0), done_at(order.size(), 0);
+    const bool entry0 = nzr::lzhd_enc::ProcessDictTablesBuilt();
+    // Test only: no job inherits the flag from the jobs before it. The archive
+    // then changes on an input whose later workers depend on the inheritance,
+    // which is how tests/encode/parallel_determinism.sh proves its quirk-56 cases
+    // are sensitive before trusting their "identical".
+    const bool isolated = NZ_ENV("NZ_TEST_Q56_ISOLATED") != nullptr;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        Job& j = jobs[order[i]];
+        if (i == 0u || entry0 || isolated) {
+            j.view.resolved = true;
+            j.view.built = entry0;
+        } else {
+            j.view.resolved = false;
+            j.view.resolve = [&chain_mu, &chain_cv, &set_at, &done_at, i]() -> bool {
+                std::unique_lock<std::mutex> lk(chain_mu);
+                for (;;) {
+                    bool all_done = true;
+                    for (std::size_t q = 0; q < i; ++q) {
+                        if (set_at[q] != 0) return true;
+                        if (done_at[q] == 0) all_done = false;
+                    }
+                    if (all_done) return false;
+                    chain_cv.wait(lk);
+                }
+            };
+        }
+        j.view.on_set = [&chain_mu, &chain_cv, &set_at, i]() {
+            { std::lock_guard<std::mutex> lk(chain_mu); set_at[i] = 1; }
+            chain_cv.notify_all();
+        };
+    }
+    std::atomic<std::size_t> next{0};
+    std::mutex done_mu;
+    std::condition_variable done_cv;
+    const auto work = [&]() {
+        for (;;) {
+            const std::size_t i = next.fetch_add(1u);
+            if (i >= order.size()) break;
+            const unsigned k = order[i];
+            Job& j = jobs[k];
+            const auto r = range_of(k);
+            nzr::lzhd_enc::SetThreadDictTableView(&j.view);
+            try {
+                j.ok = LegacyWriteStoreStream(j.body, k, sources, start, r.first, r.second, window, ckmode, options,
+                                              k != workers - 1u, k == workers - 1u, j.lines, status, &j.read_ms,
+                                              codecs[k], &os);
+            } catch (...) {
+                j.err = std::current_exception();
+                j.ok = false;
+            }
+            nzr::lzhd_enc::SetThreadDictTableView(nullptr);
+            { std::lock_guard<std::mutex> lk(chain_mu); done_at[i] = 1; }
+            chain_cv.notify_all();
+            { std::lock_guard<std::mutex> lk(done_mu); j.finished = true; }
+            done_cv.notify_all();
+        }
+    };
+    NzBwtSetThreadCount(1u);
+    std::vector<std::thread> threads;
+    bool failed = false;
+    std::exception_ptr fail_err;
+    {
+        // every thread is joined on every way out, a throw included
+        struct Joiner { std::vector<std::thread>& t; ~Joiner() { for (std::thread& x : t) if (x.joinable()) x.join(); } } joiner{threads};
+        for (unsigned t = 0; t < pool; ++t) threads.emplace_back(work);
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            Job& j = jobs[order[i]];
+            { std::unique_lock<std::mutex> lk(done_mu); done_cv.wait(lk, [&j] { return j.finished; }); }
+            const std::string lines = j.lines.str();
+            if (!lines.empty()) status.Line(os, lines);
+            if (j.err) { fail_err = j.err; break; }
+            if (!j.ok) { failed = true; break; }
+            timed_write(j.body);
+            std::vector<unsigned char>().swap(j.body);
+            // the engines are done with once the body is out (the -cF hash alone is
+            // 64 MB a worker); what the self-check needs is `expected`
+            EncodeCodec& c = codecs[order[i]];
+            c.lz.reset(); c.cd.reset(); c.co.reset(); c.co_v.reset(); c.cO.reset(); c.cO_v.reset();
+            if (c.cc != nullptr) { NzCmDestroy(c.cc); c.cc = nullptr; }
+        }
+    }
+    NzBwtSetThreadCount(DecodeThreadCount());
+    bool any_set = entry0;
+    for (std::size_t i = 0; i < order.size(); ++i) any_set = any_set || (set_at[i] != 0);
+    nzr::lzhd_enc::SetProcessDictTablesBuilt(any_set);
+    for (const Job& j : jobs) *read_ms += j.read_ms;
+    if (fail_err) std::rethrow_exception(fail_err);
+    return !failed;
 }
 
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
@@ -15048,7 +15215,25 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         return {b, e};
     };
     for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
-    if (workers == 1u) {
+    // The worker streams are independent, so with more than one thread they are
+    // compressed concurrently and written in the SAME order as below, which keeps
+    // the archive byte-identical to the one-thread run. The pool is T = min(-t,
+    // host) threads, at most one per worker; NZ_THREADS may set it (tests and
+    // timings). The worker COUNT never follows it -- that changes the archive.
+    // The store gains nothing (it is I/O), and total == 0 has its own order.
+    unsigned pool = 1u;
+    {
+        const unsigned host = HostThreadCount();
+        unsigned T = host;
+        if (options.threads > 0u && options.threads < host) T = options.threads;
+        if (const char* e = NZ_ENV("NZ_THREADS")) { const int v = std::atoi(e); if (v > 0) T = static_cast<unsigned>(v); }
+        pool = std::min<unsigned>(T, workers);
+    }
+    if (workers > 1u && pool > 1u && total != 0u && p0 != 0u) {
+        if (!RunWorkersConcurrently(workers, pool, range_of, sources, start, window, ckmode, options, os, status,
+                                    &read_ms, codecs, timed_write))
+            return decline();
+    } else if (workers == 1u) {
         std::vector<unsigned char> body;
         if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0])) return decline();
         timed_write(body);
