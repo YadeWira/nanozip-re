@@ -48,6 +48,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
+| `-cf`/`-cF` archives whose window wraps more than once: the original's, of 127 real files, at windows from 64 KB to 256 MB, single container and `-p2`/`-p8` (`tests/lzpf_ring_laps.sh`) | 30/30 test clean and extract identically; v0.17.4-pre: 15/30, and the same defect is in every release measured, back to v0.14.2-pre (2026-09-24) |
 | Archives made by the **Windows** original, 8 codecs (`tests/windows_original.sh` through wine, `tests/parity/windows_vm_check.ps1` on Windows 10) | 24/24 through wine; on Windows 47/48 identical, one progress-tick difference, file attributes included (2026-09-04) |
 | Damaged and truncated archives, 8 codecs (`tests/parity/`) | 48 damaged variants of the fixtures the harness builds (`make_fixtures.sh`): 47/48 identical file sets, report lines identical in `x` 34/48, `l` 47/48, `t` 34/48; on the release package's fixtures v0.14.2-pre gave 42/48 and `x` 38/48, and `-cf`/`-cF` gave 9/12 identical file sets there on 2026-09-22, before 5be60d5 moved their single containers to the streaming path; file filters on a damaged archive 8/8 (`filter_checksum.sh`); 105/152 identical reports over 19 cut points in the release run (103 to 105 across that night's runs), ours stable run to run, the original's not on two cut `-cd` archives (2026-09-23); damaged parallel containers, five `-p4` fixtures × seven damages: 34/35 extract the original's tree, reports identical in v0.16.0-pre, v0.17.0-pre and v0.17.1-pre (2026-09-23). The rest include the original's crashes, uninitialised memory and garbage decodes ([quirks 26, 27, 47, 51](docs/ORIGINAL_QUIRKS.md)) |
 | Writing the files (`tests/parity/sink_files.sh`): many files, name collisions, empty entries, a full disk; 4 codecs, single and `-p4` | 28/28 identical (2026-09-23); a 3000-file archive extracts whole on Windows 10. `-forceout` over a parallel container still differs; there the original's own result varies run to run |
@@ -133,7 +134,10 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   is kept and a `Note:` line says it was not checked. The original does no such check. It costs a
   decode: on 12 MB of real files at `-t1`, `-cn` +14 %, `-cf` +59 %, `-cF` +100 %, `-cd` +34 %, `-cD`
   +17 %, `-co` +17 %, `-cO` +21 %, `-cc` +92 % (the CM decodes as slowly as it encodes);
-  `NZ_NO_SELFCHECK=1` turns it off. `s` writes nothing, so it has nothing to check.
+  `NZ_NO_SELFCHECK=1` turns it off. `s` writes nothing, so it has nothing to check. In v0.17.4-pre it
+  wrongly refused `a -cF` of a folder of many files at the default thread count (and `-cf`/`-cF` at
+  small `-m`): the archive was right, this port's reader was not (fixed in v0.17.5-pre, see
+  `tests/lzpf_ring_laps.sh`).
 - **Threads.** `-t` above 1 still compresses on one thread (stated at v0.10.0-pre and v0.11.0-pre), and `a` lays the
   archive out the `-t1` way at every thread count. From 8 MB of input it splits into worker streams by
   the original's rule (since v0.17.1-pre: `-cn`, `-cO` and `-cc` keep one compressor unless the input is

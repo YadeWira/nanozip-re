@@ -5129,6 +5129,7 @@ bool DecodeLzpfMember(
         std::vector<std::uint8_t> byte_buffer_b(
             is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
         std::size_t window_cursor = window_initial_cursor;
+        bool window_tail_dirty = true;   // +0x1005c, set by the reset FUN_080b6c60
         ArcPos input_pos = first_block_pos;
         bool decode_ok = true;
         std::size_t blk_idx = 0;
@@ -5198,11 +5199,23 @@ bool DecodeLzpfMember(
             // block output is produced and reports how many input bytes it read.
             const bool mode_lz77_raw = !mode_prefilter && (uvar9 & 2u) && !(uvar9 & 1u);
             nz_trace::Construct("lzpf_block mode=%s bit3=%u", mode_prefilter ? "prefilter" : mode_literal ? "literal" : mode_lz77_side ? "lz77_side" : "lz77_raw", (uvar9 >> 3) & 1u);
-            // Sliding-window wrap (legacy FUN_080b6bb0): zero [cursor, cap+0x8000)
-            // then reset the cursor to 0 when fewer than 32 KiB remain.
-            if (window_capacity - window_cursor < window_wrap_threshold) {
-                std::memset(window + window_cursor, 0,
-                            window_capacity + window_tail_slack - window_cursor);
+            // Sliding-window wrap (legacy FUN_080b6bb0): when fewer than 32 KiB
+            // remain, reset the cursor to 0 -- and zero [cursor, cap+0x8000) only
+            // on the FIRST wrap. The zeroing is gated by +0x1005c, which only the
+            // reset (FUN_080b6c60) sets and the first wrap clears; every later lap
+            // keeps the previous lap's bytes past the cursor, and a stale hash
+            // entry can match into them. Zeroing every lap decoded those matches
+            // as zeros: 9 files, 229 KB, -cF -m64m (a 64 KB window, 3 laps)
+            // failed the last file's checksum 7 bytes in, while the original read
+            // it. The encoder has the same gate (State::Wrap).
+            // The comparison is the original's: `cap < cursor + 0x8000`, which a
+            // 0x8001-byte block ending one past the capacity still trips.
+            if (window_capacity < window_cursor + window_wrap_threshold) {
+                if (window_tail_dirty) {
+                    window_tail_dirty = false;
+                    std::memset(window + window_cursor, 0,
+                                window_capacity + window_tail_slack - window_cursor);
+                }
                 window_cursor = 0;
             }
             if (mode_prefilter) {
