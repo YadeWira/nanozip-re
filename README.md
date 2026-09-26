@@ -48,7 +48,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
-| `-cf`/`-cF` archives whose window wraps more than once: the original's, of 127 real files, at windows from 64 KB to 256 MB, single container and `-p2`/`-p8` (`tests/lzpf_ring_laps.sh`) | 30/30 test clean and extract identically; v0.17.4-pre: 15/30, and the same defect is in every release measured, back to v0.14.2-pre (2026-09-24) |
+| `-cf`/`-cF` archives whose window wraps more than once: the original's, of 127 real files (13 MB), at budgets from `-m1m` to `-m256m` (windows from 64 KB to the whole input, so most of them wrap several times), single container and `-p2`/`-p8` (`tests/lzpf_ring_laps.sh`) | 30/30 test clean and extract identically; v0.17.4-pre: 15/30, and the same defect is in every release measured, back to v0.14.2-pre (2026-09-24) |
 | Archives made by the **Windows** original, 8 codecs (`tests/windows_original.sh` through wine, `tests/parity/windows_vm_check.ps1` on Windows 10) | 24/24 through wine; on Windows 47/48 identical, one progress-tick difference, file attributes included (2026-09-04) |
 | Damaged and truncated archives, 8 codecs (`tests/parity/`) | 48 damaged variants of the fixtures the harness builds (`make_fixtures.sh`): 47/48 identical file sets, report lines identical in `x` 34/48, `l` 47/48, `t` 34/48; on the release package's fixtures v0.14.2-pre gave 42/48 and `x` 38/48, and `-cf`/`-cF` gave 9/12 identical file sets there on 2026-09-22, before 5be60d5 moved their single containers to the streaming path; file filters on a damaged archive 8/8 (`filter_checksum.sh`); 105/152 identical reports over 19 cut points in the release run (103 to 105 across that night's runs), ours stable run to run, the original's not on two cut `-cd` archives (2026-09-23); damaged parallel containers, five `-p4` fixtures × seven damages: 34/35 extract the original's tree, reports identical in v0.16.0-pre, v0.17.0-pre and v0.17.1-pre (2026-09-23). The rest include the original's crashes, uninitialised memory and garbage decodes ([quirks 26, 27, 47, 51](docs/ORIGINAL_QUIRKS.md)) |
 | Writing the files (`tests/parity/sink_files.sh`): many files, name collisions, empty entries, a full disk; 4 codecs, single and `-p4` | 28/28 identical (2026-09-23); a 3000-file archive extracts whole on Windows 10. `-forceout` over a parallel container still differs; there the original's own result varies run to run |
@@ -59,13 +59,13 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 
 | what | result |
 |---|---|
-| Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 135/135 on 2026-09-24 (134/135 on other runs: an extra progress redraw of ours, a different case each time) |
+| Encode oracle (`tests/encode/oracle.sh`): all eight compressors; the `-s`, `-r`, `-sp`, `-x`, `-pN`, checksum and metadata switches; block and piece boundaries; empty, text, random, ELF, audio, image, CRLF, PGN and block-RLE inputs | 135/135 archives byte-identical, 135/135 read back by the other binary in both directions; consoles identical in 130 to 135 of 135 depending on the run (135 on 2026-09-24): extra progress redraws of ours, a different case each time |
 | 45 BMP/TGA/TIFF/PNM images | `-cn`, `-cF`, `-cD` 45/45 (v0.16.0-pre); `-cf`, `-cd`, `-cc` 45/45, `-co` 44/45, `-cO` 43/45 (2026-09-22) |
 | 127 mixed real files | `-co` 126/127, `-cO` 126/127, `-cc` 126/127 (2026-09-23) |
 | 294 corpus files at `-m4m`; 45 groups of four consecutive corpus files | `-co` 292, `-cO` 292, `-cc` 294, 0 declined; groups 45/44/45 of 45 (last measured at v0.15.2-pre) |
 | Multi-file archives of real size: five shapes, from two 3 MB files to an 18-file tree, × 8 codecs (`tests/encode/multifile_sizes.sh`) | 40/40 byte-identical at `-t1` and read by the original, which also reads the default-thread-count archives (2026-09-23) |
 | Above the automatic split (8 MB): `a -t4` of 20 MB × 8 codecs read back and extracted by the original, with its compressor count; `-t1 -p3`/`-p16` for `-co`/`-cO`/`-cc`; the original's `-cc -p12`/`-p16` read at `-t1` (`tests/encode/parallel_readback.sh`) | 16/16 (v0.17.0-pre: 6/16) (2026-09-23) |
-| Worker streams compressed on several threads (`tests/encode/parallel_determinism.sh`), 8 codecs: `-p4 -t4` against `-p4 -t1` on a folder with empty, one-byte and unreadable files; the automatic split against a pool of one thread; repeated runs and runs under `MALLOC_PERTURB_`/`MALLOC_ARENA_MAX`; the self-check; and [quirk 56](docs/ORIGINAL_QUIRKS.md) with the text in each of three streams, first shown to depend on the inheritance, against the original's `-p3 -t1` | 94/94; ThreadSanitizer and ASan + UBSan report nothing on all eight codecs (2026-09-24) |
+| Worker streams compressed on several threads (`tests/encode/parallel_determinism.sh`), the 7 compressing methods: `-p4 -t4` against `-p4 -t1` on a folder with empty, one-byte and unreadable files; the automatic split against a pool of one thread; repeated runs and runs under `MALLOC_PERTURB_`/`MALLOC_ARENA_MAX`; the self-check; and [quirk 56](docs/ORIGINAL_QUIRKS.md) for the 5 methods that run the dictionary transform, with the text in each of three streams or all, against the original's `-p3 -t1`, after one input per method has been shown to depend on the inheritance | 94/94; ThreadSanitizer found one race, a debug counter in the `-co`/`-cO` reader (fixed), and nothing after it; ASan + UBSan nothing, on the 7 methods (2026-09-24) |
 | `-cd` across the 128 MB window (`tests/encode/large_window.sh`), and real files to 328 MB | byte-identical, memory line included, from 132 087 807 bytes to 328 MB; `-cD` too (2026-09-23) |
 | Real audio, mixed-type and image files | 54 audio, 64 mixed-type and 24 image files byte-identical under `-cf`, `-cF`, `-cd` (v0.10.0-pre) and `-cD` (v0.11.0-pre) |
 | Memory budgets (`-m`) | 100/100 archives identical over five codecs × twenty budgets (v0.11.0-pre); `-co` sizing 552/552 points (v0.14.0-pre); `-cc` sizing 91/91 and 16/64/256 MB × 3 codecs × 5 files 45/45 (v0.15.0-pre) |
@@ -97,15 +97,19 @@ port did not have. Fixed in v0.17.1-pre: byte-identical from just below that siz
 `-co` and `-cO` archives differ from the original's; on a 16 MB fixture the difference is the last
 block only ([quirk 72](docs/ORIGINAL_QUIRKS.md), below), and on this one it has not been traced.
 
-**With the default threads, where the input is split into worker streams, it compresses faster than the
-original** (since v0.17.5-pre, which runs the streams at the same time). Same 128 MB, 16 streams (the
-automatic split on a 16-thread host), each program's own archive, best of 2, 2026-09-25: `-cf` 0.34×,
-`-cF` 0.58×, `-cd` 0.72×, `-cD` 0.33×, `-co` 0.28× of the original's time, and `-cO`/`-cc` under `-p16`
-0.23×/0.20×. `-cn`, and `-cO`/`-cc` without `-pN`, keep one stream, so the one-thread figures above stand.
-The self-check adds a decode, run on the same threads.
+**With the default threads, where the input is split into worker streams, the compression itself is
+faster than the original's** (since v0.17.5-pre, which runs the streams at the same time). Same 128 MB,
+16 streams (the automatic split where `Threads:` says 16: a 32-core, 64-thread host), each program's own
+archive, best of 2, the self-check off, 2026-09-25: `-cf` 0.34×, `-cF` 0.58×, `-cd` 0.72×, `-cD` 0.33×,
+`-co` 0.28× of the original's time, and `-cO`/`-cc` under `-p16` 0.23×/0.20×. **With the self-check on,
+as by default,** `-cf` 0.67×, `-cD` 0.43× and `-co` 0.33× stay faster and `-cF` (1.36×) and `-cd`
+(1.23×) are slower than the original. `-cn` stays serial, and `-cO`/`-cc` without `-pN` keep one
+stream unless the input is mostly media files, so for them threads change nothing.
 
-Parallel (`-pN`) archives compress (since v0.17.5-pre) and decode on one thread per worker stream
-(`-t<n>` caps it). Method and full
+Parallel (`-pN`) archives compress (since v0.17.5-pre; not `-cn`) and decode on one thread per worker
+stream. The compressor runs at most the `Threads:` count at once; the decoder, and the self-check's
+read-back with it, follows its own rule: `NZ_THREADS`, else `-t<n>`, else the machine's logical CPU
+count. Method and full
 tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). Details: [Decode Coverage](https://github.com/YadeWira/nanozip-re/wiki/Decode-Coverage),
 [Console Parity](https://github.com/YadeWira/nanozip-re/wiki/Console-Parity), [Component Status](https://github.com/YadeWira/nanozip-re/wiki/Component-Status), [Changelog](https://github.com/YadeWira/nanozip-re/wiki/Changelog).
 
@@ -149,12 +153,14 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   `tests/lzpf_ring_laps.sh`).
 - **Threads.** From 8 MB of input `a` splits into worker streams by the original's rule (since
   v0.17.1-pre: `-cn`, `-cO` and `-cc` keep one compressor unless the input is mostly media files), and
-  `-pN` asks for N. Since v0.17.5-pre the streams are compressed at the same time, one thread each, up
-  to `-t<n>` threads (the host's count by default); up to v0.17.4-pre they were compressed one after
-  another. Either way the archive is the one `-t1 -pN` writes, byte for byte, and `a` lays it out the
-  `-t1` way at every thread count: the number of threads decides only how many streams run at once,
-  never how many there are. `NZ_THREADS` sets the number of threads without touching the archive. The
-  original's own output above one thread changes from run to run
+  `-pN` asks for N. Without `-pN`, `-t<n>` (capped at the `Threads:` count the original's rule
+  derives from the machine) is what sets the automatic split's N, as in the original, so `a -t4` of
+  more than 8 MB writes what `a -t1 -p4` writes, not what `a -t1` writes. Since v0.17.5-pre the
+  streams are compressed at the same time, one thread each, up to that `Threads:` count (the store,
+  `-cn`, stays serial); up to v0.17.4-pre they were compressed one after another. How many run at once
+  never changes the archive: for a given N it is the one `-t1 -pN` writes, byte for byte, with the
+  files of each stream grouped the `-t1` way. `NZ_THREADS=n` sets only how many run at once, never N.
+  The original's own output above one thread changes from run to run
   ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison needs `-t1` on the original's side.
 - **Decode memory** is above the original's: 128 MB of real files, `-t1` (v0.17.0-pre), `-cd` 359 MB
   (original 109 MB), `-cD` 352 MB (109), `-cf` 179 MB (133), `-cF` 239 MB (195). `-cf`/`-cF` single
@@ -191,7 +197,7 @@ of the `nz-re` binary; the stub is not included here. Before v0.13.0-pre the bin
 |---|---|
 | `NZ_SAFE=1` | on a damaged archive write only entries whose checksum verifies, skip the rest with the `Checksum mismatch` line, exit 2 (the original writes whatever it decoded) |
 | `NZ_STRICT_EXIT=1` | distinct exit codes for damage and usage errors |
-| `NZ_THREADS=n` | thread count, of the decoder and of `a`'s worker streams (default: `-t<n>`, else the CPU count); it never changes how many streams `a` writes, so never the archive |
+| `NZ_THREADS=n` | thread count: of the decoder (default `-t<n>`, else the logical CPU count) and of the pool that runs `a`'s worker streams (default the `Threads:` count, `-t<n>` capped at what the original's rule derives from the machine); it replaces that count for the pool, but never changes how many streams `a` writes, so never the archive |
 | `NZ_TRACE_CONSTRUCTS=1` | print each format construct met, once (`[construct] k=v` on stderr) |
 | `NZ_NO_SELFCHECK=1` | `a`/`w32c`: skip the whole-archive self-check |
 | `NZ_TRACE_SELFCHECK=1` | `a`/`w32c`: one `[selfcheck]` line on stderr with the verdict, entries, bytes and time |

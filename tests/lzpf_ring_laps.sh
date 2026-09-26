@@ -2,8 +2,9 @@
 # lzpf_ring_laps.sh -- -cf/-cF archives whose window ring wraps more than once.
 #
 # The lzpf window is a ring: when fewer than 32 KB are left the cursor goes back
-# to 0 (FUN_080b6bb0), and the 32 KB past it are zeroed only on the FIRST wrap
-# after the reset (the flag at +0x1005c, set by FUN_080b6c60). From the second
+# to 0 (FUN_080b6bb0), and the tail from the cursor to 32 KB past the capacity
+# is zeroed only on the FIRST wrap after the reset (the flag at +0x1005c, set by
+# FUN_080b6c60). From the second
 # lap on, the bytes past the cursor are the previous lap's, and a stale hash
 # entry can match into them. Up to v0.17.4-pre this reader zeroed them on every
 # lap and decoded such a match as zeros: 15 of these 30 archives failed, and
@@ -11,7 +12,9 @@
 # default thread count (16 workers make the -cF windows 64 KB).
 #
 # The original compresses a folder of many real files with -cf and -cF, at
-# windows from 64 KB (-cF under -m64m) to 256 MB, single container and -p2/-p8;
+# budgets from -m1m to -m256m (windows from 64 KB, -cF under -m64m, up to the
+# whole input, so most but not all of them wrap more than once), single
+# container and -p2/-p8;
 # ours must test clean and extract every file identical to the input. The
 # folder is NZ_LAPS_DIR (default: the 127 mixed files of the wide sweep); the
 # test is skipped (exit 77) without it or without the original.
