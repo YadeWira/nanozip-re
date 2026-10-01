@@ -2198,6 +2198,9 @@ struct LegacyCnContext {
     std::shared_ptr<SpliceMap> splice;
     ByteView payload_view;
     bool payload_is_view = false;
+    // Where zero padding begins in the payload (a cut last data record handed to
+    // the codec at its declared length, see the parser); none when ~0.
+    ArcPos pad_from = ~ArcPos{0};
     ByteView Payload() const {
         if (payload_is_view) return payload_view;
         return ByteView(data.data(), data.size());
@@ -3410,7 +3413,13 @@ bool ApplyLegacyAttributeRecords(
     const std::set<std::string>& split_paths,
     std::vector<LegacyCnEntry>* entries,
     // Where each table starts, to place a permission record in its own block.
-    const LegacyTableMarks* table_marks = nullptr) {
+    const LegacyTableMarks* table_marks = nullptr,
+    // The archive is cut: the records of its last blocks are gone, so the
+    // values cover only the files before them. Hand out what there is (the
+    // entries past it keep no checksum, as they keep no date) instead of
+    // refusing the whole set -- the original checks the entries it has values
+    // for. Only for an archive the record walk found cut.
+    bool lenient_tail = false) {
     if (entries == nullptr || entries->empty()) {
         return false;
     }
@@ -3606,9 +3615,9 @@ bool ApplyLegacyAttributeRecords(
         // records the same way and hand out what there is; the entries past the
         // end keep has_mtime = false, which prints the same empty column, and
         // the perms and checksums (fixed-width, exact) still apply. Quirk 43.
-        if ((!a.perms.empty() && a.perms.size() != n) ||
+        if ((!a.perms.empty() && (lenient_tail ? a.perms.size() > n : a.perms.size() != n)) ||
             (!a.attrs.empty() && a.attrs.size() > n) ||
-            (!a.checksums.empty() && a.checksums.size() != n) ||
+            (!a.checksums.empty() && (lenient_tail ? a.checksums.size() > n : a.checksums.size() != n)) ||
             a.mtimes.size() > n) {
             return false;
         }
@@ -3625,7 +3634,7 @@ bool ApplyLegacyAttributeRecords(
         for (std::size_t i = 0; i < named.size(); ++i) {
             LegacyCnEntry& e = (*entries)[named[i]];
             if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
-            if (!a.perms.empty()) {
+            if (!a.perms.empty() && i < a.perms.size()) {
                 e.permissions = a.perms[i]; e.has_permissions = true;
                 // The original's LISTER hands the stored modes out in order,
                 // without the block alignment its extractor applies, and gives
@@ -3647,7 +3656,7 @@ bool ApplyLegacyAttributeRecords(
             if (a.uids.size() == named.size() && a.gids.size() == named.size()) {
                 e.uid = a.uids[i]; e.gid = a.gids[i]; e.has_owner = true;
             }
-            if (!a.checksums.empty()) {
+            if (!a.checksums.empty() && i < a.checksums.size()) {
                 if (split_paths.count(e.path) != 0u) {
                     e.checksum_na = true;  // slice checksum, not this file's
                 } else {
@@ -5618,6 +5627,14 @@ private:
 // path only, in TryDecodeLegacyOptimum) -- the parallel-container branch
 // below only ever instantiates it with NzOptimumLzDecoder (-co parallel
 // containers; parallel -cO containers are wired too, see TryParseLegacyCnArchive).
+// The padded tail of a cut archive (LegacyCnContext::pad_from), for the block
+// loop below while TryDecodeLegacyOptimum runs. Only a block's HEADER FIELDS
+// may come from the padding: a block whose payload reaches it stops there with
+// the short end, exactly as before the padding existed -- which is what the
+// original reports (-co cut 1000 to 40 000 bytes into its last block: 25600;
+// decoding the zeros gave 26368).
+static thread_local ArcPos t_opt_pad_from = ~ArcPos{0};
+
 template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
     // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
@@ -5807,6 +5824,13 @@ bool TryParseLegacyCnArchive(
     // A data record whose header is complete (its payload may be cut off).
     bool saw_data_record = false;
     bool cut_first_data_record = false;
+    // A main-stream data record whose header is whole but whose payload the end
+    // of the file cuts off: where its bytes start and how many it declares. A
+    // stored archive needs it (the original writes such a record at its full
+    // length and reads on; see the store branch below).
+    bool cut_data_valid = false;
+    ArcPos cut_data_begin = 0;
+    std::uint64_t cut_data_declared = 0;
 
     // Every record consumes at least one byte, so `pos` alone bounds the loop --
     // but "at least one byte" is not enough of a bound on the tables this walk
@@ -5888,6 +5912,7 @@ bool TryParseLegacyCnArchive(
             // constant there, garbage-dependent beyond it. (Dropping the stub
             // instead, as the parallel workers do, was tried: it matches less.)
             if (cut_in_data && !found_first_data) cut_first_data_record = true;
+            if (cut_in_data) { cut_data_valid = true; cut_data_begin = pos; cut_data_declared = csize; }
             // A filename table cut off by the end of the file: the original
             // reads the names that fit and then reports the truncation the way
             // it reports any other one ("Archive corrupted. Unexpected end of
@@ -6071,7 +6096,7 @@ bool TryParseLegacyCnArchive(
         }
         return false;
     }
-    const bool native_store_payload = (method_p0 == 0u);
+    bool native_store_payload = (method_p0 == 0u);   // cleared for a store cut inside a data record (below)
 
     if (table_end > bytes.size()) {
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
@@ -6156,7 +6181,8 @@ bool TryParseLegacyCnArchive(
         if (NZ_ENV("NZ_TRACE_PARSTREAM"))
             std::fprintf(stderr, "[HDR] store size check: total_data_size=%llu size=%zu\n",
                          (unsigned long long)total_data_size, bytes.size());
-        if (native_store_payload && total_data_size > bytes.size()) {
+        if (native_store_payload && total_data_size > bytes.size() &&
+            !(truncated_input && (cut_data_valid || !data_payloads.empty()))) {
             if (out_error_message != nullptr) {
                 *out_error_message = "Data corrupted while reading headers!";
             }
@@ -6421,7 +6447,11 @@ bool TryParseLegacyCnArchive(
         // (the -t1 multi-block layout, where a block of all-0600 files omits it).
         // Nothing is written on a false return, so the second try starts clean.
         ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries) ||
-        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks);
+        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks) ||
+        // A stored archive cut inside its data: the cut took the last blocks' records.
+        (truncated_input && method_p0 == 0u && (cut_data_valid || !data_payloads.empty()) &&
+         ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks,
+                                     /*lenient_tail=*/true));
     const ArcPos run_metadata_end = first_data_record;
 
     // Some decodes run here, at parse time; the progress engine prints the
@@ -6460,6 +6490,62 @@ bool TryParseLegacyCnArchive(
     // their concatenation (the block-chain and parallel sites are not).
     std::shared_ptr<SpliceMap> store_splice;
 
+    // A STORED archive cut inside a data record. The original's reader takes a
+    // record whose header is whole at its declared length -- the bytes the file
+    // no longer has come out as whatever its buffer held, stale memory (quirk 26)
+    // -- and reads on: with nothing after it the archive ends normally, that
+    // entry's checksum fails ("Checksum mismatch", "Decompressed <total>"); when
+    // the next record's header is what is missing it stops there with "Unexpected
+    // end of file", every complete record written. Measured on a five-file -cn
+    // archive cut by 1 to 200 010 bytes: the switch is exactly where the cut
+    // reaches the last record's header. Zeros stand in for the stale bytes; this
+    // reader used to refuse the whole archive ("Legacy stream prefix is not
+    // recognized." / "Data corrupted while reading headers!") and extract nothing.
+    bool store_cut_eof = false, store_cut_full = false;
+    std::vector<unsigned char> store_cut_buf;
+    std::vector<std::uint8_t> store_cut_ok;
+    if (native_store_payload && truncated_input && (cut_data_valid || !data_payloads.empty()) &&
+        !has_parallel_streams && total_data_size <= (std::uint64_t{1} << 40)) {
+        std::vector<unsigned char> sbuf;
+        for (const auto& dp : data_payloads) bytes.AppendTo(&sbuf, dp.first, dp.second - dp.first);
+        if (cut_data_valid) {
+            const std::uint64_t got = static_cast<std::uint64_t>(bytes.size() - cut_data_begin);
+            if (cut_data_begin < bytes.size()) bytes.AppendTo(&sbuf, cut_data_begin, bytes.size() - cut_data_begin);
+            if (cut_data_declared > got) {
+                // The bytes the file no longer has: the original reads every data
+                // record into ONE buffer from its start, so what it writes there
+                // is whatever the last earlier record that reached that far left
+                // behind -- zeros when none did (a fresh buffer). Measured exact
+                // on a two-record and a one-record -cn archive.
+                const std::size_t base = sbuf.size();
+                sbuf.resize(base + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                std::uint64_t filled = got;   // offsets inside the record, [got, declared)
+                for (auto it = data_payloads.rbegin(); it != data_payloads.rend() && filled < cut_data_declared; ++it) {
+                    const std::uint64_t len = it->second - it->first;
+                    if (len <= filled) continue;
+                    const std::uint64_t upto = std::min<std::uint64_t>(len, cut_data_declared);
+                    const unsigned char* q = bytes.Span(it->first + filled, upto - filled);
+                    if (q != nullptr)
+                        std::memcpy(sbuf.data() + base + static_cast<std::size_t>(filled - got), q,
+                                    static_cast<std::size_t>(upto - filled));
+                    filled = upto;
+                }
+            }
+        }
+        if (sbuf.size() > total_data_size) sbuf.resize(static_cast<std::size_t>(total_data_size));
+        native_store_payload = false;
+        if (sbuf.size() == total_data_size) {
+            std::size_t bad = 0;
+            CheckEntries(entries, checksum_mode, checksum_verification_supported,
+                         sbuf.data(), sbuf.size(), &store_cut_ok, &bad);
+            if (bad == 0u) store_cut_ok.clear();
+            store_cut_full = true;
+        } else {
+            store_cut_eof = true;
+        }
+        store_cut_buf = std::move(sbuf);   // handed over with the decoders' outputs, below
+        nz_trace::Construct("store_assembly=cut_record %s", store_cut_eof ? "eof" : "padded");
+    }
     if (native_store_payload) {
         data_offset_u64 = static_cast<std::uint64_t>(bytes.size()) - total_data_size;
         if (data_offset_u64 < table_end) {
@@ -8304,7 +8390,7 @@ bool TryParseLegacyCnArchive(
                                                               total_data_size, is_variant_b, method_p1,
                                                               /*derived_cap_only=*/true, accept_all, &unused,
                                                               /*direct_out=*/nullptr, truncated_input, &mdone,
-                                                              /*lenient=*/false, /*input_end=*/0u, &to_sink,
+                                                              /*lenient=*/!truncated_input, /*input_end=*/0u, &to_sink,
                                                               /*stream_members=*/true);
                             if (published && streamed > 0u) {
                                 psink::StreamEnd(0u, nullptr, streamed, okd, false);
@@ -8537,6 +8623,16 @@ bool TryParseLegacyCnArchive(
     ctx.cm_a_bits = cm_a_bits;
     ctx.cm_b_bits = cm_b_bits;
     ctx.cm_window_size = cm_window_size;
+    if (store_cut_full) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = store_cut_buf.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(store_cut_buf);
+        ctx.entry_checksum_ok = std::move(store_cut_ok);
+    } else if (store_cut_eof && !store_cut_buf.empty()) {
+        partial_prefix = std::move(store_cut_buf);
+    }
     if (!native_literal_payload && !native_store_payload && !partial_candidate.empty()) {
         native_literal_payload = true;
         literal_data_offset = 0u;
@@ -8591,6 +8687,7 @@ bool TryParseLegacyCnArchive(
         ctx.records_after_data = !data_records.empty() && data_records.back().second < bytes.size();
     }
     if (ctx.decode_failed) AdoptDecodeError(ctx);
+    if (store_cut_eof) ctx.decode_eof = true;
     // Every native_literal_payload path above went through validate_decoded_candidate
     // (or the partial fallback, whose verdicts are in entry_checksum_ok).
     ctx.checksums_verified = native_literal_payload && checksum_verification_supported && !ctx.decode_failed;
@@ -8670,6 +8767,31 @@ bool TryParseLegacyCnArchive(
             ctx.payload_view = bytes.Spliced(spliced_map.get());
         } else {
             ctx.payload_view = bytes.subview(payload_start);
+        }
+        // A -co/-cO/-cc single container cut inside a data record after the first:
+        // the original's reader hands the codec the record at its DECLARED length,
+        // the bytes the file no longer has being what its record buffer still
+        // holds from the previous record at the same offset (the store branch
+        // above, measured byte for byte). A block's header fields follow its
+        // payload, so a cut of a few bytes lands in them -- and the original reads
+        // on and reports success when the codec never needs those bytes (a
+        // two-block -co and -cc archive cut by one byte: `t` OK, where this reader
+        // said code 25600). So give the codec the same padded record. A cut in the
+        // FIRST data record keeps its measured short-end rule (quirk 51).
+        if ((method_p0 == 5u || method_p0 == 6u || method_p0 == 7u) && truncated_input && cut_data_valid &&
+            !cut_first_data_record && !has_parallel_streams && !data_payloads.empty() &&
+            spliced_map->total == 0u && cut_data_begin <= bytes.size()) {
+            const std::uint64_t got = bytes.size() - cut_data_begin;
+            if (cut_data_declared > got && cut_data_declared - got <= (std::uint64_t{1} << 30)) {
+                std::vector<unsigned char> pb;
+                ctx.payload_view.AppendTo(&pb, 0u, ctx.payload_view.size());
+                ctx.pad_from = pb.size();
+                pb.resize(pb.size() + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                ctx.payload_is_view = false;
+                ctx.payload_view = ByteView();
+                ctx.data = ByteBuffer(std::move(pb));
+                nz_trace::Construct("cut_record padded codec=%u", method_p0);
+            }
         }
     }
 
@@ -9268,6 +9390,7 @@ static bool TryDecodeLegacyCm(
         if (payload_size > stream_end - pos) { ok = false; break; }
         const std::uint8_t* payload = raw + pos;
         pos += payload_size;
+        if (pos > legacy.pad_from) { ok = false; break; }   // payload cut: the short end (see t_opt_pad_from)
 
         if (pos >= stream_end) { ok = false; break; }
         const std::uint8_t decr_param = raw[pos++];
@@ -9996,6 +10119,10 @@ static bool DecodeOptimumBlockSequence(
         const std::uint8_t* payload = src.Span(pos, payload_size);
         if (payload == nullptr) { ok = false; break; }
         pos += payload_size;
+        if (pos > t_opt_pad_from) {   // the payload itself is cut (see t_opt_pad_from)
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: payload reaches the padding of a cut record\n");
+            ok = false; break;
+        }
 
         if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         const std::uint8_t decr_param = src[pos++];
@@ -10859,6 +10986,8 @@ static bool TryDecodeLegacyOptimum(
     const ByteView pv = legacy.Payload();
     if (pv.empty()) return false;
     const ArcPos raw_len = pv.size();
+    t_opt_pad_from = legacy.pad_from;
+    struct PadReset { ~PadReset() { t_opt_pad_from = ~ArcPos{0}; } } pad_reset;
 
     // Read one top-level `stream_tag` varint: (stream_bytes<<4)|0, giving the
     // byte range of one segment's block-record sequence. Real single-
@@ -14909,7 +15038,10 @@ static void SelfCheckInjectFault(const fs::path& path, const std::vector<nzr::se
     const std::uintmax_t size = fs::file_size(path, ec);
     if (ec || size < 32u) return;
     const std::string k(kind);
-    if (k == "trunc") { fs::resize_file(path, size - 1u, ec); return; }
+    // Two bytes, not one: a -co/-cO/-cc archive cut by ONE byte reads back
+    // whole, in the original too -- the last byte is the last block's dece
+    // flag, read as zero from the record buffer -- so it damages nothing.
+    if (k == "trunc") { fs::resize_file(path, size - 2u, ec); return; }
     std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
     if (!f) return;
     std::uintmax_t at = 0;

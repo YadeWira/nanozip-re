@@ -167,9 +167,12 @@ with 0, 2^1 … 2^31, 0.
   `Cannot open: ??? ????.txt` and leaves the file OUT of the archive. German and Nordic names work
   there because CP1252 covers them; on a Hungarian (CP1250) machine the coverage is different again.
   This is not a limitation a reimplementation can quietly improve on: measured on nine languages,
-  this port's scan uses the wide API, so it OPENS all nine and stores six of them under the same
-  mangled `???` names -- two different files (Russian and Hindi) collapsing onto one stored name.
-  The original's refusal loses nothing; ours loses the distinction. [pending: match the refusal]
+  a scan through the wide API OPENS all nine and stores six of them under the same mangled `???`
+  names -- two different files (Russian and Hindi) collapsing onto one stored name. The original's
+  refusal loses nothing; that would lose the distinction. Reproduced since v0.14.2-pre (3f69293): a
+  name the active code page cannot express (no best-fit) is reported `Cannot open:` and left out.
+  Re-measured on Windows 10, CP1252, 2026-10-01: Russian, Chinese, Japanese, Arabic and Hindi names
+  refused with the original's five lines, German and Nordic stored, the archive byte-identical.
 - **The version string is a record**: an archive begins with a type-14 record holding
   `NanoZip 0.09 alpha` and a type-30 record holding the byte 9; the "incompatible version"
   message reports that byte divided by 100.
