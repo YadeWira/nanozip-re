@@ -44,7 +44,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 |---|---|
 | Synthetic fixtures, 12 × 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact (2026-09-23) |
 | Multi-file archives, 12 selectors × 9 shapes, trees + listings (`tests/multifile_v2.sh`); multi-block `-t1` attribute records (`tests/parity/multiblock_attrs.sh`) | 144/144 + 72/72; 105/105, the original's `l` mode shift reproduced ([quirk 76](docs/ORIGINAL_QUIRKS.md)) (2026-09-23) |
-| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.5-pre binaries, the Windows two on a real Windows 10 (2026-09-25) |
+| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.6-pre binaries, the Windows two on a real Windows 10 (2026-10-01) |
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
@@ -164,7 +164,7 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison needs `-t1` on the original's side.
 - **Decode memory** is above the original's. Peak resident memory, 128 MB of real files, `x -t1`,
   2026-09-25 (the original / this port): `-cn` 129 / 132 MiB, `-cf` 133 / 180, `-cF` 196 / 239, `-cd`
-  110 / 152, `-cD` 110 / 152, `-co` 222 / 333, `-cO` 238 / 367, `-cc` 448 / 585 (v0.17.5-pre: `-cd`
+  110 / 153, `-cD` 110 / 152, `-co` 222 / 333, `-cO` 238 / 367, `-cc` 448 / 585 (v0.17.5-pre: `-cd`
   359, `-cD` 353, `-cc` 866). The `-cd`/`-cD` single container now streams to disk one data record at
   a time, as `-cf`/`-cF`, `-co`/`-cO` and `-cc` already did and as the original does, except under
   `NZ_SAFE=1` or when checksums cannot be judged entry by entry (those still buffer the whole output). Most of what is left is the archive's mapping, which the
