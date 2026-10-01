@@ -13373,8 +13373,19 @@ struct CoAudioState {
     bool ready = false;
 };
 
+// The -co/-cO block read-back: every coded LZ block decoded by a second engine
+// and compared before it is committed, a failure declining the archive. Since
+// the whole-archive self-check (v0.17.4-pre) decodes everything `a`/`w32c` wrote
+// and refuses to keep an archive that does not read back, the block check proves
+// nothing more there -- and it was ~14 % of a -co encode (perf, 16 MB of real
+// files) plus a second engine's memory per stream. It stays where the self-check
+// does not run: `s` (nothing is written) and NZ_NO_SELFCHECK=1.
+static bool BlockReadBackWanted(const CliOptions& options) {
+    return options.command == Command::kSimulate || NZ_ENV("NZ_NO_SELFCHECK") != nullptr;
+}
+
 template <class Engine>
-static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& exe_enc,
+static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& exe_enc,
                                  nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
                                  const unsigned char* data, std::uint32_t len, unsigned stream,
                                  std::vector<unsigned char>& out, bool final,
@@ -13690,8 +13701,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
             // verifier never saw it, so it gets the decoder's stored branch.
             if (payload.empty() || payload.size() >= m) {
                 co.ResetModel();
-                verifier.StoreBlock(lz_in, m);
-                verifier.ResetModel();
+                if (verifier != nullptr) { verifier->StoreBlock(lz_in, m); verifier->ResetModel(); }
                 put32(m);
                 seg.insert(seg.end(), lz_in, lz_in + m);
                 seg.push_back(1u);                       // decr_param: LZ
@@ -13705,10 +13715,10 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
                 goto block_tail;
             }
-            {
+            if (verifier != nullptr) {
                 // prove the block reads back before committing it
                 std::vector<std::uint8_t> chk(m);
-                if (!verifier.DecodeBlock(payload.data(), static_cast<std::uint32_t>(payload.size()),
+                if (!verifier->DecodeBlock(payload.data(), static_cast<std::uint32_t>(payload.size()),
                                           chk.data(), m) ||
                     std::memcmp(chk.data(), lz_in, m) != 0) {
                     if (NZ_ENV("NZOPT_TRACE_TDO"))
@@ -13796,7 +13806,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 // vtable+0x0c: the window takes the block's ORIGINAL bytes, after
                 // param15 has looked and before anything else -- both engines.
                 co.FeedWindow(blk, blk_len);
-                verifier.FeedWindow(blk, blk_len);
+                if (verifier != nullptr) verifier->FeedWindow(blk, blk_len);
                 // param14 loads a 32-bit word per position (P14Load32) and
                 // compares candidates at `cur - 3`, so it reads up to three bytes
                 // past the last one it counts, and what it finds there CHANGES
@@ -13828,7 +13838,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine& verifier, NzExeFilterEnc& e
                 if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
             } else {
                 co.FeedWindow(blk, blk_len);
-                verifier.FeedWindow(blk, blk_len);
+                if (verifier != nullptr) verifier->FeedWindow(blk, blk_len);
             }
             if (NZ_ENV("NZOPT_TRACE_STAGES"))
                 std::fprintf(stderr, "[STG2] m=%u p15=%d p14=%d\n", m, (int)p15_on, (int)p14_on);
@@ -14464,8 +14474,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         // The finder has to exist before the first FeedWindow, or a leading BWT
         // block's bytes reach the window without reaching the hash.
         codec.co->EnableParser();
-        codec.co_v = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
-        codec.co_v->SetBlockSize(codec.co_block);
+        if (BlockReadBackWanted(options)) {
+            codec.co_v = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+            codec.co_v->SetBlockSize(codec.co_block);
+        }
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     if (codec.p0 == 7u && !codec.cc) {
@@ -14477,8 +14489,10 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
         codec.cO->SetBlockSize(codec.co_block);
         codec.cO->EnableParser();
-        codec.cO_v = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
-        codec.cO_v->SetBlockSize(codec.co_block);
+        if (BlockReadBackWanted(options)) {
+            codec.cO_v = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+            codec.cO_v->SetBlockSize(codec.co_block);
+        }
         codec.co_window = static_cast<std::uint32_t>(window);
     }
     // The pieces of this range, in the order the reader meets them, then the
@@ -14614,11 +14628,11 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     const auto run_optimum = [&](std::vector<unsigned char>& payload, const unsigned char* d,
                                  std::uint32_t n, bool final) -> bool {
         if (codec.p0 == 5u)
-            return OptimumEncodeSegment(*codec.co, *codec.co_v, codec.exe_enc, codec.feeder,
+            return OptimumEncodeSegment(*codec.co, codec.co_v.get(), codec.exe_enc, codec.feeder,
                                         codec.co_block, d, n, stream, payload, final,
                                         &codec.audio, codec.p0);
         if (codec.p0 == 6u)
-            return OptimumEncodeSegment(*codec.cO, *codec.cO_v, codec.exe_enc, codec.feeder,
+            return OptimumEncodeSegment(*codec.cO, codec.cO_v.get(), codec.exe_enc, codec.feeder,
                                         codec.co_block, d, n, stream, payload, final,
                                         &codec.audio, codec.p0);
         return codec.cc != nullptr &&

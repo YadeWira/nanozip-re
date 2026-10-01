@@ -40,6 +40,13 @@
 #include <string>
 #include <vector>
 
+// NZOPT_CHECK_LRCACHE=1: rebuild the long-range hash at every flush start even
+// when a recorded or rolled value is at hand, and abort if they ever differ.
+static bool kCheckLr() {
+    static const bool v = NZ_ENV("NZOPT_CHECK_LRCACHE") != nullptr;
+    return v;
+}
+
 extern std::int16_t kLzModelInterpolation[256];   // DAT_08172900, the stretch table
 
 namespace nzr {
@@ -117,6 +124,14 @@ struct NzOptimum2LzDecoder::ParserState {
     std::vector<std::uint32_t> head, cache, tree;
     std::vector<std::uint32_t> lr;
     std::uint32_t lrmask = 0, lrhash = 0;
+    // The rolling hash at each position already walked, so a flush need not
+    // rebuild it from 256 bytes (the same cache as nz_optimum_lz_parser.cpp,
+    // where it is explained; -cO's flushes are as short). A generation is bumped
+    // wherever the hash is rebuilt from scratch.
+    struct LrSeen { std::uint32_t pos1 = 0, gen = 0, hash = 0; };
+    std::vector<LrSeen> lrseen = std::vector<LrSeen>(4096u);
+    LrSeen lrlast;
+    std::uint32_t lrgen = 1;
     bool verbose = false;            // debug: dump one Find's chain walk
     bool ready = false;
     const std::uint8_t* block = nullptr;
@@ -582,6 +597,7 @@ void NzOptimum2LzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t 
     std::uint8_t* const base = ring_.Base();
     const std::uint32_t* const LRO = LrOut();
     auto lr_span = [&](std::uint32_t at, std::uint32_t cnt) {
+        ++F.lrgen;
         std::uint32_t h = 0;
         for (std::uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + base[at + i];
         F.lrhash = h;
@@ -634,6 +650,7 @@ void NzOptimum2LzDecoder::BeginChunk(std::uint32_t off, std::uint32_t len,
     std::uint32_t lrh = 0;
     for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[ring_pos + i];
     F.lrhash = lrh;
+    ++F.lrgen;
 }
 
 void NzOptimum2LzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
@@ -704,6 +721,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         std::uint32_t lrh = 0;
         for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[F.pos0 + i];
         F.lrhash = lrh;
+        ++F.lrgen;
     }
 
     std::uint8_t* const base = ring_.Base();
@@ -712,9 +730,30 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
     const std::uint32_t cend = pos0 + chunk;
     const std::uint32_t emitted = F.consumed;
     {
-        std::uint32_t lrh = 0;
-        for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + base[pos0 + emitted + i];
-        F.lrhash = lrh;
+        const std::uint32_t at = pos0 + emitted;
+        const auto seen = F.lrseen[at & 4095u];
+        const auto& last = F.lrlast;
+        const bool roll_ok = last.gen == F.lrgen && last.pos1 != 0u && last.pos1 - 1u <= at &&
+                             at - (last.pos1 - 1u) < 0x100u;
+        const auto roll = [&]() {
+            std::uint32_t h = last.hash;
+            for (std::uint32_t q = last.pos1 - 1u; q < at; ++q)
+                h = h * 0x104070bu + base[q + 0x100u] - LRO[base[q]];
+            return h;
+        };
+        if (seen.pos1 == at + 1u && seen.gen == F.lrgen && !kCheckLr()) {
+            F.lrhash = seen.hash;
+        } else if (roll_ok && !kCheckLr()) {
+            F.lrhash = roll();
+        } else {
+            std::uint32_t lrh = 0;
+            for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + base[at + i];
+            if ((seen.pos1 == at + 1u && seen.gen == F.lrgen && seen.hash != lrh) || (roll_ok && roll() != lrh)) {
+                std::fprintf(stderr, "[lrcache] MISMATCH at %u\n", at);
+                std::abort();
+            }
+            F.lrhash = lrh;
+        }
     }
     const std::uint32_t remain0 = chunk - emitted;
     nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
@@ -857,6 +896,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         }
         {
             const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
+            F.lrseen[cur & 4095u] = {cur + 1u, F.lrgen, F.lrhash};
             const std::uint32_t lidx = F.lrhash & F.lrmask;
             const std::uint32_t prev = F.lr[lidx];
             const std::uint32_t tag = F.lrhash & 0xffc00000u;
@@ -874,6 +914,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
                 if (bestf < a) cands.push_back({a, lsrc});
             }
             F.lrhash = F.lrhash * 0x104070bu + base[cur + 0x100u] - LRO[base[cur]];
+            F.lrseen[(cur + 1u) & 4095u] = {cur + 2u, F.lrgen, F.lrhash};
+            F.lrlast = {cur + 2u, F.lrgen, F.lrhash};
         }
         if (trace) {
             std::fprintf(stderr, "[C2] rem=%u ni=%u n=%zu:", chunk - emitted, ni, cands.size());

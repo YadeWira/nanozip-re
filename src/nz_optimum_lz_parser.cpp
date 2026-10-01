@@ -36,6 +36,13 @@
 extern "C" {}
 extern std::int16_t kLzModelInterpolation[256];
 
+// NZOPT_CHECK_LRCACHE=1: rebuild the long-range hash at every flush start even
+// when a recorded value is at hand, and abort if the two ever differ.
+static bool kCheckLr() {
+    static const bool v = NZ_ENV("NZOPT_CHECK_LRCACHE") != nullptr;
+    return v;
+}
+
 namespace nzr {
 namespace optimum {
 
@@ -104,6 +111,20 @@ struct NzOptimumLzDecoder::ParserState {
     // long-range rolling hash
     std::vector<std::uint32_t> lr;
     std::uint32_t lrmask = 0, lrhash = 0;
+    // The rolling hash's value at each position a flush has already walked, so
+    // the next flush (which starts at the coder's cursor, BEHIND where the last
+    // one's lookahead rolled to) need not rebuild it from 256 bytes: a flush
+    // every few bytes made that rebuild 8 % of a -co encode. The hash is a pure
+    // function of the 256 ring bytes at the position, and the walk's rolling is
+    // exact (h*K + b[p+256] - b[p]*K^256 == the rebuilt value, mod 2^32), so a
+    // recorded value IS the rebuilt one while those bytes stand -- hence a
+    // generation, bumped wherever the hash is rebuilt from scratch (a block
+    // start, a window feed). NZOPT_CHECK_LRCACHE=1 rebuilds anyway and aborts
+    // on a difference.
+    struct LrSeen { std::uint32_t pos1 = 0, gen = 0, hash = 0; };
+    std::vector<LrSeen> lrseen = std::vector<LrSeen>(4096u);
+    LrSeen lrlast;   // the last value recorded: a flush after a long match rolls on from it
+    std::uint32_t lrgen = 1;
     bool ready = false;
     // the block being parsed, and how much of it has been handed to the coder
     const std::uint8_t* block = nullptr;      // the whole block
@@ -560,6 +581,7 @@ void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t l
     // stores is a block param15 can never match into.
     const std::uint32_t* const LRO = LrOut();
     auto lr_span = [&](std::uint32_t at, std::uint32_t cnt) {
+        ++F.lrgen;
         std::uint32_t h = 0;
         for (std::uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + base[at + i];
         F.lrhash = h;
@@ -616,6 +638,7 @@ void NzOptimumLzDecoder::BeginChunk(std::uint32_t off, std::uint32_t len,
     std::uint32_t lrh = 0;
     for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[ring_pos + i];
     F.lrhash = lrh;
+    ++F.lrgen;
 }
 
 void NzOptimumLzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
@@ -684,6 +707,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
         std::uint32_t lrh = 0;
         for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[F.pos0 + i];
         F.lrhash = lrh;
+        ++F.lrgen;
     }
     {
         std::uint8_t* const base = ring_.Base();
@@ -697,10 +721,38 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             // own cursor, which the coder has already advanced past everything
             // emitted so far), and then rolls forward one byte per node below.
             {
-                std::uint32_t lrh = 0;
-                for (std::uint32_t i = 0; i < 0x100u; ++i)
-                    lrh = lrh * 0x104070bu + base[pos0 + emitted + i];
-                F.lrhash = lrh;
+                const std::uint32_t at = pos0 + emitted;
+                const auto seen = F.lrseen[at & 4095u];
+                const auto& last = F.lrlast;
+                if (seen.pos1 == at + 1u && seen.gen == F.lrgen && !kCheckLr()) {
+                    F.lrhash = seen.hash;
+                } else if (last.gen == F.lrgen && last.pos1 != 0u && last.pos1 - 1u <= at &&
+                           at - (last.pos1 - 1u) < 0x100u && !kCheckLr()) {
+                    // past a long match: roll on from the last walked position
+                    std::uint32_t h = last.hash;
+                    for (std::uint32_t q = last.pos1 - 1u; q < at; ++q)
+                        h = h * 0x104070bu + base[q + 0x100u] - LRO[base[q]];
+                    F.lrhash = h;
+                } else {
+                    std::uint32_t lrh = 0;
+                    for (std::uint32_t i = 0; i < 0x100u; ++i)
+                        lrh = lrh * 0x104070bu + base[at + i];
+                    if (seen.pos1 == at + 1u && seen.gen == F.lrgen && seen.hash != lrh) {
+                        std::fprintf(stderr, "[lrcache] MISMATCH at %u: recorded %08x rebuilt %08x\n", at, seen.hash, lrh);
+                        std::abort();
+                    }
+                    if (kCheckLr() && last.gen == F.lrgen && last.pos1 != 0u && last.pos1 - 1u <= at &&
+                        at - (last.pos1 - 1u) < 0x100u) {
+                        std::uint32_t h = last.hash;
+                        for (std::uint32_t q = last.pos1 - 1u; q < at; ++q)
+                            h = h * 0x104070bu + base[q + 0x100u] - LRO[base[q]];
+                        if (h != lrh) {
+                            std::fprintf(stderr, "[lrcache] ROLL MISMATCH at %u from %u: %08x rebuilt %08x\n", at, last.pos1 - 1u, h, lrh);
+                            std::abort();
+                        }
+                    }
+                    F.lrhash = lrh;
+                }
             }
             const std::uint32_t remain0 = chunk - emitted;
             nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
@@ -907,6 +959,7 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // so cands.back() is still the top.
                 {
                     const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
+                    F.lrseen[cur & 4095u] = {cur + 1u, F.lrgen, F.lrhash};
                     const std::uint32_t lidx = F.lrhash & F.lrmask;
                     const std::uint32_t prev = F.lr[lidx];
                     const std::uint32_t tag = F.lrhash & 0xffc00000u;
@@ -928,6 +981,10 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                         if (bestf < a) cands.push_back({a, lsrc});
                     }
                     F.lrhash = F.lrhash * 0x104070bu + base[cur + 0x100u] - LRO[base[cur]];
+                    // ...and the rolled value is position cur + 1's: a flush is
+                    // often one node long, so the next one starts right there.
+                    F.lrseen[(cur + 1u) & 4095u] = {cur + 2u, F.lrgen, F.lrhash};
+                    F.lrlast = {cur + 2u, F.lrgen, F.lrhash};
                 }
                 if (probe_at != nullptr && probe_at[0] == 'a') {
                     const std::uint32_t w16 = static_cast<std::uint32_t>(base[cur]) |

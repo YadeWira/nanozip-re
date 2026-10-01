@@ -133,9 +133,9 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   by an LZ block (`tests/encode/stored_lz_block.sh`).
 - **Declines and the self-check.** A block `a` cannot write is declined in one line and no archive is
   left behind; an existing archive of the same name is left as it was (before v0.17.1-pre it was
-  truncated first, and a decline deleted it). Every coded `-co`/`-cO` LZ or BWT block is decoded back
-  and compared before it is committed (the LZ payload through a second engine, the BWT payload through
-  the bucket decoder). Since v0.17.4-pre `a` and `w32c` also decode the WHOLE archive
+  truncated first, and a decline deleted it). Every coded `-co`/`-cO` BWT block is decoded back through the bucket decoder before it is
+  committed; LZ blocks were decoded back through a second engine too, which since v0.17.6-pre is done
+  only where the whole-archive check below does not run (`s`, and `NZ_NO_SELFCHECK=1`). Since v0.17.4-pre `a` and `w32c` also decode the WHOLE archive
   they have just written, in-process, before keeping it (a replacement is renamed over the old archive
   only after it passes), and compare every entry with what was
   read from disk: the same names, the same sizes, the same CRC-64 of the content. That covers what the
