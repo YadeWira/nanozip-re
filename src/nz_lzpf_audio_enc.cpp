@@ -25,10 +25,8 @@ inline std::uint16_t LoadBE16(const std::uint8_t* p) { return static_cast<std::u
 
 // floor(log2(x)) for x >= 1; the original's `for (; x >> i == 0; --i)` from 31
 // (and 31 when x == 0, which its callers never pass).
-inline std::uint32_t BitLen(std::uint32_t x) {
-    std::uint32_t i = 31u;
-    if (x != 0u) while ((x >> i) == 0u) --i;
-    return i;
+inline std::uint32_t BitLen(std::uint32_t x) {   // same value as that loop, without it
+    return x != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(x)) : 31u;
 }
 inline std::uint32_t AbsPlus1(std::int32_t v) { const std::uint32_t s = static_cast<std::uint32_t>(v >> 31); return ((static_cast<std::uint32_t>(v) ^ s) - s) + 1u; }
 // DAT_081b4410[b] = floor(log2 b) (0 for 0): the cost of coding a bit count
