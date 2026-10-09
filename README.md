@@ -23,7 +23,7 @@ The rule that follows is **fidelity first**. Format and output bytes are identic
 messages and switches are identical except where timing makes them unobservable; behaviour is
 identical *including the alpha's defects*, so the two binaries can be compared on equal terms and
 every difference is a bug on this side. The defects are catalogued in
-[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md) (78 numbered items), and the maintainer's decision
+[docs/ORIGINAL_QUIRKS.md](docs/ORIGINAL_QUIRKS.md) (79 numbered items), and the maintainer's decision
 (2026-09-24) is that all of them are reproduced; fixes belong to a future separate project. The decode
 phase closed with v0.9.9-pre;
 every release stays a pre-release until the encoder is complete too. Meanwhile the only escape hatches are environment
@@ -44,7 +44,7 @@ its own `a` on the same inputs with the same switches (`-t1`) is the reference, 
 |---|---|
 | Synthetic fixtures, 12 × 8 codecs (`tests/native_only_v2.sh`) | 96/96 byte-exact (2026-09-23) |
 | Multi-file archives, 12 selectors × 9 shapes, trees + listings (`tests/multifile_v2.sh`); multi-block `-t1` attribute records (`tests/parity/multiblock_attrs.sh`) | 144/144 + 72/72; 105/105, the original's `l` mode shift reproduced ([quirk 76](docs/ORIGINAL_QUIRKS.md)) (2026-09-23) |
-| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.6-pre binaries, the Windows two on a real Windows 10 (2026-10-01) |
+| Release verification package: 87 `.nz` and 8 self-extracting `.exe` archives (all eight codecs, single- and multi-file, parallel containers, a `-co` archive with a stored LZ block), plus one whose stored name is not valid UTF-8, checked by content | 245/245 checks on each of the four v0.17.7-pre binaries, the Windows two on a real Windows 10 (2026-10-09) |
 | Real files: 61 × 8 codecs (`tests/real_corpus_sweep.sh`), 155 × 8, a stratified 3037 × 8, and 744 file × codec pairs of 20-300 MB | 488/488, 1240/1240, 24 272/24 272, and no open failure (2026-09-02 to 2026-09-05) |
 | One entry over 4 GB: a reporter's 4.6 GB `-cO` archive, and a 4.5 GB entry written by the original with each codec | all eight codecs `t` OK and extract byte-identically on a 64-bit build (v0.14.0-pre); a 32-bit build decodes the 4.6 GB archive too, checksum verified (v0.14.2-pre) |
 | Every checksum setting × 8 codecs × single and parallel containers (`tests/checksum_modes.sh`) | 240/240 (2026-09-23) |
@@ -89,6 +89,11 @@ level with it on `-cn` and `-cF` and slower on the rest.**
 | `-co` | 1.85× | 1.31× |
 | `-cO` | 1.54× | 1.19× |
 | `-cc` | 1.29× | 1.08× |
+
+Since v0.17.7-pre `-cf`, `-cF` and `-cd` compress in fewer CPU cycles than in this table's release (the
+audio probe that every block goes through, 2026-10-09, cycles of `a -t1 -p1` on 128 MB against v0.17.6-pre):
+−22 %, −16 % and −9 % with the self-check off, −11 %, −3 % and −9 % with it on (the default); `-cD`
+−5 % and −1 %. The table has not been re-measured.
 
 Every extraction matched the source. The `-cn`, `-cf`, `-cF`, `-cD` and `-cc` archives are the
 original's bytes. The `-cd` one was not, at v0.17.0-pre: from an input of 132 087 808 bytes the `-cd`
