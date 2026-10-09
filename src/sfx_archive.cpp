@@ -1273,7 +1273,8 @@ bool SkipBytes(std::istream& in, std::uint64_t size) {
 
 fs::path SanitizeExtractPath(const std::string& name) {
     fs::path p = PathFromNativeBytes(name);
-    if (p.is_absolute()) {
+    // on Windows "C:x" is not absolute, but root / "C:x" leaves the root
+    if (p.is_absolute() || p.has_root_name() || p.has_root_directory()) {
         return {};
     }
 
@@ -1284,7 +1285,12 @@ fs::path SanitizeExtractPath(const std::string& name) {
             continue;
         }
         if (x == "..") {
-            return {};
+            // `a` keeps a ".." past the front of what it was typed with
+            // (`a x.nz d1/sub/../f`), so it is resolved here; only one that
+            // climbs out of the extraction directory is refused
+            if (!out.has_relative_path()) return {};
+            out = out.parent_path();
+            continue;
         }
         out /= part;
     }
@@ -2316,6 +2322,7 @@ struct Engine {
     std::string name, shown_name;
     bool worker_gate = false, writer_gate = false;
     std::time_t worker_sec = 0, writer_sec = 0;
+    bool asking = false;    // an overwrite question waits on the line: draw nothing over it
 };
 
 inline Engine& E() { static Engine e; return e; }
@@ -2427,6 +2434,7 @@ inline void EnsureHeader() {
 }
 
 inline void WorkerTickLocked(Engine& e) {
+    if (e.asking) return;
     const std::time_t now = std::time(nullptr);
     if (e.worker_gate && now == e.worker_sec) return;
     e.worker_gate = true; e.worker_sec = now;
@@ -2438,7 +2446,7 @@ inline void WorkerTickLocked(Engine& e) {
 // then the "0 MB" tick, exactly the single-container start (measured on a 4-stream
 // 2 MB archive: "name     \b\b\b\b" then "0 MB    \b...", as for one stream).
 inline void WriterStartLocked(Engine& e) {
-    if (e.name.empty() || e.name == e.shown_name) return;
+    if (e.asking || e.name.empty() || e.name == e.shown_name) return;
     EnsureHeaderLocked(e);
     ClearStatusLine(*e.os);
     WriteFieldLocked(e, Name40(e.name) + " ", std::string());
@@ -2456,7 +2464,7 @@ inline void Add(std::uint64_t n) {
     const bool first_of_stream0 = slot == 0u && e.done[0].load(std::memory_order_relaxed) == 0u;
     std::lock_guard<std::mutex> lk(e.mu);
     EnsureHeaderLocked(e);
-    if (slot < kMaxSlots && !e.announced[slot] && e.compressor_line) {
+    if (slot < kMaxSlots && !e.announced[slot] && e.compressor_line && !e.asking) {
         // This worker's line was not in the header: clear the status line, print
         // it, and redraw the name (the original's writer re-ticks right after).
         e.announced[slot] = true;
@@ -2503,7 +2511,7 @@ inline void FileStart(const std::string& name) {
     if (e.os == nullptr) return;
     std::lock_guard<std::mutex> lk(e.mu);
     e.name = name;
-    if (name.empty() || name == e.shown_name) return;
+    if (e.asking || name.empty() || name == e.shown_name) return;
     const std::time_t now = std::time(nullptr);
     if (e.writer_gate && now == e.writer_sec) return;
     e.writer_gate = true; e.writer_sec = now;
@@ -2611,6 +2619,7 @@ struct FileState {
     bool selected = false;
     bool write_it = false;            // after the overwrite prompt / unsafe path
     bool decided = false;             // prompt asked / path judged
+    bool deciding = false;            // its overwrite question is still waiting for the answer
     bool created = false;
     bool cannot_write = false;
     // Every file used to stay open until Finish: a -co archive of 2000 files,
@@ -2645,6 +2654,8 @@ struct Engine {
     std::uint64_t quantum = 0;        // -cd: 1 MB flush quanta inside a group
     std::vector<std::unique_ptr<FileState>> files;
     bool yes_to_all = false;
+    std::mutex ask_mu;                // held while the overwrite question waits (DecideLocked)
+    std::condition_variable decided_cv;   // a file's question was answered
     std::size_t mismatches = 0;
     std::size_t unsafe = 0;
     std::size_t cannot = 0;
@@ -2759,7 +2770,13 @@ inline void ReportWriteError(FileState& f, int err) {
 // question (std::cin is read with the lock dropped; the timer keeps drawing).
 inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex>& lk) {
     FileState& f = *e.files[idx];
-    if (f.decided) return;
+    if (f.decided) {
+        // a file split between workers: the other one is asking about it, and
+        // must not find it decided (write_it is still true) and truncate it
+        // before the answer -- answering No lost the file's old contents
+        e.decided_cv.wait(lk, [&f] { return !f.deciding; });
+        return;
+    }
     f.decided = true;
     const LegacyCnEntry& en = (*e.entries)[idx];
     if (e.test_mode || !f.selected) { f.write_it = false; return; }
@@ -2777,19 +2794,31 @@ inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
     f.write_it = true;
     std::error_code ec;
     if (!e.yes_to_all && fs::exists(f.path, ec)) {
-        for (;;) {
+        // One question at a time. e.mu is dropped while the answer is read, so
+        // another worker reaching an existing file asked too: two questions on
+        // one line, two threads reading the same keyboard, and after `a` the
+        // others kept waiting for a line nobody would type -- `x` of a -pN
+        // archive over files already there hung (reported by xman).
+        f.deciding = true;
+        lk.unlock();
+        std::lock_guard<std::mutex> ask(e.ask_mu);
+        lk.lock();
+        if (!e.yes_to_all) for (;;) {
             {
                 progress::Engine& pe = progress::E();
                 std::lock_guard<std::mutex> plk(pe.mu);
+                progress::EnsureHeaderLocked(pe);   // the question comes after the Compressor lines
                 ClearStatusLine(*e.os);
                 // the same 40/37 elision the progress line uses -- the original
                 // asks about "...<last 37>" for a name over 40 columns
                 *e.os << '\r' << "Overwrite " << progress::Name40(en.path) << " (Yes/No/Always)? ";
                 e.os->flush();
+                pe.asking = true;
             }
             std::string answer;
             lk.unlock();
             const bool got = static_cast<bool>(std::getline(std::cin, answer));
+            { progress::Engine& pe = progress::E(); std::lock_guard<std::mutex> plk(pe.mu); pe.asking = false; }
             lk.lock();
             if (!got) { f.write_it = false; break; }
             const char k = answer.empty() ? '\0' : answer[0];
@@ -2797,6 +2826,8 @@ inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex
             if (k == 'n') { f.write_it = false; break; }
             if (k == 'a') { e.yes_to_all = true; break; }
         }
+        f.deciding = false;
+        e.decided_cv.notify_all();
     }
 }
 
@@ -13017,6 +13048,22 @@ void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern
     }
 }
 
+// The stored name loses the front of the path it was typed with, and only the
+// front (measured on both originals, Linux and Windows): a drive ("C:"), then
+// any run of "/", "./" and "../". So `a x.nz /etc/hostname` stores
+// `etc/hostname`, `C:\data\f` stores `data/f`, `../../d1/f` stores `d1/f` and
+// `d1/.` recursed stores `d1/./f`; a "./" or "../" further in stays. The
+// directory to read keeps the whole path; only the stored name loses it.
+std::string StripStoredNameFront(std::string s) {
+    if (s.size() >= 2u && s[1] == ':') s.erase(0, 2);
+    for (;;) {
+        if (!s.empty() && s[0] == '/') s.erase(0, 1);
+        else if (s.compare(0, 2, "./") == 0) s.erase(0, 2);
+        else if (s.compare(0, 3, "../") == 0) s.erase(0, 3);
+        else return s;
+    }
+}
+
 // One argument of `a`: split at the last slash, scan. "." and ".." as the
 // pattern name the directory itself (`a -r x.nz .` stores names without "./").
 void LegacyScanArgument(const std::string& arg_in, bool recurse, std::vector<EncodeSource>* out) {
@@ -13034,18 +13081,14 @@ void LegacyScanArgument(const std::string& arg_in, bool recurse, std::vector<Enc
     std::string dir_part, pattern = arg;
     const std::size_t slash = arg.find_last_of('/');
     if (slash != std::string::npos) { dir_part = arg.substr(0, slash); pattern = arg.substr(slash + 1u); if (dir_part.empty()) dir_part = "/"; }
-    std::string prefix = dir_part.empty() ? std::string() : (dir_part == "." ? std::string() : dir_part + "/");
-    // An ABSOLUTE argument is stored without its leading '/': the original turns
-    // `a x.nz /etc/hostname` into the entry `etc/hostname` (measured), which is
-    // also what keeps an extraction from writing outside the current directory.
-    // The directory to read keeps the slash; only the stored name loses it.
-    prefix.erase(0, prefix.find_first_not_of('/'));
+    const std::string prefix = dir_part.empty() ? std::string() : dir_part + "/";
+    if (pattern.empty()) pattern = "*";   // `a x.nz dir/` takes what `dir/*` takes (measured)
     if (pattern == "." || pattern == "..") {
         if (recurse) LegacyScanDirectory(dir_part.empty() ? pattern : dir_part + "/" + pattern, "*",
-                                         pattern == "." ? prefix : prefix + pattern + "/", recurse, out);
+                                         StripStoredNameFront(prefix + pattern + "/"), recurse, out);
         return;
     }
-    LegacyScanDirectory(dir_part, pattern, prefix, recurse, out);
+    LegacyScanDirectory(dir_part, pattern, StripStoredNameFront(prefix), recurse, out);
 }
 
 // FUN_08051f40's comparison, mode 1 = extension, 2 = name, 3 = size. Returns
