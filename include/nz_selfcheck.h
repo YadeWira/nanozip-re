@@ -20,13 +20,28 @@
 namespace nzr {
 namespace selfcheck {
 
+// src/nz_selfcheck_crc.cpp: the same CRC folded with PCLMULQDQ. Consumes a
+// multiple of 16 bytes (0 under 64, or without the instruction) and leaves a
+// 16-byte state whose table CRC from 0 is the CRC of what it consumed.
+std::size_t Crc64Fold(std::uint64_t crc, const unsigned char* p, std::size_t n, unsigned char state[16]);
+bool Crc64FoldAvailable();
+
 // CRC-64/XZ (ECMA-182, reflected; initial value and final xor all ones),
-// slicing-by-8.
+// folded with carry-less multiplication where the processor has it, else
+// slicing-by-8 (the reference: UpdateTable).
 class Crc64 {
 public:
     static constexpr std::uint64_t kPoly = 0xc96c5795d7870f42ull;
     Crc64() { v_ = ~0ull; }
     void Update(const unsigned char* p, std::size_t n) {
+        if (n >= 256u && Crc64FoldAvailable()) {
+            unsigned char st[16];
+            const std::size_t used = Crc64Fold(v_, p, n, st);
+            if (used != 0u) { v_ = 0u; UpdateTable(st, 16u); p += used; n -= used; }
+        }
+        UpdateTable(p, n);
+    }
+    void UpdateTable(const unsigned char* p, std::size_t n) {
         const auto& t = Tables();
         std::uint64_t c = v_;
         while (n >= 8u) {

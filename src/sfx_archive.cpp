@@ -36,6 +36,9 @@
 
 #include <algorithm>
 #include <array>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <set>
 #include <chrono>
 #include <cctype>
@@ -281,6 +284,36 @@ void UpdateFletcher32(
     // accumulators a block of 2^20 words cannot overflow.
     {
         std::uint64_t a = *s1, b = *s2;
+#if defined(__SSE2__)
+        // Blocks of up to 256 x 8 words with SSE2, the Adler-32 way: per lane l the
+        // sum S_l of its words and the running total A_l of those sums after each
+        // 16 bytes. Over N = 8K words, a += sum(S) and b += N*a + sum((N-i)*w_i)
+        // = N*a + 8*sum(A) - sum(l*S_l). Same residues mod 65535, so the same
+        // checksum; the lanes stay in 32 bits (A_l <= 256*257/2 * 65535).
+        while (size - i >= 16u) {
+            const std::size_t k = std::min<std::size_t>((size - i) / 16u, 256u);
+            const __m128i z = _mm_setzero_si128();
+            __m128i sl = z, sh = z, al = z, ah = z;
+            const unsigned char* q = data + i;
+            for (std::size_t j = 0; j < k; ++j, q += 16) {
+                const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+                sl = _mm_add_epi32(sl, _mm_unpacklo_epi16(x, z));
+                sh = _mm_add_epi32(sh, _mm_unpackhi_epi16(x, z));
+                al = _mm_add_epi32(al, sl);
+                ah = _mm_add_epi32(ah, sh);
+            }
+            alignas(16) std::uint32_t vs[8], va[8];
+            _mm_store_si128(reinterpret_cast<__m128i*>(vs), sl); _mm_store_si128(reinterpret_cast<__m128i*>(vs + 4), sh);
+            _mm_store_si128(reinterpret_cast<__m128i*>(va), al); _mm_store_si128(reinterpret_cast<__m128i*>(va + 4), ah);
+            std::uint64_t sum = 0, acc = 0, weighted = 0;
+            for (unsigned l = 0; l < 8u; ++l) { sum += vs[l]; acc += va[l]; weighted += static_cast<std::uint64_t>(l) * vs[l]; }
+            b += static_cast<std::uint64_t>(8u * k) * a + 8u * acc - weighted;
+            a += sum;
+            a %= 0xffffu;
+            b %= 0xffffu;
+            i += 16u * k;
+        }
+#endif
         while (i + 1 < size) {
             const std::size_t end = std::min(size - 1, i + (std::size_t{1} << 21));
             for (; i + 1 < end + 1 && i + 1 < size; i += 2u) {

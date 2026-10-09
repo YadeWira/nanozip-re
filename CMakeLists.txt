@@ -48,6 +48,7 @@ set(RECON_SOURCES
     src/nz_optimum_lz_tables.cpp
     src/nz_optimum2_lz.cpp
     src/nz_optimum2_lz_tables.cpp
+    src/nz_selfcheck_crc.cpp
 )
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
@@ -111,6 +112,7 @@ add_executable(test_optimum2_lz
     src/nz_optimum2_lz.cpp
     src/nz_optimum2_lz_parser.cpp
     src/nz_optimum2_lz_tables.cpp
+    src/nz_selfcheck_crc.cpp
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_parser.cpp
     src/nz_optimum_lz_tables.cpp
