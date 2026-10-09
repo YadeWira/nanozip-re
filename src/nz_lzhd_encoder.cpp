@@ -19,10 +19,7 @@ namespace {
 inline std::uint32_t LoadU32(const std::uint8_t* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline std::uint32_t Rotl(std::uint32_t v, unsigned k) { return (v << k) | (v >> (32u - k)); }
 inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0 (the original's masked bsr)
-    if (v == 0u) return 0u;
-    std::uint32_t k = 31u;
-    while ((v >> k) == 0u) --k;
-    return k;
+    return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
 }
 // DAT_081b4380: 0, 2, 4, 8, ... (1 << k for k >= 1)
 inline std::uint32_t Base(std::uint32_t k) { return k == 0u ? 0u : (1u << k); }
@@ -756,9 +753,13 @@ void CompressPiece(State& st, const std::uint8_t* src, std::uint32_t n, std::vec
                     // it sits inside the `0x1ff < len` block: a chunk of 512 bytes or
                     // less goes straight to the LZ path (a 288-byte tail after an audio
                     // chunk under -cD, measured)
+                    // (both estimates only read the state, so one that `dec` would ignore is
+                    // not computed: its finder probes were most of this function's time)
                     const bool dec = lzpf_enc::AudioDecide(st.probe_ctx, buf, std::min<std::uint32_t>(len, 0x400u), len);
-                    const std::uint32_t est = st.hds ? HdsEstimate(st, buf, len) : LzEstimate(st, buf, len);
-                    if (dec && !(est * 4u <= len * 3u)) go_audio = true;
+                    if (dec) {
+                        const std::uint32_t est = st.hds ? HdsEstimate(st, buf, len) : LzEstimate(st, buf, len);
+                        if (!(est * 4u <= len * 3u)) go_audio = true;
+                    }
                 }
             }
         }

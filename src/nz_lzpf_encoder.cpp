@@ -92,11 +92,10 @@ void State::BackfillSparse(std::size_t len) {
 
 // FUN_0805a190. Pointers mirror the decompile: `block` walks the input inside the
 // window, `end` its end, `win_end` the window's end, `out` the bytecode cursor.
-std::size_t LzParse(State& st, std::size_t pos, std::size_t len, std::vector<std::uint8_t>& out) {
-    const std::size_t start_size = out.size();
-    // the bytecode can exceed the block (escapes, long-match records): 9 bytes per input byte is a safe bound
-    out.resize(start_size + len * 9u + 16u);
-    std::uint8_t* o = out.data() + start_size;
+std::size_t LzParse(State& st, std::size_t pos, std::size_t len, std::uint8_t* const out) {
+    // the bytecode can exceed the block (escapes, long-match records): 9 bytes per
+    // input byte is a safe bound (LzParseBound)
+    std::uint8_t* o = out;
     std::uint8_t* const base = st.window;
     const std::uint8_t* block = base + pos;
     const std::uint8_t* const end = block + len;
@@ -291,9 +290,7 @@ std::size_t LzParse(State& st, std::size_t pos, std::size_t len, std::vector<std
         }
     }
     st.last_long = last_long;
-    const std::size_t produced = static_cast<std::size_t>(o - (out.data() + start_size));
-    out.resize(start_size + produced);
-    return produced;
+    return static_cast<std::size_t>(o - out);
 }
 
 // FUN_08059cb0 (regparm: out, size, flags, image).
@@ -939,34 +936,33 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
         flags58 = 4u;
         ExeFilterForward(block, static_cast<std::uint32_t>(len), st.exe_pos);
     }
-    std::vector<std::uint8_t> bc;
-    LzParse(st, static_cast<std::size_t>(block - st.window), len, bc);
+    std::uint8_t* const bc = st.bc_buf.Get(LzParseBound(len));
+    const std::size_t bcn = LzParse(st, static_cast<std::size_t>(block - st.window), len, bc);
     // NZ_DUMP_LZBC=<prefix>: this block's LZ bytecode, one file per block, for
     // diffing two builds against each other.
     if (const char* bp = NZ_ENV("NZ_DUMP_LZBC")) {
         static int bn = 0;
         char path[512];
         std::snprintf(path, sizeof path, "%s.%d", bp, bn++);
-        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(bc.data(), 1, bc.size(), f); std::fclose(f); }
+        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(bc, 1, bcn, f); std::fclose(f); }
     }
     const std::uint32_t flags = flags58 | 3u;
     const std::size_t limit = len - (len < 2u ? len : 2u);
-    std::vector<std::uint8_t> ar;
     // the header comes first; its length decides the alignment of what follows
     std::vector<std::uint8_t> hdr;
     WriteBlockHeader(hdr, static_cast<std::uint32_t>(len), flags, 0u);
-    ar.resize(limit + 8u);
-    const std::size_t got = EncodeArithAt(bc.data(), bc.size(), ar.data(), limit, (align + hdr.size() + 2u) & 3u);
-    if (bc.size() < len) {
+    std::uint8_t* const ar = st.ar_buf.Get(limit + 8u);
+    const std::size_t got = EncodeArithAt(bc, bcn, ar, limit, (align + hdr.size() + 2u) & 3u);
+    if (bcn < len) {
         // the queued job (FUN_08059f10): raw bytecode when the side stream does not pay
         if (got == 0u || len <= got + 2u) {
             WriteBlockHeader(out, static_cast<std::uint32_t>(len), (flags & ~3u) | 2u, 0u);
-            out.insert(out.end(), bc.begin(), bc.end());
+            out.insert(out.end(), bc, bc + bcn);
         } else {
             out.insert(out.end(), hdr.begin(), hdr.end());
-            out.push_back(static_cast<std::uint8_t>(bc.size()));
-            out.push_back(static_cast<std::uint8_t>(bc.size() >> 8u));
-            out.insert(out.end(), ar.begin(), ar.begin() + static_cast<std::ptrdiff_t>(got));
+            out.push_back(static_cast<std::uint8_t>(bcn));
+            out.push_back(static_cast<std::uint8_t>(bcn >> 8u));
+            out.insert(out.end(), ar, ar + got);
         }
     } else {
         // parsed in place: a literal block when the side stream does not pay
@@ -975,9 +971,9 @@ void EncodeBlock(State& st, const std::uint8_t* src, std::size_t len, std::size_
             st.BackfillDense(len);
         } else {
             out.insert(out.end(), hdr.begin(), hdr.end());
-            out.push_back(static_cast<std::uint8_t>(bc.size()));
-            out.push_back(static_cast<std::uint8_t>(bc.size() >> 8u));
-            out.insert(out.end(), ar.begin(), ar.begin() + static_cast<std::ptrdiff_t>(got));
+            out.push_back(static_cast<std::uint8_t>(bcn));
+            out.push_back(static_cast<std::uint8_t>(bcn >> 8u));
+            out.insert(out.end(), ar, ar + got);
         }
     }
     (void)out_start;

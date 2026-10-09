@@ -239,6 +239,13 @@ struct State {
     AudioProbe probe_ctx;                     // the codec's copy (ctx+0x487c0), the one the encoder edits
     AudioModel audio;                         // +0x10080 (ctx + 0x4020)
     ImageEncModel image;                      // +0x12200 (the image model object)
+    // A block's bytecode and arith output, kept across blocks and never zeroed:
+    // a fresh zero-filled vector of 9x the block per block was ~10 % of `a -cf`.
+    struct Scratch {
+        std::unique_ptr<std::uint8_t[]> p; std::size_t cap = 0;
+        std::uint8_t* Get(std::size_t n) { if (cap < n) { p.reset(new std::uint8_t[n]); cap = n; } return p.get(); }
+    };
+    Scratch bc_buf, ar_buf;
 
     void Init(bool variant_b, std::size_t capacity);
     // FUN_080b6bb0: when fewer than 32 KB remain, zero [cursor, capacity + 32 KB) and rewind.
@@ -250,8 +257,10 @@ struct State {
 };
 
 // FUN_0805a190: the LZ parse of `len` bytes at window + pos (already copied
-// there). Appends the opcode bytecode to `out` and returns its length.
-std::size_t LzParse(State& st, std::size_t pos, std::size_t len, std::vector<std::uint8_t>& out);
+// there). Writes the opcode bytecode to `out`, which holds LzParseBound(len)
+// bytes, and returns its length.
+inline std::size_t LzParseBound(std::size_t len) { return len * 9u + 16u; }
+std::size_t LzParse(State& st, std::size_t pos, std::size_t len, std::uint8_t* out);
 
 // FUN_08059cb0: the block header varint. flags = the low bits (0/1 literal,
 // 2 raw bytecode, 3 bytecode + side stream, 4 prefilter), size 0x8000 -> 0.

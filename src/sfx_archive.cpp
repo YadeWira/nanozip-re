@@ -14663,7 +14663,12 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                             const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
                             std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
                             bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec,
-                            std::ostream* live_os = nullptr) {
+                            std::ostream* live_os = nullptr,
+                            const std::function<void(const unsigned char*, std::size_t)>* drain = nullptr) {
+    // `drain` (the serial writer): after each block what `out` holds goes to it and
+    // `out` is emptied, so the stream is never held whole (264 MiB for `a -cn` of
+    // 128 MB, the original 129); a stored block goes to it straight from `block`.
+    // Nothing here writes back into bytes already in `out`, so this changes no byte.
     // `os` takes the permanent lines ("Cannot open:", "Error: cannot read"); the
     // status redraws go to `live` -- the same stream on one thread, the console
     // itself while `os` is a worker's buffer, replayed in the serial order later.
@@ -14969,8 +14974,15 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         } else {
             const std::vector<unsigned char>& data = chunked ? payload : block;
             std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
-            out.insert(out.end(), hdr.begin(), hdr.end()); out.insert(out.end(), data.begin(), data.end());
+            out.insert(out.end(), hdr.begin(), hdr.end());
+            if (drain != nullptr) {
+                (*drain)(out.data(), out.size()); out.clear();
+                (*drain)(data.data(), data.size());
+            } else {
+                out.insert(out.end(), data.begin(), data.end());
+            }
         }
+        if (drain != nullptr && !out.empty()) { (*drain)(out.data(), out.size()); out.clear(); }
         written = block_end;
         status.BlockDone(live, stream, block.size());
         if (total == 0u) break;
@@ -15592,8 +15604,22 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             return decline();
     } else if (workers == 1u) {
         std::vector<unsigned char> body;
-        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0])) return decline();
-        timed_write(body);
+        // the per-block writes are timed whole and turned into milliseconds once
+        // (one truncation, as when the stream was written in one piece)
+        std::chrono::steady_clock::duration drained{};
+        const std::function<void(const unsigned char*, std::size_t)> drain = [&](const unsigned char* d, std::size_t n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            drained += std::chrono::steady_clock::now() - t0;
+        };
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0], nullptr, &drain)) return decline();
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+            out.flush();
+            drained += std::chrono::steady_clock::now() - t0;
+            write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(drained).count());
+        }
     } else {
         std::vector<unsigned char> body;
         // the last worker's header first

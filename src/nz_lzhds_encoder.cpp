@@ -25,10 +25,7 @@ constexpr std::uint32_t kK = 0x104070bu;   // the rolling hash multiplier
 inline std::uint32_t LoadU32(const std::uint8_t* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline std::uint16_t LoadU16(const std::uint8_t* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
 inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for 0
-    if (v == 0u) return 0u;
-    std::uint32_t k = 31u;
-    while ((v >> k) == 0u) --k;
-    return k;
+    return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
 }
 
 // DAT_08171d40: c * K^256, what leaves the 256-byte window (FUN_08059b20 builds it).
@@ -410,6 +407,10 @@ std::uint32_t HdsEncodeChunk(State& st, std::uint32_t n) {
                 dist = cpos;
             }
             hash = (p[0x100] - T[p[0]]) + hash * kK;
+            // the next position's two table slots, fetched while this one is worked on
+            // (both loads miss the cache on most positions; no effect on the output)
+            __builtin_prefetch(lrt + (lrmask & hash));
+            { const std::uint32_t nx = LoadU32(p + 1); __builtin_prefetch(head + (((nx >> 19u) ^ nx) & hmask)); }
             if (mlen < 8u) {
                 if (n < 5u) mlen = 0;
                 else {
