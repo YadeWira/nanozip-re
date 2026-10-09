@@ -678,12 +678,16 @@ namespace {
 inline std::uint32_t RingReduce(std::uint32_t idx, std::uint32_t ring_size) {
     return idx >= ring_size ? idx - ring_size : idx;   // idx < 2*ring_size by construction
 }
+// (each with a straight copy when the range does not reach the ring end; the
+// per-byte wrap only where it does -- the same bytes either way)
 inline void RingWrite(std::uint8_t* ring, std::uint32_t ring_size, std::uint32_t base,
                       const std::uint8_t* src, std::uint32_t n) {
+    if (n != 0u && base < ring_size && n <= ring_size - base) { std::memcpy(ring + base, src, n); return; }
     for (std::uint32_t i = 0; i < n; ++i) ring[RingReduce(base + i, ring_size)] = src[i];
 }
 inline void RingRead(const std::uint8_t* ring, std::uint32_t ring_size, std::uint32_t base,
                      std::uint8_t* dst, std::uint32_t n) {
+    if (n != 0u && base < ring_size && n <= ring_size - base) { std::memcpy(dst, ring + base, n); return; }
     for (std::uint32_t i = 0; i < n; ++i) dst[i] = ring[RingReduce(base + i, ring_size)];
 }
 
@@ -727,7 +731,7 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::
         if (lit_run) {
             std::uint32_t run = lit_run;
             if (pos + run > out_size) run = out_size - pos;
-            for (std::uint32_t i = 0; i < run; ++i) ring[RingReduce(base + pos + i, ring_size)] = lp[i];
+            RingWrite(ring, ring_size, RingReduce(base + pos, ring_size), lp, run);
             lp += tokens[t * 3 + 0];            // advance by the full (unclamped) run
             pos += run;
             if (pos >= out_size) break;
@@ -747,16 +751,30 @@ std::uint32_t ReconstructRing(std::uint8_t* ring, std::uint32_t ring_size, std::
         {
             const std::uint32_t wstart = RingReduce(base + pos, ring_size);
             std::uint32_t si = (offset <= wstart) ? (wstart - offset) : (wstart + ring_size - offset);
-            for (std::uint32_t i = 0; i < mlen; ++i, ++si) {
-                const std::uint32_t wi = RingReduce(base + pos + i, ring_size);
-                ring[wi] = (si < ring_size) ? ring[si] : 0u;
+            if (mlen <= ring_size - wstart && mlen <= ring_size - si) {
+                // neither range reaches the ring end: the byte loop below, without
+                // its per-byte wrap tests (a source behind that overlaps repeats
+                // the pattern byte by byte; a source ahead reads before any write
+                // reaches it, which is what memmove does)
+                std::uint8_t* const d = ring + wstart;
+                const std::uint8_t* const q = ring + si;
+                if (si < wstart) {
+                    if (offset >= mlen) std::memcpy(d, q, mlen);
+                    else for (std::uint32_t i = 0; i < mlen; ++i) d[i] = q[i];
+                } else {
+                    std::memmove(d, q, mlen);
+                }
+            } else {
+                for (std::uint32_t i = 0; i < mlen; ++i, ++si) {
+                    const std::uint32_t wi = RingReduce(base + pos + i, ring_size);
+                    ring[wi] = (si < ring_size) ? ring[si] : 0u;
+                }
             }
         }
         pos += mlen;
     }
     if (pos < out_size) {                       // trailing literal flush
-        for (std::uint32_t i = 0, e = out_size - pos; i < e; ++i)
-            ring[RingReduce(base + pos + i, ring_size)] = lp[i];
+        RingWrite(ring, ring_size, RingReduce(base + pos, ring_size), lp, out_size - pos);
         pos = out_size;
     }
     return pos;

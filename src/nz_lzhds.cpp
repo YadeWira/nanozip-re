@@ -541,9 +541,22 @@ std::uint32_t NzLzhdsReconstruct(const std::uint32_t* tokens, std::uint32_t num_
         {
             const std::uint32_t wstart = LzhdsRingReduce(base + pos, ring_size);
             std::uint32_t si = (offset <= wstart) ? (wstart - offset) : (wstart + ring_size - offset);
-            for (std::uint32_t k = 0; k < mcopy; ++k, ++si) {
-                const std::uint32_t wi = LzhdsRingReduce(base + pos + k, ring_size);
-                ring[wi] = (si < ring_size) ? ring[si] : 0u;
+            if (mcopy <= ring_size - wstart && mcopy <= ring_size - si) {
+                // neither range reaches the ring end: the loop below without its
+                // per-byte wrap tests (as in nz_cd_tokens.cpp's ReconstructRing)
+                std::uint8_t* const d = ring + wstart;
+                const std::uint8_t* const q = ring + si;
+                if (si < wstart) {
+                    if (offset >= mcopy) std::memcpy(d, q, mcopy);
+                    else for (std::uint32_t k = 0; k < mcopy; ++k) d[k] = q[k];
+                } else {
+                    std::memmove(d, q, mcopy);
+                }
+            } else {
+                for (std::uint32_t k = 0; k < mcopy; ++k, ++si) {
+                    const std::uint32_t wi = LzhdsRingReduce(base + pos + k, ring_size);
+                    ring[wi] = (si < ring_size) ? ring[si] : 0u;
+                }
             }
         }
         pos += mcopy;

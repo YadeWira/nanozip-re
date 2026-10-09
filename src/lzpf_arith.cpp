@@ -364,6 +364,30 @@ void DecodeHuffmanBytes(HuffmanContext& ctx, BitReader& br,
     if (count == 0) return;
 
     std::uint32_t code = ctx.code_register;
+    // ReadBits, kept in registers for this loop (it lives in this file but was
+    // called once per symbol, ~17 % of a -cd decode); the same steps exactly.
+    const std::uint8_t* cur = br.cur;
+    const std::uint8_t* const end = br.end;
+    std::uint32_t cache = br.cache, n_valid = br.n_valid;
+    const auto read_bits = [&](std::uint32_t req) -> std::uint32_t {
+        std::uint32_t result;
+        if (n_valid < req) {
+            const std::uint32_t deficit = req - n_valid;
+            const std::uint32_t new_n = 32u - deficit;
+            const std::uint32_t shifted_cache = cache << deficit;
+            std::uint32_t fresh = new_n;  // legacy: junk-default if past end
+            if (cur < end) fresh = LoadBigEndianU32Bounded(cur, end);
+            cur += 4;
+            result = shifted_cache | (fresh >> new_n);
+            cache = fresh;
+            n_valid = new_n;
+        } else {
+            n_valid -= req;
+            result = cache >> n_valid;
+        }
+        return result & kMaskTable[req];
+    };
+    const auto put_back = [&]() { br.cur = cur; br.cache = cache; br.n_valid = n_valid; };
     for (std::size_t i = 0; i < count; ++i) {
         unsigned length = ctx.length_table[code >> 23];
         unsigned val = code >> (31u - length);
@@ -385,6 +409,7 @@ void DecodeHuffmanBytes(HuffmanContext& ctx, BitReader& br,
                     // Nothing valid can follow; zero the rest and stop consuming bits.
                     std::memset(dst + i, 0, count - i);
                     ctx.code_register = code;
+                    put_back();
                     return;
                 }
             }
@@ -400,10 +425,11 @@ void DecodeHuffmanBytes(HuffmanContext& ctx, BitReader& br,
         // `length` fresh bits. Equivalent to the tail of the slow-path loop in
         // FUN_0809cf40 — implemented through ReadBits to centralise the
         // big-endian/refill semantics.
-        const std::uint32_t fresh = ReadBits(br, length);
+        const std::uint32_t fresh = read_bits(length);
         code = ((code << length) & 0x7fffffffu) | (fresh & Mask(length));
     }
     ctx.code_register = code;
+    put_back();
 }
 
 // Faithful port of FUN_080a41d0 — pass 1 only (meta-Huffman code lengths).
