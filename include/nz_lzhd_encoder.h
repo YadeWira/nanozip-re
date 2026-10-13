@@ -74,7 +74,8 @@ struct HdsLrHash {
 struct HdsFinder {
     std::uint32_t win = 0, mask = 0, tag = 0, hmask = 0, cmask = 0, depth = 0;
     std::vector<std::uint32_t> head, chain;
-    void Init(std::uint32_t window, std::uint32_t per);
+    void Size(std::uint32_t window, std::uint32_t per);   // the masks only, no tables
+    void Init(std::uint32_t window, std::uint32_t per);   // Size, then the tables
     void Clear() { std::fill(head.begin(), head.end(), 0u); std::fill(chain.begin(), chain.end(), 0u); depth = 0; }
 };
 // FUN_080b1f20 / FUN_080b2030: the MSB-first bit writer behind the Exp-Golomb

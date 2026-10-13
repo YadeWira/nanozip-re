@@ -82,6 +82,54 @@ void OneBlock(const std::vector<std::uint8_t>& in, const std::string& what) {
     Check(NzBwtUntransform(back.data(), n, primary) && back == in, what + ": ida y vuelta");
 }
 
+// The inverse as the original computes it: one walk, the byte at a position
+// found by searching the cumulative counts. NzBwtUntransform packs the byte into
+// the table below 16 MiB and walks many chains from 256 KiB; on any input,
+// corrupt included, it must answer as this does.
+bool RefUntransform(std::vector<std::uint8_t>& d, std::uint32_t pos) {
+    const std::uint32_t n = (std::uint32_t)d.size();
+    if (n == 0u) return true;
+    if (pos >= n) return false;
+    std::uint32_t C[257] = {0}, cnt[256] = {0};
+    for (std::uint8_t c : d) ++cnt[c];
+    for (std::uint32_t c = 0; c < 256u; ++c) C[c + 1u] = C[c] + cnt[c];
+    std::uint32_t fill[256];
+    for (std::uint32_t c = 0; c < 256u; ++c) fill[c] = C[c];
+    std::vector<std::uint32_t> t(n);
+    for (std::uint32_t i = 0; i < n; ++i) t[fill[d[i]]++] = i;
+    std::vector<std::uint8_t> out(n);
+    const std::uint32_t start = pos;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::uint32_t s = 0;
+        for (std::uint32_t k = 128; k; k >>= 1) if (pos >= C[s + k]) s += k;
+        out[i] = (std::uint8_t)s;
+        pos = t[pos];
+    }
+    if (pos != start) return false;
+    d.swap(out);
+    return true;
+}
+
+// Large blocks: either side of the chain walk's cut-over (256 KiB) and of the
+// packed table's limit (16 MiB), round trip plus the same block damaged.
+void LargeBlock(const std::vector<std::uint8_t>& in, const std::string& what, Rng& rng) {
+    const std::uint32_t n = (std::uint32_t)in.size();
+    std::vector<std::uint8_t> bwt(n);
+    const std::uint32_t primary = NzBwtTransform(in.data(), n, bwt.data());
+    std::vector<std::uint8_t> back = bwt;
+    Check(NzBwtUntransform(back.data(), n, primary) && back == in, what + ": ida y vuelta");
+    for (int k = 0; k < 3; ++k) {   // a flipped byte, a wrong primary, both
+        std::vector<std::uint8_t> bad = bwt;
+        std::uint32_t p = primary;
+        if (k != 1) bad[rng() % n] ^= (std::uint8_t)(1u + rng() % 255u);
+        if (k != 0) p = rng() % n;
+        std::vector<std::uint8_t> ref = bad, got = bad;
+        const bool rok = RefUntransform(ref, p);
+        const bool gok = NzBwtUntransform(got.data(), n, p);
+        Check(rok == gok && (!rok || got == ref), what + ": dañado " + std::to_string(k));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -122,6 +170,14 @@ int main() {
             std::vector<std::uint8_t> in(period * reps);
             for (std::uint32_t i = 0; i < in.size(); ++i) in[i] = pat[i % period];
             OneBlock(in, "periodo=" + std::to_string(period) + " x" + std::to_string(reps));
+        }
+    }
+    for (std::uint32_t n : {0x3ffffu, 0x40000u, 0x40001u, 0x100003u, 0xffffffu, 0x1000000u, 0x1000001u}) {
+        for (int kind = 0; kind < 2; ++kind) {
+            std::vector<std::uint8_t> in(n);
+            for (std::uint32_t i = 0; i < n; ++i)
+                in[i] = kind == 0 ? (std::uint8_t)rng() : (std::uint8_t)"etaoin "[rng() % 7u];
+            LargeBlock(in, "n=" + std::to_string(n) + " grande=" + std::to_string(kind), rng);
         }
     }
     std::printf("%d checks, %d failed\n", checks, failed);

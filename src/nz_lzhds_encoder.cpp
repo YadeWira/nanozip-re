@@ -115,7 +115,7 @@ void HdsLrHash::Init(std::uint32_t window) {
     hash = 0;
 }
 
-void HdsFinder::Init(std::uint32_t window, std::uint32_t per) {
+void HdsFinder::Size(std::uint32_t window, std::uint32_t per) {
     win = window;
     std::uint32_t a = window - 1u; if (a < 0xffffu) a = 0xffffu;
     const std::uint32_t b = BitLen1(a);
@@ -126,6 +126,10 @@ void HdsFinder::Init(std::uint32_t window, std::uint32_t per) {
     hmask = (1u << (sh & 31u)) - 1u;
     cmask = (1u << ((sh - ((window + (window >> 1u) < mask) ? 1u : 0u)) & 31u)) - 1u;
     depth = 0;
+}
+
+void HdsFinder::Init(std::uint32_t window, std::uint32_t per) {
+    Size(window, per);
     head.assign(static_cast<std::size_t>(hmask) + 1u, 0u);
     chain.assign(static_cast<std::size_t>(cmask) + 1u, 0u);
 }
@@ -200,7 +204,7 @@ void Hds::ResetSelection(std::uint32_t pos) {   // FUN_080bf3f0(obj+0x4a00, base
 }
 
 std::uint64_t HdsMemoryBytes(std::uint32_t window, unsigned threads) {   // FUN_0805d3d0
-    HdsFinder f; f.Init(window, window);
+    HdsFinder f; f.Size(window, window);   // the figure needs the masks, not 2 x 4(mask+1) zeroed bytes
     const std::uint32_t q = (window - 1u) >> 6u;
     const std::uint32_t bits = (q != 0u ? BitLen1(q) : 0u) + 1u;
     // FUN_080bf740: window + 0x40 + two FUN_080c1120(.., 0xf) objects of 0xa0000 each

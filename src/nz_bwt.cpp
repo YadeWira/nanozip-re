@@ -609,9 +609,10 @@ struct BwtUnpackInput {
 // independent misses are in flight instead of one. Its start-detection trick is
 // kept: a chain's start index has the chain's id in its low byte, so "is this
 // index a start" is one L1 lookup (starts[idx & 0xff] == idx); the primary index
-// takes the chain slot its own low byte selects. The byte for a position comes
+// takes the chain slot its own low byte selects. The byte for a position rides
+// in the table entry's low byte for blocks under 16 MiB; above that it comes
 // from the 256-entry cumulative count table (largest c with C[c] <= pos), as in
-// the original, so no second random access is needed.
+// the original. Either way no second random access is needed.
 namespace {
 
 constexpr uint32_t kBwtChainThreshold = 0x40000u;   // the original's cut-over
@@ -632,6 +633,10 @@ struct BwtChain {
     bool done = false;
 };
 
+// kPacked: each table entry is (successor << 8) | the row's symbol (blocks
+// under 16 MiB), so one load gives both; otherwise the entry is the successor
+// and the symbol comes from C.
+template <bool kPacked>
 bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
                           const uint32_t* C, const std::vector<uint32_t>& table) {
     // Chain k starts at a spaced index whose low byte is k; the primary index
@@ -681,8 +686,9 @@ bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
             for (size_t a = 0; a < active.size();) {
                 BwtChain& c = chains[active[a]];
                 const uint32_t pos = c.idx;
-                const uint32_t sym = BwtSymOf(C, pos);
-                const uint32_t nxt = table[pos];
+                const uint32_t e = table[pos];
+                const uint32_t sym = kPacked ? (e & 0xffu) : BwtSymOf(C, pos);
+                const uint32_t nxt = kPacked ? (e >> 8) : e;
                 ++steps;
                 if (c.page_fill == kBwtPage) { c.pages.push_back(next_page_atomic.fetch_add(1u)); c.page_fill = 0; }
                 pool[(size_t)c.pages.back() * kBwtPage + c.page_fill++] = (uint8_t)sym;
@@ -771,19 +777,28 @@ bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     }
     C[256] = sum;
 
+    // Below 16 MiB a successor fits in 24 bits, and the entry also carries the
+    // row's symbol (row byte_count[c] belongs to symbol c = data[i]): one load
+    // per output byte instead of the load plus an 8-step search of C.
+    const bool packed = data_size <= 0x1000000u;
     std::vector<uint32_t> table(data_size);
-    for (uint32_t i = 0; i != data_size; ++i) table[byte_count[data[i]]++] = i;
+    if (packed)
+        for (uint32_t i = 0; i != data_size; ++i) table[byte_count[data[i]]++] = (i << 8) | data[i];
+    else
+        for (uint32_t i = 0; i != data_size; ++i) table[byte_count[data[i]]++] = i;
 
     if (data_size >= kBwtChainThreshold)
-        return BwtUntransformChains(data, data_size, bwt_pos, C, table);
+        return packed ? BwtUntransformChains<true>(data, data_size, bwt_pos, C, table)
+                      : BwtUntransformChains<false>(data, data_size, bwt_pos, C, table);
 
     // Small block: the plain single-chain walk; the byte at a position is its
     // symbol in the sorted column (largest c with C[c] <= pos), which equals
     // the BWT byte the reference reads through the table.
     const uint32_t start = bwt_pos;
-    for (uint32_t i = 0; i != data_size; ++i) {
-        data[i] = (uint8_t)BwtSymOf(C, bwt_pos);
-        bwt_pos = table[bwt_pos];
+    for (uint32_t i = 0; i != data_size; ++i) {   // packed: data_size < 0x40000 here
+        const uint32_t e = table[bwt_pos];
+        data[i] = (uint8_t)e;
+        bwt_pos = e >> 8;
     }
     // A genuine BWT is one cycle of length data_size, so the walk ends where it
     // began. Corrupt input (a flipped byte changes the symbol counts) breaks the

@@ -107,7 +107,9 @@ inline std::uint32_t Load32(const std::uint8_t* p) { std::uint32_t v; std::memcp
 // the ring is read with SIGNED positions: just before the cursor is negative and
 // lands in the 256-byte prefix mirror (the decoder's own RingAt)
 inline std::uint8_t At(const std::uint8_t* b, std::uint32_t p) { return b[static_cast<std::int32_t>(p)]; }
-inline std::uint32_t BitLen1(std::uint32_t v) { std::uint32_t n = 31; if (v == 0) return 0; while ((v >> n) == 0) --n; return n; }
+inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0
+    return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
+}
 
 // One relaxation candidate the DP considers at a position.
 struct Cand { std::uint32_t len; std::uint32_t src; };
@@ -132,6 +134,10 @@ struct NzOptimum2LzDecoder::ParserState {
     std::vector<LrSeen> lrseen = std::vector<LrSeen>(4096u);
     LrSeen lrlast;
     std::uint32_t lrgen = 1;
+    // a flush's candidate list and its backtracking chain, kept here so their
+    // capacity outlives the call (built fresh, they were ~2 allocations a byte)
+    std::vector<Cand> cands_buf;
+    std::vector<std::uint32_t> chain_buf;
     bool verbose = false;            // debug: dump one Find's chain walk
     bool ready = false;
     const std::uint8_t* block = nullptr;
@@ -884,7 +890,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         if (took_long) { endnode = front; break; }
 
         // ---- the bt4 finder, then the long-range index
-        std::vector<Cand> cands;
+        std::vector<Cand>& cands = F.cands_buf;
+        cands.clear();
         if (const char* fd = NZ_ENV("NZO2_FINDDBG"))
             F.verbose = (cur == static_cast<std::uint32_t>(std::atoi(fd)));
         F.Find(base, cur, cend, remain, cands, 0x100u);
@@ -1067,7 +1074,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
     }
 
     // ---- backtrack and emit
-    std::vector<std::uint32_t> chain;
+    std::vector<std::uint32_t>& chain = F.chain_buf;
+    chain.clear();
     for (std::uint32_t k = endnode; k != 0u; k = nodes[k].back) chain.push_back(k);
     std::reverse(chain.begin(), chain.end());
     std::uint32_t adv = 0;

@@ -94,7 +94,9 @@ inline std::uint32_t Load32(const std::uint8_t* p) { std::uint32_t v; std::memcp
 // The ring is read with SIGNED positions: a position just before the cursor is
 // negative and lands in the 256-byte prefix mirror (the decoder's RingAt).
 inline std::uint8_t At(const std::uint8_t* b, std::uint32_t p) { return b[static_cast<std::int32_t>(p)]; }
-inline std::uint32_t BitLen1(std::uint32_t v) { std::uint32_t n = 31; if (v == 0) return 0; while ((v >> n) == 0) --n; return n; }
+inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0
+    return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
+}
 
 // One relaxation candidate the DP considers at a position.
 struct Cand { std::uint32_t len; std::uint32_t src; };
@@ -125,6 +127,10 @@ struct NzOptimumLzDecoder::ParserState {
     std::vector<LrSeen> lrseen = std::vector<LrSeen>(4096u);
     LrSeen lrlast;   // the last value recorded: a flush after a long match rolls on from it
     std::uint32_t lrgen = 1;
+    // a flush's candidate list and its backtracking chain, kept here so their
+    // capacity outlives the call (built fresh, they were ~2 allocations a byte)
+    std::vector<Cand> cands_buf;
+    std::vector<std::uint32_t> chain_buf;
     bool ready = false;
     // the block being parsed, and how much of it has been handed to the coder
     const std::uint8_t* block = nullptr;      // the whole block
@@ -882,7 +888,8 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
                 // for that length), which is why each candidate is not relaxed on
                 // its own. The threshold starts at 2, so a 2-byte brand-new distance
                 // is never taken.
-                std::vector<Cand> cands;
+                std::vector<Cand>& cands = F.cands_buf;
+                cands.clear();
                 if (NZ_ENV("NZOPT_PROBES")) std::fprintf(stderr, "[PR] %u %u\n", cur - pos0, remain);
                 // NZOPT_PROBE_STATE=<n>: write the whole finder -- head, tree,
                 // 2-byte cache and the ring -- to <NZOPT_PROBE_STATE_OUT>.<name>
@@ -1192,7 +1199,8 @@ bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
             }
 
             // ---- backtrack and emit
-            std::vector<std::uint32_t> chain;
+            std::vector<std::uint32_t>& chain = F.chain_buf;
+            chain.clear();
             for (std::uint32_t k = endnode; k != 0u; k = nodes[k].back) chain.push_back(k);
             std::reverse(chain.begin(), chain.end());
             std::uint32_t adv = 0;
