@@ -166,22 +166,11 @@ struct DecodeIO {
     std::uint32_t Hi() const { return rc.hi; }
     std::uint32_t Code() const { return rc.code; }
 };
-struct EncodeIO {
-    std::vector<std::uint16_t>* q = nullptr;
-    std::uint32_t Bit(std::uint32_t prob, std::uint32_t intended) {
-        q->push_back(static_cast<std::uint16_t>((prob << 2) | (intended & 1u)));
-        return intended & 1u;
-    }
-    std::uint32_t RawBit(std::uint32_t intended) { return Bit(0x800u, intended); }
-    std::uint32_t Lo() const { return 0; }
-    std::uint32_t Hi() const { return 0; }
-    std::uint32_t Code() const { return 0; }
-};
-// FUN_0806d8f0 over the whole queue, then the single flush byte FUN_0806f8e0 writes.
-void RangeEncodePairs(const std::vector<std::uint16_t>& q, std::vector<std::uint8_t>& out) {
-    std::uint32_t lo = 0, hi = 0xffffffffu;
-    for (std::uint16_t e : q) {
-        const std::uint32_t prob = e >> 2, bit = e & 1u;
+// FUN_0806d8f0 over queued pairs; the single flush byte FUN_0806f8e0 writes is EncodeIO::Finish.
+void RangeEncodePairs(const std::uint16_t* q, std::size_t n, std::uint32_t& lo, std::uint32_t& hi,
+                      std::vector<std::uint8_t>& out) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t prob = q[i] >> 2, bit = q[i] & 1u;
         const std::uint32_t mid = ((hi - lo) >> 12) * prob + lo;
         if (bit) hi = mid; else lo = mid + 1u;
         while ((hi ^ lo) < 0x1000000u) {
@@ -190,8 +179,35 @@ void RangeEncodePairs(const std::vector<std::uint16_t>& q, std::vector<std::uint
             lo <<= 8;
         }
     }
-    out.push_back(static_cast<std::uint8_t>(hi >> 24));
 }
+// The queue is coded in batches as it fills, the coder's lo/hi carried from one
+// to the next: the same bytes as queueing the whole block first (FUN_0806d8f0
+// runs one coder over it, and the single flush byte comes once, at Finish),
+// without a 16-bit entry per modelled bit held for the whole block. `keep`, when
+// set, also collects every pair (the queue dumps).
+struct EncodeIO {
+    static constexpr std::size_t kBatch = 4096;
+    std::uint16_t buf[kBatch];
+    std::size_t n = 0;
+    std::uint32_t lo = 0, hi = 0xffffffffu;
+    std::vector<std::uint8_t>* out = nullptr;
+    std::vector<std::uint16_t>* keep = nullptr;
+    std::uint32_t Bit(std::uint32_t prob, std::uint32_t intended) {
+        buf[n++] = static_cast<std::uint16_t>((prob << 2) | (intended & 1u));
+        if (n == kBatch) Drain();
+        return intended & 1u;
+    }
+    std::uint32_t RawBit(std::uint32_t intended) { return Bit(0x800u, intended); }
+    std::uint32_t Lo() const { return 0; }
+    std::uint32_t Hi() const { return 0; }
+    std::uint32_t Code() const { return 0; }
+    void Drain() {
+        if (keep != nullptr) keep->insert(keep->end(), buf, buf + n);
+        RangeEncodePairs(buf, n, lo, hi, *out);
+        n = 0;
+    }
+    void Finish() { Drain(); out->push_back(static_cast<std::uint8_t>(hi >> 24)); }
+};
 inline std::uint32_t BitLenU(std::uint32_t v) { std::uint32_t n = 0; while (v) { ++n; v >>= 1; } return n; }
 
 // Adaptive bit decode against a 16-bit direct-probability cell at mem+off
@@ -1151,16 +1167,16 @@ bool NzOptimumLzDecoder::DecodeBlock(const std::uint8_t* in, std::uint32_t in_le
 
 bool NzOptimumLzDecoder::EncodeBlock(const OptimumDecision* dec, std::size_t ndec, std::uint32_t out_size,
                                      std::vector<std::uint8_t>& payload) {
+    const std::size_t payload0 = payload.size();
     EncodeIO io;
-    std::vector<std::uint16_t> q;
-    io.q = &q;
+    io.out = &payload;
     std::vector<std::uint8_t> tmp(static_cast<std::size_t>(out_size) + 16u);
     const bool saved_record = record_;
     record_ = false;
     const bool ok = RunBlock(io, dec, ndec, tmp.data(), out_size);
     record_ = saved_record;
-    if (!ok) return false;
-    RangeEncodePairs(q, payload);
+    if (!ok) { payload.resize(payload0); return false; }
+    io.Finish();
     return true;
 }
 
@@ -1169,9 +1185,9 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
                                            std::vector<OptimumDecision>* out_decisions) {
     if (size == 0u) return false;
     BeginParse(data, size);
+    const std::size_t payload0 = payload.size();
     EncodeIO io;
-    std::vector<std::uint16_t> q;
-    io.q = &q;
+    io.out = &payload;
     std::vector<std::uint8_t> tmp(static_cast<std::size_t>(size) + 16u);
     std::vector<OptimumDecision> pending;
     std::size_t pi = 0;
@@ -1204,8 +1220,8 @@ bool NzOptimumLzDecoder::EncodeBlockParsed(const std::uint8_t* data, std::uint32
     // reset raised is down from the stream's first block on, whatever its kind,
     // and only a BWT block that opens the stream skips param15.
     window_reset_pending_ = false;
-    if (!ok || !parse_ok) return false;
-    RangeEncodePairs(q, payload);
+    if (!ok || !parse_ok) { payload.resize(payload0); return false; }
+    io.Finish();
     return true;
 }
 

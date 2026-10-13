@@ -11,6 +11,7 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
+#include <memory>
 #include <thread>
 
 namespace {
@@ -618,7 +619,16 @@ namespace {
 constexpr uint32_t kBwtChainThreshold = 0x40000u;   // the original's cut-over
 constexpr uint32_t kBwtChains = 128u;               // walked round-robin, split over threads
 std::atomic<unsigned> g_bwt_threads{0};             // 0 = decide from the hardware
-constexpr uint32_t kBwtPage = 1u << 16;             // scratch page per piece
+// Scratch page per piece: a chain wastes up to one page, so with 129 chains a
+// fixed 64 KiB page cost 8 MiB on a 256 KiB block. The page grows with the
+// block instead -- n/256 rounded down to a power of two, 1 KiB to 64 KiB --
+// keeping the waste near n/2 at most. NZ_BWT_PAGE=<bytes> forces one size.
+uint32_t BwtPageFor(uint32_t n) {
+    if (const char* e = NZ_ENV("NZ_BWT_PAGE")) { const uint32_t v = (uint32_t)std::atoi(e); if (v != 0u) return v; }
+    uint32_t page = 1u << 10;
+    while (page < (1u << 16) && page * 2u <= n / 256u) page *= 2u;
+    return page;
+}
 
 inline uint32_t BwtSymOf(const uint32_t* C, uint32_t pos) {
     uint32_t s = 0;
@@ -629,7 +639,7 @@ inline uint32_t BwtSymOf(const uint32_t* C, uint32_t pos) {
 struct BwtChain {
     uint32_t start = 0, idx = 0, next_start = 0, len = 0;
     std::vector<uint32_t> pages;   // page indices into the scratch pool
-    uint32_t page_fill = kBwtPage; // bytes used in the last page (full = need a new one)
+    uint32_t page_fill = 0;        // bytes used in the last page (== page: need a new one)
     bool done = false;
 };
 
@@ -662,9 +672,11 @@ bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
 
     // Scratch pool: every byte lands in exactly one page, plus one partial page
     // per chain.
-    const uint64_t npages = (uint64_t)((n + kBwtPage - 1u) / kBwtPage) + nchains;
-    std::vector<uint8_t> pool((size_t)npages * kBwtPage);
-    for (uint32_t k = 0; k < nchains; ++k) chains[k].idx = chains[k].start;
+    // Not zeroed: the stitch below copies only the c.len bytes each chain wrote.
+    const uint32_t page = BwtPageFor(n);
+    const uint64_t npages = (uint64_t)((n + page - 1u) / page) + nchains;
+    std::unique_ptr<uint8_t[]> pool(new uint8_t[(size_t)npages * page]);
+    for (uint32_t k = 0; k < nchains; ++k) { chains[k].idx = chains[k].start; chains[k].page_fill = page; }
 
     // The chains are independent: split them over threads, each walking its
     // subset round-robin (one step of every live chain per round, so the
@@ -690,8 +702,8 @@ bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
                 const uint32_t sym = kPacked ? (e & 0xffu) : BwtSymOf(C, pos);
                 const uint32_t nxt = kPacked ? (e >> 8) : e;
                 ++steps;
-                if (c.page_fill == kBwtPage) { c.pages.push_back(next_page_atomic.fetch_add(1u)); c.page_fill = 0; }
-                pool[(size_t)c.pages.back() * kBwtPage + c.page_fill++] = (uint8_t)sym;
+                if (c.page_fill == page) { c.pages.push_back(next_page_atomic.fetch_add(1u)); c.page_fill = 0; }
+                pool[(size_t)c.pages.back() * page + c.page_fill++] = (uint8_t)sym;
                 ++c.len;
                 if (starts[nxt & 0xffu] == nxt) {
                     c.next_start = nxt; c.done = true;
@@ -738,8 +750,8 @@ bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
         if (c.len == 0u || total + c.len > n) { BWT_FAIL("chain stitch: piece does not fit\n"); return false; }
         uint32_t left = c.len;
         for (size_t p = 0; p < c.pages.size() && left; ++p) {
-            const uint32_t take = left < kBwtPage ? left : kBwtPage;
-            std::memcpy(out, pool.data() + (size_t)c.pages[p] * kBwtPage, take);
+            const uint32_t take = left < page ? left : page;
+            std::memcpy(out, pool.get() + (size_t)c.pages[p] * page, take);
             out += take; left -= take;
         }
         total += c.len;
@@ -908,15 +920,21 @@ static void SaIs(const C* T, uint32_t n, uint32_t sigma, uint32_t* SA) {
         if (k > 0u && !same(sorted[k], sorted[k - 1u])) ++name;
         named[lms_idx[sorted[k] >> 1]] = name;
     }
-    std::vector<uint32_t> sa1(n1);
+    // The reduced problem's answer goes into the position index, dead from
+    // here and at least n1 long (n/2 + 1 >= n1, LMS positions are never
+    // adjacent), and the seeds then overwrite it in place (entry t is read
+    // once, by itself). Reusing the storage rather than freeing it early keeps
+    // the allocator's pattern: freeing these mid-sort raised glibc's mmap
+    // threshold and the whole -co encode's peak with it.
+    std::vector<uint32_t>& sa1 = lms_idx;
+    sa1.resize(n1);
     if (name + 1u == n1) {          // every name distinct: the order is known
         for (uint32_t t = 0; t < n1; ++t) sa1[named[t]] = t;
     } else {
         SaIs<uint32_t>(named.data(), n1, name + 1u, sa1.data());
     }
-    std::vector<uint32_t> seeds(n1);
-    for (uint32_t t = 0; t < n1; ++t) seeds[t] = lms[sa1[t]];
-    induce(seeds);
+    for (uint32_t t = 0; t < n1; ++t) sa1[t] = lms[sa1[t]];
+    induce(sa1);
 }
 
 // True when no two rotations of `s` are equal, which is what lets the suffix
