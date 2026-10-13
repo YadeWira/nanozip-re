@@ -920,21 +920,15 @@ static void SaIs(const C* T, uint32_t n, uint32_t sigma, uint32_t* SA) {
         if (k > 0u && !same(sorted[k], sorted[k - 1u])) ++name;
         named[lms_idx[sorted[k] >> 1]] = name;
     }
-    // The reduced problem's answer goes into the position index, dead from
-    // here and at least n1 long (n/2 + 1 >= n1, LMS positions are never
-    // adjacent), and the seeds then overwrite it in place (entry t is read
-    // once, by itself). Reusing the storage rather than freeing it early keeps
-    // the allocator's pattern: freeing these mid-sort raised glibc's mmap
-    // threshold and the whole -co encode's peak with it.
-    std::vector<uint32_t>& sa1 = lms_idx;
-    sa1.resize(n1);
+    std::vector<uint32_t> sa1(n1);
     if (name + 1u == n1) {          // every name distinct: the order is known
         for (uint32_t t = 0; t < n1; ++t) sa1[named[t]] = t;
     } else {
         SaIs<uint32_t>(named.data(), n1, name + 1u, sa1.data());
     }
-    for (uint32_t t = 0; t < n1; ++t) sa1[t] = lms[sa1[t]];
-    induce(sa1);
+    std::vector<uint32_t> seeds(n1);
+    for (uint32_t t = 0; t < n1; ++t) seeds[t] = lms[sa1[t]];
+    induce(seeds);
 }
 
 // True when no two rotations of `s` are equal, which is what lets the suffix
