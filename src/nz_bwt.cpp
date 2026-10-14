@@ -770,6 +770,7 @@ bool BwtUntransformChains(uint8_t* data, uint32_t n, uint32_t bwt_pos,
 }  // namespace
 
 void NzBwtSetThreadCount(unsigned n) { g_bwt_threads.store(n, std::memory_order_relaxed); }
+unsigned NzBwtGetThreadCount() { return g_bwt_threads.load(std::memory_order_relaxed); }
 
 bool NzBwtUntransform(uint8_t* data, uint32_t data_size, uint32_t bwt_pos) {
     if (data_size == 0u) return true;

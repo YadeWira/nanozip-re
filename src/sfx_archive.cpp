@@ -3051,6 +3051,13 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     if (!e.published || k >= e.streams.size()) return;
     Stream& s = e.streams[k];
     if (e.policy == Policy::kStore) return;      // store keeps the buffered path
+    const bool hold_back = (e.policy == Policy::kGroup);
+    // The checksums, the self-check's CRC-64 and the hold copy run without e.mu
+    // (issue #2 item 8): they touch only this stream's own state (sck, sdig,
+    // hold, produced), which only its worker uses, and the slices' positions,
+    // fixed at Publish. e.streams is not resized while workers run (Configure and
+    // Reset come before and after them), so `s` stays valid with the lock off.
+    lk.unlock();
     s.incremental = true;
     if (s.sck.size() != s.slices.size()) {
         s.sck.resize(s.slices.size());
@@ -3061,9 +3068,19 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
     const std::uint64_t from = s.produced;
     std::uint64_t to = from + n;
     if (to > s.total) to = s.total;               // the caller overran its declared size
+    // Checksums follow the bytes as they pass, whatever the flush rule does
+    // with them: the original checks a slice it decoded, not one it wrote.
+    for (std::size_t i = 0; i < s.slices.size(); ++i) {
+        const Slice& sl = s.slices[i];
+        if (sl.len == 0u) continue;
+        const std::uint64_t ca = std::max(sl.spos, from);
+        const std::uint64_t cb = std::min(sl.spos + sl.len, to);
+        if (ca >= cb) continue;
+        s.sck[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+        if (digest) s.sdig[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+    }
     // kProduced flushes everything as it arrives, so the bytes go straight from
     // the caller's buffer -- no hold, and no copy of every block.
-    const bool hold_back = (e.policy == Policy::kGroup);
     if (hold_back) {
         if (s.hold.empty()) s.held_base = from;
         s.hold.insert(s.hold.end(), buf, buf + static_cast<std::size_t>(to - from));
@@ -3071,6 +3088,7 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
         s.held_base = from;
     }
     s.produced = to;
+    lk.lock();
     const std::uint64_t safe = SafeFlushPoint(e, s, to);
     // Each slice is created AND written before the next one is created, in entry
     // order, as the original writes them: creating every file the range reached
@@ -3083,12 +3101,6 @@ inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) 
             if (sl.spos < safe && EmptySliceLocked(e, sl, &got, lk)) s.pending_bad.emplace_back(i, got);
             continue;
         }
-        // Checksums follow the bytes as they pass, whatever the flush rule does
-        // with them: the original checks a slice it decoded, not one it wrote.
-        const std::uint64_t ca = std::max(sl.spos, from);
-        const std::uint64_t cb = std::min(sl.spos + sl.len, to);
-        if (ca < cb) s.sck[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
-        if (digest && ca < cb) s.sdig[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
         const std::uint64_t a = std::max(sl.spos, s.held_base);
         const std::uint64_t b = std::min(sl.spos + sl.len, safe);
         if (a < b) {
@@ -4014,6 +4026,16 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
         publish_failure();
         return ok;
     }
+    // The streams share the thread budget with the inverse BWT inside each of
+    // them (issue #2 item 9): `threads` workers each running a BWT team of the
+    // whole -t count oversubscribed the machine (8 x 8 on 8 cores). While they
+    // run, each team gets its share, at least one; set here, on the calling
+    // thread, before the workers start, and put back after they are joined.
+    struct BwtShare {
+        unsigned saved;
+        explicit BwtShare(unsigned share) : saved(NzBwtGetThreadCount()) { NzBwtSetThreadCount(share); }
+        ~BwtShare() { NzBwtSetThreadCount(saved); }
+    } bwt_share(std::max<unsigned>(1u, DecodeThreadCount() / static_cast<unsigned>(threads)));
     std::atomic<std::size_t> next{0};
     auto worker = [&]() {
         for (;;) {
@@ -6451,8 +6473,13 @@ bool TryParseLegacyCnArchive(
     // were already known. Verified on -p2/-p3/-p4 of one set and on the pmf_*
     // fixtures; a sequential container has one stream and is unaffected.
     if (has_parallel_streams && entries.size() > 1u) {
-        std::vector<std::size_t> global;
+        // Each run goes in at the head: kept in a list and joined last-first at
+        // the end, which is the same order without moving the list each time
+        // (with 30 000 entries the head inserts and the membership scan of the
+        // run were 6 % of an `a -cn`, through the self-check's read-back).
+        std::vector<std::vector<std::size_t>> runs;
         std::vector<bool> present(entries.size(), false);
+        std::vector<std::size_t> in_run_of(entries.size(), 0);   // run number + 1 that holds the entry
         for (const auto& kv : stream_named) {              // std::map: ascending stream id
             const std::vector<std::size_t>& names = kv.second;
             const auto fl = stream_split.find(kv.first);
@@ -6460,7 +6487,7 @@ bool TryParseLegacyCnArchive(
             const auto flush = [&]() {
                 if (run.empty()) return;
                 for (std::size_t idx : run) present[idx] = true;
-                global.insert(global.begin(), run.begin(), run.end());
+                runs.push_back(std::move(run));
                 run.clear();
             };
             for (std::size_t k = 0; k < names.size(); ++k) {
@@ -6469,12 +6496,12 @@ bool TryParseLegacyCnArchive(
                 const bool split = fl != stream_split.end() && k < fl->second.size() && fl->second[k];
                 if (split) flush();
                 if (present[idx]) continue;                // merged into the entry already listed
-                bool in_run = false;
-                for (std::size_t r : run) if (r == idx) { in_run = true; break; }
-                if (!in_run) run.push_back(idx);
+                if (in_run_of[idx] != runs.size() + 1u) { in_run_of[idx] = runs.size() + 1u; run.push_back(idx); }
             }
             flush();
         }
+        std::vector<std::size_t> global;
+        for (auto it = runs.rbegin(); it != runs.rend(); ++it) global.insert(global.end(), it->begin(), it->end());
         // Anything no stream table named (should not happen) keeps record order after it.
         for (std::size_t i = 0; i < entries.size(); ++i)
             if (!present[i]) global.push_back(i);
@@ -14471,6 +14498,13 @@ struct EncodeCodec {
     // What this stream actually read, piece by piece (stored name, offset in the
     // file, length, CRC-64), for the whole-archive self-check after `a`.
     std::vector<nzr::selfcheck::Item> expected;
+    // Once the stream is compressed nothing here is needed but `expected` (and the
+    // labels): the windows, tables, verifiers and the feeder's 1 MB ring go back.
+    void ReleaseEngines() {
+        lz.reset(); cd.reset(); co.reset(); co_v.reset(); cO.reset(); cO_v.reset();
+        if (cc != nullptr) { NzCmDestroy(cc); cc = nullptr; }
+        feeder = nzr::opt_enc::CoBlockFeeder{};
+    }
     const char* Label() const {
         return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
              : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
@@ -15277,6 +15311,14 @@ static bool RunWorkersConcurrently(unsigned workers, unsigned pool, const RangeO
                 j.ok = false;
             }
             nzr::lzhd_enc::SetThreadDictTableView(nullptr);
+            // The engines are done with once the stream is compressed (issue #2
+            // item 6): released here, by the worker that owns them, and not when
+            // the stream's turn to be written comes -- a stream that finished
+            // early kept its window and tables (the -cF hash alone is 64 MB)
+            // while it waited behind a slower one. Quirk 56's inheritance passes
+            // flags only (set_at/done_at), nothing these hold. `expected`, what
+            // the self-check needs, stays.
+            codecs[k].ReleaseEngines();
             { std::lock_guard<std::mutex> lk(chain_mu); done_at[i] = 1; }
             chain_cv.notify_all();
             { std::lock_guard<std::mutex> lk(done_mu); j.finished = true; }
@@ -15299,12 +15341,7 @@ static bool RunWorkersConcurrently(unsigned workers, unsigned pool, const RangeO
             if (j.err) { fail_err = j.err; break; }
             if (!j.ok) { failed = true; break; }
             timed_write(j.body);
-            std::vector<unsigned char>().swap(j.body);
-            // the engines are done with once the body is out (the -cF hash alone is
-            // 64 MB a worker); what the self-check needs is `expected`
-            EncodeCodec& c = codecs[order[i]];
-            c.lz.reset(); c.cd.reset(); c.co.reset(); c.co_v.reset(); c.cO.reset(); c.cO_v.reset();
-            if (c.cc != nullptr) { NzCmDestroy(c.cc); c.cc = nullptr; }
+            std::vector<unsigned char>().swap(j.body);   // the engines went when the worker finished
         }
     }
     NzBwtSetThreadCount(DecodeThreadCount());
@@ -15641,6 +15678,22 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         }
     } else {
         std::vector<unsigned char> body;
+        // One stream after another (issue #2 item 6): each goes to the file block
+        // by block through `drain`, as the single-stream writer does, instead of
+        // whole; and its engines are released once it is out, as the concurrent
+        // path does -- only `expected` (the self-check's) is kept. With eight
+        // streams of -cF that was eight 64 MB hash tables alive at the end.
+        std::chrono::steady_clock::duration drained{};
+        const std::function<void(const unsigned char*, std::size_t)> drain = [&](const unsigned char* d, std::size_t n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            drained += std::chrono::steady_clock::now() - t0;
+        };
+        const auto finish_stream = [&](unsigned k) {
+            drain(body.data(), body.size());
+            body.clear();
+            codecs[k].ReleaseEngines();
+        };
         // the last worker's header first
         {
             const auto r = range_of(workers - 1u);
@@ -15658,21 +15711,23 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             // block -- table, stamps, checksums, an empty DATA -- comes AFTER
             // every header, worker 0's included (measured with -p2 and -p3).
             if (k == workers - 1u && total == 0u) continue;
-            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k])) return decline();
-            timed_write(body);
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k], nullptr, &drain)) return decline();
+            finish_stream(k);
         }
         {
             const auto r = range_of(0u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0])) return decline();
-            timed_write(body);
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0], nullptr, &drain)) return decline();
+            finish_stream(0u);
         }
         if (total == 0u) {
             const auto r = range_of(workers - 1u);
             body.clear();
-            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u])) return decline();
-            timed_write(body);
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u], nullptr, &drain)) return decline();
+            finish_stream(workers - 1u);
         }
+        out.flush();
+        write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(drained).count());
     }
     if (!out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
     const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));

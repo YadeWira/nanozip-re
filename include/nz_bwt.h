@@ -39,6 +39,7 @@ uint32_t NzBwtEncodeInput(const uint8_t* bwt, uint32_t n, uint32_t cap, std::vec
                           unsigned threads = 1u);
 // Threads used by the inverse BWT walk on large blocks (0 = hardware default).
 void NzBwtSetThreadCount(unsigned n);
+unsigned NzBwtGetThreadCount();   // what NzBwtSetThreadCount last set (0 = from the hardware)
 
 // Decodes the param6 == 1 entropy layer that wraps the BWT output (reference
 // BwtDecodeInput). `payload`/`payload_size` are the block's raw payload,
