@@ -13674,14 +13674,18 @@ static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& e
             exe_enc.Reset();
         }
 
-        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16, scratch(n + 0x2000u, 0);
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16;
         std::uint8_t applied = 0;
         bool tt_on = false;
         const std::uint8_t* lz_in = exe_out;
         std::uint32_t m = exe_len;
         if (!exe_on) {
             bool route = false;
-            const std::uint32_t mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), false, &route);
+            std::uint32_t mask;
+            {   // the detector's scratch: only when the exe filter did not take the block, and only for the detection
+                std::vector<std::uint8_t> scratch(n + 0x2000u, 0);
+                mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), false, &route);
+            }
             if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, true, false)) {
                 tbuf.assign(src, src + n);
                 tbuf.resize(n + 0x2000u, 0);
@@ -14221,7 +14225,7 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
             exe_enc.Reset();
         }
 
-        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16, scratch(n + 0x2000u, 0);
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16;
         std::uint8_t applied = 0;
         bool tt_on = false;
         const std::uint8_t* cm_in = exe_out;
@@ -14230,7 +14234,11 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
             bool route = false;
             // `cm` true and the dictionary's ASCII reorder OFF: the two flags the
             // text machinery already carries for this codec.
-            const std::uint32_t mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), true, &route);
+            std::uint32_t mask;
+            {   // the detector's scratch: only when the exe filter did not take the block, and only for the detection
+                std::vector<std::uint8_t> scratch(n + 0x2000u, 0);
+                mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), true, &route);
+            }
             if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, false, true)) {
                 tbuf.assign(src, src + n);
                 tbuf.resize(n + 0x2000u, 0);

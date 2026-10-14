@@ -1405,7 +1405,9 @@ static void CM_Init(CM* cm) {
     memset(cm->factors, 0, sizeof(cm->factors));
     memset(cm->modelh,  0, sizeof(cm->modelh));
     cm->modelh_ptr = (int16_t*)cm->modelh;
-    memset(cm->some_ptr, 0, cm->some_mask + 16449);
+    // The hash table was cleared above, before CM_GetHashSlot(cm, 0), which on a
+    // zeroed table returns slot 0 without writing it; nothing else here touches
+    // the table, so the original's second clear at this point is not repeated.
 }
 
 // ---------------------------------------------------------------------------

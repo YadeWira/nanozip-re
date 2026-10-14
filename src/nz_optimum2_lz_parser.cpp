@@ -107,6 +107,22 @@ inline std::uint32_t Load32(const std::uint8_t* p) { std::uint32_t v; std::memcp
 // the ring is read with SIGNED positions: just before the cursor is negative and
 // lands in the 256-byte prefix mirror (the decoder's own RingAt)
 inline std::uint8_t At(const std::uint8_t* b, std::uint32_t p) { return b[static_cast<std::int32_t>(p)]; }
+// First i in [from, lim) where a[i] != b[i], or lim: the byte scans of the
+// finder and the rep matches, 8 bytes at a time (issue #2 item 10). Reads only
+// a[from..lim) and b[from..lim), the bytes the one-byte loops read.
+inline std::uint32_t MatchFwd(const std::uint8_t* a, const std::uint8_t* b, std::uint32_t from, std::uint32_t lim) {
+    std::uint32_t i = from;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (lim - i >= 8u) {
+        std::uint64_t x, y;
+        std::memcpy(&x, a + i, 8); std::memcpy(&y, b + i, 8);
+        if (x != y) return i + (static_cast<std::uint32_t>(__builtin_ctzll(x ^ y)) >> 3);
+        i += 8u;
+    }
+#endif
+    while (i < lim && a[i] == b[i]) ++i;
+    return i;
+}
 inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0
     return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
 }
@@ -258,7 +274,7 @@ struct NzOptimum2LzDecoder::ParserState {
                 const std::int32_t pre = static_cast<std::int32_t>(k) - 1;
                 if (pre > 2 && ((cp ^ chain) != (~maskA & w))) return;
                 std::uint32_t j = k;
-                for (;;) { const std::uint32_t nx = j + 1u; if (lim <= nx) { j = nx; break; } if (base[cur + nx] != base[cp + nx]) { j = nx; break; } j = nx; }
+                j = MatchFwd(base + cur, base + cp, k + 1u, lim);   // k matched; lim > k
                 if (bestlen < j) {
                     bool ok = true;
                     for (std::int32_t q = pre; q >= 0; --q) if (base[cur + q] != base[cp + q]) { ok = false; break; }
@@ -864,8 +880,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
             if (src >= cap) continue;
             const std::uint32_t avail = std::min<std::uint32_t>(cap - src, remain);
             if (avail == 0u) continue;
-            std::uint32_t len = 0;
-            while (len < avail && At(base, cur + len) == At(base, src + len)) ++len;
+            const std::uint32_t len = MatchFwd(base + cur, base + src, 0u, avail);
             if (trace) std::fprintf(stderr, "[R2] ni=%u rep%u r=%u src=%u len=%u best=%u avail=%u\n",
                                     ni, i, r, src, len, best, avail);
             if (len <= best || len == 1u) { best = std::max(best, len); continue; }

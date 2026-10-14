@@ -181,7 +181,8 @@ void Hds::Init(std::uint32_t window) {
     ResetCtx();
     // FUN_0805d330: the code ring, its sum, the tables
     std::memset(ring, 8, sizeof(ring)); ring_idx = 0; ring_sum = 0x800;
-    finder.Clear(); lr.Clear();
+    // FUN_0805d330 also clears the finder and long-range tables here; Init just
+    // created them zeroed (hash and depth 0), so that second pass is skipped.
     ratebits.clear();
     ResetSelection(0u);
 }
