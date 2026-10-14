@@ -35,6 +35,9 @@ python3 -c "import random; random.seed(7); open('in/rnd.bin','wb').write(bytes(r
 : > in/empty.dat
 printf 'x' > in/tiny
 head -c 150000 "$OURS" > in/sub/prog.bin
+# nothing but empty files: a -cn -p3 archive of these was written right but its
+# store could not be read back ("Legacy stream prefix is not recognized")
+mkdir -p in_e; : > in_e/a; : > in_e/b; : > in_e/c
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); }
@@ -49,7 +52,7 @@ norm() {   # the console's own lines, minus what timing decides (rates, times); 
 entries_of() { "$OURS" l "$1" </dev/null 2>/dev/null | tr '\r\b' '\n\n' | grep -a '^Total of' | awk '{print $3}'; }
 
 # ---------------------------------------------------------------- A: silent
-shapes=( "dir|-r x.nz in" "p3|-p3 -r x.nz in" "twice|x.nz in/text.txt in/text.txt" "hn|-hn -r x.nz in" "excl|-xin/* -r x.nz in" "excl-p2|-p2 -xin/* -r x.nz in" )
+shapes=( "dir|-r x.nz in" "p3|-p3 -r x.nz in" "twice|x.nz in/text.txt in/text.txt" "hn|-hn -r x.nz in" "excl|-xin/* -r x.nz in" "excl-p2|-p2 -xin/* -r x.nz in" "empty-p3|-p3 -r x.nz in_e" )
 for c in cn cf cF cd cD co cO cc; do
     for sh in "${shapes[@]}"; do
         tag=${sh%%|*}; args=${sh#*|}

@@ -6672,6 +6672,17 @@ bool TryParseLegacyCnArchive(
                 if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site0 (data records) -> %zu\n", payload_start);
             }
         }
+        // A parallel store of nothing but empty files (`a -cn -p3` of five 0-byte
+        // files, which the original writes and reads) has no slice to assemble:
+        // every path below wants data and declined it with "Legacy stream
+        // prefix is not recognized", `l` included.
+        if (!prefix_found && has_parallel_streams && total_data_size == 0u && !entries.empty()) {
+            store_multiblock = true;
+            metadata_end = table_end;
+            payload_start = table_end;
+            prefix_found = true;
+            nz_trace::Construct("store_assembly=parallel_empty");
+        }
         if (!prefix_found && entries.size() > 1u) {
             // Parallel store holding several files: the slices are raw, so
             // "decoding" a stream is copying its concatenated chunks.
