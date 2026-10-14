@@ -13,7 +13,10 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
 #endif
+#include <cstdint>
 #include <ctime>
 
 #include <algorithm>
@@ -324,20 +327,47 @@ std::string ProcField(const char* path, const char* key) {
     return std::string();
 }
 
+// The clock the banner prints, measured the way the original measures it
+// (linux32 nz 0x80af0e4..0x80af1a7; the Win64 build's equivalent read from
+// fcorbelli's nzfra): wait for the system clock's "millisecond" to change (at
+// most 0xffff reads), read the TSC, wait for the next change (again at most
+// 0xffff reads), then cycles / (elapsed * 1000 + 1), kept in 16 BITS.
+//  - Linux: gettimeofday as a real system call, its "millisecond" being
+//    (tv_sec << 10) + (tv_usec >> 10) -- 1.024 ms, which is why a 2.60 GHz part
+//    reads about 2653 here, not 2600.
+//  - Windows: GetSystemTimeAsFileTime in true milliseconds. It moves in ~15.6 ms
+//    steps, so on a fast machine 0xffff reads can end before it moves: the
+//    divisor is then 1 and the 16-bit result is any number at all -- the
+//    original's "random MHz", reproduced.
 unsigned MeasuredMhz(const std::string& cpuinfo_mhz) {
 #if defined(__i386__) || defined(__x86_64__)
-    // std::chrono + sleep_for rather than clock_gettime/nanosleep: the latter
-    // pair does not exist on mingw, and this measures the same thing.
-    const auto t0 = std::chrono::steady_clock::now();
-    const unsigned long long c0 = __rdtsc();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    const unsigned long long c1 = __rdtsc();
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ns = static_cast<double>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    if (ns > 0.0) return static_cast<unsigned>(static_cast<double>(c1 - c0) * 1000.0 / ns);
+    (void)cpuinfo_mhz;
+#if defined(_WIN32)
+    const auto now_ms = []() -> std::uint32_t {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        const std::uint64_t t = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        return static_cast<std::uint32_t>((t - 116444736000000000ull) / 10000u);
+    };
+#else
+    const auto now_ms = []() -> std::uint32_t {
+        struct timeval tv;
+        ::syscall(SYS_gettimeofday, &tv, nullptr);
+        return (static_cast<std::uint32_t>(tv.tv_sec) << 10) + (static_cast<std::uint32_t>(tv.tv_usec) >> 10);
+    };
 #endif
+    std::uint32_t a = now_ms(), b = a;
+    for (unsigned n = 0xffffu; n != 0u; --n) { b = now_ms(); if (b != a) break; }
+    const unsigned long long c0 = __rdtsc();
+    std::uint32_t e = b;
+    bool moved = false;
+    for (unsigned n = 0xffffu; n != 0u; --n) { e = now_ms(); if (e != b) { moved = true; break; } }
+    const unsigned long long cycles = __rdtsc() - c0;
+    const unsigned long long div = moved ? static_cast<unsigned long long>((e - b) * 1000u + 1u) : 1ull;
+    return static_cast<std::uint16_t>(cycles / div);
+#else
     return cpuinfo_mhz.empty() ? 0u : (unsigned)std::strtod(cpuinfo_mhz.c_str(), nullptr);
+#endif
 }
 
 // The brand string from CPUID leaves 0x80000002-4 -- what the original prints,
