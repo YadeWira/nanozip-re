@@ -1958,10 +1958,14 @@ private:
         // window at a time. A 32-bit build gets about 3 GB, so anything near or
         // above that -- xman's 4.6 GB -cO archive, the case this exists for --
         // never had a whole-file mapping available; it used to be refused with
-        // "Out of memory!" while the original, which streams, read it. Forcing
-        // the windowed path with NZ_MAP_WINDOW=1 is how a 64-bit build exercises
-        // it against the same archives the flat path is tested on.
-        if (!Addressable(FileSizeOf(path)) || NZ_ENV("NZ_MAP_WINDOW") != nullptr) {
+        // "Out of memory!" while the original, which streams, read it.
+        // It is the DEFAULT now (2026-10-15): with a whole-file mapping every page
+        // a decode had read stayed resident, so `t` of a 128 MB stored archive
+        // peaked at 132 MiB and reads 36 MiB windowed; the compressing methods
+        // lose 8-15 MiB, -co/-cO/-cc about nothing, at the same speed.
+        // NZ_MAP_WHOLE=1 asks for the whole-file mapping (comparisons).
+        const bool must_window = !Addressable(FileSizeOf(path));
+        if (must_window || NZ_ENV("NZ_MAP_WHOLE") == nullptr) {
             if (win_.Open(path)) {
                 windowed_ = true;
                 if (NZ_ENV("NZ_VERBOSE_NATIVE"))
@@ -1970,8 +1974,10 @@ private:
                                  (unsigned long long)WindowedFile::kWindowBytes);
                 return true;
             }
-            oom_ = true;
-            return false;
+            // Only an archive this build cannot address is "Out of memory!";
+            // anything else the window could not open goes the old way below,
+            // which reports what it finds.
+            if (must_window) { oom_ = true; return false; }
         }
 #if !defined(_WIN32)
         const int fd = ::open(path.c_str(), O_RDONLY);
