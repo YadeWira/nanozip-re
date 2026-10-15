@@ -319,7 +319,9 @@ NzOptimumLzDecoder::NzOptimumLzDecoder(std::uint32_t window_capacity) {
         mem_[kAlignTableOff + i + 1] = 0x80;
     }
     ring_.capacity = window_capacity;
-    ring_.storage.assign(static_cast<std::size_t>(window_capacity) + 512u, 0u);
+    // zero pages from the allocator: only the part of the window a stream
+    // reaches is ever resident (see nz_calloc_vec.h)
+    ring_.storage = nz::CallocVec(static_cast<std::size_t>(window_capacity) + 512u);
     ring_.cursor = 0;
     ring_.scrolled_once = false;
 }

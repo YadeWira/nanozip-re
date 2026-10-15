@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include "nz_calloc_vec.h"
 #include <memory>
 #include <functional>
 
@@ -246,7 +247,7 @@ public:
 private:
     struct Ring {
         std::uint32_t capacity = 0;
-        std::vector<std::uint8_t> storage;  // capacity + 512 bytes; logical
+        nz::CallocVec storage;              // capacity + 512 bytes; logical
                                              // position p in [-256, capacity+256)
                                              // maps to storage[p + 256].
         std::uint32_t cursor = 0;           // next logical write position, 0..capacity

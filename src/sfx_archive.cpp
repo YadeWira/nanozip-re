@@ -18,6 +18,7 @@
 #include "nz_text_transform.h"
 #include "nz_postfilter.h"
 #include "nz_bwt.h"
+#include "nz_calloc_vec.h"
 #include "nz_audio.h"
 #include <atomic>
 #include <exception>
@@ -10178,6 +10179,12 @@ static bool TryDecodeLegacyCm(
 // `bool DecodeBlock(in, in_len, out, out_size)` signature (see
 // nz_optimum_lz.h / nz_optimum2_lz.h), differing only in which real-binary
 // function ports the actual per-block LZ/CM engine.
+// A decode stage's output buffer (see nz_calloc_vec.h): each stage reserves a
+// generous capacity and fills part of it, and only that part is ever resident --
+// param2 reserved 90 MiB for a 64 MiB result on a 128 MB `-co` archive, all of
+// it written to zero first.
+using StageBuf = nz::CallocVec;
+
 template <typename OptimumDecoder>
 static bool DecodeOptimumBlockSequence(
     // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
@@ -10527,7 +10534,7 @@ static bool DecodeOptimumBlockSequence(
                     payload_dump_n, payload_size, nm, decr_param, param6, out_size);
         }
 
-        std::vector<std::uint8_t> work;
+        StageBuf work;
         std::uint32_t cur_size = 0;
         stgmark("payload", payload, payload_size);
         if (decr_param == 0u) {
@@ -10568,11 +10575,11 @@ static bool DecodeOptimumBlockSequence(
                 // whatever this entry still has left to produce.
                 const std::uint32_t limit14 = OptimumRemainingOut(total_size_hint, out_data->size());
                 std::uint32_t cap = OptimumExpandStart(cur_size, limit14);
-                std::vector<std::uint8_t> t14;
+                StageBuf t14;
                 std::uint32_t n14 = 0;
                 bool p14ok = false;
                 for (;;) {
-                    t14.assign(cap, 0);
+                    t14 = StageBuf(cap);
                     n14 = 0;
                     p14ok = NzBwtParam14(param14_data.data(),
                                 static_cast<std::uint32_t>(param14_data.size()),
@@ -10607,13 +10614,13 @@ static bool DecodeOptimumBlockSequence(
                 // bound check below rather than read garbage.)
                 const std::uint32_t limit15 = OptimumRemainingOut(total_size_hint, out_data->size());
                 std::uint32_t cap = OptimumExpandStart(cur_size, limit15);
-                std::vector<std::uint8_t> t15;
+                StageBuf t15;
                 std::uint32_t n15 = 0;
                 bool p15ok = false;
                 const std::uint8_t* const ring_base = dec.WindowBase();
                 const std::size_t ring_len = static_cast<std::size_t>(dec.WindowCapacity()) + 256u;
                 for (;;) {
-                    t15.assign(cap, 0);
+                    t15 = StageBuf(cap);
                     n15 = 0;
                     p15ok = NzBwtParam15(param15_data.data(),
                                 static_cast<std::uint32_t>(param15_data.size()),
@@ -10770,11 +10777,11 @@ static bool DecodeOptimumBlockSequence(
 
         if (param2_flag) {
             std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
-            std::vector<std::uint8_t> exp;
+            StageBuf exp;
             std::uint32_t esz = 0;
             bool p2ok = false;
             for (;;) {
-                exp.assign(cap2, 0);
+                exp = StageBuf(cap2);
                 esz = cap2;
                 p2ok = NzBwtRleDecodeU32(param2_data.data(),
                                          static_cast<std::uint32_t>(param2_data.size()),
@@ -10792,7 +10799,7 @@ static bool DecodeOptimumBlockSequence(
         // shared post-filter, not codec-specific (the "not yet ported" gate
         // here was just never wired for the optimum family until now).
         if (param1_flag) {
-            std::vector<std::uint8_t> tbuf(cur_size);
+            StageBuf tbuf(cur_size);
             const bool p1ok = NzAddBytesFilter(param1_data.data(),
                                   static_cast<std::uint32_t>(param1_data.size()),
                                   work.data(), cur_size, tbuf.data());
@@ -10869,25 +10876,25 @@ static bool DecodeOptimumBlockSequence(
         // did not fit. A transform returns 0 both for bad data and for no room,
         // so the retry is what makes the small first try safe: no valid block can
         // be lost by it, whatever the real expansion bound turns out to be.
-        const auto tt_scratch = [&](std::vector<std::uint8_t>* buf, std::uint32_t slack,
+        const auto tt_scratch = [&](StageBuf* buf, std::uint32_t slack,
                                     const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run)
                                 -> std::uint32_t {
             std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
             if (want > remaining) want = remaining;
             std::uint32_t cap = static_cast<std::uint32_t>(want);
-            buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+            *buf = StageBuf(static_cast<std::size_t>(cap) + slack);
             std::uint32_t n = run(buf->data(), cap);
             if (n == 0u && cap < remaining) {
                 if (NZ_ENV("NZ_TRACE_BIGALLOC"))
                     std::fprintf(stderr, "[big] tt scratch retry at the full cap: %u -> %u\n", cap, remaining);
                 cap = remaining;
-                buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+                *buf = StageBuf(static_cast<std::size_t>(cap) + slack);
                 n = run(buf->data(), cap);
             }
             return n;
         };
         if (tt_enabled && (tt_flags & 0x10u)) {
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 1u << 16, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransformNumber(tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
                                              work.data(), cur_size, o, cap + (1u << 16));
@@ -10915,7 +10922,7 @@ static bool DecodeOptimumBlockSequence(
             // NzTextTransformDict call site above (CopyDictEntWithCase's
             // intentional fixed-width over-write needs caller-provided
             // headroom past the logical output size).
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 16u, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransformDict(work.data(), cur_size, o, cap + 16u);
             });
@@ -10926,7 +10933,7 @@ static bool DecodeOptimumBlockSequence(
         if (tt_enabled && (tt_flags & 0x04u)) {
             // HTML closing-tag restoration (NzTextTransformHtml). Reference
             // order puts 0x04 after the 0x08 dictionary and before 0x02.
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransformHtml(work.data(), cur_size, o, cap);
             });
@@ -10947,7 +10954,7 @@ static bool DecodeOptimumBlockSequence(
             // block on a 281 MB worker stream, sixteen workers at once. The
             // other text stages moved off `remaining` in ef6468b; this one and
             // dece below were missed.
-            std::vector<std::uint8_t> tbuf(cur_size);
+            StageBuf tbuf(cur_size);
             const std::uint32_t n = NzTextTransformInsertLf(
                 tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
                 work.data(), cur_size, tbuf.data(), cur_size);
@@ -10961,7 +10968,7 @@ static bool DecodeOptimumBlockSequence(
             // byte post-filter, no side-channel data, order-independent of
             // the entropy coder (verified against real -co archives whose
             // literal payload didn't warrant the word dictionary).
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransformRle(work.data(), cur_size, o, cap);
             });
@@ -10973,7 +10980,7 @@ static bool DecodeOptimumBlockSequence(
             // Chess/PGN transform, between 0x20 and 0x01 in the reference's
             // dispatch order. Not in the community reference at all (its body
             // is assert(0)); decoded from (input, output) pairs plus the binary.
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransform6(work.data(), cur_size, o, cap);
             });
@@ -10988,7 +10995,7 @@ static bool DecodeOptimumBlockSequence(
             // and 0x40). One byte of slack: the reference's output budget is
             // out_cap + 1 and it writes that extra byte before noticing the
             // overrun (see NzTextTransformCrToCrLf's header comment).
-            std::vector<std::uint8_t> tbuf;
+            StageBuf tbuf;
             const std::uint32_t n = tt_scratch(&tbuf, 1u, [&](std::uint8_t* o, std::uint32_t cap) {
                 return NzTextTransformCrToCrLf(work.data(), cur_size, o, cap);
             });
@@ -11020,7 +11027,7 @@ static bool DecodeOptimumBlockSequence(
             const std::uint32_t dece_cap = dece_bound >= remaining
                                                ? remaining
                                                : static_cast<std::uint32_t>(dece_bound);
-            std::vector<std::uint8_t> tbuf(dece_cap);
+            StageBuf tbuf(dece_cap);
             std::uint32_t n = 0;
             const bool dok = exe.Decode(dece_data.data(),
                                  static_cast<std::uint32_t>(dece_data.size()),
