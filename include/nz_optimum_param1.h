@@ -28,7 +28,10 @@ namespace opt_enc {
 bool NzOptimumParam1Encode(const std::uint8_t* data, std::uint32_t n,
                            std::vector<std::uint8_t>* out,
                            std::vector<std::uint8_t>* side,
-                           std::uint32_t cap = 0x1000u);
+                           std::uint32_t cap = 0x1000u,
+                           // the 256 bytes the block buffer holds in front of the
+                           // block (CoBlockFeeder::front's last 256); null = zeros
+                           const std::uint8_t* front256 = nullptr);
 
 }  // namespace opt_enc
 }  // namespace nzr

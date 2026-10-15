@@ -13875,7 +13875,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& e
         const std::uint8_t* pre_p1 = lz_in;
         std::uint32_t pre_p1_len = m;
         if (!tt_on) {
-            if (nzr::opt_enc::NzOptimumParam1Encode(lz_in, m, &p1buf, &p1side)) {
+            if (nzr::opt_enc::NzOptimumParam1Encode(lz_in, m, &p1buf, &p1side, 0x1000u, feeder.front + 768)) {
                 p1_on = true;
                 lz_in = p1buf.data();
             }
@@ -14091,6 +14091,10 @@ static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& e
                 std::fprintf(stderr, "[STG2] m=%u p15=%d p14=%d\n", m, (int)p15_on, (int)p14_on);
             std::vector<std::uint8_t> bwt(m + 4u);
             const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
+            // The reference sorts this block in the codec's block buffer and wraps
+            // it around that buffer on the way: what is left in front of it is
+            // what the next blocks' param1 reads behind their first byte.
+            nzr::opt_enc::CoNoteBwtWrap(feeder.front, lz_in, m);
             // FUN_0806c350's capacity argument is `block_size * 5 + 0x100487`,
             // not a constant: the 0x600487 this used to pass is that formula
             // frozen at a 1 MB block. With a bigger block the bucket coder

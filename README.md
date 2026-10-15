@@ -128,12 +128,13 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   round-trip. Three traced cases (`i19_lighthouse_rgb48.ppm`, `150_menu.tbk_` at `-m4m`, the 16 MB
   fixture's last block) are [quirk 72](docs/ORIGINAL_QUIRKS.md): the original keeps param14's hash tables
   in the block buffer's tail, so each pass starts on the last one's leftovers; partial emulation does not
-  converge, so it is left unreproduced on purpose. Also open: `i36_fax2d.tif` under `-cO` (our match
-  finder returns candidates the original's does not) and `081_AWSOFTWA.PLA_` (param1's first probes
-  read the previous block's bytes in the original, zeros here, [quirk 75](docs/ORIGINAL_QUIRKS.md)).
-  The 127-file mixed corpus differences are not attributed here; on 2026-09-19 the two outside the
-  parser class were a clean `-co` decline (`PowerPacker.pp`, which needed the stored LZ form and is
-  byte-identical since 2026-09-23) and the `[1]` name.
+  converge, so it is left unreproduced on purpose. `i36_fax2d.tif` under `-cO` is the same class, traced
+  2026-10-15: a watchpoint caught the original's param14 (`FUN_080bb3a0`) writing into the memory its
+  `-cO` parser's tree lives in, so the parser's walk stops at a link that ours still follows.
+  `089_SERVICES.PLA_` (its one difference is in its only param14 block) and `157_sp1ainet.tbk_` (two
+  param14 blocks, not traced further) are left with them. `081_AWSOFTWA.PLA_` is byte-identical since
+  2026-10-15 ([quirk 75](docs/ORIGINAL_QUIRKS.md)). The 126 readable files of the mixed corpus are all
+  byte-identical under `-co`, `-cO` and `-cc` (the 127th, a name containing `[1]`, is not compared).
 - **The stored LZ block form** (the raw block the original writes when its LZ engine cannot shrink
   one) is written since v0.17.3-pre; before, `-co` declined the inputs that need it
   (a 12 MB folder of 21 corpus files, an 8 MB slice of real data). Up to v0.17.2-pre this port also

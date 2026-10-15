@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace nzr::opt_enc {
 
@@ -188,6 +189,17 @@ std::uint32_t CoBlockLength(const std::uint8_t* buf, std::uint32_t n, std::uint3
     if (NZ_ENV("NZOPT_TRACE_TDO") != nullptr)
         std::fprintf(stderr, "[tdo] segment n=%u take=%u -> %u\n", n, take, r);
     return r;
+}
+
+void CoNoteBwtWrap(std::uint8_t front[1024], const std::uint8_t* in, std::uint32_t n) {
+    if (n == 0u) return;
+    // M = [front 1024][block n, reversed][1024 for the forward copy]
+    std::vector<std::uint8_t> m(1024u + static_cast<std::size_t>(n) + 1024u);
+    std::memcpy(m.data(), front, 1024u);
+    for (std::uint32_t i = 0; i < n; ++i) m[1024u + i] = in[n - 1u - i];
+    for (std::uint32_t i = 0; i < 1024u; ++i) m[1024u + n + i] = m[1024u + i];     // cld; rep movsb
+    for (std::uint32_t k = 1024u; k-- > 0u;) m[k] = m[static_cast<std::size_t>(n) + k];  // std; rep movsb
+    std::memcpy(front, m.data(), 1024u);
 }
 
 void CoBlockFeeder::Feed(const std::uint8_t* p, std::size_t n) {

@@ -89,6 +89,18 @@ struct CoBlockFeeder {
     std::uint32_t budget = 0;            // param_4, what is left of block_size
     std::uint32_t blk_len = 0;
     bool started = false;                // a block is half-gathered across calls
+    // The 1024 bytes in front of the codec's block buffer (the one param1 runs
+    // over). The reference's BWT wraps each block it sorts around that buffer
+    // (FUN_0807da90 at 0x807db03: buf[0..1024) -> buf[len..), then
+    // buf[len-1024..len) -> buf[-1024..0) backwards), with the block REVERSED
+    // in it at that point, so param1's first probes (data[-1], data[-2], ...)
+    // read the reversed head of the last BWT block -- zeros before the first.
+    std::uint8_t front[1024] = {};
 };
+// What the BWT's circular wrap leaves in `front` after coding `in` (the block
+// as handed to the transform, n bytes): the block reversed, the forward copy,
+// then the backward one, byte by byte, so blocks under 1 KB overlap the way the
+// reference's rep movsb does.
+void CoNoteBwtWrap(std::uint8_t front[1024], const std::uint8_t* in, std::uint32_t n);
 
 }  // namespace nzr::opt_enc

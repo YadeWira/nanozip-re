@@ -876,16 +876,17 @@ bool Driver::Run(std::vector<std::uint8_t>* side, std::uint32_t cap) {
 bool NzOptimumParam1Encode(const std::uint8_t* data, std::uint32_t n,
                            std::vector<std::uint8_t>* out,
                            std::vector<std::uint8_t>* side,
-                           std::uint32_t cap) {
+                           std::uint32_t cap, const std::uint8_t* front256) {
     if (data == nullptr || out == nullptr || side == nullptr) return false;
     out->assign(n, 0);
     side->clear();
     if (n <= 0x107u) return false;
 
     // The reference runs over the codec's own block buffer, so its window
-    // probes reach outside the block into the rest of that allocation, which
-    // is zero on a fresh buffer. A copy padded on BOTH sides reproduces that
-    // without reading memory we do not own:
+    // probes reach outside the block into the rest of that allocation: zero on
+    // a fresh buffer, and behind the block whatever the last BWT's circular
+    // wrap left there (`front256`, see CoBlockFeeder::front). A copy padded on
+    // BOTH sides reproduces that without reading memory we do not own:
     //   * behind, up to 255 bytes: the very first bytes of a block are
     //     delta-coded against `data[-offsetA]` / `data[-offsetB]`, and the two
     //     offsets are 1 and 2 only until the first re-evaluation;
@@ -895,6 +896,12 @@ bool NzOptimumParam1Encode(const std::uint8_t* data, std::uint32_t n,
     static const std::size_t kFrontPad = 0x100u;
     std::vector<std::uint8_t> padded(kFrontPad + static_cast<std::size_t>(n) + 0x1000u, 0);
     std::memcpy(padded.data() + kFrontPad, data, n);
+    if (front256 != nullptr) std::memcpy(padded.data(), front256, kFrontPad);
+    if (NZ_ENV("NZOPT_TRACE_P1FRONT")) {
+        std::fprintf(stderr, "[P1FRONT] n=%u front=", n);
+        for (std::size_t i = 0; i < kFrontPad; ++i) std::fprintf(stderr, "%02x", padded[i]);
+        std::fprintf(stderr, "\n");
+    }
 
     Driver d;
     d.data = padded.data() + kFrontPad;
