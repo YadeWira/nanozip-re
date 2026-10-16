@@ -274,7 +274,7 @@ private:
     // codec+0x1082c48: raised by the set-up reset (FUN_08083160), cleared by the
     // first feed or encode (FUN_08088100); see the -co sibling.
     bool window_reset_pending_ = true;
-    std::vector<std::uint8_t> mem_;  // the "large" subengine's ~0x1083000-byte state
+    nz::CallocVec mem_;              // the "large" subengine's ~0x1083000-byte state (zero pages + cold state)
 };
 
 }  // namespace optimum2

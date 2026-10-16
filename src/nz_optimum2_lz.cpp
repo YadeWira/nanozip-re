@@ -183,6 +183,7 @@ constexpr std::size_t kTier2AlignSize = 128u;  // generous; real usage needs
                                                 // treepos resets to 1 every
                                                 // match)
 constexpr std::size_t kTotalMemSize = kMemSize + kTier2AlignSize;
+constexpr std::size_t kColdSize = kMemSize;   // what the cold state covers
 
 inline std::uint8_t Rd8(const std::uint8_t* mem, int off) { return mem[off]; }
 inline void Wr8(std::uint8_t* mem, int off, std::uint8_t v) { mem[off] = v; }
@@ -394,8 +395,11 @@ inline std::uint8_t RingAt(const std::uint8_t* base, std::uint32_t logical_pos) 
 }  // namespace
 
 NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
-    mem_ = Optimum2ColdState();
-    mem_.resize(kTotalMemSize, 0);
+    // the cold state written over zero pages: only its non-zero tables, and
+    // later whatever the model writes, are resident (the 16.5 MiB state was
+    // copied whole from a second full copy, both resident)
+    mem_ = nz::CallocVec(kTotalMemSize);
+    Optimum2ColdStateInto(mem_.data(), kColdSize);
     // The tier2 "align" table cold-starts at 0x8000 per u16 entry, exactly
     // like every other adaptive length/distance table in this engine (and
     // the sibling -co port's own external align table) -- see
@@ -423,8 +427,11 @@ NzOptimum2LzDecoder::NzOptimum2LzDecoder(std::uint32_t window_capacity) {
 void NzOptimum2LzDecoder::ResetModel() {
     // The model only (FUN_080b9290, reached from the decoder's FUN_080a5d60 and
     // the encoder's vtable +0x1c, FUN_080885a0); see the -co sibling.
-    mem_ = Optimum2ColdState();
-    mem_.resize(kTotalMemSize, 0);
+    // the cold state written over zero pages: only its non-zero tables, and
+    // later whatever the model writes, are resident (the 16.5 MiB state was
+    // copied whole from a second full copy, both resident)
+    mem_ = nz::CallocVec(kTotalMemSize);
+    Optimum2ColdStateInto(mem_.data(), kColdSize);
     for (std::size_t i = 0; i < kTier2AlignSize; i += 2) {
         mem_[static_cast<std::size_t>(kTier2AlignOff) + i] = 0x00;
         mem_[static_cast<std::size_t>(kTier2AlignOff) + i + 1] = 0x80;

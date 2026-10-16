@@ -18,6 +18,7 @@
 
 #include "nz_optimum2_lz_tables.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nzr {
@@ -1414,6 +1415,25 @@ const std::vector<std::uint8_t>& Optimum2ColdState() {
     return full;
   }();
   return kState;
+}
+
+void Optimum2ColdStateInto(std::uint8_t* dst, std::size_t n) {
+  static const std::vector<std::uint8_t> enc = B64Decode(kOptimum2ColdStateRleB64, kColdStateRleLen);
+  std::size_t i = 0, at = 0;
+  while (i < enc.size() && at < n) {
+    const std::uint8_t value = enc[i++];
+    std::uint32_t run = 0;
+    unsigned shift = 0;
+    for (;;) {
+      const std::uint8_t b = enc[i++];
+      run |= static_cast<std::uint32_t>(b & 0x7fu) << shift;
+      shift += 7u;
+      if ((b & 0x80u) == 0u) break;
+    }
+    const std::size_t m = std::min<std::size_t>(run, n - at);
+    if (value != 0u) std::memset(dst + at, value, m);
+    at += m;
+  }
 }
 
 const std::uint16_t* Optimum2Dat081732c0() { return kDat081732c0; }

@@ -21,6 +21,9 @@ namespace optimum2 {
 // approach verbatim" plan would have required). Callers copy the decoded
 // result into a fresh mutable buffer at NzOptimum2LzDecoder construction time.
 const std::vector<std::uint8_t>& Optimum2ColdState();
+// The same cold state written straight into `dst` (n bytes, ALREADY ZERO): its
+// zero runs are skipped, so on fresh pages only the non-zero tables are touched.
+void Optimum2ColdStateInto(std::uint8_t* dst, std::size_t n);
 
 // DAT_081732c0: the literal-mixer's / dispatch-bit's second SSE/APM stage
 // seed table, indexed by (mixed_probability >> 4) i.e. 0..255. Captured via
