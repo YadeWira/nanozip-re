@@ -2285,10 +2285,20 @@ void AdoptDecodeError(LegacyCnContext& ctx) {
     bool last = ctx.truncated_input || e.parallel;   // a worker stream's status is always reported at the end
     if (!e.parallel && e.has_pos && !ctx.payload_record_ends.empty()) {
         std::size_t idx = 0;
-        while (idx + 1u < ctx.payload_record_ends.size() && e.input_pos >= ctx.payload_record_ends[idx]) ++idx;
-        last = (idx + 1u == ctx.payload_record_ends.size()) && !ctx.records_after_data;
+        // a position ON a record's end belongs to that record: the block loop
+        // records where the failing record stops
+        while (idx + 1u < ctx.payload_record_ends.size() && e.input_pos > ctx.payload_record_ends[idx]) ++idx;
+        // shifted when the failing record is the last one -- or the input ended
+        last = ((idx + 1u == ctx.payload_record_ends.size()) && !ctx.records_after_data) || ctx.truncated_input;
     }
     ctx.decode_at_last_record = last && !ctx.sink_plain_code;
+    if (NZ_ENV("NZ_TRACE_DERR")) {
+        std::fprintf(stderr, "[derr] code=%u parallel=%d has_pos=%d pos=%llu records=%zu after_data=%d sink_plain=%d trunc=%d -> last=%d ends:",
+                     e.code, (int)e.parallel, (int)e.has_pos, (unsigned long long)e.input_pos, ctx.payload_record_ends.size(),
+                     (int)ctx.records_after_data, (int)ctx.sink_plain_code, (int)ctx.truncated_input, (int)ctx.decode_at_last_record);
+        for (auto x : ctx.payload_record_ends) std::fprintf(stderr, " %llu", (unsigned long long)x);
+        std::fprintf(stderr, "\n");
+    }
     nzr::derr::Clear();
 }
 
@@ -2315,7 +2325,11 @@ int PrintCorruptLine(std::ostream& os, const LegacyCnContext& c) {
         (c.legacy_method_p0 == 1u || c.legacy_method_p0 == 2u)) code = 2u << 8;        // lzpf
     else if (c.cut_first_data_record && c.legacy_method == 0x2bu &&
              (c.legacy_method_p0 == 3u || c.legacy_method_p0 == 4u)) code = 4u << 8;   // -cd/-cD
-    else if (c.decode_code == 0u) code = c.truncated_input ? 25600u : 100u;
+    // A record the engine declined without a status of its own is the original's
+    // 100, and it follows the same plain-or-shifted rule as any other: shifted
+    // (100 << 8) when the failing record is the archive's last -- a -co/-cc/-cO
+    // archive with a byte flipped 80-99 % in reports 25600 there, 100 at 30-60 %.
+    else if (c.decode_code == 0u) code = (c.truncated_input || c.decode_at_last_record) ? 25600u : 100u;
     else code = c.decode_at_last_record ? ((c.decode_code << 8) | static_cast<std::uint32_t>(c.decode_slot & 0xffu)) : c.decode_code;
     os << "Archive corrupted. Error decoding (code " << code << ")\n";
     return 2;
@@ -8426,7 +8440,51 @@ bool TryParseLegacyCnArchive(
                     // payload_start IS data_records[0].first, so the same parse
                     // applies to the spliced buffer from its own start.
                     const bool use_splice = spliced_map->total != 0u;
-                    const ByteView chain_src = use_splice ? bytes.Spliced(spliced_map.get()) : bytes;
+                    // Cut inside a data record past the first: the original reads the
+                    // record at its DECLARED length into the one buffer every record
+                    // goes through, so the bytes the file lacks are the last earlier
+                    // record's bytes at the same offset (zeros where none reached) --
+                    // measured on a -cf archive cut at 129 330 bytes: all 100 809
+                    // missing bytes of record 1 were record 0's. It then decodes on
+                    // and reports what the garbage trips (a block header too large:
+                    // code 4), where reading only the bytes that exist said 6. The
+                    // stored family has the same model (see store_cut_buf).
+                    std::vector<unsigned char> lzpf_pad;
+                    bool lzpf_padded = false;
+                    if (truncated_input && cut_data_valid && !cut_first_data_record && !has_parallel_streams &&
+                        !data_payloads.empty() && cut_data_begin <= bytes.size()) {
+                        const std::uint64_t got = bytes.size() - cut_data_begin;
+                        if (cut_data_declared > got && cut_data_declared - got <= (std::uint64_t{1} << 30)) {
+                            // the view the chain reads (the records spliced, or the file),
+                            // flat, with the cut record's missing tail after it
+                            const ByteView v = use_splice ? bytes.Spliced(spliced_map.get()) : bytes;
+                            v.AppendTo(&lzpf_pad, 0u, v.size());
+                            const std::size_t base = lzpf_pad.size();
+                            lzpf_pad.resize(base + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                            std::uint64_t filled = got;   // offsets inside the record, [got, declared)
+                            for (auto it = data_payloads.rbegin(); it != data_payloads.rend() && filled < cut_data_declared; ++it) {
+                                const std::uint64_t len = it->second - it->first;
+                                if (len <= filled) continue;
+                                const std::uint64_t upto = std::min<std::uint64_t>(len, cut_data_declared);
+                                const unsigned char* q = bytes.Span(it->first + filled, upto - filled);
+                                if (q != nullptr)
+                                    std::memcpy(lzpf_pad.data() + base + static_cast<std::size_t>(filled - got), q,
+                                                static_cast<std::size_t>(upto - filled));
+                                filled = upto;
+                            }
+                            lzpf_padded = true;
+                            if (const char* dp = NZ_ENV("NZ_DUMP_LZPFCUT"))
+                                if (FILE* df = std::fopen(dp, "wb")) { std::fwrite(lzpf_pad.data(), 1, lzpf_pad.size(), df); std::fclose(df); }
+                        }
+                    }
+                    const ByteView chain_src = lzpf_padded ? ByteView(lzpf_pad)
+                                                           : (use_splice ? bytes.Spliced(spliced_map.get()) : bytes);
+                    const bool chain_cut = truncated_input && !lzpf_padded;
+                    if (NZ_ENV("NZ_TRACE_LZPFCUT"))
+                        std::fprintf(stderr, "[lzpfcut] trunc=%d cut_valid=%d first=%d par=%d splice=%d payloads=%zu begin=%llu size=%llu declared=%llu padded=%d\n",
+                                     (int)truncated_input, (int)cut_data_valid, (int)cut_first_data_record, (int)has_parallel_streams,
+                                     (int)use_splice, data_payloads.size(), (unsigned long long)cut_data_begin,
+                                     (unsigned long long)bytes.size(), (unsigned long long)cut_data_declared, (int)lzpf_padded);
                     const ArcPos chain_sp = use_splice ? (sp - payload_start) : sp;
                     // Stream the chain to disk, one whole data record at a time, the
                     // way the single-container original writes it: the output never
@@ -8498,8 +8556,8 @@ bool TryParseLegacyCnArchive(
                             const bool okd = DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
                                                               total_data_size, is_variant_b, method_p1,
                                                               /*derived_cap_only=*/true, accept_all, &unused,
-                                                              /*direct_out=*/nullptr, truncated_input, &mdone,
-                                                              /*lenient=*/!truncated_input, /*input_end=*/0u, &to_sink,
+                                                              /*direct_out=*/nullptr, chain_cut, &mdone,
+                                                              /*lenient=*/!chain_cut, /*input_end=*/0u, &to_sink,
                                                               /*stream_members=*/true);
                             if (published && streamed > 0u) {
                                 psink::StreamEnd(0u, nullptr, streamed, okd, false);
@@ -8521,7 +8579,7 @@ bool TryParseLegacyCnArchive(
                     } else if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
                                          total_data_size, is_variant_b, method_p1,
                                          /*derived_cap_only=*/checksum_mode == ChecksumMode::kNone,
-                                         member_verify, &member_out, nullptr, truncated_input)) {
+                                         member_verify, &member_out, nullptr, chain_cut)) {
                         native_literal_payload = true;
                         literal_data_offset = 0u;
                         literal_data_size = member_out.size();
@@ -11771,6 +11829,10 @@ LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
     r.entries = c.entries;
     r.data_offset = c.data_offset;
     r.total_data_size = c.total_data_size;
+    // where each data record ends: what tells a failure in the archive's last
+    // record (reported shifted, status << 8) from one with records after it
+    r.payload_record_ends = c.payload_record_ends;
+    r.records_after_data = c.records_after_data;
     return r;
 }
 
