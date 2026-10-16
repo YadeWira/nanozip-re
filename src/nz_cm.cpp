@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <cmath>
 
 // ---------------------------------------------------------------------------
@@ -1418,8 +1419,15 @@ static CM* CM_Allocate(int a_bits, int b_bits, uint32_t window_size) {
     CM* cm = new CM(a_bits, b_bits);
 
     cm->cmb.window_size  = window_size;
-    cm->cmb.window       = (new uint8_t[window_size + 64]) + 64;
-    memset(cm->cmb.window - 64, 0, cm->cmb.window_size + 64);
+    // Zero, untouched until written: the window was written to zero at once,
+    // all of it resident from the start (`t -t1` of a 128 MB -cc archive: 557 ->
+    // 487 MiB, the original 448). The hash table above keeps its memset: it is
+    // all touched anyway, and the clear lets it start on huge pages -- left to
+    // fault in at random it cost 7 % more cycles. new[] threw on failure, so does
+    // this (main() turns std::bad_alloc into "Out of memory!").
+    uint8_t* const win_base = static_cast<uint8_t*>(calloc(static_cast<size_t>(window_size) + 64u, 1));
+    if (win_base == nullptr) throw std::bad_alloc();
+    cm->cmb.window       = win_base + 64;
     cm->cmb.write_pos    = 1;
     cm->cmb.mask         = (1u << (BSR(window_size - 1) + 1)) - 1;
     cm->cmb.inverse_mask = ~cm->cmb.mask;
@@ -1452,7 +1460,7 @@ static void CM_Free(CM* cm) {
     nz_aligned_free(cm->modelw);
     for (size_t i = 0; i < 8; i++)
         nz_aligned_free(cm->modele[i].model);
-    delete[] (cm->cmb.window - 64);
+    free(cm->cmb.window - 64);
     delete cm;
 }
 
