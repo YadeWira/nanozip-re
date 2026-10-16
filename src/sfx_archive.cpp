@@ -1636,7 +1636,11 @@ public:
                   "build with -D_FILE_OFFSET_BITS=64: a 32-bit off_t cannot describe "
                   "an archive over 2 GB, which is the whole point of the windowed reader");
 #endif
-    static constexpr std::uint64_t kWindowBytes = 8ull << 20;
+    // 1 MiB, not the 8 it was: every window a thread holds stays resident, and
+    // with four of 8 MiB the archive added ~30 MiB to a decode's peak (`t -t1` of
+    // a 128 MB -cd archive: 143 MiB, the original 110; at 1 MiB, 116). The
+    // CPU cycles of `t` are the same.
+    static constexpr std::uint64_t kWindowBytes = 1ull << 20;
     static constexpr std::size_t kWindowsPerThread = 4;
 
     ~WindowedFile() { Close(); }
